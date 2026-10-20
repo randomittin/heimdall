@@ -21,6 +21,14 @@
 #     HEIMDALL_HOME, bin/lib/hmd_relay_approval.py, never in the repo). The same rule holds for `hmd app add-device`, `hmd app identity revoke`
 #     and a `hmd app connect` that names no relay itself; a relay typed after --relay on the command line is the operator's own choice.
 #
+#   * which home: the operator's no is read from HEIMDALL_HOME, which that same environment names. A repository that pointed it at a directory that does not
+#     exist -- or at an empty one, which hmd's own interpreter cache makes of any path it can -- would find no record, no record is the default (on), and the
+#     operator's `hmd app disconnect` would be forgotten, the token sent. So an off in the account's OWN home (<pw_dir>/.heimdall from the account database, never
+#     $HOME) wins whatever HEIMDALL_HOME says, the home must be one that can be believed (the relay-approval store's rule: absolute, existing, searchable, in no
+#     git work tree), and the default (on) applies only where HEIMDALL_HOME is unset or is the account's own home by device and inode: any other home with no
+#     record is OFF. HMD_PAIR_WINDOW is the same environment and the hook cannot tell whose value it is, so it only ever says no, and DATA.md says plainly that a
+#     repository can change it.
+#
 # Hermetic: a loopback relay (test/lib/fake_relay_code.py), a `gh` that logs each call and prints an obviously fake token (or says it is not
 # logged in), throwaway HOME / repo / TMPDIR / HEIMDALL_HOME. The cases are test/lib/pair_window_token_optin_cases.py; the static checks are below.
 set -u
@@ -143,6 +151,26 @@ if grep -q 'Which relay gets the token' "$REPO/DATA.md" && grep -q 'app/relay-ap
   ok "DATA.md says which relay gets the token, where an approval lives (outside the repo) and that HMD_RELAY_URL alone is not one"
 else
   bad "DATA.md does not document which relay gets the token and the approval store"
+fi
+# a repository sets the session's environment, HEIMDALL_HOME and HMD_PAIR_WINDOW included: what it can and cannot undo is said where the switches are documented
+data_flat="$(tr -s '[:space:]' ' ' <"$REPO/DATA.md")"
+help_flat="$(printf '%s' "$help_text" | tr -s '[:space:]' ' ')"
+if printf '%s' "$data_flat" | grep -q 'A `HEIMDALL_HOME` that is missing, relative, unreadable or inside a git work tree reads as off' \
+   && printf '%s' "$data_flat" | grep -q 'cannot tell a value you set from one the repository set' \
+   && printf '%s' "$data_flat" | grep -q 'a convenience switch, not a lock' \
+   && printf '%s' "$data_flat" | grep -q 'An `off` recorded there wins whatever the environment says' \
+   && printf '%s' "$data_flat" | grep -q 'pairing is on by default only in your own home' \
+   && printf '%s' "$data_flat" | grep -q 'record in `HEIMDALL_HOME` and in your own home alike' \
+   && printf '%s' "$data_flat" | grep -q 'no value of it turns pairing on'; then
+  ok "DATA.md says an off in the operator's own home wins, that pairing is on by default only there, that a HEIMDALL_HOME that is missing, relative, unreadable or in a work tree reads as off, that the hook cannot tell the operator's HMD_PAIR_WINDOW from a repository's, and that the switch only ever turns pairing off"
+else
+  bad "DATA.md does not document what a repository's environment can and cannot undo (the operator's own home and its off, the homes that read as off, HMD_PAIR_WINDOW being a convenience switch that only turns pairing off)"
+fi
+if printf '%s' "$help_flat" | grep -q 'HEIMDALL_HOME that is missing, relative, unreadable or inside a git work tree counts as off' \
+   && printf '%s' "$help_flat" | grep -q 'wins over any HEIMDALL_HOME'; then
+  ok "the usage text says a HEIMDALL_HOME that is missing, relative, unreadable or in a work tree counts as off, and that an off in the operator's own home wins over any HEIMDALL_HOME"
+else
+  bad "the usage text does not say a HEIMDALL_HOME that cannot be believed counts as off, or that an off in the operator's own home wins over any HEIMDALL_HOME"
 fi
 
 # ── the cases ─────────────────────────────────────────────────────────────────────────────────────────

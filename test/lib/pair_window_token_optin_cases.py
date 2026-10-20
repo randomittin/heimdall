@@ -47,16 +47,37 @@ relay it names gets it only when it is the default or one the operator approved 
   E10 the directory that is read is the directory that is judged: $HEIMDALL_HOME/app (or app/relay-approved) a link into the repo is not honoured, and the judge
       walks the ancestors of the directory it was handed by device and inode, so one reached through a link is judged where it is
   E11 a store outside every work tree is honoured -- from the repo, from a subdirectory of it, with no --repo -- and what makes a record believable is unchanged
+WHICH HOME THE CHOICE IS READ FROM. The same environment names HEIMDALL_HOME, where the operator's `hmd app disconnect` is kept, and no record is the default, which is on: a
+repository that pointed HEIMDALL_HOME at nothing -- or at an empty directory, which hmd's own interpreter cache makes of any path it can -- would have forgotten the operator's no for
+them. So the choice is read like this (bin/lib/hmd_pair_optin.py): the home must be believable (the rule of the relay-approval store, hmd_relay_approval.home and in_a_repo: an absolute
+path to a directory that exists, can be searched and is in no git work tree); an off in the account's OWN home -- <pw_dir>/.heimdall from the account database, never $HOME -- wins
+whatever HEIMDALL_HOME says; and the default (on) applies only when HEIMDALL_HOME is unset or is that directory by device and inode: any other home with no record is off. A test must
+not touch the real home, so the sandbox's own home stands in for the account's (HMD_TEST_CANONICAL_HOME, honoured only for a directory carrying a marker file, which a repository
+cannot make outside its own tree, and in no work tree). These run with the default relay and a recorder where the relay client goes, so what a start would have handed it is seen:
+  H1  `hmd app disconnect`, then session starts whose environment names a HEIMDALL_HOME that is missing, a file, not searchable, relative, inside a work tree -- or an empty, existing
+      directory that is not the operator's own: no token is read, no client is handed one, no window opens
+  H2  a HEIMDALL_HOME inside a git work tree (the repo's, another one, through a link) is off, with no record in it or with an `on` a repository planted; `set` and `off` refuse it
+  H3  the operator's own home is on by default (HEIMDALL_HOME that directory, a link to it, or unset with HOME the account's own; the token goes once), and not when $HOME is moved
+  H4  HMD_PAIR_WINDOW only ever says no: no value of it opens a window for a repo `hmd app disconnect` switched off
+  H5  the choice and the approval store judge a home alike (missing, relative, a file, a work tree, a link into one, a sound one, a plain project directory)
+  H6  an empty, existing directory that is not the operator's own reads off with no record anywhere; an `on` made there is honoured, and an off in the operator's own home wins over it
+  H7  the operator's own home is named by the account database, never by $HOME: the cases above stand a directory in for it (SEAM), this one swaps the database for a stand-in in-process
+  H8  the seam adds a store and never replaces the real home: an off in the real home is read even when HMD_TEST_CANONICAL_HOME and HEIMDALL_HOME name a decoy
+  H9  `off` and `set` record in HEIMDALL_HOME and in the account's own home (so an off survives a change of environment, and `connect` can undo it), and say so, once, when the own
+      home cannot be written
 Scaled like the other pair-window cases: the relay keeps a registration 2 s (the real one 360 s), the floor is 0.5 s (300 s) and the lead 0.2 s
 (10 s). The window this replaces registered the code again about every 1.8 s here; WAIT seconds are about 4.5 lifetimes -- 27 minutes of the
 real relay's 6 -- and the old schedule would have made five or six registrations (each one a send of the token) in them.
 """
+import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import time
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import app_pair_confirm_cases as C  # noqa: E402  (the hook command, run, wait_until, the relay's purge of lapsed sessions)
@@ -74,6 +95,10 @@ WAIT = 9.0
 SIGNED_OUT = "You are not logged into any GitHub hosts. To log in, run: gh auth login"
 DEFAULT_RELAY = H.HOSTED_RELAY
 TOKEN_SHA = hashlib.sha256(H.TOKEN.encode()).hexdigest()
+# bin/lib/hmd_pair_optin.py reads the account's own home from the account database, and a test must not touch the real one: SEAM names the directory that stands in for it. The helper
+# honours it only for a directory carrying SEAM_MARKER (a file of this user's, 0600, which no repository can make outside its own tree) and in no work tree.
+SEAM = "HMD_TEST_CANONICAL_HOME"
+SEAM_MARKER = ".hmd-test-canonical-home"
 
 # Stands in for bin/heimdall-relay-client where a case must see what the window HANDS its client, for the default relay (the real one is not
 # reachable from a test): its argv and the hash of the first line of its stdin -- the token, when one was handed over, never the line itself --
@@ -84,6 +109,17 @@ REC="$HMD_FAKE_REC"
 if IFS= read -r first; then printf '%s' "$first" | shasum -a 256 | cut -d' ' -f1 > "$REC/stdin.$$"; fi
 exit 0
 """
+
+
+def plant(home, choice, repo):
+    """What `hmd app connect` (on) or `hmd app disconnect` (off) record for `repo`, put in `home` without asking where that is -- the helper itself refuses a home inside a git work
+    tree, so a plant cannot be made with it, and it records in the account's own home as well, which a plant must not."""
+    optin = H.load_module("hmd_pair_optin_plant", OPTIN_PY)
+    real = os.path.realpath(repo)
+    when = {"connected_at": int(time.time())} if choice == "on" else {"off_at": int(time.time())}
+    body = json.dumps(dict(when, v=optin.VERSION, repo=real, state=choice), sort_keys=True, separators=(",", ":"))
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    optin.PRIVATE.write(home, optin.REL, optin._name(real), body.encode("utf-8"))
 
 
 class Scn:
@@ -102,6 +138,9 @@ class Scn:
         self.relay = FakeCodeRelay(ttl_s=ttl, expect_token=H.TOKEN).start()
         self.procs = []
         self.dummies = []
+        # the operator's HEIMDALL_HOME exists, as it does on any machine hmd has run on: a home that is missing is not "no record", it is a home that cannot be believed
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        C.write_private(os.path.join(self.home, SEAM_MARKER), "a test's stand-in for this account's own home\n")
         if approve:
             self.approve_relay()
 
@@ -129,7 +168,7 @@ class Scn:
     def env(self, **extra):
         """The environment of a run. `extra` overrides any of it; a value of None leaves that variable out altogether (HMD_RELAY_URL=None: the
         environment names no relay)."""
-        merged = {"PATH": self.sb.bin + os.pathsep + os.environ.get("PATH", ""), "HMD_RELAY_URL": self.relay.url, "HMD_SESSION_LOGIN_STORE": "file"}
+        merged = {"PATH": self.sb.bin + os.pathsep + os.environ.get("PATH", ""), "HMD_RELAY_URL": self.relay.url, "HMD_SESSION_LOGIN_STORE": "file", SEAM: self.home}
         merged.update(KNOBS)
         merged.update(extra)
         return self.sb.env(**{name: value for name, value in merged.items() if value is not None})
@@ -159,6 +198,10 @@ class Scn:
         body = json.dumps({"v": approval.VERSION, "relay": origin, "approved_at": int(time.time())}, sort_keys=True, separators=(",", ":"))
         os.makedirs(home, mode=0o700, exist_ok=True)
         approval.PRIVATE.write(home, approval.REL, approval._name(origin), body.encode("utf-8"))
+
+    def plant_choice(self, home, choice="on", repo=None):
+        """`plant` for `repo` (this one by default)."""
+        plant(home, choice, repo or self.repo)
 
     @staticmethod
     def records_in(home):
@@ -468,7 +511,8 @@ def case_gh_signed_out_starts_nothing():
                 "N9. ...nothing started: no window, no request of any kind to the relay", "window %r requests %r" % (s.window_state(), s.relay.requests))
         started = s.hook(C.SID2)
         recorded = C.wait_until(lambda: s.session_record(C.SID2), 20)
-        time.sleep(2)
+        C.wait_until(lambda: s.gh_token_reads() >= 2, 30)  # the hook's window is a background process: how long it takes to reach gh depends on the load, so it is waited for ...
+        time.sleep(1)  # ... and a read beyond the two it is allowed would show in this second
         T.check(started.returncode == 0 and started.stdout == "" and bool(recorded) and s.window_state() is None and s.relay.requests == [],
                 "N9. ...and the SessionStart hook is silent and the session unaffected: it exits 0, the session is still recorded, no window opens",
                 "rc %r out %r record %r" % (started.returncode, started.stdout, recorded))
@@ -916,6 +960,387 @@ def case_a_store_outside_every_work_tree_is_honoured():
                 "loose dir %r believed %r restored %r" % (loose_dir, [what for what, yes in believed.items() if yes], restored))
 
 
+# -- H: which home the choice is read from -------------------------------------------------------------------------
+class Homes:
+    """The HEIMDALL_HOMEs a repository's environment could name -- none of them the operator's own, which is s.home -- as `entries`: [(label, value, sound, kind)]. `value` is what the
+    environment says (a session runs in the repo, as the hook does, so a relative value is relative to it); `sound` says whether the home passes the test a store must pass (absolute,
+    exists, can be searched, in no work tree: what the relay-approval store applies too), and the sound ones carry SEAM_MARKER so a test can make one of them the account's own. None of
+    them holds a record for the repo, so a reader that took "no record" at face value would call every one of them on. A directory nobody can search is left out when this runs as root,
+    who searches anything."""
+
+    def __init__(self, s):
+        root, repo = os.path.realpath(s.sb.root), os.path.realpath(s.repo)
+
+        def made(*parts):
+            path = os.path.join(*parts)
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            return path
+
+        other_tree = os.path.join(root, "other-work-tree")
+        C.run(["git", "init", "-q", other_tree], s.env(), timeout=60)
+        in_repo = made(repo, ".hmd-home")
+        link = os.path.join(root, "link-to-repo-home")
+        os.symlink(in_repo, link)
+        a_file = os.path.join(root, "home-is-a-file")
+        C.write_private(a_file, "not a directory\n")
+        relative_target = made(root, "sound-relative-target")
+        busy = made(root, "busy-home")
+        s.plant_choice(busy, "off", repo=made(root, "some-other-repo"))
+        sound = made(root, "sound-home")
+        for place in (sound, busy):
+            C.write_private(os.path.join(place, SEAM_MARKER), "a test's stand-in for an account's own home\n")
+        self.entries = [
+            ("that does not exist (`HEIMDALL_HOME=/nonexistent`, the reported attack)", "/nonexistent", False, "missing"),
+            ("that does not exist and cannot be made (it is below a regular file)", os.path.join(a_file, "home"), False, "missing"),
+            # the helper's own answer only: any hmd command that runs with this HEIMDALL_HOME makes the directory (hmd-python.sh keeps its interpreter path there), and a made one exists
+            ("that does not exist yet, beside a directory that does", os.path.join(root, "no-such-home"), False, "absent"),
+            ("that is a regular file", a_file, False, "file"),
+            ("that is relative, and resolves to a sound directory outside every work tree", os.path.relpath(relative_target, repo), False, "relative"),
+            ("that is relative, into the repo", ".hmd-home", False, "relative"),
+            ("that is the repo's own top directory", repo, False, "tree"),
+            ("that is a directory in the repo", in_repo, False, "tree"),
+            ("that is four directories down in the repo", made(repo, "a", "b", "c", "home"), False, "tree"),
+            ("that is a link to a directory in the repo", link, False, "tree"),
+            ("that is in another git work tree", made(other_tree, "home"), False, "tree"),
+            ("that is sound and empty", sound, True, "sound"),
+            ("that is sound and holds another repo's choice", busy, True, "sound"),
+        ]
+        self.locked = None
+        if os.geteuid() != 0:
+            self.locked = made(root, "locked-home")
+            os.chmod(self.locked, 0)
+            self.entries.append(("that cannot be searched", self.locked, False, "locked"))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        if self.locked:
+            os.chmod(self.locked, 0o700)  # so the sandbox can be removed
+
+
+def session_start(s, sid, home, **extra):
+    """A session start in the repo -- `hmd app pair-window`, which the SessionStart hook runs -- in the environment a repository could set up: `home` as HEIMDALL_HOME, no
+    HMD_RELAY_URL (the default relay, which needs no approval) and a recorder where the relay client goes, run from the repo as the hook is. A window that opens is closed
+    again, so the next start is judged on its own. Returns (the process, `gh auth token` reads it made, code windows it handed a client to, whether a window opened)."""
+    reads, starts = s.gh_token_reads(), len(s.started())
+    out = C.run([H.APP_PATH, "pair-window", "--session", sid, "--pid", str(os.getpid()), "--repo", s.repo],
+                s.env(HEIMDALL_HOME=home, HMD_RELAY_URL=None, **dict(s.recorder(), **extra)), timeout=60, cwd=s.repo)
+    pid = (s.window_state() or {}).get("pid")
+    opened = isinstance(pid, int) and C.alive(pid)  # a window is open while its supervisor lives: the state file it leaves behind says nothing
+    if opened:
+        C.run([H.APP_PATH, "pair-window", "--stop", "--session", sid, "--repo", s.repo], s.env(HEIMDALL_HOME=home), timeout=60, cwd=s.repo)
+    return out, s.gh_token_reads() - reads, len(s.started()) - starts, opened
+
+
+def started_anything(label, got):
+    """`label` and what a session start did, when it did anything (or failed): a token read, a client handed one, a window opened."""
+    out, reads, clients, opened = got
+    if out.returncode == 0 and not reads and not clients and not opened:
+        return None
+    return "%s (rc %r, %d token read(s), %d client(s), window %r)" % (label, out.returncode, reads, clients, opened)
+
+
+def choice_in(s, home, action="state", repo=None, **env):
+    """`hmd_pair_optin.py ACTION --repo REPO` as a session in the repo would run it, with `home` as HEIMDALL_HOME and `env` over the sandbox's environment (where SEAM names the
+    directory standing in for this account's own home): the finished process."""
+    return C.run([sys.executable, OPTIN_PY, action, "--repo", repo or s.repo], s.env(HEIMDALL_HOME=home, **env), timeout=60, cwd=s.repo)
+
+
+def unset_home(s, **extra):
+    """The sandbox's environment with no HEIMDALL_HOME at all (Sandbox.env always sets one, and a value of None only keeps it out of what is passed on)."""
+    env = s.env(**extra)
+    env.pop("HEIMDALL_HOME", None)
+    return env
+
+
+# -- H1 ------------------------------------------------------------------------------------------------------------
+def case_an_environment_cannot_point_the_off_record_away():
+    with Scn(approve=False) as s:
+        out = C.run([H.APP_PATH, "disconnect", "--repo", s.repo], s.env(), timeout=120)  # the operator, in their own environment: the off goes in their own home
+        T.check(out.returncode == 0 and s.state() == "off",
+                "H1. (setup) the operator runs `hmd app disconnect`: this repo is off in their own home",
+                "rc %r state %r err %r" % (out.returncode, s.state(), out.stderr[-200:]))
+        with Homes(s) as homes:
+            # the helper's own answer first: the session starts below would make a home that merely does not exist yet (see Homes), and a made one exists
+            says = [(label, choice_in(s, value, "state").stdout.strip(), choice_in(s, value, "check").returncode) for label, value, _sound, _kind in homes.entries]
+            ran = [(label, kind, session_start(s, "h1-%d" % n, value)) for n, (label, value, _sound, kind) in enumerate(homes.entries) if kind != "absent"]
+        T.check(bool(says) and all(state == "off" and rc == 1 for _label, state, rc in says),
+                "H1. ...and the helper the hook asks says so directly: `state` is off and `check` exits 1 for every home a repository's environment could name -- the empty, well-formed "
+                "ones among them: the operator's off is in their own home, which is read whatever HEIMDALL_HOME says",
+                "; ".join("%s: state %r, check %r" % v for v in says if v[1] != "off" or v[2] != 1))
+        said = {"missing": "does not exist and cannot be made (`/nonexistent`, a path below a regular file)", "file": "is a file", "locked": "cannot be searched",
+                "relative": "is relative (to a sound directory, or into the repo)", "tree": "is inside a git work tree (the repo's, another one, a link into one)",
+                "sound": "is an empty directory of yours that is not your own home (also one holding another repo's choice)"}
+        for kind, what in said.items():
+            mine = [(label, got) for label, k, got in ran if k == kind]
+            if not mine:
+                continue  # no search-less directory for root
+            T.check(all(started_anything(label, got) is None for label, got in mine),
+                    "H1. ...a session start whose environment names a HEIMDALL_HOME that %s reads no token (gh is not asked), hands no client one and opens no window: "
+                    "the operator's off is not forgotten" % what,
+                    "; ".join(filter(None, (started_anything(label, got) for label, got in mine))))
+
+
+# -- H2 ------------------------------------------------------------------------------------------------------------
+def case_a_home_inside_a_work_tree_is_off():
+    with Scn(approve=False) as s, Homes(s) as homes:
+        trees = [(label, value) for label, value, _sound, kind in homes.entries if kind == "tree"]
+        wrong = []
+        for label, value in trees:
+            for planted in (False, True):
+                if planted:
+                    s.plant_choice(value, "on")  # what a repository could write there: valid in every respect but where it is
+                said, checked = choice_in(s, value, "state").stdout.strip(), choice_in(s, value, "check").returncode
+                if said != "off" or checked != 1:
+                    wrong.append("%s%s: state %r, check %r" % (label, " with an `on` planted in it" if planted else "", said, checked))
+        T.check(len(trees) == 5 and not wrong,
+                "H2. a HEIMDALL_HOME inside a git work tree (the repo's top, a directory in it, four down, through a link, another work tree) reads as off -- with no record in it "
+                "and with an `on` record a repository planted -- and `check` says no",
+                "; ".join(wrong))
+        fresh = os.path.join(os.path.realpath(s.repo), ".hmd-fresh")
+        refused = [choice_in(s, fresh, action) for action in ("set", "off")]
+        T.check(all(r.returncode == 1 and "git work tree" in r.stderr for r in refused) and not os.path.exists(fresh),
+                "H2. `set` and `off` refuse such a home, say why on stderr and create nothing in it, not even the directories",
+                "rc %r err %r made %r" % ([r.returncode for r in refused], [r.stderr[-120:] for r in refused], os.path.exists(fresh)))
+        ran = [(label, session_start(s, "h2-%d" % n, value)) for n, (label, value) in enumerate(trees)]
+        T.check(all(started_anything(label, got) is None for label, got in ran),
+                "H2. ...and a session start in such a home, the planted `on` still in it, reads no token, hands no client one and opens no window",
+                "; ".join(filter(None, (started_anything(label, got) for label, got in ran))))
+
+
+# -- H3 ------------------------------------------------------------------------------------------------------------
+def case_the_operators_own_home_is_on_by_default():
+    with Scn(approve=False) as s:
+        link = os.path.join(s.sb.root, "link-to-own-home")
+        os.symlink(s.home, link)
+        hostile = os.path.join(os.path.realpath(s.sb.root), "hostile-home")  # the $HOME an environment could set: it exists, with an empty .heimdall in it
+        os.makedirs(os.path.join(hostile, ".heimdall"), mode=0o700)
+        own = [("HEIMDALL_HOME is the home itself", choice_in(s, s.home)), ("HEIMDALL_HOME is a link to it (the same directory, by device and inode)", choice_in(s, link)),
+               ("HEIMDALL_HOME is unset and $HOME is the account's own", C.run([sys.executable, OPTIN_PY, "state", "--repo", s.repo], unset_home(s), timeout=60, cwd=s.repo))]
+        T.check(all(proc.stdout.strip() == "default" for _way, proc in own),
+                "H3. in the operator's own home a repo with no record reads as the default, on -- whether HEIMDALL_HOME is that directory, a link to it, or unset with $HOME the account's own",
+                "; ".join("%s: %r" % (way, proc.stdout.strip()) for way, proc in own))
+        moved = C.run([sys.executable, OPTIN_PY, "state", "--repo", s.repo], unset_home(s, HOME=hostile), timeout=60, cwd=s.repo)
+        T.check(moved.stdout.strip() == "off",
+                "H3. ...but not when the environment moves $HOME instead of HEIMDALL_HOME: the empty .heimdall it then names is not the account's own home (read from the account "
+                "database, never from $HOME), so the repo reads as off",
+                repr(moved.stdout))
+        out = s.pair_window("h3-on", HEIMDALL_HOME=link, HMD_RELAY_URL=None, **s.recorder())
+        C.wait_until(lambda: any(first for _argv, first in s.started()), 40)  # the recorder writes its argv first, the hash of what it read on stdin after it
+        starts = s.started()
+        T.check(out.returncode == 0 and bool(starts) and starts[0][1] == TOKEN_SHA and s.gh_token_reads() >= 1,
+                "H3. ...and a session start there (HEIMDALL_HOME a link to it) opens the window: gh is asked and the client is handed the laptop's token (the recorder saw its hash)",
+                "rc %r err %r starts %r gh reads %d" % (out.returncode, out.stderr, starts, s.gh_token_reads()))
+        gone = C.run([H.APP_PATH, "disconnect", "--repo", s.repo], s.env(), timeout=120)
+        T.check(gone.returncode == 0 and s.state() == "off",
+                "H3. `hmd app disconnect` records the repo as off there", "rc %r state %r err %r" % (gone.returncode, s.state(), gone.stderr[-200:]))
+        again = session_start(s, "h3-off", link)
+        T.check(started_anything("the same home after disconnect", again) is None,
+                "H3. ...and the next session start in it reads no token, hands no client one and opens no window", repr(started_anything("again", again)))
+
+
+# -- H4 ------------------------------------------------------------------------------------------------------------
+def case_the_machine_switch_only_turns_pairing_off():
+    with Scn(approve=False) as s:
+        out = C.run([H.APP_PATH, "disconnect", "--repo", s.repo], s.env(), timeout=120)
+        ran = [(value, session_start(s, "h4-%d" % n, s.home, HMD_PAIR_WINDOW=value)) for n, value in enumerate(("1", "on", "yes", "true", "force", "ON", "2"))]
+        T.check(out.returncode == 0 and all(started_anything("HMD_PAIR_WINDOW=%s" % value, got) is None for value, got in ran),
+                "H4. HMD_PAIR_WINDOW is the session's environment, a repository can set it and the hook cannot tell whose value it is -- so it only ever says no: with any other value "
+                "(1, on, yes, true, force, ON, 2) a repo `hmd app disconnect` switched off still reads no token, hands no client one and opens no window",
+                "disconnect rc %r; %s" % (out.returncode, "; ".join(filter(None, (started_anything("HMD_PAIR_WINDOW=%s" % value, got) for value, got in ran)))))
+
+
+# -- H5 ------------------------------------------------------------------------------------------------------------
+def case_the_choice_and_the_approval_judge_a_home_alike():
+    with Scn(approve=False) as s, Homes(s) as homes:
+        repo = os.path.realpath(s.repo)
+        verdicts = []
+        for label, value, sound, kind in homes.entries:
+            if kind in ("tree", "sound", "relative"):  # a place that can be made: the approval a store would hold is planted where the spelling leads
+                s.plant_approval(value if os.path.isabs(value) else os.path.normpath(os.path.join(repo, value)))
+            approving = s.trusted_in(value, s.repo, cwd=s.repo)  # the store believed ...
+            # ... is the home the choice is read from: a sound home is made the account's own (SEAM), so that what is asked is whether the HOME can be believed, not whether it is the
+            # operator's -- any other is read with the sandbox's own home standing in for the account's
+            reading = choice_in(s, value, **{SEAM: value if sound else s.home}).stdout.strip() != "off"
+            verdicts.append((label, approving, reading))
+        T.check(all(approving == reading for _label, approving, reading in verdicts) and any(a for _l, a, _r in verdicts) and not all(a for _l, a, _r in verdicts),
+                "H5. the choice and the relay-approval store judge a HEIMDALL_HOME alike: for each of missing, a file, unsearchable, relative, in a work tree (also through a link, or "
+                "another one) and a sound one, a store holding an approval is believed exactly where the choice is read (and not off)",
+                "; ".join("%s: approval %r, choice read %r" % v for v in verdicts if v[1] != v[2]) or "none or all believed: %r" % [(v[0], v[1]) for v in verdicts])
+        # the repo a question names is part of it: a plain project directory (no .git) holding the home refuses by the repo's own identity, for both
+        project = os.path.join(os.path.realpath(s.sb.root), "Project")
+        plain_home = os.path.join(project, ".hmd-home")
+        s.plant_approval(plain_home)
+        C.write_private(os.path.join(plain_home, SEAM_MARKER), "a test's stand-in for an account's own home\n")
+        about = {"the project itself": project, "another repo": s.repo}
+        results = {who: (s.trusted_in(plain_home, repo_arg, cwd=s.repo), choice_in(s, plain_home, repo=repo_arg, **{SEAM: plain_home}).stdout.strip() != "off")
+                   for who, repo_arg in about.items()}
+        T.check(results == {"the project itself": (False, False), "another repo": (True, True)},
+                "H5. ...and so do they when the repo asked about holds the home without being a git work tree: refused for that repo (by device and inode), believed for another",
+                repr(results))
+
+
+# -- H6 ------------------------------------------------------------------------------------------------------------
+def case_a_home_that_is_not_the_operators_own_reads_off_with_no_record_anywhere():
+    with Scn(approve=False) as s, Homes(s) as homes:
+        sound = [(label, value) for label, value, is_sound, _kind in homes.entries if is_sound]
+        T.check(len(sound) == 2 and s.state() == "default",
+                "H6. (setup) no record anywhere: the operator's own home reads the repo as the default", "state %r, sound homes %r" % (s.state(), sound))
+        said = [(label, choice_in(s, value, "state").stdout.strip(), choice_in(s, value, "check").returncode) for label, value in sound]
+        T.check(all(state == "off" and rc == 1 for _label, state, rc in said),
+                "H6. an empty, existing directory the environment names as HEIMDALL_HOME reads as off even though no record exists anywhere: a home that is not the operator's own is "
+                "no place to take the default from",
+                repr(said))
+        started = session_start(s, "h6-0", sound[0][1])
+        T.check(started_anything("an empty existing home", started) is None,
+                "H6. ...and a session start in it reads no token, hands no client one and opens no window", repr(started_anything("an empty existing home", started)))
+        home = sound[0][1]
+        choice_in(s, home, "set")  # what `hmd app connect` records, made there
+        recorded = choice_in(s, home).stdout.strip()
+        s.record("off")  # the operator's own home
+        vetoed = choice_in(s, home).stdout.strip()
+        T.check(recorded == "on" and vetoed == "off",
+                "H6. a record that says on, made in such a home, is honoured -- and an off in the operator's own home wins over it",
+                "recorded %r, after the operator's off %r" % (recorded, vetoed))
+
+
+@contextlib.contextmanager
+def environment(**env):
+    """os.environ with these set (a value of None removes the variable) and restored afterwards: what an in-process case reads the helper's environment from."""
+    saved = {name: os.environ.get(name) for name in env}
+    try:
+        for name, value in env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+# -- H7 ------------------------------------------------------------------------------------------------------------
+def case_the_account_database_not_home_names_the_operators_home():
+    sb = H.Sandbox()
+    try:
+        root = os.path.realpath(sb.root)
+        optin = H.load_module("hmd_pair_optin_account", OPTIN_PY)
+        account = os.path.join(root, "account")  # what the stand-in account database names as this account's home directory
+        own = os.path.join(account, ".heimdall")
+        os.makedirs(own, mode=0o700)
+        elsewhere = os.path.join(root, "elsewhere")  # a $HOME that exists, with an empty .heimdall in it: not the account's own either
+        os.makedirs(os.path.join(elsewhere, ".heimdall"), mode=0o700)
+        link = os.path.join(root, "link-to-own")
+        os.symlink(own, link)
+        empty = os.path.join(root, "empty")
+        os.makedirs(empty, mode=0o700)
+        asked = []
+        optin.pwd = types.SimpleNamespace(getpwuid=lambda uid: asked.append(uid) or types.SimpleNamespace(pw_dir=account))  # the account database, as a test can have it
+        with environment(HMD_TEST_CANONICAL_HOME=None, HEIMDALL_HOME=None, HOME=elsewhere):
+            named = optin.real_home()
+        T.check(named == own and asked == [os.getuid()],
+                "H7. the operator's own home is <pw_dir>/.heimdall from the account database, asked for this account's uid -- not $HOME, which the environment sets",
+                "named %r, asked %r" % (named, asked))
+        got = {}
+        for way, env in (("no HEIMDALL_HOME, $HOME the account's own", dict(HEIMDALL_HOME=None, HOME=account)),
+                         ("no HEIMDALL_HOME, $HOME moved to a directory with an empty .heimdall", dict(HEIMDALL_HOME=None, HOME=elsewhere)),
+                         ("HEIMDALL_HOME a link to the own home", dict(HEIMDALL_HOME=link, HOME=elsewhere)),
+                         ("HEIMDALL_HOME an empty directory", dict(HEIMDALL_HOME=empty, HOME=account))):
+            with environment(HMD_TEST_CANONICAL_HOME=None, **env):
+                got[way] = optin.state(sb.repo)
+        T.check(got == {"no HEIMDALL_HOME, $HOME the account's own": "default", "no HEIMDALL_HOME, $HOME moved to a directory with an empty .heimdall": "off",
+                        "HEIMDALL_HOME a link to the own home": "default", "HEIMDALL_HOME an empty directory": "off"},
+                "H7. ...so the default (on) is the own home's alone: with no record, HEIMDALL_HOME unset or naming it (through a link too) reads default, and $HOME moved, or HEIMDALL_HOME "
+                "an empty directory, reads off",
+                repr(got))
+        with environment(HMD_TEST_CANONICAL_HOME=None, HEIMDALL_HOME=own, HOME=account):
+            optin.off(sb.repo)  # the operator's `hmd app disconnect`
+        with environment(HMD_TEST_CANONICAL_HOME=None, HEIMDALL_HOME=empty, HOME=elsewhere):
+            vetoed = optin.state(sb.repo)
+        T.check(vetoed == "off", "H7. ...and the off in the own home is read whatever the environment names: HEIMDALL_HOME an empty directory still reads off", "got %r" % vetoed)
+    finally:
+        sb.close()
+
+
+# -- H8 ------------------------------------------------------------------------------------------------------------
+def case_the_seam_adds_a_store_and_never_replaces_the_real_home():
+    sb = H.Sandbox()
+    try:
+        root = os.path.realpath(sb.root)
+        optin = H.load_module("hmd_pair_optin_seam", OPTIN_PY)
+        account = os.path.join(root, "account")
+        real = os.path.join(account, ".heimdall")  # the account's real home, as the stand-in account database names it
+        os.makedirs(real, mode=0o700)
+        decoy = os.path.join(root, "decoy")  # a directory an environment names as the seam, with the marker a test puts in it
+        os.makedirs(decoy, mode=0o700)
+        C.write_private(os.path.join(decoy, SEAM_MARKER), "a decoy\n")
+        optin.pwd = types.SimpleNamespace(getpwuid=lambda uid: types.SimpleNamespace(pw_dir=account))
+        with environment(HMD_TEST_CANONICAL_HOME=decoy, HEIMDALL_HOME=decoy, HOME=account):
+            before = optin.state(sb.repo)
+        plant(real, "off", sb.repo)  # the operator's `hmd app disconnect`, recorded in their real home
+        with environment(HMD_TEST_CANONICAL_HOME=decoy, HEIMDALL_HOME=decoy, HOME=account):
+            after = optin.state(sb.repo)
+        T.check(before == "default" and after == "off",
+                "H8. the seam adds a store and never replaces the real home: with HMD_TEST_CANONICAL_HOME and HEIMDALL_HOME both naming a decoy, a repo with no record reads default, "
+                "and the same repo reads off once the real home holds an off -- naming a seam does not hide it",
+                "before %r, after %r" % (before, after))
+    finally:
+        sb.close()
+
+
+# -- H9 ------------------------------------------------------------------------------------------------------------
+def case_off_and_on_are_recorded_in_the_account_home_too():
+    sb = H.Sandbox()
+    try:
+        root = os.path.realpath(sb.root)
+        optin = H.load_module("hmd_pair_optin_mirror", OPTIN_PY)
+        account = os.path.join(root, "account")
+        real = os.path.join(account, ".heimdall")  # not made: recording is what makes it
+        custom = os.path.join(root, "custom")  # a HEIMDALL_HOME that is not the account's own
+        os.makedirs(custom, mode=0o700)
+        optin.pwd = types.SimpleNamespace(getpwuid=lambda uid: types.SimpleNamespace(pw_dir=account))
+
+        def kept(base):
+            folder = os.path.join(base, "app", "pair-optin")
+            return len(os.listdir(folder)) if os.path.isdir(folder) else 0
+
+        with environment(HMD_TEST_CANONICAL_HOME=None, HEIMDALL_HOME=custom, HOME=account):
+            optin.off(sb.repo)  # `hmd app disconnect`, in a session whose environment named another home
+        with environment(HMD_TEST_CANONICAL_HOME=None, HEIMDALL_HOME=None, HOME=account):
+            later = optin.state(sb.repo)  # a clean environment afterwards
+        T.check(kept(custom) == 1 and kept(real) == 1 and later == "off",
+                "H9. `off` records the repo in HEIMDALL_HOME and in the account's own home, so the off survives the environment that was in force changing",
+                "records in HEIMDALL_HOME %d, in the own home %d, later state %r" % (kept(custom), kept(real), later))
+        with environment(HMD_TEST_CANONICAL_HOME=None, HEIMDALL_HOME=custom, HOME=account):
+            optin.set_(sb.repo)  # `hmd app connect`
+            now = optin.state(sb.repo)
+        with environment(HMD_TEST_CANONICAL_HOME=None, HEIMDALL_HOME=None, HOME=account):
+            later = optin.state(sb.repo)
+        T.check(now == "on" and later == "on",
+                "H9. ...and `set` replaces the off in both, so `hmd app connect` turns pairing back on (an off left in the own home would veto it)",
+                "in the session that named HEIMDALL_HOME %r, in a clean one %r" % (now, later))
+        broken = os.path.join(root, "broken-account")  # an account whose own home cannot be written: its .heimdall is a file
+        os.makedirs(broken)
+        C.write_private(os.path.join(broken, ".heimdall"), "not a directory\n")
+        optin.pwd = types.SimpleNamespace(getpwuid=lambda uid: types.SimpleNamespace(pw_dir=broken))
+        second = os.path.join(root, "second")
+        os.makedirs(second, mode=0o700)
+        said = io.StringIO()
+        with environment(HMD_TEST_CANONICAL_HOME=None, HEIMDALL_HOME=second, HOME=broken), contextlib.redirect_stderr(said):
+            rc = optin.main(["off", "--repo", sb.repo])
+        lines = [line for line in said.getvalue().splitlines() if line.strip()]
+        T.check(rc == 1 and len(lines) == 1 and "account's own home" in lines[0] and kept(second) == 1,
+                "H9. ...and when the account's own home cannot be written the command exits 1 with ONE line on stderr that names it -- the HEIMDALL_HOME record is still made",
+                "rc %r, stderr %r, records in HEIMDALL_HOME %d" % (rc, said.getvalue(), kept(second)))
+    finally:
+        sb.close()
+
+
 CASES = [case_switched_off_nothing_sent, case_connect_is_an_explicit_yes, case_default_repo_registers_once, case_paired_phone_needs_no_code,
          case_no_code_switches_it_off, case_record_is_outside_the_repo, case_replacement_client_resumes_without_a_token, case_machine_wide_off,
          case_gh_signed_out_starts_nothing, case_env_relay_nobody_approved_gets_nothing, case_default_relay_gets_the_token,
@@ -923,7 +1348,11 @@ CASES = [case_switched_off_nothing_sent, case_connect_is_an_explicit_yes, case_d
          case_connect_env_relay_pairs_by_qr_without_the_token,
          case_connect_relay_flag_names_the_relay, case_connect_no_code_approves_nothing, case_add_device_and_identity_revoke_refuse_an_env_relay,
          case_relay_matching_is_exact, case_identity_revoke_asks_about_the_repo_root_not_the_working_directory, case_a_store_inside_any_git_work_tree_is_not_honoured,
-         case_a_store_directory_that_is_a_link_is_judged_where_it_is, case_a_store_outside_every_work_tree_is_honoured]
+         case_a_store_directory_that_is_a_link_is_judged_where_it_is, case_a_store_outside_every_work_tree_is_honoured,
+         case_an_environment_cannot_point_the_off_record_away, case_a_home_inside_a_work_tree_is_off, case_the_operators_own_home_is_on_by_default,
+         case_the_machine_switch_only_turns_pairing_off, case_the_choice_and_the_approval_judge_a_home_alike,
+         case_a_home_that_is_not_the_operators_own_reads_off_with_no_record_anywhere, case_the_account_database_not_home_names_the_operators_home,
+         case_the_seam_adds_a_store_and_never_replaces_the_real_home, case_off_and_on_are_recorded_in_the_account_home_too]
 
 
 def main():

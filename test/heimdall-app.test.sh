@@ -62,6 +62,10 @@ export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 mkdir -p "$HOME/.claude"
+# bin/lib/hmd_pair_optin.py reads the account's real home and `hmd app connect` / `disconnect` write it too: this directory stands in for it as the one that is
+# WRITTEN (honoured only because of the marker file in it, which no repository can make outside its own tree), so a run never writes the real ~/.heimdall
+export HMD_TEST_CANONICAL_HOME="$TMPROOT/canonical"
+mkdir -m 700 "$HMD_TEST_CANONICAL_HOME" && (umask 077 && printf 'a test stand-in for an account own home\n' >"$HMD_TEST_CANONICAL_HOME/.hmd-test-canonical-home")
 
 PIDS=()
 cleanup() {

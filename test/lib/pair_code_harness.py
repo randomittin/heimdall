@@ -198,6 +198,14 @@ class Sandbox:
             os.makedirs(d)
         subprocess.run("git init -q . && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m fixture",
                        shell=True, cwd=self.repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # bin/lib/hmd_pair_optin.py reads the account's real home and `hmd app disconnect` / `connect` write it too: this directory stands in for it as the one that is WRITTEN,
+        # so a test never writes the real ~/.heimdall. It is honoured only for a directory carrying the marker file below, which no repository can make outside its own tree.
+        self.canonical = os.path.join(self.root, "canonical")
+        os.makedirs(self.canonical, mode=0o700)
+        marker = os.path.join(self.canonical, ".hmd-test-canonical-home")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("a test's stand-in for an account's own home\n")
+        os.chmod(marker, 0o600)
 
     def env(self, **extra):
         """A clean environment: nothing inherited but PATH, so no session id or token of the machine running
@@ -208,7 +216,8 @@ class Sandbox:
                # the login a client keeps once a phone is bound (bin/lib/hmd_session_login.py) goes to a 0600 file under this sandbox's HEIMDALL_HOME,
                # never to the macOS Keychain: under a throwaway HOME `security` has no default keychain, so every bind waited on a Keychain write that
                # cannot succeed and said device_bound seconds late (the 2.4.8 sweep: 14 suites)
-               "HMD_SESSION_LOGIN_STORE": "file"}
+               "HMD_SESSION_LOGIN_STORE": "file",
+               "HMD_TEST_CANONICAL_HOME": self.canonical}
         env.update({k: str(v) for k, v in extra.items()})
         return env
 

@@ -615,7 +615,9 @@ Saying no is yours to do, per repo or for the machine: `hmd app disconnect` and 
 record the repo as off in a small record in `$HEIMDALL_HOME` (`app/pair-optin/<hash of the repo's path>.json`:
 the repo's path, the state and the time, outside the repo so a repository can neither write nor clear it),
 `hmd app connect` records it as on again, a session ending writes nothing, and a record that cannot be read
-counts as off. `HMD_PAIR_WINDOW=0` turns the window off for the whole machine. For a repo that is not off,
+counts as off, as does a `HEIMDALL_HOME` that cannot be believed, or that is not your own home and holds no `on` record (see "What a repository's environment
+can and cannot undo" below).
+`HMD_PAIR_WINDOW=0` turns the window off for the whole machine. For a repo that is not off,
 and while `gh auth token` yields a token, the 5-character session code `hmd ui` shows is registered with
 the relay under your GitHub identity, so a phone signed in to GitHub as the same user can pair by typing it;
 with no gh sign-in nothing is registered and one line on stderr names `gh auth login`.
@@ -669,6 +671,24 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
   checkout) is not read, however its path is spelled (it is judged by file identity, so another letter case on macOS's
   case-insensitive volume does not help), and a relative `HEIMDALL_HOME` is not read at all: a repository cannot approve its
   own server.
+- **What a repository's environment can and cannot undo.** A repository sets the environment of the session it is opened in
+  (`.claude/settings.json` `env`, `.envrc`), and the SessionStart hook cannot tell a value you set from one the repository set. So
+  the choice you recorded is not looked for only where `HEIMDALL_HOME` points. Your own home is your account's home directory plus
+  `/.heimdall`, read from the account database and never from `$HOME`, and it is always read. An `off` recorded there wins whatever the
+  environment says, and pairing is on by default only in your own home (`HEIMDALL_HOME` unset, or naming that directory, judged by device
+  and inode): any other `HEIMDALL_HOME`, however empty and well-formed, reads as off for a repo that holds no `on` record in it. A
+  `HEIMDALL_HOME` that is missing, relative, unreadable or inside a git work tree reads as off too — the test the relay-approval store
+  applies, one definition for both: an absolute path to a directory of yours that exists and can be searched, reached through no link, and
+  not inside the repo or inside any git work tree. A repository can therefore point `HEIMDALL_HOME` (or `HOME`) away to switch pairing off
+  for its own sessions, never to switch it on or to make you lose your `hmd app disconnect`. `hmd app disconnect` and `hmd app connect`
+  record in `HEIMDALL_HOME` and in your own home alike, so an off survives a change of environment and `connect` can turn pairing back on;
+  one that cannot be recorded in your own home exits non-zero with one line on stderr. They keep no record in a home that cannot be
+  believed, so with `~` a work tree, set `HEIMDALL_HOME` outside it; and if you keep `HEIMDALL_HOME` elsewhere on purpose, a repo is on
+  there only once `hmd app connect` has recorded it. `HMD_PAIR_WINDOW` is read from the same environment, so a repository can change it as
+  well: it can set `HMD_PAIR_WINDOW=0` to switch pairing off for its own sessions, or any other value to undo a `HMD_PAIR_WINDOW=0` you
+  set. Treat it as a convenience switch, not a lock. It can only turn pairing off — no value of it turns pairing on — so it never turns
+  on a repo that `hmd app disconnect` recorded as off. For a no that a repository cannot undo, use `hmd app disconnect` (or
+  `hmd app connect --no-code`): a record in your own home.
 - **The phone's side** (`POST /identity/github`, `POST /pair/code`): the phone's GitHub
   device-flow token is checked against hmd's GitHub App and deleted at GitHub, and replaced
   by a relay-signed assertion bound to the phone's key. The relay releases a pending pairing
