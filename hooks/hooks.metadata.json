@@ -465,9 +465,9 @@
       "event": "SessionEnd",
       "index": 1,
       "id": "session-end-sweep",
-      "description": "Foreground, each alarm-bounded (10s): checkpoint write, then autocommit — the never-lose contract; both must land before the hook returns (a checkpoint written but not committed is lost on `git worktree remove`). Background: parallelism grade, verify-edits --quick, cleanup, reel, summary-card, context-sync; then the farewell.",
+      "description": "Foreground: only the farewell, under a 1s alarm (Claude Code cancels a SessionEnd hook that outlives its budget: 1.5s, or this hook's timeout of 5s). Detached (nohup + setsid, survives the hook's exit), in order: checkpoint write then autocommit, each alarm-bounded (10s) with their cut-short/failed notices written to .heimdall/logs/session-end.log, then parallelism grade, verify-edits --quick, cleanup, reel, summary-card, context-sync. The checkpoint and the commit land a few seconds after the session ends, not before the hook returns.",
       "matcher": "",
-      "fingerprint": "d16e0f6719b946647fa132de22d44fed27aafb2068324b7fa66b1d5533f1986c",
+      "fingerprint": "78a86b8681eade240a84b0cedae78501418e4357818544be1574b1aed978ee56",
       "locked": false,
       "remote_toggle": false
     },
