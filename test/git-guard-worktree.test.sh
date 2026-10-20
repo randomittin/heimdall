@@ -189,6 +189,8 @@ read -r MAIN2c WT2c <<<"$(mkpair 2c)"
 BEFORE="$(commits_in "$WT2c")"
 ( cd "$WT2c" && CLAUDE_PLUGIN_ROOT="$ROOT" CLAUDE_PROJECT_DIR="$WT2c" \
   HEIMDALL_HOME="$SCRATCH/home2c" sh -c "$(session_end_body)" </dev/null ) >/dev/null 2>&1
+# The commit is made by the DETACHED worker (hooks.json: nohup + setsid) after the hook returns: wait for it, bounded at 15s.
+for _w in $(seq 1 150); do [ "$(commits_in "$WT2c")" -gt "$BEFORE" ] && break; sleep 0.1; done
 AFTER="$(commits_in "$WT2c")"
 if [ "$AFTER" -gt "$BEFORE" ]; then
   ok "session-end checkpoint fires inside a worktree ($BEFORE → $AFTER)"

@@ -6,17 +6,15 @@
 # REAL session stats (never fabricated) + a punchy "unproven → proven" tagline.
 # Designed to feel like a satisfying, screenshot-worthy end to the run.
 #
-# Where it runs: the SessionEnd hook, in the FOREGROUND, AFTER the checkpoint
-# write AND the autocommit have landed (both synchronous and alarm-bounded in
-# the hook — since 2026-09-19; 5acd427c had briefly backgrounded them and a
-# session could end without the CHECKPOINT.md heimdall-resume-probe needs, or
-# with the checkpoint commit still in flight — test/git-guard-worktree.test.sh
-# 2c counts commits the instant the hook returns). The heavy reel/summary-card
-# render IS still backgrounded and may be running when this prints. "clean
-# tree" below is an observation of the tree at this instant: true once the
-# autocommit committed everything, dropped when the autocommit was cut short or
-# had nothing in its edit ledger to stage. It stays cheap on purpose: never
-# re-introduce the heavy work here.
+# Where it runs: the SessionEnd hook, in the FOREGROUND, and it is the ONLY thing
+# that does — under a 1s alarm, so a slow farewell is cut, never waited for.
+# Claude Code cancels a SessionEnd hook that outlives its budget (1.5s unless the
+# hook sets a `timeout`) and prints "SessionEnd hook [...] failed: Hook cancelled",
+# so the checkpoint write, the autocommit and the housekeeping run DETACHED
+# (nohup + setsid, hooks/hooks.json) and may still be running when this prints.
+# "clean tree" below is an observation of the tree at this instant: true only
+# when nothing was left to commit (the detached autocommit has not landed yet),
+# dropped otherwise. It stays cheap on purpose: never re-introduce heavy work here.
 #
 # Stats are REAL or ABSENT — never invented:
 #   - files edited this session  <- bin/edit-tracker paths   (session-scoped ledger)
@@ -53,17 +51,15 @@ edits=""; agents=""; clean=""
 
 ETRACKER="$PLUGIN_DIR/bin/edit-tracker"
 if [ -x "$ETRACKER" ]; then
-  # Fork-free line count (was `| grep -c .`): edit-tracker paths never emits
-  # blank lines (verified against its real output), and bash command
-  # substitution strips the trailing newline, so counting embedded newlines
-  # in the captured string and adding 1 for the truncated final line gives
-  # the same count as `grep -c .` for N>=1 lines; N=0 is the empty-string
-  # guard below. Saves 1 fork (grep) per farewell run.
+  # Line count via wc, which is linear. The former fork-free count,
+  # `${_paths_out//[^$'\n']/}`, is quadratic in bash 3.2 (macOS /bin/bash): on a
+  # ledger of a few thousand paths it pinned a CPU for minutes, and the SessionEnd
+  # hook sat waiting on it. edit-tracker paths never emits blank lines.
   _paths_out="$("$ETRACKER" paths 2>/dev/null || true)"
   _e=0
   if [ -n "$_paths_out" ]; then
-    _nl="${_paths_out//[^$'\n']/}"
-    _e=$(( ${#_nl} + 1 ))
+    _e="$(printf '%s\n' "$_paths_out" | wc -l | tr -d ' ')"
+    case "$_e" in ''|*[!0-9]*) _e=0 ;; esac
   fi
   [ "$_e" -gt 0 ] && edits="$_e"
 fi
@@ -82,8 +78,8 @@ if [ -x "$PTRACKER" ]; then
 fi
 
 # Clean tree = `git status --porcelain` is empty RIGHT NOW. A true observation,
-# cheap (one porcelain call). The hook's autocommit ran synchronously before
-# this, but it stages only edit-tracker-ledgered paths and is alarm-bounded, so
+# cheap (one porcelain call). The hook's autocommit runs detached and has
+# usually not landed yet, and it stages only edit-tracker-ledgered paths, so
 # a dirty tree here is not a fault and the stat is simply dropped from the
 # receipt rather than reported as dirty.
 # One fork, not two: `git status --porcelain` itself exits non-zero outside a
