@@ -465,9 +465,9 @@
       "event": "SessionEnd",
       "index": 1,
       "id": "session-end-sweep",
-      "description": "Foreground: only the farewell, under a 1s alarm (Claude Code cancels a SessionEnd hook that outlives its budget: 1.5s, or this hook's timeout of 5s). Detached (nohup + setsid, survives the hook's exit), in order: checkpoint write then autocommit, each alarm-bounded (10s) with their cut-short/failed notices written to .heimdall/logs/session-end.log, then parallelism grade, verify-edits --quick, cleanup, reel, summary-card, context-sync. The checkpoint and the commit land a few seconds after the session ends, not before the hook returns.",
+      "description": "Foreground: only the farewell, under a 1s alarm (Claude Code cancels a SessionEnd hook that outlives its budget: 1.5s, or this hook's timeout of 5s). Detached (nohup + setsid, survives the hook's exit), in order: checkpoint write then autocommit, each alarm-bounded (10s) with their cut-short/failed notices written to .heimdall/logs/session-end.log (a repo controls that path, so a notice is skipped, never written through, when .heimdall, .heimdall/logs or session-end.log is a symlink or not a plain dir/file), then parallelism grade, verify-edits --quick, cleanup, reel, summary-card, context-sync. The checkpoint and the commit land a few seconds after the session ends, not before the hook returns.",
       "matcher": "",
-      "fingerprint": "78a86b8681eade240a84b0cedae78501418e4357818544be1574b1aed978ee56",
+      "fingerprint": "1ce4a476ede276afa70a8cea8b4b39b9543353050889a4064b86168a442163a7",
       "locked": false,
       "remote_toggle": false
     },
