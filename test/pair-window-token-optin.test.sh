@@ -126,6 +126,13 @@ if [ "$(grep -c '_relay_trusted "' "$APP")" -ge 4 ] && [ "$(grep -c '_relay_appr
 else
   bad "bin/heimdall-app does not ask the trust check on all four token paths (found $(grep -c '_relay_trusted "' "$APP"), want 4) or never records an approval"
 fi
+calls="$(grep -c '_relay_trusted "' "$APP")"
+asked_about_the_repo="$(grep -cE '_relay_trusted "\$(relay|RELAY_URL)" "\$(REPO|repo)"' "$APP")"
+if [ "$calls" -ge 4 ] && [ "$calls" -eq "$asked_about_the_repo" ] && grep -q '_relay_approve "\$RELAY_URL" "\$REPO"' "$APP"; then
+  ok "every trust check is asked about the resolved repo (\$REPO / \$repo, which resolve_repo_value made) -- never the working directory -- and the approval is recorded against it too"
+else
+  bad "a _relay_trusted call does not pass the resolved repo as its second argument ($calls calls, $asked_about_the_repo with \$REPO or \$repo), or _relay_approve is not handed the repo"
+fi
 if printf '%s' "$help_text" | grep -q 'WHICH RELAY GETS THE TOKEN' && printf '%s' "$help_text" | grep -q 'the environment is not trusted with the token' \
    && printf '%s' "$help_text" | grep -q 'app/relay-approved'; then
   ok "the usage text says which relay may have the token: the default, one named on the command line or approved with connect --relay -- never one only the environment names"
