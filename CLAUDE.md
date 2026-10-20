@@ -242,6 +242,21 @@ what ate the day. The rules:
   candidate defects unless asked: a list becomes the next round.
 - **Done means delivered.** A release that is green, reviewed once and HIGH-free ships; the backlog is
   where the rest of the perfection lives.
+- **Enforced by the Bash hook, not by prose (`bin/lib/hmd_sweep_guard.py`, 2026-10-21).** The sweep rules
+  did not hold as text, so `bin/heimdall-precheck-bash` DENIES a FULL `test/run-all.sh` (no `--failed`,
+  `--since-green`, `--filter` or `--dry-run`) in three cases, checked in this order: a sweep is running
+  (`receipts/sweep.lock` names a live pid: `a sweep is already running (pid N)`); the last receipt is red or
+  aborted and its `head_sha` is HEAD or an ancestor of it (`last sweep was red at <sha>; fix, commit, then:
+  bash test/run-all.sh --failed`); a green full receipt already covers HEAD, the same commit or only the
+  hooks' own journal and ledger commits after it, tree clean (`already proven green at HEAD; nothing to
+  re-test`). `--failed`, `--since-green`, `--filter`, a single suite and `--cold` while the cache is cold
+  anyway (the salt changed: no suite-cache entry carries it) always go through. It runs after the CI waste
+  guard and the disk floor, finds a real run with the kill guard's lexer (text that only mentions
+  `run-all.sh` is no run), takes the repo from the script's own location, costs every other command one
+  `case`, and FAILS OPEN like the CI waste guard (a missing or garbled receipt, a git failure or a timeout
+  is one stderr line and an allow). The operator override is `HMD_SWEEP_ALLOW=1` in the environment Claude
+  Code runs in (an inline prefix reaches the sweep, not the hook). Best effort, not a security boundary.
+  Proof: `test/sweep-guard.test.sh`.
 
 ## Pre-commit vs pre-push: what stays at commit, what dedups at push
 Two things are easy to conflate and must not be: the ~1600s full sweep above (never

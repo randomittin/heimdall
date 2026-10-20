@@ -39,7 +39,7 @@
 #   stderr  every advisory: gate verdicts, "UNAVAILABLE" notices, the native-hook
 #           delegation line, falsify/corpus output, and a copy of every deny verdict.
 #   exit 2  DENY — a gate failed (secret in staged diff, quality gate rc 2, push
-#           secret gate, self-scan, non-falsifiable oracle, corpus regression, CI waste guard).
+#           secret gate, self-scan, non-falsifiable oracle, corpus regression, CI waste guard, sweep guard).
 #   exit 0  everything else, including "gate never evaluated" (the quality-gate
 #           verdict UNAVAILABLE branch warns and allows, as before).
 #
@@ -60,6 +60,8 @@
 #   HMD_CI_RERUN_ALLOW  exactly 1 turns the CI waste guard off (no empty commit, CI re-run or re-dispatch is denied): none of it runs. Read from THIS hook's
 #                       environment, so an inline `HMD_CI_RERUN_ALLOW=1 git commit --allow-empty ...` reaches git, not the hook that has already said no.
 #                       Unset, empty, 0, true or any other value leaves it ON. Only that guard: every other gate still runs.
+#   HMD_SWEEP_ALLOW     exactly 1 turns the sweep guard off (a FULL test/run-all.sh is no longer denied after a red sweep, at a HEAD already proven green, or beside a running sweep): none of it runs. Read from THIS hook's
+#                       environment, so an inline `HMD_SWEEP_ALLOW=1 bash test/run-all.sh` reaches the sweep, not the hook that has already said no. Unset, empty, 0, true or any other value leaves it ON.
 #
 # Deliberately NO `set -e`, `set -u` or `pipefail`: the inline string ran under
 # Claude Code's plain `sh -c`/`bash -c` defaults, and its logic depends on them —
@@ -68,16 +70,17 @@
 #
 # -h, --help   print this header (the hook never passes arguments).
 case "${1:-}" in
-  -h|--help) sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,71p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-# SINCE THE EXTRACTION — six deliberate deltas from the historical inline chain
+# SINCE THE EXTRACTION — seven deliberate deltas from the historical inline chain
 # (2026-10-11, "precheck never blocks silently in another repo"; then "never execute the session's
 # repo"; 2026-10-13, "each repo's own checks, not heimdall's"; 2.4.8, "a disk-space floor";
-# 2026-10-19, "never pay CI minutes to re-roll a flaky result").
+# 2026-10-19, "never pay CI minutes to re-roll a flaky result"; 2026-10-21, "never start a full
+# sweep the records already answer").
 # test/heimdall-precheck-bash.test.sh cases 17, 21 and 24-29 pin the first three,
 # test/heimdall-push-gate-per-repo.test.sh the fourth, test/disk-floor.test.sh the fifth,
-# test/ci-waste-guard.test.sh the sixth;
+# test/ci-waste-guard.test.sh the sixth, test/sweep-guard.test.sh the seventh;
 # every other branch is still byte-identical to the inline string.
 #
 #   1. deny(): a deny states its verdict on stderr TOO. Claude Code surfaces ONLY stderr for an
@@ -158,6 +161,14 @@ esac
 #      workflow ... run (quotes and backslashes removed first, as the kill guard does, so --allow-"empty" is still seen): every other command pays for one tr and one case. OPERATOR OVERRIDE: HMD_CI_RERUN_ALLOW=1, read from THIS hook's environment (an inline
 #      prefix reaches the command, not this hook). A COST guard, not a security gate, so it FAILS OPEN like the disk floor and not closed like the kill guard: a helper that is missing, crashes or times out, or a command it cannot read, is one stderr line and
 #      an allow, and only a form it READ denies. Best effort, not a boundary: git and gh are the two tools it reads. Proof: test/ci-waste-guard.test.sh.
+#   7. SWEEP GUARD (2026-10-21; operator: enforce the sweep part of CLAUDE.md mechanically, "prose rules have not held"). A FULL `test/run-all.sh` (no --failed, --since-green, --filter, --dry-run or help) is DENIED when the last receipt (receipts/last-sweep.json)
+#      is red or aborted and its head_sha is HEAD or an ancestor of it ("fix, commit, then: bash test/run-all.sh --failed"), when a green full receipt already covers HEAD (the same commit, or only the hooks' own journal and ledger commits after it, and no uncommitted
+#      code: "already proven green at HEAD; nothing to re-test"), or when receipts/sweep.lock names a live pid ("a sweep is already running (pid N)", checked first). --cold (or HMD_COLD=1) goes through while the cache is cold anyway, i.e. the salt of HEAD is on
+#      no suite-cache entry. bin/lib/hmd_sweep_guard.py is the one definition (its docstring has the rule): it reads the command the way a shell does by reusing the kill guard's lexer, follows `cd` and takes the repo from the SCRIPT's own location (as the runner
+#      does), so text that only MENTIONS run-all.sh (echo, grep, cat, git add, a commit message) is no run. It sits AFTER the CI waste guard and the disk floor, and its pre-filter is one builtin `case` on the raw command: every command that does not mention run-all
+#      pays nothing else. OPERATOR OVERRIDE: HMD_SWEEP_ALLOW=1, read from THIS hook's environment (an inline prefix reaches the sweep, not this hook). A COST guard, not a security gate, so it FAILS OPEN like the CI waste guard: a missing or garbled receipt, a git failure,
+#      a command it cannot read or a timeout is one stderr line and an allow, and only a form it READ denies. A plugin root without the helper prints nothing and allows (a plumbing gap, as for the disk floor's lib). The hook never runs what the session's repo
+#      ships: the salt comes from the plugin's own closure engine. Best effort, not a boundary. Proof: test/sweep-guard.test.sh.
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
 
 INPUT=$(cat)
@@ -230,6 +241,29 @@ case $CMD in
         fi
       fi
     fi ;;
+esac
+# SWEEP GUARD (delta 7 in the header above), AFTER the CI waste guard and the disk floor. The outer `case` is the operator's switch (exactly 1 = off), the inner one the pre-filter: one builtin `case` on the raw command is all an ordinary command pays (no tr, no
+# fork), and the statements here are builtins whose xtrace lines test/heimdall-precheck-bash.test.sh's equiv() already drops (`+ case`, `GP_*`). The helper's exit status is the verdict: 3 denies; 4 (could not tell) and anything else (a crash, python3 absent) is ONE
+# stderr line and an allow -- a cost guard fails OPEN, like the CI waste guard. A plugin root with no helper (a fixture root, a partial copy) is silent and allows, as a root with no disk-floor lib is. The payload's cwd is where a relative script path is read from.
+case ${HMD_SWEEP_ALLOW:-} in
+  1) ;;
+  *)
+    case $CMD in
+      *run-all*)
+        if [ -r "$PLUGIN/bin/lib/hmd_sweep_guard.py" ]; then
+          GP_SW_CWD=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
+          GP_SW_WHY=$(python3 -I -S "$PLUGIN/bin/lib/hmd_sweep_guard.py" "$GP_SW_CWD" <<<"$CMD" 2>/dev/null)
+          GP_SW_RC=$?
+          case $GP_SW_RC in
+            0) ;;
+            3)
+              GP_SW_ESC=$(printf '%s' "$GP_SW_WHY" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+              deny "$(printf '{"error": "BLOCKED: hmd sweep guard: %s. A full sweep takes 45-60 minutes and the records of this checkout already answer it: after a red sweep fix, commit and run bash test/run-all.sh --failed (never a second full sweep), a HEAD already proven green has nothing to re-test, and two sweeps never run at once (CLAUDE.md: When the full gate runs, Release convergence). --failed, --since-green, --filter and single suites are never held here. If a full sweep is wanted on purpose, the OPERATOR sets HMD_SWEEP_ALLOW=1 in the environment Claude Code runs in: an inline HMD_SWEEP_ALLOW=1 in front of the command is seen by that command only, not by this hook, which reads its own environment and has already said no. This guard is best-effort cost control, not a security boundary."}' "$GP_SW_ESC")" ;;
+            4) printf 'heimdall sweep guard: %s -- no sweep check for this command, allowing\n' "$GP_SW_WHY" >&2 ;;
+            *) printf 'heimdall sweep guard: the guard itself failed (exit %s) -- no sweep check for this command, allowing\n' "$GP_SW_RC" >&2 ;;
+          esac
+        fi ;;
+    esac ;;
 esac
 # KILLS BY NAME OR BY A COMPUTED PID are denied (2026-10-12 16:29Z incident). A sub-agent debugging its own temp-repo test ran
 # `pkill -f heimdall-relay-client`; the pattern matched EVERY relay client on the machine -- the operator's two live phone
