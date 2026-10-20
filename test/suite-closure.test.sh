@@ -158,6 +158,27 @@ FIXTURE
 usage() { grep '^#' "$0"; }
 usage
 FIXTURE
+  mkh bin/selfread3.sh <<'FIXTURE'
+#!/usr/bin/env bash
+# selfread3: the full path of the script, built from dirname and basename
+# second header line
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+usage() { sed -n '2,3p' "$SELF"; }
+usage
+FIXTURE
+  mkh bin/nested.sh <<'FIXTURE'
+#!/usr/bin/env bash
+x="$(printf %s "a
+# looks like a comment inside the nested string
+b")"
+echo "$x"
+FIXTURE
+  mkh bin/pyself.py <<'FIXTURE'
+#!/usr/bin/env python3
+# pyself header v1
+import sys
+print(open(sys.argv[0]).read())
+FIXTURE
   mkh bin/readme-tool <<'FIXTURE'
 #!/usr/bin/env bash
 # a note about the tool v1
@@ -173,6 +194,53 @@ FIXTURE
 # two v1
 echo two
 FIXTURE
+}
+
+# what a tool only SAYS (no edge) and what it may read or run (an edge, or the engine is not sure and keeps it), the dispatcher's callers, and the files a tool reads as text
+build_display_fixtures() {
+  mkh bin/helptool <<'FIXTURE'
+#!/usr/bin/env bash
+echo "see docs/guide.md for the long story"
+printf '%s\n' "run bin/helptarget to try it" >&2
+cat <<'EOF'
+Usage: helptool
+  docs/manual.md describes every flag
+EOF
+echo "done"   # see docs/trailer.md
+FIXTURE
+  mk docs/guide.md 'guide v1'; mk docs/manual.md 'manual v1'; mk docs/trailer.md 'trailer v1'
+  mk bin/helptarget '#!/usr/bin/env bash' 'echo helptarget v1'
+  mkh bin/readtool <<'FIXTURE'
+#!/usr/bin/env bash
+DOC="$(dirname "$0")/../docs/read.md"
+cat "$DOC"
+FIXTURE
+  mk docs/read.md 'read v1'
+  mkh bin/valuetool <<'FIXTURE'
+#!/usr/bin/env bash
+echo "docs/value.md"
+FIXTURE
+  mk docs/value.md 'value v1'
+  mkh bin/gentool <<'FIXTURE'
+#!/usr/bin/env bash
+echo "exec bin/genpayload now" >> "$HOME/hook.sh"
+echo "run bin/pipedtarget now" | sh
+FIXTURE
+  mk bin/genpayload '#!/usr/bin/env bash' 'echo genpayload v1'
+  mk bin/pipedtarget '#!/usr/bin/env bash' 'echo pipedtarget v1'
+  mkh bin/binuser.sh <<'FIXTURE'
+#!/usr/bin/env bash
+FACE_BIN="$(dirname "$0")/heimdall-face"
+echo "run hmd other to see more"
+"$FACE_BIN" "$1"
+FIXTURE
+  mk bin/heimdall-face '#!/usr/bin/env bash' 'echo face v1'
+  mkh bin/grepper.sh <<'FIXTURE'
+#!/usr/bin/env bash
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+grep -q needle "$REPO/bin/commented-lib.sh"
+FIXTURE
+  mk bin/commented-lib.sh '#!/usr/bin/env bash' '# lib note v1' 'lib() { :; }'
 }
 
 build_fixture() {
@@ -192,8 +260,11 @@ build_fixture() {
   mk test/lib/py-pin.sh '#!/usr/bin/env bash' 'pin() { echo pin v1; }'
   mk bin/lib/sweep-chain.sh '#!/usr/bin/env bash' 'chain() { echo chain v1; }'
   mk bin/lib/hook-owned-path.sh '#!/usr/bin/env bash' 'owned() { echo owned v1; }'
-  mk bin/heimdall '#!/usr/bin/env bash' 'case "${1:-}" in' '  sub)' '    exec "$PLUGIN_DIR/bin/heimdall-sub" "$@"' '    ;;' \
+  mk bin/heimdall '#!/usr/bin/env bash' 'unused_helper() {' '  "$PLUGIN_DIR/bin/heimdall-lazy"' '}' 'called_helper() {' '  "$PLUGIN_DIR/bin/heimdall-called"' '}' \
+    'case "${1:-}" in' '  sub)' '    called_helper' '    exec "$PLUGIN_DIR/bin/heimdall-sub" "$@"' '    ;;' \
     '  other)' '    exec "$PLUGIN_DIR/bin/heimdall-other" "$@"' '    ;;' '  *)' '    echo usage' '    ;;' 'esac'
+  mk bin/heimdall-lazy '#!/usr/bin/env bash' 'echo lazy v1'
+  mk bin/heimdall-called '#!/usr/bin/env bash' 'echo called v1'
   mk bin/heimdall-sub '#!/usr/bin/env bash' 'echo sub v1'
   mk bin/heimdall-other '#!/usr/bin/env bash' 'echo other v1'
   mk bin/hmd '#!/usr/bin/env bash' 'dir="$(cd "$(dirname "$0")" && pwd)"' 'exec "$dir/heimdall" "$@"'
@@ -204,6 +275,7 @@ build_fixture() {
   mk bin/mentions-code.sh '#!/usr/bin/env bash' '"$(dirname "$0")/run-tool"'
   mk bin/run-tool '#!/usr/bin/env bash' 'echo run-tool v1'
   mk bin/commented-tool '#!/usr/bin/env bash' 'echo commented v1'
+  build_display_fixtures
   build_normal_fixtures
   mk test/run-all.sh '#!/usr/bin/env bash' '# the fixture runner: verify-receipt reads only its live list' 'live_reason() {' '  # a live suite is never cached' \
     '  case "$(basename "$1")" in' '    *-deployed.test.sh)' '      echo "deployed" ;;' \
@@ -232,6 +304,17 @@ build_fixture() {
   suite k18b-execs '"$REPO/bin/readme-tool"'
   suite k19-dirgrep 'grep -rq needle "$REPO/libdir"'
   suite k19b-dirpath 'LIB="$REPO/libdir"'
+  suite k17b-selfread3 '"$REPO/bin/selfread3.sh"'
+  suite k22-help '"$REPO/bin/helptool"'
+  suite k23-read '"$REPO/bin/readtool"'
+  suite k24-value '"$REPO/bin/valuetool"'
+  suite k25-generated '"$REPO/bin/gentool"'
+  suite k26-dyn '"$REPO/bin/hmd" "$sub"'
+  suite k27-bin '"$REPO/bin/binuser.sh"'
+  suite k28-toolgreps '"$REPO/bin/grepper.sh"'
+  suite k29-sources '. "$REPO/bin/commented-lib.sh"'
+  suite k30-nested '"$REPO/bin/nested.sh"'
+  suite k31-pyself 'python3 "$REPO/bin/pyself.py"'
   local i=1 n
   while [ "$i" -le 30 ]; do n="$(printf 'p%02d' "$i")"; suite "$n" 'echo plain'; i=$((i+1)); done
   commit_all base >/dev/null 2>&1
@@ -255,8 +338,8 @@ eq "B3 hash --suite test/x == its hash-all line" "$("$CLI" hash --suite test/k1-
 eq "B4 hash --suite accepts the bare file name" "$("$CLI" hash --suite k1-source.test.sh --repo "$FIX")" "$(pick "$BASE_TSV" k1-source)"
 eq "B5 deps k1 = the suite, bin/dep.sh and what it sources (sorted)" "$("$CLI" deps --suite test/k1-source.test.sh --repo "$FIX")" \
   "$(printf '%s\n' bin/dep-inner.sh bin/dep.sh test/k1-source.test.sh)"
-eq "B6 deps k6 follows ONLY the invoked dispatcher arm" "$("$CLI" deps --suite test/k6-dispatch.test.sh --repo "$FIX")" \
-  "$(printf '%s\n' bin/heimdall bin/heimdall-sub bin/hmd test/k6-dispatch.test.sh)"
+eq "B6 deps k6 follows ONLY the invoked dispatcher arm and the function that arm calls (not the function nobody calls)" "$("$CLI" deps --suite test/k6-dispatch.test.sh --repo "$FIX")" \
+  "$(printf '%s\n' bin/heimdall bin/heimdall-called bin/heimdall-sub bin/hmd test/k6-dispatch.test.sh)"
 eq "B7 deps k4 pulls every file under the directory token" "$("$CLI" deps --suite test/k4-dir.test.sh --repo "$FIX")" \
   "$(printf '%s\n' fixtures/dir/a.txt fixtures/dir/b.txt test/k4-dir.test.sh)"
 eq "B8 deps k10 ignores a tool only an executable's COMMENT names" "$("$CLI" deps --suite test/k10-nocomment.test.sh --repo "$FIX")" \
@@ -284,6 +367,12 @@ gitf checkout -q -- bin/dep.sh
 "$CLI" hash --suite test/no-such.test.sh --repo "$FIX" >/dev/null 2>&1; eq "B19 a suite that does not exist exits 2" "$?" 2
 "$CLI" hash-all --repo "$WORK" >/dev/null 2>&1; eq "B20 a directory that is not a git repository exits 2" "$?" 2
 has "B21 --help names every sub-command" "$("$CLI" --help 2>&1)" "verify-receipt"
+eq "B22 deps k22: text a tool only prints (echo, printf, a bare cat here-document, a trailing comment) is no edge" "$("$CLI" deps --suite test/k22-help.test.sh --repo "$FIX")" \
+  "$(printf '%s\n' bin/helptool test/k22-help.test.sh)"
+eq "B23 deps k27: a variable named like a binary is not the dispatcher, and the words hmd other in text are no call" "$("$CLI" deps --suite test/k27-bin.test.sh --repo "$FIX")" \
+  "$(printf '%s\n' bin/binuser.sh bin/heimdall-face test/k27-bin.test.sh)"
+eq "B24 deps k26: a word nobody can read follows every arm and the functions they call" "$("$CLI" deps --suite test/k26-dyn.test.sh --repo "$FIX")" \
+  "$(printf '%s\n' bin/heimdall bin/heimdall-called bin/heimdall-other bin/heimdall-sub bin/hmd test/k26-dyn.test.sh)"
 
 # ── C. mutation proof ────────────────────────────────────────────────────────────────────────────────────────────────
 echo "── C. mutation proof: each dependency edited -> the closure hash changes; unrelated edits -> nothing changes"
@@ -340,8 +429,9 @@ kill "2 PATH basename: one byte of bin/tool-x" bin/tool-x byte k2-path
 kill "3 data file: one byte of data/config.txt" data/config.txt byte k3-data
 kill "4 directory token: one byte of fixtures/dir/b.txt" fixtures/dir/b.txt byte k4-dir
 kill "5 test/lib helper: one byte of test/lib/helper.sh" test/lib/helper.sh byte k5-lib
-kill "6 dispatcher sub-command: one byte of bin/heimdall-sub" bin/heimdall-sub byte k6-dispatch
-kill "6 dispatcher: one byte of bin/heimdall itself" bin/heimdall byte k6-dispatch
+kill "6 dispatcher sub-command: one byte of bin/heimdall-sub" bin/heimdall-sub byte k6-dispatch k26-dyn
+kill "6 dispatcher function: one byte of bin/heimdall-called, run by the function the invoked arm calls" bin/heimdall-called byte k6-dispatch k26-dyn
+kill "6 dispatcher: one byte of bin/heimdall itself" bin/heimdall byte k6-dispatch k26-dyn
 kill "7 wildcard (git ls-files): one byte of an unrelated file" unrelated/noise.txt byte k7-wild
 kill "8 hints extra: one byte of the hinted extra/hinted.txt" extra/hinted.txt byte k8-hint
 kill "9 suite comment: one byte of bin/commented-tool named only in the suite's header" bin/commented-tool byte k9-comment
@@ -349,8 +439,18 @@ kill "10 executable code mention: one byte of bin/mentions.sh" bin/mentions.sh b
 kill "10 transitive: bin/mentions-code.sh runs bin/run-tool" bin/run-tool byte k10b-code
 kill "11 hints always_run: one byte of an unrelated file" unrelated/noise.txt byte k11-always
 same "C-p1 an unrelated edit changes only the whole-tree suites" unrelated/noise.txt byte
-same "C-p2 an arm of the dispatcher nobody invoked (bin/heimdall-other) changes no suite that did not invoke it" bin/heimdall-other byte
+kill "26 a word nobody can read: every arm is followed, so one byte of bin/heimdall-other reaches k26-dyn and no suite that named another arm or none" bin/heimdall-other byte k26-dyn
+kill 'a real read: cat "$DOC" in a tool, one byte of docs/read.md' docs/read.md byte k23-read
+kill "uncertain is kept: an echo of a lone path is a value a function may hand back (docs/value.md)" docs/value.md byte k24-value
+kill "uncertain is kept: an echo written to a file may be a generated script (bin/genpayload)" bin/genpayload byte k25-generated
+kill "uncertain is kept: an echo piped on may be run (bin/pipedtarget)" bin/pipedtarget byte k25-generated
+kill "28 a TOOL greps the file: a comment-only edit of bin/commented-lib.sh reaches the suite that runs the grepping tool, not the one that sources it" bin/commented-lib.sh 'sub|lib note v1|lib note v2' k28-toolgreps
 same "C-p3 a tool only an executable's COMMENT names (bin/never-run-tool) adds no edge" bin/never-run-tool byte
+same "C-p4 a function of the dispatcher that nothing calls (bin/heimdall-lazy) adds no edge" bin/heimdall-lazy byte
+same "C-p5 a file named only in echo text (docs/guide.md) adds no edge" docs/guide.md byte
+same "C-p6 a file named only in a bare cat here-document (docs/manual.md) adds no edge" docs/manual.md byte
+same "C-p7 a tool named only in a printf message (bin/helptarget) adds no edge" bin/helptarget byte
+same "C-p8 a file named only in a trailing comment (docs/trailer.md) adds no edge" docs/trailer.md byte
 
 # What cannot change what a shell or Python file does is not in the closure hash. A suite that sources, runs or imports the file does not see it
 # (only the whole-tree suites, which read every file as text, do); a here-document body, a multi-line string, a continuation, a script that
@@ -375,6 +475,9 @@ kill "16 continuation: the comment line between the two halves of one command" b
 kill "16 continuation: a blank after the backslash is not a continuation" bin/contin.sh 'sub|echo a \ |echo a \' k16-cont
 kill "17 prints its own header through a variable holding $0: its comments are its --help" bin/selfread.sh 'sub|second header line|second header LINE' k17-selfread
 kill "17 prints its own header through $0: its comments are its --help" bin/selfread2.sh 'sub|the direct form|the DIRECT form' k17-selfread
+kill "17 prints its own header through a path built from dirname and basename: its comments are its --help" bin/selfread3.sh 'sub|second header line|second header LINE' k17b-selfread3
+kill "30 nested quoting the scanner cannot follow (a command substitution inside double quotes that runs past the line): a # line inside it is data" bin/nested.sh 'sub|looks like a comment|LOOKS like a comment' k30-nested
+kill "31 a Python file that opens its own path: its comments are visible" bin/pyself.py 'sub|pyself header v1|pyself header v2' k31-pyself
 kill "18 python code: a string in bin/pyhelper.py" bin/pyhelper.py 'sub|"hello "|"hi "' k12-py
 kill "18 python docstring: it is visible at run time" bin/pyhelper.py 'sub|visible at run time|visible at RUN time' k12-py
 kill "18 python shebang" bin/pyhelper.py 'sub|#!/usr/bin/env python3|#!/usr/bin/python3' k12-py
