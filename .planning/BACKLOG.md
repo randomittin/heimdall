@@ -28,3 +28,4 @@
 - `pmr_corpus._alarm` appends, and `purge` deletes, without the no-follow helper.
 - Companion UI "save-checkpoint" labels every non-zero `write` exit "incomplete"; exit 4 (refused, unsafe path) needs its own label.
 - `HEIMDALL_RELAY_CLIENT_BIN` (test override) lets the environment pick the program that receives the gh token. Same trust level as PATH, so not fixed alone; revisit if the env-trust model changes.
+- (LOW, deferred 2026-10-21) Other SessionEnd writers follow links: `bin/heimdall-autocommit:145,148` (`.heimdall/receipts/unproven.log`), `bin/heimdall-reel:69-71,98,123,193,202` (`.planning/reels`), `bin/heimdall-context-sync:229-230,242,249` (reads into `hmd/context`), `bin/heimdall-checkpoint:431` (lists `.heimdall/cases/*` names). Route through `hmd_nofollow_write.py`.
