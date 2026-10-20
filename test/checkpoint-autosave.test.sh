@@ -33,6 +33,11 @@
 #      or session-end.log that is a symlink (a dangling one too) or a FIFO is skipped, never written
 #      through: the link's target stays byte-for-byte unchanged. RED before the guard (the notice
 #      lands in the target); a clean-repo control proves the notice is still logged when the path is real.
+#   H. LINK-SAFE WRITES      — the WRITER itself never writes through, or over, a link a cloned repo planted. A
+#      .planning, .planning/ledger, CHECKPOINT.md, RESUME-KEY.json or settings.json that is a symlink (a dangling
+#      one too) or a FIFO is REFUSED: the save is skipped, one stderr line says why, rc 0 (fail open), the link's
+#      target is unchanged, the link itself is left alone and nothing is written beside it. RED before the guard;
+#      a clean-repo control proves the same writer still writes everything when the paths are real.
 #
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 
@@ -231,6 +236,153 @@ exec 3<&-
 [ -z "$LEAK" ] \
   && ok "nothing was written to the FIFO" \
   || bad "a notice was written to the FIFO: $LEAK"
+rm -rf "$P"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "H. LINK-SAFE WRITES — the writer never writes through, or over, a link a cloned repo planted:"
+# bin/heimdall-checkpoint write runs unattended (the SessionEnd worker, the PreCompact hook) in whatever
+# repository the session is in, and a repository controls every name below its root: .planning, .planning/ledger
+# and each file the writer puts there can be a symlink to anywhere the user can write (a dangling one is created
+# through), or a FIFO. The writer must REFUSE: skip the save, say so ONCE on stderr, exit 0 (fail open), leave the
+# link's target unchanged AND the link itself alone, and write nothing beside it. H0 is the control: the same
+# writer in a repo whose paths are real writes everything, so the refusals are judged against a writer that works.
+# The writer runs with a throwaway HOME (its team-record step honours ~/.heimdall/presence-off, and a developer's
+# own opt-out marker would turn H0 and H6 into proofs of nothing) and LC_ALL=C (no perl locale warning on stderr).
+H_ERR=""; H_RC=0
+run_writer() { # <project> [VAR=value ...]: stderr -> H_ERR, exit status -> H_RC
+  local home p="$1"; shift
+  home="$(mktemp -d)"
+  H_ERR="$(cd "$p" && env -u HEIMDALL_PLANNING_DIR -u HEIMDALL_PRESENCE_DIR HOME="$home" LC_ALL=C "$@" \
+    perl -e 'alarm 60; exec @ARGV' "$CKPT" write "$p" 2>&1 >/dev/null)"
+  H_RC=$?
+  rm -rf "$home"
+}
+said_once() { # <phrase>: stderr held ONE line and it says <phrase>
+  [ "$(printf '%s\n' "$H_ERR" | grep -c .)" -eq 1 ] && printf '%s\n' "$H_ERR" | grep -q -- "$1"
+}
+holds_only() { # <dir> <name>: nothing was created beside <name>
+  [ "$(ls -A "$1")" = "$2" ]
+}
+
+echo "  H0. control — a repo with real paths is written in full:"
+P="$(make_project)"
+run_writer "$P"
+{ [ "$H_RC" -eq 0 ] && [ -f "$P/.planning/CHECKPOINT.md" ] && [ -f "$P/.planning/RESUME-KEY.json" ] && [ -f "$P/.planning/settings.json" ]; } \
+  && ok "CHECKPOINT.md, RESUME-KEY.json and settings.json written, rc 0" \
+  || bad "a clean repo was not written in full (rc=$H_RC): the refusals below prove nothing"
+ls "$P/.planning/ledger/checkpoints/"*.json >/dev/null 2>&1 \
+  && ok "the team record was published under .planning/ledger/checkpoints" \
+  || bad "no team record in a clean repo: H6 proves nothing"
+rm -rf "$P"
+
+echo "  H1. .planning is a symlink to a directory:"
+P="$(make_project)"; T="$(mktemp -d)"
+rmdir "$P/.planning"; printf 'precious\n' > "$T/CHECKPOINT.md"; ln -s "$T" "$P/.planning"
+run_writer "$P"
+{ [ "$H_RC" -eq 0 ] && [ "$(cat "$T/CHECKPOINT.md")" = "precious" ] && holds_only "$T" CHECKPOINT.md; } \
+  && ok "rc 0, the target of the .planning link is unchanged and nothing was created in it" \
+  || bad "the checkpoint was written THROUGH the .planning link (rc=$H_RC): $(ls -A "$T" | tr '\n' ' ')"
+{ [ -L "$P/.planning" ] && [ "$(readlink "$P/.planning")" = "$T" ]; } \
+  && ok "the .planning link itself is left alone" || bad "the .planning link was replaced"
+said_once "\.planning is a symbolic link" \
+  && ok "one stderr line says why" || bad "stderr should be ONE line naming the link (got: $H_ERR)"
+rm -rf "$P" "$T"
+
+echo "  H2. CHECKPOINT.md is a symlink to an existing file:"
+P="$(make_project)"; T="$(mktemp -d)"
+printf 'precious\n' > "$T/target.md"; ln -s "$T/target.md" "$P/.planning/CHECKPOINT.md"
+run_writer "$P"
+[ "$(cat "$T/target.md")" = "precious" ] \
+  && ok "the file the CHECKPOINT.md link points at is unchanged" \
+  || bad "the checkpoint was written THROUGH the CHECKPOINT.md link"
+{ [ "$H_RC" -eq 0 ] && [ -L "$P/.planning/CHECKPOINT.md" ] && [ "$(readlink "$P/.planning/CHECKPOINT.md")" = "$T/target.md" ] \
+    && holds_only "$P/.planning" CHECKPOINT.md; } \
+  && ok "rc 0, the link is left alone (not replaced) and no key, settings or ledger was written beside it" \
+  || bad "the link was replaced or the save went ahead beside it (rc=$H_RC): $(ls -A "$P/.planning" | tr '\n' ' ')"
+said_once "CHECKPOINT.md is a symbolic link" \
+  && ok "one stderr line says why" || bad "stderr should be ONE line naming the link (got: $H_ERR)"
+rm -rf "$P" "$T"
+
+echo "  H3. CHECKPOINT.md is a DANGLING symlink (a write would create its target):"
+P="$(make_project)"; T="$(mktemp -d)"
+ln -s "$T/created-through-link" "$P/.planning/CHECKPOINT.md"
+run_writer "$P"
+[ ! -e "$T/created-through-link" ] \
+  && ok "the dangling link's target was not created" \
+  || bad "the dangling CHECKPOINT.md link was CREATED THROUGH"
+{ [ "$H_RC" -eq 0 ] && [ -L "$P/.planning/CHECKPOINT.md" ] && [ "$(readlink "$P/.planning/CHECKPOINT.md")" = "$T/created-through-link" ] \
+    && holds_only "$P/.planning" CHECKPOINT.md; } \
+  && ok "rc 0, the dangling link is left alone and nothing was written beside it" \
+  || bad "the dangling link was replaced or the save went ahead beside it (rc=$H_RC): $(ls -A "$P/.planning" | tr '\n' ' ')"
+said_once "CHECKPOINT.md is a symbolic link" \
+  && ok "one stderr line says why" || bad "stderr should be ONE line naming the link (got: $H_ERR)"
+rm -rf "$P" "$T"
+
+echo "  H4. RESUME-KEY.json is a symlink to an existing file:"
+P="$(make_project)"; T="$(mktemp -d)"
+printf '{"keep": 1}\n' > "$T/target.json"; ln -s "$T/target.json" "$P/.planning/RESUME-KEY.json"
+run_writer "$P"
+[ "$(cat "$T/target.json")" = '{"keep": 1}' ] \
+  && ok "the file the RESUME-KEY.json link points at is unchanged" \
+  || bad "the answer key was written THROUGH the RESUME-KEY.json link"
+{ [ "$H_RC" -eq 0 ] && [ -L "$P/.planning/RESUME-KEY.json" ] && holds_only "$P/.planning" RESUME-KEY.json; } \
+  && ok "rc 0, the link is left alone and the checkpoint was not written without its key" \
+  || bad "the link was replaced or the save went ahead beside it (rc=$H_RC): $(ls -A "$P/.planning" | tr '\n' ' ')"
+said_once "RESUME-KEY.json is a symbolic link" \
+  && ok "one stderr line says why" || bad "stderr should be ONE line naming the link (got: $H_ERR)"
+rm -rf "$P" "$T"
+
+echo "  H5. settings.json is a symlink to an existing file:"
+P="$(make_project)"; T="$(mktemp -d)"
+printf '{"keep": 1}\n' > "$T/target.json"; ln -s "$T/target.json" "$P/.planning/settings.json"
+run_writer "$P"
+[ "$(cat "$T/target.json")" = '{"keep": 1}' ] \
+  && ok "the file the settings.json link points at is unchanged" \
+  || bad "settings were written THROUGH the settings.json link"
+{ [ "$H_RC" -eq 0 ] && [ -L "$P/.planning/settings.json" ] && holds_only "$P/.planning" settings.json; } \
+  && ok "rc 0, the link is left alone (its target was not read into a new file either) and nothing was written beside it" \
+  || bad "the link was replaced or the save went ahead beside it (rc=$H_RC): $(ls -A "$P/.planning" | tr '\n' ' ')"
+said_once "settings.json is a symbolic link" \
+  && ok "one stderr line says why" || bad "stderr should be ONE line naming the link (got: $H_ERR)"
+rm -rf "$P" "$T"
+
+echo "  H6. .planning/ledger is a symlink to a directory (the team record would be published through it):"
+P="$(make_project)"; T="$(mktemp -d)"
+ln -s "$T" "$P/.planning/ledger"
+run_writer "$P"
+[ -z "$(ls -A "$T")" ] \
+  && ok "nothing was created in the target of the ledger link" \
+  || bad "the team record was published THROUGH the ledger link: $(ls -AR "$T" | tr '\n' ' ')"
+{ [ "$H_RC" -eq 0 ] && [ -L "$P/.planning/ledger" ] && [ -f "$P/.planning/CHECKPOINT.md" ] && [ -f "$P/.planning/RESUME-KEY.json" ]; } \
+  && ok "rc 0, the ledger link is left alone and the rest of the save still landed (only the team record is skipped)" \
+  || bad "the ledger link was replaced, or the rest of the save was lost (rc=$H_RC): $(ls -A "$P/.planning" | tr '\n' ' ')"
+rm -rf "$P" "$T"
+
+echo "  H6b. HEIMDALL_PLANNING_DIR names a directory that is not there yet (the team record is made under it, as before the guard):"
+P="$(make_project)"; T="$(mktemp -d)"
+run_writer "$P" HEIMDALL_PLANNING_DIR="$T/plan"
+ls "$T/plan/ledger/checkpoints/"*.json >/dev/null 2>&1 \
+  && ok "the team record landed under the explicit planning dir, which the writer made" \
+  || bad "no team record under HEIMDALL_PLANNING_DIR (rc=$H_RC, got: $(ls -AR "$T" | tr '\n' ' ')): the guard broke the explicit-dir path"
+mv "$T/plan/ledger" "$T/moved" 2>/dev/null; mkdir "$T/target"; ln -s "$T/target" "$T/plan/ledger"
+run_writer "$P" HEIMDALL_PLANNING_DIR="$T/plan"
+{ [ "$H_RC" -eq 0 ] && [ -L "$T/plan/ledger" ] && [ -z "$(ls -A "$T/target")" ]; } \
+  && ok "rc 0, a ledger link under the explicit dir is left alone and nothing was created through it" \
+  || bad "the explicit dir's ledger link was written through or replaced (rc=$H_RC): $(ls -AR "$T/target" | tr '\n' ' ')"
+rm -rf "$P" "$T"
+
+echo "  H7. CHECKPOINT.md is a FIFO (not a regular file):"
+P="$(make_project)"
+mkfifo "$P/.planning/CHECKPOINT.md"
+exec 3<>"$P/.planning/CHECKPOINT.md"   # the test holds the FIFO open, so a stray open cannot hang the writer
+run_writer "$P"
+LEAK="$(perl -e 'use Fcntl; fcntl(STDIN, F_SETFL, O_NONBLOCK); sysread(STDIN, $b, 4096); print $b' <&3)"
+exec 3<&-
+{ [ "$H_RC" -eq 0 ] && [ -p "$P/.planning/CHECKPOINT.md" ] && [ -z "$LEAK" ] && holds_only "$P/.planning" CHECKPOINT.md; } \
+  && ok "rc 0, the FIFO is still a FIFO, nothing was written to it or beside it" \
+  || bad "the FIFO was replaced or written to, or the save went ahead beside it (rc=$H_RC): $(ls -A "$P/.planning" | tr '\n' ' ')"
+said_once "not a regular file" \
+  && ok "one stderr line says why" || bad "stderr should be ONE line naming the FIFO (got: $H_ERR)"
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────

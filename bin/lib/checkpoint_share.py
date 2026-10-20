@@ -47,6 +47,7 @@ if _HERE not in sys.path:
 import telemetry as _tel          # noqa: E402 — _scrub / _SECRET_PATTERNS / _ASSIGNED_OPAQUE
 import pmr_corpus                  # noqa: E402 — _leaf_strings / secret_scan_payload
 import issue_corpus               # noqa: E402 — _SECURITY_CLASSES (the taxonomy)
+import hmd_nofollow_write as _nf  # noqa: E402 — the no-follow walk + atomic write every store write goes through
 
 # ── schema + policy constants ─────────────────────────────────────────────────
 
@@ -447,14 +448,21 @@ def roster_from_files(repo_root=None):
 # ── atomic write ──────────────────────────────────────────────────────────────
 
 
-def _atomic_write_json(path, obj):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp-%d" % os.getpid()
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, sort_keys=True, indent=2)
-        fh.write("\n")
-        fh.flush()
-    os.replace(tmp, path)
+def _atomic_write_json(path, obj, repo_root=None):
+    """Write `obj` as `path` (a file under planning_dir()): atomically, and WITHOUT following a link. The repository
+    controls every name below its root, so .planning, .planning/ledger, .planning/ledger/checkpoints or the record
+    itself can be a symlink (a dangling one too) or a FIFO a clone planted; hmd_nofollow_write walks down from the
+    directory the caller named -- the git root, or HEIMDALL_PLANNING_DIR itself when that is set -- and REFUSES
+    (OSError: publish() reports reason "error", nothing is written) instead of writing through it. The file gets the
+    umask's usual mode (0644): this store is committed, shared state."""
+    pdir = planning_dir(repo_root)
+    if os.environ.get("HEIMDALL_PLANNING_DIR"):
+        root = pdir
+        os.makedirs(root, exist_ok=True)  # named by the caller (the environment), so trusted, and made when missing as before
+    else:
+        root = os.path.dirname(pdir)  # the git root: .planning below it belongs to the repository
+    data = (json.dumps(obj, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    _nf.write(root, os.path.relpath(os.path.dirname(path), root), os.path.basename(path), data, 0o666)
 
 
 # ── the publish path: consent -> build -> guard -> scan -> route/write (sec 6) ─
@@ -485,7 +493,7 @@ def publish(inputs, repo_root=None, now=None):
                 return {"published": False, "reason": "security-blocked",
                         "violations": violations, "findings": findings}
             path = os.path.join(security_lane_dir(repo_root), haid_slug(haid) + ".json")
-            _atomic_write_json(path, rec)
+            _atomic_write_json(path, rec, repo_root)
             return {"published": False, "reason": "security-sensitive-private",
                     "private": True, "lane_path": path, "haid": haid}
 
@@ -502,7 +510,7 @@ def publish(inputs, repo_root=None, now=None):
                     "findings": findings}
 
         path = checkpoint_path(haid, repo_root)
-        _atomic_write_json(path, rec)
+        _atomic_write_json(path, rec, repo_root)
         return {"published": True, "haid": haid, "path": path,
                 "resumable": rec["resumable"]}
     except Exception as exc:  # noqa: BLE001 — a publish fault never fails the caller
