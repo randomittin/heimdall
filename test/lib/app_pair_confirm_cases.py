@@ -69,6 +69,7 @@ REPO = H.REPO
 SESSION_CODE_PY = os.path.join(REPO, "bin", "lib", "hmd_session_code.py")
 APP_CODE_PY = os.path.join(REPO, "bin", "lib", "hmd_app_code.py")
 OPTIN_PY = os.path.join(REPO, "bin", "lib", "hmd_pair_optin.py")
+APPROVAL_PY = os.path.join(REPO, "bin", "lib", "hmd_relay_approval.py")
 STATUSLINE = os.path.join(REPO, "bin", "heimdall-statusline")
 UI_BIN = os.path.join(REPO, "bin", "heimdall-ui")
 DELIVER = os.path.join(REPO, "bin", "heimdall-inbox-deliver")
@@ -271,9 +272,17 @@ class Scn:
         self.phone = H.Phone(E2E)
         self.procs = []
         self.opt_in()
+        self.approve_relay()
 
     def __enter__(self):
         return self
+
+    def approve_relay(self):
+        """The loopback relay is one this sandbox's operator approved (`hmd app connect --relay URL` records that, bin/lib/hmd_relay_approval.py, in
+        HEIMDALL_HOME): the environment names it (HMD_RELAY_URL), and a session start, `hmd app add-device` and a `connect` that names no relay send the
+        gh token only to the default relay or an approved one -- what these cases are about is not which relay gets it.
+        test/pair-window-token-optin.test.sh is where a relay nobody approved is proved to get nothing."""
+        run([sys.executable, APPROVAL_PY, "approve", "--relay", self.relay.url], self.env(), timeout=60)
 
     def opt_in(self):
         """This repo is one `hmd app connect` was run for: the `on` record connect leaves (made through the helper connect uses, in this sandbox's

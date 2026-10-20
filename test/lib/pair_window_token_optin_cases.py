@@ -23,10 +23,28 @@ disconnect` and `hmd app connect --no-code` write it as `off`, `hmd app connect`
       relay sees no second registration and no token
   N8  HMD_PAIR_WINDOW=0 (also off, false, no): the machine-wide off -- a repo nobody switched off starts nothing either
   N9  gh not signed in: nothing starts, the session goes on (exit 0, the session still recorded), and ONE line on stderr names `gh auth login`
+
+WHICH RELAY GETS THE TOKEN. On by default means a cloned repository's session start sends the token too -- and a repository sets the environment of
+the session it is opened in (`.claude/settings.json` "env", `.envrc`), HMD_RELAY_URL included. So the environment is not trusted with the token: a
+relay it names gets it only when it is the default or one the operator approved (bin/lib/hmd_relay_approval.py, in HEIMDALL_HOME, never in the repo;
+`hmd app connect --relay URL` records it). Every case above runs with its fake relay approved (Scn's default); these run with it not:
+  E1  HMD_RELAY_URL names a relay nobody approved: the SessionStart window reads no token (gh is not called), makes no relay request, starts no window,
+      and says so in ONE line on stderr and in the app log -- whatever shape the URL has
+  E2  no HMD_RELAY_URL, or the default one spelled another way: the window's client is started for the default relay and handed the token
+  E3  a relay approved in HEIMDALL_HOME gets the token; approving one relay approves no other
+  E4  an approval a repository planted (any place its own tree has, a whole HEIMDALL_HOME inside it, a relative HEIMDALL_HOME) is not honoured, and the
+      same record in the operator's own HEIMDALL_HOME is; a HEIMDALL_HOME inside the repo is judged by file identity (device and inode), so spelling it in
+      another case -- one place on APFS -- does not get it past, and a relative HEIMDALL_HOME is no store even where it resolves outside the repo
+  E5  `hmd app connect` with the relay named only by the environment pairs by QR and sends no token; `connect --relay URL` is the operator naming it:
+      the token goes, and the relay is recorded as approved -- unless `--no-code`, which sends no token and approves nothing
+  E6  `hmd app add-device` and `hmd app identity revoke` refuse an environment relay they do not trust (exit 2, gh not asked); `--relay URL` names it
+      for that one command and approves nothing
+  E7  the matching is exact: scheme, host and port, compared as written once normalised; no path, no credentials, no lookalike character
 Scaled like the other pair-window cases: the relay keeps a registration 2 s (the real one 360 s), the floor is 0.5 s (300 s) and the lead 0.2 s
 (10 s). The window this replaces registered the code again about every 1.8 s here; WAIT seconds are about 4.5 lifetimes -- 27 minutes of the
 real relay's 6 -- and the old schedule would have made five or six registrations (each one a send of the token) in them.
 """
+import hashlib
 import json
 import os
 import subprocess
@@ -41,18 +59,32 @@ from fake_relay_code import FakeCodeRelay  # noqa: E402
 T = H.Tally()
 REPO = H.REPO
 OPTIN_PY = os.path.join(REPO, "bin", "lib", "hmd_pair_optin.py")
+APPROVAL_PY = os.path.join(REPO, "bin", "lib", "hmd_relay_approval.py")
 DEVICES_PY = os.path.join(REPO, "bin", "lib", "hmd_devices.py")
 KNOBS = {"HMD_PAIR_WINDOW_RENEW_MIN_S": "0.5", "HMD_PAIR_WINDOW_RENEW_LEAD_S": "0.2", "HMD_PAIR_WINDOW_POLL_S": "0.2",
          "HMD_PAIR_WINDOW_RESTART_S": "1", "HMD_CONNECT_RESTART_S": "1"}
 WAIT = 9.0
 SIGNED_OUT = "You are not logged into any GitHub hosts. To log in, run: gh auth login"
+DEFAULT_RELAY = H.HOSTED_RELAY
+TOKEN_SHA = hashlib.sha256(H.TOKEN.encode()).hexdigest()
+
+# Stands in for bin/heimdall-relay-client where a case must see what the window HANDS its client, for the default relay (the real one is not
+# reachable from a test): its argv and the hash of the first line of its stdin -- the token, when one was handed over, never the line itself --
+# one pair of files per start.
+RECORDER_SH = r"""#!/bin/sh
+REC="$HMD_FAKE_REC"
+{ for a in "$@"; do printf '[%s]\n' "$a"; done; } > "$REC/argv.$$"
+if IFS= read -r first; then printf '%s' "$first" | shasum -a 256 | cut -d' ' -f1 > "$REC/stdin.$$"; fi
+exit 0
+"""
 
 
 class Scn:
     """A sandbox, a `gh` that records every call, a loopback relay -- and a repo nobody ever connected or switched off, until a case says so. The
-    default environment is the DEFAULT one: no HMD_PAIR_WINDOW_RENEW, no HMD_PAIR_WINDOW."""
+    default environment is the DEFAULT one: no HMD_PAIR_WINDOW_RENEW, no HMD_PAIR_WINDOW. HMD_RELAY_URL names the loopback relay, which the
+    sandbox's operator has approved (`approve=False`: has not -- a relay only a cloned repository's environment would name)."""
 
-    def __init__(self, ttl=2, signed_in=True):
+    def __init__(self, ttl=2, signed_in=True, approve=True):
         self.sb = H.Sandbox()
         self.gh_log = os.path.join(self.sb.root, "gh-calls.log")
         token_call = ("printf '%%s\\n' \"%s\"; exit 0" % H.TOKEN) if signed_in else ("echo '%s' >&2; exit 1" % SIGNED_OUT)
@@ -63,6 +95,8 @@ class Scn:
         self.relay = FakeCodeRelay(ttl_s=ttl, expect_token=H.TOKEN).start()
         self.procs = []
         self.dummies = []
+        if approve:
+            self.approve_relay()
 
     def __enter__(self):
         return self
@@ -86,8 +120,55 @@ class Scn:
         return os.path.join(self.sb.home, ".heimdall")
 
     def env(self, **extra):
-        return self.sb.env(PATH=self.sb.bin + os.pathsep + os.environ.get("PATH", ""), HMD_RELAY_URL=self.relay.url,
-                           HMD_SESSION_LOGIN_STORE="file", **dict(KNOBS, **extra))
+        """The environment of a run. `extra` overrides any of it; a value of None leaves that variable out altogether (HMD_RELAY_URL=None: the
+        environment names no relay)."""
+        merged = {"PATH": self.sb.bin + os.pathsep + os.environ.get("PATH", ""), "HMD_RELAY_URL": self.relay.url, "HMD_SESSION_LOGIN_STORE": "file"}
+        merged.update(KNOBS)
+        merged.update(extra)
+        return self.sb.env(**{name: value for name, value in merged.items() if value is not None})
+
+    def approve_relay(self, url=None, home=None):
+        """Approve a relay the way `hmd app connect --relay URL` does (bin/lib/hmd_relay_approval.py), in this sandbox's HEIMDALL_HOME -- or in
+        `home`, to plant the same record somewhere else. The exit status of the helper."""
+        extra = {"HEIMDALL_HOME": home} if home else {}
+        return C.run([sys.executable, APPROVAL_PY, "approve", "--relay", url or self.relay.url], self.env(**extra), timeout=60).returncode
+
+    def trusted(self, url, home=None):
+        """Whether the helper the session start asks would let the token go to `url` for this repo: the default relay or an approved one."""
+        extra = {"HEIMDALL_HOME": home} if home else {}
+        argv = [sys.executable, APPROVAL_PY, "trusted", "--relay", url, "--default", DEFAULT_RELAY, "--repo", self.repo]
+        return C.run(argv, self.env(**extra), timeout=60).returncode == 0
+
+    def recorder(self):
+        """The extra environment that puts a recorder where the relay client goes (HEIMDALL_RELAY_CLIENT_BIN, bin/heimdall-app's documented override)."""
+        rec = os.path.join(self.sb.root, "rec")
+        os.makedirs(rec, exist_ok=True)
+        return {"HEIMDALL_RELAY_CLIENT_BIN": self.sb.write_executable("fake-relay-client", RECORDER_SH), "HMD_FAKE_REC": rec}
+
+    def started(self):
+        """[(argv, hash of the first stdin line or None)] for each start the recorder saw, code windows only (a --resume-only start is not one)."""
+        rec = os.path.join(self.sb.root, "rec")
+        found = []
+        for name in sorted(os.listdir(rec)) if os.path.isdir(rec) else []:
+            if not name.startswith("argv."):
+                continue
+            with open(os.path.join(rec, name), encoding="utf-8") as f:
+                argv = [line[1:-1] for line in f.read().splitlines()]
+            try:
+                with open(os.path.join(rec, "stdin." + name.split(".", 1)[1]), encoding="utf-8") as f:
+                    first = f.read().strip()
+            except OSError:
+                first = None
+            if "--code" in argv:
+                found.append((argv, first))
+        return found
+
+    def app_log(self):
+        try:
+            with open(os.path.join(self.home, "logs", "app.log"), encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return ""
 
     def gh_calls(self):
         try:
@@ -137,10 +218,31 @@ class Scn:
     def connect_json(self):
         return os.path.join(self.repo, ".heimdall", "app", "connect.json")
 
-    def connect(self, *args):
-        proc = H.Proc([H.APP_PATH, "connect", "--repo", self.repo, "--port", "0", "--relay", self.relay.url] + list(args), self.env(), cwd=self.repo)
+    def connect(self, *args, env=None):
+        """`hmd app connect --relay <the loopback relay>`: the relay is named on the command line, as an operator does it."""
+        proc = H.Proc([H.APP_PATH, "connect", "--repo", self.repo, "--port", "0", "--relay", self.relay.url] + list(args), self.env(**(env or {})),
+                      cwd=self.repo)
         self.procs.append(proc)
         return proc
+
+    def connect_env(self, *args):
+        """`hmd app connect` with NO --relay: the relay is whatever the environment names (HMD_RELAY_URL), the default when it names none."""
+        proc = H.Proc([H.APP_PATH, "connect", "--repo", self.repo, "--port", "0"] + list(args), self.env(), cwd=self.repo)
+        self.procs.append(proc)
+        return proc
+
+    def pair_a_phone(self):
+        """A phone paired to the repo, as the repo's records know it: a device record naming a live process that is a relay client of this repo (a
+        stand-in this case starts and ends itself -- its argv is all the record is checked by). The count the helper reports."""
+        real = os.path.realpath(self.repo)
+        dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)", "heimdall-relay-client", "--repo", real, "--ui-port", "1"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.dummies.append(dummy)
+        devices = H.load_module("hmd_devices_probe", DEVICES_PY)
+        now = int(time.time())
+        devices.write_record(real, {"v": 1, "id": "0123abcd", "label": "Pixel 9a", "gh_login": "octocat", "via": "code", "code": None, "bound_at": now,
+                                    "last_seen": now, "caps": [], "push_fps": [], "pid": dummy.pid})
+        return C.run([sys.executable, DEVICES_PY, "count", "--repo", self.repo], self.env()).stdout.strip()
 
 
 # -- N1 ------------------------------------------------------------------------------------------------------------
@@ -221,17 +323,7 @@ def case_default_repo_registers_once():
 # -- N4 ------------------------------------------------------------------------------------------------------------
 def case_paired_phone_needs_no_code():
     with Scn() as s:
-        real = os.path.realpath(s.repo)
-        # a paired phone, as the repo's records know it: a record naming a live process that is a relay client of this repo (a stand-in this
-        # case starts and ends itself -- its argv is all the record is checked by)
-        dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)", "heimdall-relay-client", "--repo", real, "--ui-port", "1"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        s.dummies.append(dummy)
-        devices = H.load_module("hmd_devices_probe", DEVICES_PY)
-        now = int(time.time())
-        devices.write_record(real, {"v": 1, "id": "0123abcd", "label": "Pixel 9a", "gh_login": "octocat", "via": "code", "code": None, "bound_at": now,
-                                    "last_seen": now, "caps": [], "push_fps": [], "pid": dummy.pid})
-        count = C.run([sys.executable, DEVICES_PY, "count", "--repo", s.repo], s.env()).stdout.strip()
+        count = s.pair_a_phone()
         T.check(count == "1", "N4. (setup) one phone is paired to the repo", "count %r" % count)
         started = s.hook(C.SID1)
         paired = C.wait_until(lambda: (s.window_state() or {}).get("state") == "paired", 30)
@@ -357,9 +449,256 @@ def case_gh_signed_out_starts_nothing():
                 "N9. ...gh was asked one thing, once per session start: can it give a token (two starts, two reads, no `gh auth status`, no login)", repr(s.gh_calls()))
 
 
+# -- E1 ------------------------------------------------------------------------------------------------------------
+def case_env_relay_nobody_approved_gets_nothing():
+    with Scn(approve=False) as s:
+        direct = s.pair_window(C.SID1)  # HMD_RELAY_URL names the loopback relay; nobody approved it
+        said = [line for line in direct.stderr.splitlines() if line.strip()]
+        T.check(direct.returncode == 0 and direct.stdout.strip() == "" and len(said) == 1 and "HMD_RELAY_URL" in said[0] and s.relay.url in said[0]
+                and "hmd app connect --relay" in said[0],
+                "E1. HMD_RELAY_URL -- which a cloned repository can set for the session -- names a relay that is not the default and was never approved: "
+                "pair-window exits 0, says nothing on stdout and ONE line on stderr that names HMD_RELAY_URL, the relay and how to approve it",
+                "rc %r out %r err %r" % (direct.returncode, direct.stdout, direct.stderr))
+        T.check(s.gh_calls() == [] and s.relay.requests == [] and not s.relay.registrations and s.window_state() is None,
+                "E1. ...no token was read (gh was not called, not even to ask), the relay it named got no request of any kind, and no window started",
+                "gh %r requests %r window %r" % (s.gh_calls(), s.relay.requests, s.window_state()))
+        started = s.hook(C.SID2)
+        recorded = C.wait_until(lambda: s.session_record(C.SID2), 20)
+        time.sleep(3)  # a probe, a supervisor or a registration would have shown by now
+        T.check(started.returncode == 0 and started.stdout == "" and bool(recorded) and s.gh_calls() == [] and s.relay.requests == [] and s.window_state() is None,
+                "E1. ...the SessionStart hook is silent and the session unaffected (exit 0, the session still recorded), and still no gh call, no relay request, no window",
+                "rc %r out %r record %r gh %r requests %r window %r"
+                % (started.returncode, started.stdout, recorded, s.gh_calls(), s.relay.requests, s.window_state()))
+        T.check("HMD_RELAY_URL" in s.app_log(), "E1. ...and the app log says why no window opened (the hook's own stderr goes nowhere)", repr(s.app_log()[-300:]))
+        # whatever shape the URL has, with a recorder where the relay client goes: none of them is the default, none of them was approved
+        refused = []
+        for url in ("http://evil", "https://evil.example/pair", "HTTPS://EVIL.EXAMPLE:443", "http://127.0.0.1:1", DEFAULT_RELAY + ".evil.example",
+                    DEFAULT_RELAY + "/x", DEFAULT_RELAY.replace("https://", "https://user@")):
+            out = s.pair_window(C.SID1, HMD_RELAY_URL=url, **s.recorder())
+            refused.append(out.returncode == 0 and len([line for line in out.stderr.splitlines() if line.strip()]) == 1)
+        T.check(all(refused) and s.started() == [] and s.gh_calls() == [] and s.relay.requests == [],
+                "E1. ...nor does any other URL the environment could name -- another host, a path, an upper-case spelling, the default relay's name with a suffix or "
+                "with credentials: each is refused with its one line, no client is started, no token read", repr(refused))
+
+
+# -- E2 ------------------------------------------------------------------------------------------------------------
+def case_default_relay_gets_the_token():
+    for label, named in (("names no relay", None), ("names the default relay in another spelling", "https://HMD-Relay.TheRishabh16.workers.dev/")):
+        with Scn(approve=False) as s:
+            out = s.pair_window(C.SID1, HMD_RELAY_URL=named, **s.recorder())
+            C.wait_until(lambda: any(first for _argv, first in s.started()), 40)  # the recorder writes its argv first, the hash of what it read on stdin after it
+            starts = s.started()
+            argv = starts[0][0] if starts else []
+            T.check(out.returncode == 0 and len(starts) == 1 and "--relay" in argv and argv[argv.index("--relay") + 1] == (named or DEFAULT_RELAY)
+                    and starts[0][1] == TOKEN_SHA,
+                    "E2. HMD_RELAY_URL %s: the window's client is started for the default relay and handed the laptop's token (the recorder saw its hash)" % label,
+                    "rc %r err %r starts %r" % (out.returncode, out.stderr, starts))
+            T.check(out.stderr.strip() == "" and s.relay.requests == [],
+                    "E2. ...with nothing said on stderr, and no request to the loopback relay the sandbox runs (which is not the default)", repr(out.stderr))
+
+
+# -- E3 ------------------------------------------------------------------------------------------------------------
+def case_approved_relay_gets_the_token():
+    other = FakeCodeRelay(ttl_s=2, expect_token=H.TOKEN).start()
+    try:
+        with Scn(approve=False) as s:
+            before = s.trusted(s.relay.url)
+            approved = s.approve_relay()  # what `hmd app connect --relay URL` records
+            T.check(not before and approved == 0 and s.trusted(s.relay.url),
+                    "E3. (setup) the loopback relay is not trusted until it is approved, and `approve` -- what `hmd app connect --relay URL` records -- makes it so",
+                    "before %r approve rc %r after %r" % (before, approved, s.trusted(s.relay.url)))
+            elsewhere = s.pair_window(C.SID1, HMD_RELAY_URL=other.url)
+            T.check(elsewhere.returncode == 0 and other.requests == [] and not other.registrations and s.gh_calls() == [],
+                    "E3. approving one relay approves no other: a second relay (the same host, another port) named by the environment gets no request and no token",
+                    "rc %r requests %r gh %r" % (elsewhere.returncode, other.requests, s.gh_calls()))
+            started = s.hook(C.SID2)
+            registered = C.wait_until(lambda: s.relay.registrations, 40)
+            T.check(started.returncode == 0 and registered and len(s.relay.registrations) == 1 and s.token_sends() == 1,
+                    "E3. a relay approved in HEIMDALL_HOME and named by the environment gets the token: the SessionStart window registers the code once, with it",
+                    "rc %r registrations %d sends %d" % (started.returncode, len(s.relay.registrations), s.token_sends()))
+    finally:
+        other.stop()
+
+
+# -- E4 ------------------------------------------------------------------------------------------------------------
+def case_approval_planted_in_the_repo_is_not_honoured():
+    with Scn(approve=False) as s:
+        # what the helper writes, in each place a repository's own tree has -- the state tree hmd keeps in a repo, a dot directory, its top level --
+        # valid in every respect but where it is
+        homes = [os.path.join(s.repo, ".heimdall"), os.path.join(s.repo, ".hmd-home"), s.repo]
+        planted = [s.approve_relay(home=home) for home in homes]
+        T.check(planted == [0, 0, 0] and not s.trusted(s.relay.url) and [s.trusted(s.relay.url, home=home) for home in homes] == [False, False, False],
+                "E4. approvals planted inside the repository (under .heimdall, in a dot directory, at its top level) are not read: the relay is still not trusted, "
+                "and a store inside the repository is not believed even when it is named as HEIMDALL_HOME",
+                "planted %r trusted %r" % (planted, [s.trusted(s.relay.url), [s.trusted(s.relay.url, home=home) for home in homes]]))
+        first = s.pair_window(C.SID1)
+        T.check(first.returncode == 0 and s.gh_calls() == [] and s.relay.requests == [] and s.window_state() is None,
+                "E4. ...so the session start with that relay named by the environment still reads no token and makes no relay request",
+                "rc %r err %r gh %r requests %r" % (first.returncode, first.stderr, s.gh_calls(), s.relay.requests))
+        results = []
+        for home in homes + [".hmd-home"]:  # the last one is relative: it resolves inside the repo because a hook runs there
+            out = C.run([H.APP_PATH, "pair-window", "--session", C.SID1, "--pid", str(os.getpid()), "--repo", s.repo], s.env(HEIMDALL_HOME=home), timeout=60,
+                        cwd=s.repo)
+            results.append(out.returncode == 0)
+        T.check(all(results) and s.gh_calls() == [] and s.relay.requests == [] and s.window_state() is None,
+                "E4. ...and nor does a HEIMDALL_HOME the environment points into the repository (absolute or relative), approval in it or not: no gh call, no relay request, no window",
+                "results %r gh %r requests %r window %r" % (results, s.gh_calls(), s.relay.requests, s.window_state()))
+        s.approve_relay()  # the same record, in the operator's own HEIMDALL_HOME
+        started = s.pair_window(C.SID1)
+        registered = C.wait_until(lambda: s.relay.registrations, 40)
+        T.check(started.returncode == 0 and registered and s.token_sends() == 1,
+                "E4. ...while the same record in the operator's own HEIMDALL_HOME is honoured: the window registers the code with the token (so what refused the plants was where they are)",
+                "rc %r registrations %d sends %d" % (started.returncode, len(s.relay.registrations), s.token_sends()))
+
+
+def case_home_in_the_repo_is_not_honoured_in_any_spelling():
+    with Scn(approve=False) as s:
+        real = os.path.realpath(s.repo)
+        home = os.path.join(real, ".hmd-home")
+        planted = s.approve_relay(home=home)  # a valid store, inside the repository
+        # the same directory spelled in another case: on a case-insensitive volume (the macOS default, APFS) /Users/RJ/x and /Users/rj/x are one place and a
+        # comparison of path strings reads them as two -- and the HEIMDALL_HOME the environment gives is the attacker's to spell
+        spelled = os.path.join(os.path.dirname(real), os.path.basename(real).upper(), ".hmd-home")
+        reaches = os.path.exists(spelled) and os.path.samefile(spelled, home)
+        out = C.run([H.APP_PATH, "pair-window", "--session", C.SID1, "--pid", str(os.getpid()), "--repo", s.repo], s.env(HEIMDALL_HOME=spelled), timeout=60,
+                    cwd=s.repo)
+        T.check(planted == 0 and out.returncode == 0 and not s.trusted(s.relay.url, home=spelled) and s.gh_calls() == [] and s.relay.requests == []
+                and s.window_state() is None,
+                "E4. a HEIMDALL_HOME inside the repository, spelled in another case (%s), is not honoured either: a store is judged by what it IS -- below the repo "
+                "directory, by device and inode -- not by how its path is written: no gh call, no relay request, no window"
+                % ("this volume reads that spelling as the planted store" if reaches else "this volume is case-sensitive, so the spelling reaches nothing here"),
+                "planted %r rc %r err %r gh %r requests %r window %r" % (planted, out.returncode, out.stderr, s.gh_calls(), s.relay.requests, s.window_state()))
+        # a HEIMDALL_HOME that is not an absolute path is no store at all, wherever it would resolve: here to the operator's own approved one
+        s.approve_relay()
+        relative = os.path.relpath(s.home, s.sb.root)
+        argv = [sys.executable, APPROVAL_PY, "trusted", "--relay=" + s.relay.url, "--default=" + DEFAULT_RELAY, "--repo=" + s.repo]
+        by_absolute = C.run(argv, s.env(), timeout=60, cwd=s.sb.root).returncode
+        by_relative = C.run(argv, s.env(HEIMDALL_HOME=relative), timeout=60, cwd=s.sb.root).returncode
+        T.check(by_absolute == 0 and by_relative == 1,
+                "E4. ...and a relative HEIMDALL_HOME is refused: the operator's own approved store, named relative to the directory the process runs in, is not read "
+                "(the same store named by its absolute path is)", "absolute rc %r relative rc %r (%s)" % (by_absolute, by_relative, relative))
+
+
+# -- E5 ------------------------------------------------------------------------------------------------------------
+def case_connect_env_relay_pairs_by_qr_without_the_token():
+    with Scn(approve=False) as s:
+        app = s.connect_env("--bg")  # no --relay: the environment names the loopback relay, which nobody approved
+        app.close_stdin()
+        rc = app.wait_exit(90)
+        said = app.text()
+        T.check(rc == 0 and "code pairing off" in said and "HMD_RELAY_URL" in said and "hmd app connect --relay" in said and "SESSION CODE" not in said,
+                "E5. `hmd app connect` with the relay named only by HMD_RELAY_URL (not the default, never approved) pairs by QR and says in one line why there is no code",
+                "rc %r %s" % (rc, app.tail()))
+        T.check(s.gh_calls() == [] and not s.relay.registrations and s.token_sends() == 0,
+                "E5. ...gh is not asked for a token and the relay gets no registration: the token goes nowhere",
+                "gh %r registrations %d" % (s.gh_calls(), len(s.relay.registrations)))
+
+
+def case_connect_relay_flag_names_the_relay():
+    with Scn(approve=False) as s:
+        app = s.connect("--bg", env={"HMD_RELAY_URL": "http://evil"})  # --relay <the loopback relay> on the command line, the environment naming another
+        app.close_stdin()
+        rc = app.wait_exit(90)
+        registered = C.wait_until(lambda: s.relay.registrations, 40)
+        T.check(rc == 0 and registered and len(s.relay.registrations) == 1 and s.token_sends() == 1,
+                "E5. `hmd app connect --relay URL` is the operator naming the relay: the code is registered there and the token sent once, whatever HMD_RELAY_URL says",
+                "rc %r registrations %d sends %d %s" % (rc, len(s.relay.registrations), s.token_sends(), app.tail()))
+        T.check(s.trusted(s.relay.url),
+                "E5. ...and it records that relay as approved, so a session start may send the token there too", "trusted %r" % s.trusted(s.relay.url))
+
+
+def case_connect_no_code_approves_nothing():
+    with Scn(approve=False) as s:
+        app = s.connect("--no-code", "--bg")
+        app.close_stdin()
+        rc = app.wait_exit(90)
+        T.check(rc == 0 and s.gh_calls() == [] and not s.relay.registrations and not s.trusted(s.relay.url),
+                "E5. `hmd app connect --relay URL --no-code` sends no token and approves nothing: the relay is still not one a session start may send it to",
+                "rc %r gh %r registrations %d trusted %r %s" % (rc, s.gh_calls(), len(s.relay.registrations), s.trusted(s.relay.url), app.tail()))
+
+
+# -- E6 ------------------------------------------------------------------------------------------------------------
+def case_add_device_and_identity_revoke_refuse_an_env_relay():
+    with Scn(approve=False) as s:
+        count = s.pair_a_phone()
+        refused = C.run([H.APP_PATH, "add-device", "--repo", s.repo], s.env(), timeout=60, cwd=s.repo)
+        T.check(count == "1" and refused.returncode == 2 and "HMD_RELAY_URL" in refused.stderr and s.gh_calls() == [] and s.relay.requests == [],
+                "E6. `hmd app add-device` with the relay named only by HMD_RELAY_URL (not the default, never approved) refuses -- exit 2, a message naming HMD_RELAY_URL -- "
+                "before it asks gh for anything or calls the relay",
+                "count %r rc %r err %r gh %r requests %r" % (count, refused.returncode, refused.stderr, s.gh_calls(), s.relay.requests))
+        revoke = C.run([H.APP_PATH, "identity", "revoke"], s.env(), timeout=60, cwd=s.repo)
+        T.check(revoke.returncode == 2 and "HMD_RELAY_URL" in revoke.stderr and s.gh_calls() == [] and s.relay.identity_revokes == [],
+                "E6. ...and so does `hmd app identity revoke`: exit 2, gh not asked, no request to the relay",
+                "rc %r err %r gh %r revokes %r" % (revoke.returncode, revoke.stderr, s.gh_calls(), s.relay.identity_revokes))
+        named = C.run([H.APP_PATH, "add-device", "--repo", s.repo, "--relay", s.relay.url], s.env(HMD_RELAY_URL="http://evil"), timeout=90, cwd=s.repo)
+        # at least once, not exactly once: add-device's window is clamped to 1 s, longer than the 0.5 s floor of this scaled sandbox, so a loaded machine can let
+        # the 2 s registration lapse and the client register again -- that the token is sent once per request is proved by the connect and window cases above
+        T.check(s.token_sends() >= 1 and not s.trusted(s.relay.url),
+                "E6. `add-device --relay URL` names the relay for that one command (the code is registered there, with the token, whatever HMD_RELAY_URL says) "
+                "and approves nothing",
+                "rc %r sends %d trusted %r out %r err %r" % (named.returncode, s.token_sends(), s.trusted(s.relay.url), named.stdout[-200:], named.stderr[-200:]))
+        revoked = C.run([H.APP_PATH, "identity", "revoke", "--relay", s.relay.url], s.env(HMD_RELAY_URL="http://evil"), timeout=60, cwd=s.repo)
+        T.check(revoked.returncode == 0 and len(s.relay.identity_revokes) == 1 and s.relay.identity_revokes[0]["token_ok"] and not s.trusted(s.relay.url),
+                "E6. ...and so does `identity revoke --relay URL`: the token goes to that relay and nothing is approved",
+                "rc %r revokes %r trusted %r err %r" % (revoked.returncode, s.relay.identity_revokes, s.trusted(s.relay.url), revoked.stderr[-200:]))
+
+
+# -- E7 ------------------------------------------------------------------------------------------------------------
+def case_relay_matching_is_exact():
+    sb = H.Sandbox()
+    saved = os.environ.get("HEIMDALL_HOME")
+    try:
+        os.environ["HEIMDALL_HOME"] = os.path.join(sb.home, ".heimdall")
+        approval = H.load_module("hmd_relay_approval_probe", APPROVAL_PY)
+        for url in ("https://relay.example.com", "http://127.0.0.1:8787", "http://[::1]:9000", "https://key.example.com"):
+            approval.approve(url)
+        yes = ("https://relay.example.com", "HTTPS://Relay.Example.COM/", "https://relay.example.com:443", "http://127.0.0.1:8787", "http://127.0.0.1:8787/",
+               "http://[::1]:9000", "http://[0:0:0:0:0:0:0:1]:9000", "https://key.example.com",
+               DEFAULT_RELAY, DEFAULT_RELAY + "/", "HTTPS://HMD-RELAY.THERISHABH16.WORKERS.DEV", DEFAULT_RELAY + ":443")
+        no = ("", " ", "relay.example.com", "ftp://relay.example.com", "//relay.example.com", "https://", "https:///x", "javascript:alert(1)",
+              "http://relay.example.com",  # the other scheme
+              "https://relay.example.com:8443", "https://relay.example.com:80",  # another port
+              "http://127.0.0.1", "http://127.0.0.1:8788", "https://127.0.0.1:8787", "http://[::1]", "http://[::2]:9000",
+              "https://relay.example.com.evil.example", "https://evil-relay.example.com", "https://x.relay.example.com", "https://relay.example.com.",
+              "https://relay.example.com@evil.example", "https://evil.example@relay.example.com", "https://:@relay.example.com",
+              "https://relay.example.com/x", "https://relay.example.com//", "https://relay.example.com?x=1", "https://relay.example.com#x",
+              "https://relay.example.com;x", "https://relay.example.com\\@evil.example", "https://relay.example.com%2eevil.example",
+              "https://relay.example.com\t", "https://relay.example.com ", " https://relay.example.com", "https://relay.example.com\n",
+              "https://relay.example.com\x00", "https://relay.example.com∕evil.example", "https://relаy.example.com",
+              "https://Key.example.com",  # KELVIN SIGN: it lower-cases to a plain k, the lookalike a case-insensitive pattern lets through
+              "https://ｒelay.example.com",  # a full-width r
+              DEFAULT_RELAY + ".evil.example", "https://evil." + DEFAULT_RELAY[len("https://"):], DEFAULT_RELAY + ":8443", DEFAULT_RELAY.replace("https", "http"))
+        wrong_yes = [url for url in yes if not approval.trusted(url, DEFAULT_RELAY, sb.repo)]
+        wrong_no = [url for url in no if approval.trusted(url, DEFAULT_RELAY, sb.repo)]
+        T.check(not wrong_yes, "E7. the default relay and the approved ones are trusted however the scheme and host are cased, with or without the closing slash or the scheme's own port",
+                "refused: %r" % wrong_yes)
+        T.check(not wrong_no, "E7. ...and nothing else is: another scheme, port, host, a suffix or prefix of one, credentials, a path, a query, a fragment, whitespace, "
+                "a lookalike or control character, an empty value", "trusted: %r" % wrong_no)
+        normalised = {"HTTPS://Relay.Example.COM:443/": "https://relay.example.com", "http://127.0.0.1:80": "http://127.0.0.1",
+                      "http://[0:0:0:0:0:0:0:1]:9000": "http://[::1]:9000", "https://x.example:8443/": "https://x.example:8443",
+                      "https://x.example:0443": None, "https://x.example:0": None, "https://x.example:65536": None, "https://-x.example": None,
+                      "https://x..example": None, "https://x.example:": None}
+        wrong_form = {url: approval.normalize(url) for url, want in normalised.items() if approval.normalize(url) != want}
+        T.check(not wrong_form, "E7. a URL is compared in one form: scheme://host[:port], lower-cased, the scheme's own port left out, IPv6 compressed -- and a port with a leading "
+                "zero, above 65535 or empty, an empty or hyphen-edged label is no URL at all", "differs: %r" % wrong_form)
+        out = C.run([sys.executable, APPROVAL_PY, "approve", "--relay", "https://relay.example.com/x"], sb.env(), timeout=60)
+        T.check(out.returncode == 1 and not approval.trusted("https://relay.example.com/x", DEFAULT_RELAY, sb.repo),
+                "E7. a URL that is not a plain scheme://host[:port] cannot be approved (exit 1)", "rc %r err %r" % (out.returncode, out.stderr))
+    finally:
+        if saved is None:
+            os.environ.pop("HEIMDALL_HOME", None)
+        else:
+            os.environ["HEIMDALL_HOME"] = saved
+        sb.close()
+
+
 CASES = [case_switched_off_nothing_sent, case_connect_is_an_explicit_yes, case_default_repo_registers_once, case_paired_phone_needs_no_code,
          case_no_code_switches_it_off, case_record_is_outside_the_repo, case_replacement_client_resumes_without_a_token, case_machine_wide_off,
-         case_gh_signed_out_starts_nothing]
+         case_gh_signed_out_starts_nothing, case_env_relay_nobody_approved_gets_nothing, case_default_relay_gets_the_token,
+         case_approved_relay_gets_the_token, case_approval_planted_in_the_repo_is_not_honoured, case_home_in_the_repo_is_not_honoured_in_any_spelling,
+         case_connect_env_relay_pairs_by_qr_without_the_token,
+         case_connect_relay_flag_names_the_relay, case_connect_no_code_approves_nothing, case_add_device_and_identity_revoke_refuse_an_env_relay,
+         case_relay_matching_is_exact]
 
 
 def main():

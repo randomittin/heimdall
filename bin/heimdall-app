@@ -114,6 +114,16 @@
 #                              offered again only when that phone's client ends -- a client that crashed is replaced
 #                              and its phone pairs again, logged as a re-pair. Another phone is added only on
 #                              purpose, with `hmd app add-device` (below).
+#                              WHICH RELAY GETS THE TOKEN: the hosted default, a relay named on THIS command line (--relay URL), or one
+#                              approved before. `hmd app connect --relay URL` (pairing by code, not --no-code) records URL as approved in
+#                              $HEIMDALL_HOME/app/relay-approved (0600, outside every repo, matched exactly on scheme, host and port), so a
+#                              session start, add-device and identity revoke may send the token there too. HMD_RELAY_URL still picks the
+#                              relay a connect publishes through, but the environment is not trusted with the token -- a cloned
+#                              repository can set it (.claude/settings.json "env", .envrc) -- so a relay it names that is neither the
+#                              default nor approved gets none: connect pairs by QR and says so, add-device and identity revoke refuse
+#                              (exit 2), and the SessionStart pair window opens nothing and prints one line on stderr. Nothing falls back
+#                              to the hosted relay: a self-hoster's token must not start going there. `--relay URL` on add-device and
+#                              identity revoke names the relay for that one command and approves nothing.
 #                              THE PORT (--port N, default 8710; 0 = any free port) may
 #                              already be held, and connect settles it by what holds it
 #                              rather than failing to bind: a loopback `hmd ui` of THIS
@@ -1124,6 +1134,27 @@ _pair_optin() {
   "$PY3" "$LIB_DIR/hmd_pair_optin.py" "$1" --repo "$2" >/dev/null 2>&1
 }
 
+# _relay_trusted RELAY REPO -- 0 when the laptop's GitHub token may go to RELAY, a relay the ENVIRONMENT named (HMD_RELAY_URL): it is the default relay or one the
+# operator approved (bin/lib/hmd_relay_approval.py, a record in $HEIMDALL_HOME that `hmd app connect --relay URL` makes; a store inside REPO is not read). A cloned
+# repository sets the environment of the session it is opened in, so the environment alone is never trusted with the token. 1 for anything else and for any
+# doubt: no python, a helper that fails, a URL that is not a plain scheme://host[:port]. A relay typed after --relay on the command line is the operator's own
+# choice and is not asked about.
+_relay_trusted() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" "$LIB_DIR/hmd_relay_approval.py" trusted --relay="$1" --default="$DEFAULT_RELAY_URL" --repo="$2" >/dev/null 2>&1
+}
+
+# _relay_approve RELAY -- record RELAY as one the token may go to (what `hmd app connect --relay URL` does). 1 when it cannot be recorded.
+_relay_approve() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" "$LIB_DIR/hmd_relay_approval.py" approve --relay="$1" >/dev/null 2>&1
+}
+
+# _relay_shown RELAY -- RELAY for a message: it came from the environment, so it is data and never raw terminal bytes, and it is cut short.
+_relay_shown() {
+  _clean_text "$1" | cut -c1-120
+}
+
 # _code_renewal_on -- 0 when the operator asked, with HMD_PAIR_WINDOW_RENEW=1 (exactly 1), for the code to be kept claimable by registering it again
 # about every 5 minutes: the gh token goes out with every one of those. The default is ONE registration per request (hmd app connect, hmd app
 # add-device, a pair window that opens with no phone paired): the relay keeps it 360 s, the code is claimable that long and no timer, restart or
@@ -1682,7 +1713,7 @@ _relay_start_ui() {
 
 cmd_connect() {
   local REPO="" PORT="8710" NO_INSTALL=false BG=false
-  local RELAY_URL="" RELAY_SET=false HTTPS_PORT_SET=false TAILSCALE=false NO_CODE=false NO_CONFIRM=false CONFIRM=false TMUX_WAKE=false
+  local RELAY_URL="" RELAY_SET=false HTTPS_PORT_SET=false TAILSCALE=false NO_CODE=false NO_CONFIRM=false CONFIRM=false TMUX_WAKE=false RELAY_FLAG=false
   HTTPS_PORT="443"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1729,7 +1760,9 @@ cmd_connect() {
     return 2
   fi
   # The relay is the default transport (the hosted one unless HMD_RELAY_URL or --relay says otherwise); a flag
-  # only Tailscale Funnel understands -- --tailscale itself, --https-port, --no-install -- selects Funnel.
+  # only Tailscale Funnel understands -- --tailscale itself, --https-port, --no-install -- selects Funnel. A --relay URL typed here is the operator naming the
+  # relay (RELAY_FLAG); one that only the environment names is not trusted with the GitHub token (_relay_trusted, asked in cmd_connect_relay).
+  [ -z "$RELAY_URL" ] || RELAY_FLAG=true
   if [ -z "$RELAY_URL" ] && [ "$TAILSCALE" != true ] && [ "$HTTPS_PORT_SET" != true ] && [ "$NO_INSTALL" != true ]; then
     RELAY_URL="${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}"
   fi
@@ -1754,7 +1787,7 @@ cmd_connect() {
 
   if [ -n "$RELAY_URL" ]; then
     RELAY_MODE=true
-    cmd_connect_relay "$REPO" "$PORT" "$BG" "$RELAY_URL" "$NO_CODE" "$CONFIRM"
+    cmd_connect_relay "$REPO" "$PORT" "$BG" "$RELAY_URL" "$NO_CODE" "$CONFIRM" "$RELAY_FLAG"
     return $?
   fi
 
@@ -2163,7 +2196,7 @@ _relay_loop() {
 # its own stdout, and tears it down. $1: REPO (already resolved). $2: PORT.
 # $3: BG (true/false). $4: RELAY_URL.
 cmd_connect_relay() {
-  local REPO="$1" PORT="$2" BG="$3" RELAY_URL="$4" NO_CODE="${5:-false}" CONFIRM="${6:-false}"
+  local REPO="$1" PORT="$2" BG="$3" RELAY_URL="$4" NO_CODE="${5:-false}" CONFIRM="${6:-false}" RELAY_FLAG="${7:-false}"
 
   if [ ! -x "$UI_BIN" ]; then
     echo "hmd app connect: heimdall-ui not found at $UI_BIN" >&2
@@ -2211,8 +2244,20 @@ cmd_connect_relay() {
   # pipe; it is never passed as an argument or exported. The repo's pair window, when open, holds the
   # code (one live window per GitHub id and code on the relay), so a plain connect leaves it there and says so,
   # while --confirm, which needs the code for a window that asks, stops that one first.
-  local code_requested=false code="" gh_tok=""
-  if [ "$NO_CODE" != true ]; then
+  local code_requested=false code="" gh_tok="" token_relay_ok=true
+  # Which relay may have the token. A relay typed after --relay is the operator's own choice, and pairing by code through it approves it (HEIMDALL_HOME, never
+  # the repo), so a session start may send the token there too. A relay only the ENVIRONMENT names (HMD_RELAY_URL: a cloned repository sets it for the session it
+  # is opened in) is not trusted with the token unless it is the default or approved: no token is read, and the QR pairs as it always did.
+  if [ "$RELAY_FLAG" = true ]; then
+    if [ "$NO_CODE" != true ] && [ "$RELAY_URL" != "$DEFAULT_RELAY_URL" ] && ! _relay_approve "$RELAY_URL"; then
+      echo "hmd app: could not record $(_relay_shown "$RELAY_URL") as an approved relay (it must be a plain http(s) scheme://host[:port], and HEIMDALL_HOME writable) -- a session start will not send your GitHub token there" >&2
+    fi
+  elif [ "$RELAY_URL" != "$DEFAULT_RELAY_URL" ] && ! _relay_trusted "$RELAY_URL" "$REPO"; then
+    token_relay_ok=false
+  fi
+  if [ "$NO_CODE" != true ] && [ "$token_relay_ok" != true ]; then
+    echo "hmd app: code pairing off — HMD_RELAY_URL names $(_relay_shown "$RELAY_URL"), which is not the default relay and was not approved here, so your GitHub token is not sent to it. Scan the QR, or approve it once: hmd app connect --relay $(_relay_shown "$RELAY_URL")"
+  elif [ "$NO_CODE" != true ]; then
     if code="$(_session_code_for_repo "$REPO")"; then
       if [ "$CONFIRM" = true ]; then
         _pair_window_stop_code "$REPO" "$code"
@@ -2505,7 +2550,18 @@ _pw_start() {
   esac
   _session_attended || return 0
   [ -n "$PY3" ] && [ -x "$RELAY_CLIENT_BIN" ] || return 0
-  relay="${relay:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
+  # The relay: --relay when whoever ran this typed one (the hook's own command line has none), else HMD_RELAY_URL, else the default. The environment is not
+  # trusted with the token -- a cloned repository sets it for the session it is opened in -- so a relay it names that is neither the default nor approved
+  # (_relay_trusted) opens no window: no gh call, no token, no relay request, no supervisor, and ONE line on stderr (never stdout) and in the app log, where a
+  # hook run by Claude Code, whose own output is discarded, leaves it. It does not fall back to the default relay: a self-hoster's token must not start going there.
+  if [ -z "$relay" ]; then
+    relay="${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}"
+    if [ "$relay" != "$DEFAULT_RELAY_URL" ] && ! _relay_trusted "$relay" "$repo"; then
+      echo "hmd app: HMD_RELAY_URL names $(_relay_shown "$relay"), which is not the default relay and was not approved here -- no GitHub token is sent and no pair window opens. To use it, run once: hmd app connect --relay $(_relay_shown "$relay")" >&2
+      _app_note "$repo" "no pair window in $repo: HMD_RELAY_URL names $(_relay_shown "$relay"), which is not the default relay and was not approved (hmd app connect --relay URL approves one) -- no GitHub token was sent"
+      return 0
+    fi
+  fi
   # Two different things start from here, and only one of them can be said no to. OFFERING a code sends the laptop's gh token to the relay: every repo
   # does it by default, unless the person switched this one off (_pair_optin: `hmd app disconnect`, `hmd app connect --no-code`; a choice that cannot
   # be read counts as off). RESUMING a paired phone sends none: the phone comes back from the login stored for it, so a repo with a stored login (a
@@ -3071,9 +3127,15 @@ cmd_identity_revoke() {
     echo "hmd app identity revoke: --relay needs a URL" >&2
     return 2
   fi
+  local RELAY_FLAG=false
+  [ -z "$RELAY_URL" ] || RELAY_FLAG=true  # --relay URL typed: the operator named the relay for this command
   RELAY_URL="${RELAY_URL:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
   if [ ! -x "$RELAY_CLIENT_BIN" ]; then
     echo "hmd app identity revoke: heimdall-relay-client not found at $RELAY_CLIENT_BIN" >&2
+    return 2
+  fi
+  if [ "$RELAY_FLAG" != true ] && [ "$RELAY_URL" != "$DEFAULT_RELAY_URL" ] && ! _relay_trusted "$RELAY_URL" "$PWD"; then
+    echo "hmd app identity revoke: HMD_RELAY_URL names $(_relay_shown "$RELAY_URL"), which is not the default relay and was not approved here, so your GitHub token is not sent to it -- pass --relay $(_relay_shown "$RELAY_URL") to use it for this command" >&2
     return 2
   fi
   local tok="" out rc ev login reason
@@ -3801,11 +3863,19 @@ cmd_add_device() {
     esac
   done
   REPO="$(resolve_repo_value "$REPO")"
+  local RELAY_FLAG=false
+  [ -z "$RELAY_URL" ] || RELAY_FLAG=true  # --relay URL typed: the operator named the relay for this command
   RELAY_URL="${RELAY_URL:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
   local repo_real code n limit win_s port gh_tok="" ctl line ev seen=0 client_gone=false deadline exp when label login reason failed="" registered=false paired=false
   local min_s lead_s relay_host args
   if [ -z "$PY3" ] || [ ! -x "$RELAY_CLIENT_BIN" ]; then
     echo "hmd app add-device: python3 and bin/heimdall-relay-client are needed" >&2
+    return 2
+  fi
+  # a relay only the environment names (HMD_RELAY_URL: a cloned repository sets it for the session) is not trusted with the token unless it is the default or
+  # approved -- refused before gh is asked anything
+  if [ "$RELAY_FLAG" != true ] && [ "$RELAY_URL" != "$DEFAULT_RELAY_URL" ] && ! _relay_trusted "$RELAY_URL" "$REPO"; then
+    echo "hmd app add-device: HMD_RELAY_URL names $(_relay_shown "$RELAY_URL"), which is not the default relay and was not approved here, so your GitHub token is not sent to it -- pass --relay $(_relay_shown "$RELAY_URL") to use it for this command" >&2
     return 2
   fi
   repo_real="$(_real_dir "$REPO")" || { echo "hmd app add-device: not a directory: $REPO" >&2; return 2; }

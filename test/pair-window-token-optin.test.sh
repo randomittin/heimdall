@@ -15,6 +15,12 @@
 #     that registration only -- no timer, no restarted client, no later session start sends it again. HMD_PAIR_WINDOW_RENEW=1 is the explicit
 #     opt-in to the old schedule (what test/app-pair-confirm.test.sh still proves, with that variable set).
 #
+#   * which relay: a repository sets the environment of the session it is opened in (`.claude/settings.json` "env", `.envrc`), HMD_RELAY_URL
+#     included, and an on-by-default window would have sent the token to whatever server it named. The environment is no longer trusted with the
+#     token: a relay it names gets it only if it is the default or one the operator approved (`hmd app connect --relay URL` records it in
+#     HEIMDALL_HOME, bin/lib/hmd_relay_approval.py, never in the repo). The same rule holds for `hmd app add-device`, `hmd app identity revoke`
+#     and a `hmd app connect` that names no relay itself; a relay typed after --relay on the command line is the operator's own choice.
+#
 # Hermetic: a loopback relay (test/lib/fake_relay_code.py), a `gh` that logs each call and prints an obviously fake token (or says it is not
 # logged in), throwaway HOME / repo / TMPDIR / HEIMDALL_HOME. The cases are test/lib/pair_window_token_optin_cases.py; the static checks are below.
 set -u
@@ -31,7 +37,7 @@ bad() { N=$((N + 1)); FAIL=$((FAIL + 1)); printf '  FAIL %d. %s\n' "$N" "$1"; }
 
 echo "pair-window-token-optin (pairing by code: on by default for every repo, a repo or a machine can say no, the gh token sent once, never on a timer)"
 
-for f in "$CASES" "$APP" "$REPO/bin/lib/hmd_pair_optin.py" "$REPO/test/lib/app_pair_confirm_cases.py" "$REPO/test/lib/fake_relay_code.py" \
+for f in "$CASES" "$APP" "$REPO/bin/lib/hmd_pair_optin.py" "$REPO/bin/lib/hmd_relay_approval.py" "$REPO/test/lib/app_pair_confirm_cases.py" "$REPO/test/lib/fake_relay_code.py" \
          "$REPO/test/lib/pair_code_harness.py" "$REPO/README.md" "$REPO/packages/runheimdall/README.md" "$REPO/DATA.md" "$REPO/docs/INVENTORY.md" \
          "$REPO/hooks/hooks.json" "$REPO/hooks/hooks.metadata.json"; do
   if [ ! -e "$f" ]; then
@@ -107,6 +113,29 @@ if jq -e '[.hooks[] | select(.id == "pair-window-start") | .description | contai
   ok "the hook's description and docs/INVENTORY.md both say the window is on by default and the hook's names gh auth login"
 else
   bad "the hook description does not name gh auth login, or docs/INVENTORY.md still says the window is only for a repo connect was run for"
+fi
+
+relay_gate="$(grep -n '_relay_trusted "\$relay" "\$repo"' "$APP" | head -1 | cut -d: -f1)"
+if [ -n "$relay_gate" ] && [ -n "$gate" ] && [ -n "$probe" ] && [ "$relay_gate" -lt "$gate" ] && [ "$relay_gate" -lt "$probe" ]; then
+  ok "_pw_start asks whether the environment's relay may have the token before it reads the opt-in, asks gh anything or starts the supervisor"
+else
+  bad "the relay trust check is not ahead of the opt-in read and the gh probe in _pw_start (relay '$relay_gate', opt-in '$gate', probe '$probe')"
+fi
+if [ "$(grep -c '_relay_trusted "' "$APP")" -ge 4 ] && [ "$(grep -c '_relay_approve "' "$APP")" -ge 1 ]; then
+  ok "the session start, connect, add-device and identity revoke each ask the trust check about a relay the environment named, and connect --relay records the approval"
+else
+  bad "bin/heimdall-app does not ask the trust check on all four token paths (found $(grep -c '_relay_trusted "' "$APP"), want 4) or never records an approval"
+fi
+if printf '%s' "$help_text" | grep -q 'WHICH RELAY GETS THE TOKEN' && printf '%s' "$help_text" | grep -q 'the environment is not trusted with the token' \
+   && printf '%s' "$help_text" | grep -q 'app/relay-approved'; then
+  ok "the usage text says which relay may have the token: the default, one named on the command line or approved with connect --relay -- never one only the environment names"
+else
+  bad "the usage text does not document which relay gets the token (WHICH RELAY GETS THE TOKEN, the environment not being trusted, app/relay-approved)"
+fi
+if grep -q 'Which relay gets the token' "$REPO/DATA.md" && grep -q 'app/relay-approved' "$REPO/DATA.md" && grep -q 'HMD_RELAY_URL' "$REPO/DATA.md"; then
+  ok "DATA.md says which relay gets the token, where an approval lives (outside the repo) and that HMD_RELAY_URL alone is not one"
+else
+  bad "DATA.md does not document which relay gets the token and the approval store"
 fi
 
 # ── the cases ─────────────────────────────────────────────────────────────────────────────────────────

@@ -18,9 +18,9 @@ code with the relay at a session start, §9) are on by default; the other three 
 | **Telemetry / Pre-Merge Corpus** (`bin/heimdall-telemetry`, `bin/heimdall-telemetry-corpus`) | **Not in this release.** Written to a LOCAL spool only; the control-plane ingest is a future step (see "Send status" below). | on (T0) | `hmd telemetry off` |
 | **Auto-update version check** (`bin/heimdall-autoupdate`) | Yes — one unauthenticated GET to the public GitHub Releases API. No body, no credential, no code. | on (throttled ~24h) | `HEIMDALL_NO_AUTOUPDATE=1` or `~/.heimdall/no-autoupdate` |
 | **`rr` cloud maintainer** (`bin/rr`) | Yes — **only when you run it.** Sends your BYO Claude credential, your GitHub App installation id, and the literal task text you typed. | off — inert unless invoked | don't run `rr` (`RR_NO_CONTEXT=1` drops the context capsule) |
-| **Phone companion relay** (`bin/heimdall-relay-client`) | Yes — **only once a phone is paired** (by `hmd app connect`, or by typing the pair window's code, §9). End-to-end sealed frames to *your own* paired phone through the hosted relay (`https://hmd-relay.therishabh16.workers.dev`): session state with repo-relative paths, and — only when the phone asks — a file diff, transcript tail or PR summary. The relay forwards ciphertext and cannot read it (§9). | off — no frame is sent until a phone pairs | `hmd app disconnect` (or Ctrl-C); `hmd app controls off` / `HMD_UI_CONTROLS=0` refuse phone views and controls; `--relay URL` / `HMD_RELAY_URL` to self-host |
+| **Phone companion relay** (`bin/heimdall-relay-client`) | Yes — **only once a phone is paired** (by `hmd app connect`, or by typing the pair window's code, §9). End-to-end sealed frames to *your own* paired phone through the hosted relay (`https://hmd-relay.therishabh16.workers.dev`): session state with repo-relative paths, and — only when the phone asks — a file diff, transcript tail or PR summary. The relay forwards ciphertext and cannot read it (§9). | off — no frame is sent until a phone pairs | `hmd app disconnect` (or Ctrl-C); `hmd app controls off` / `HMD_UI_CONTROLS=0` refuse phone views and controls; `--relay URL` / `HMD_RELAY_URL` to self-host (your GitHub token goes only to the hosted relay or one you approved — §9) |
 | **Phone push notifications** (`bin/lib/companion_push.py`) | Yes — **only once a paired phone registered an Expo push token.** hmd POSTs straight to `exp.host`: not through the relay, and **not end-to-end sealed** — Expo, and Apple or Google behind it, can read the text. Title ≤ 48 and body ≤ 120 UTF-16 units: fixed templates plus allowlisted fields (§9). | off — nothing is sent until a phone registers | `HMD_PUSH=0` (exactly `0`); `hmd app disconnect`; delete `<repo>/.heimdall/app/push.json` |
-| **Pair-by-code** (a session start, `hmd app connect`, `hmd app add-device`) | Yes — **once for each code registered; the relay keeps it about six minutes.** Your `gh auth token` goes to the relay in a TLS request body; the relay spends it on one `GET /user` to GitHub to learn your numeric GitHub id and, by its INV-39, never stores or logs it (§9). | on for every repo, whenever `gh auth token` yields a token | `HMD_PAIR_WINDOW=0` (the machine); `hmd app disconnect` or `hmd app connect --no-code` (one repo; `--no-code` also pairs by QR, no token leaves); `hmd app identity revoke` |
+| **Pair-by-code** (a session start, `hmd app connect`, `hmd app add-device`) | Yes — **once for each code registered; the relay keeps it about six minutes.** Your `gh auth token` goes to the hosted relay — or a relay you approved, never one that only an environment variable names (§9) — in a TLS request body; the relay spends it on one `GET /user` to GitHub to learn your numeric GitHub id and, by its INV-39, never stores or logs it (§9). | on for every repo, whenever `gh auth token` yields a token | `HMD_PAIR_WINDOW=0` (the machine); `hmd app disconnect` or `hmd app connect --no-code` (one repo; `--no-code` also pairs by QR, no token leaves); `hmd app identity revoke` |
 
 Everything below documents the *real* shapes emitted by the code, field by field.
 
@@ -500,7 +500,7 @@ itself. (Phone deny, §8, is the approval path of this same session.)
 Object whose source is `relay/` in this repo. The origin is baked in at
 `bin/heimdall-app:293` (`DEFAULT_RELAY_URL="https://hmd-relay.therishabh16.workers.dev"`)
 and resolves `--relay URL` > `$HMD_RELAY_URL` > that default; a Worker you deploy yourself
-takes the project's relay out of the path. `hmd app connect --tailscale` is a different
+takes the project's relay out of the path. Which relay may receive your GitHub token is narrower than which one carries the session: see "Which relay gets the token" under Pair-by-code below. `hmd app connect --tailscale` is a different
 transport and is **not** sealed end-to-end: it publishes the loopback `hmd ui` through
 Tailscale Funnel at a public hostname guarded by a per-launch token, with absolute paths
 reduced to basenames. Everything below describes the relay transport.
@@ -651,6 +651,23 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
   minutes, 10 s ahead of the relay's lapse, until a phone binds or `HMD_PAIR_WINDOW_IDLE_H` hours pass
   (`HMD_RELAY_CODE_WINDOW_S` sets it in seconds), and the token goes out with every one of those.
   `hmd hooks disable pair-window-start` or `HMD_PAIR_WINDOW=0` stops the hook's window altogether.
+- **Which relay gets the token.** The hosted relay, or a relay you approved — nothing else, whatever an environment
+  variable says. `hmd app connect --relay URL` (pairing by code, so not with `--no-code`) is the approval: it records the
+  relay's scheme, host and port in `$HEIMDALL_HOME/app/relay-approved/` (one 0600 file per relay in a 0700 directory, outside
+  every repo; `python3 bin/lib/hmd_relay_approval.py list` shows them and `forget --relay=URL` takes one back), and a session
+  start, `hmd app add-device` and `hmd app identity revoke` may then send the token there too. Matching is exact:
+  `https://x.example` is `https://X.EXAMPLE:443/` and nothing else — not `http://x.example`, not `https://x.example:8443`, and
+  no URL with a path, credentials or an unusual character. `--relay URL` on `add-device` or `identity revoke` names the relay
+  for that one command and approves nothing. `HMD_RELAY_URL` still chooses the relay a `connect` publishes through, but a
+  cloned repository can set it for the session it is opened in (`.claude/settings.json` `env`, `.envrc`), so it is never
+  trusted with the token on its own: a relay it names that is neither the default nor approved gets none. `hmd app connect`
+  then pairs by QR and says why in one line, `hmd app add-device` and `hmd app identity revoke` refuse (exit 2), and the
+  SessionStart window opens nothing and prints one line on stderr (and notes it in `$HEIMDALL_HOME/logs/app.log`, where the
+  hook's own discarded stderr cannot). Nothing falls back to the hosted relay: an operator who runs their own relay must not
+  find their token going to the hosted one. A store inside the repository (a `HEIMDALL_HOME` pointed into the
+  checkout) is not read, however its path is spelled (it is judged by file identity, so another letter case on macOS's
+  case-insensitive volume does not help), and a relative `HEIMDALL_HOME` is not read at all: a repository cannot approve its
+  own server.
 - **The phone's side** (`POST /identity/github`, `POST /pair/code`): the phone's GitHub
   device-flow token is checked against hmd's GitHub App and deleted at GitHub, and replaced
   by a relay-signed assertion bound to the phone's key. The relay releases a pending pairing
