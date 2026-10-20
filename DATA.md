@@ -654,7 +654,8 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
 - **Which relay gets the token.** The hosted relay, or a relay you approved — nothing else, whatever an environment
   variable says. `hmd app connect --relay URL` (pairing by code, so not with `--no-code`) is the approval: it records the
   relay's scheme, host and port in `$HEIMDALL_HOME/app/relay-approved/` (one 0600 file per relay in a 0700 directory, outside
-  every repo; `python3 bin/lib/hmd_relay_approval.py list` shows them and `forget --relay=URL` takes one back), and a session
+  every repo and every git work tree: a store inside either is never read and none is made there, so keep `HEIMDALL_HOME` outside
+  them if `~` is a work tree; `python3 bin/lib/hmd_relay_approval.py list` shows them and `forget --relay=URL` takes one back), and a session
   start, `hmd app add-device` and `hmd app identity revoke` may then send the token there too. Matching is exact:
   `https://x.example` is `https://X.EXAMPLE:443/` and nothing else — not `http://x.example`, not `https://x.example:8443`, and
   no URL with a path, credentials or an unusual character. `--relay URL` on `add-device` or `identity revoke` names the relay

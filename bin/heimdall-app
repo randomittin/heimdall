@@ -116,7 +116,7 @@
 #                              purpose, with `hmd app add-device` (below).
 #                              WHICH RELAY GETS THE TOKEN: the hosted default, a relay named on THIS command line (--relay URL), or one
 #                              approved before. `hmd app connect --relay URL` (pairing by code, not --no-code) records URL as approved in
-#                              $HEIMDALL_HOME/app/relay-approved (0600, outside every repo, matched exactly on scheme, host and port), so a
+#                              $HEIMDALL_HOME/app/relay-approved (0600, outside every repo and git work tree, matched exactly on scheme, host and port), so a
 #                              session start, add-device and identity revoke may send the token there too. HMD_RELAY_URL still picks the
 #                              relay a connect publishes through, but the environment is not trusted with the token -- a cloned
 #                              repository can set it (.claude/settings.json "env", .envrc) -- so a relay it names that is neither the
@@ -1135,7 +1135,9 @@ _pair_optin() {
 }
 
 # _relay_trusted RELAY REPO -- 0 when the laptop's GitHub token may go to RELAY, a relay the ENVIRONMENT named (HMD_RELAY_URL): it is the default relay or one the
-# operator approved (bin/lib/hmd_relay_approval.py, a record in $HEIMDALL_HOME that `hmd app connect --relay URL` makes; a store inside REPO is not read). A cloned
+# operator approved (bin/lib/hmd_relay_approval.py, a record in $HEIMDALL_HOME that `hmd app connect --relay URL` makes; a store inside REPO, or inside any git work
+# tree, is not read). REPO is the repo resolve_repo_value names, never the working directory: from a subdirectory of the repo the working directory is not the repo, and
+# a store inside the repo would pass as outside it. A cloned
 # repository sets the environment of the session it is opened in, so the environment alone is never trusted with the token. 1 for anything else and for any
 # doubt: no python, a helper that fails, a URL that is not a plain scheme://host[:port]. A relay typed after --relay on the command line is the operator's own
 # choice and is not asked about.
@@ -1144,10 +1146,11 @@ _relay_trusted() {
   "$PY3" "$LIB_DIR/hmd_relay_approval.py" trusted --relay="$1" --default="$DEFAULT_RELAY_URL" --repo="$2" >/dev/null 2>&1
 }
 
-# _relay_approve RELAY -- record RELAY as one the token may go to (what `hmd app connect --relay URL` does). 1 when it cannot be recorded.
+# _relay_approve RELAY REPO -- record RELAY as one the token may go to (what `hmd app connect --relay URL` does). 1 when it cannot be recorded -- also when HEIMDALL_HOME
+# is inside REPO or inside any git work tree: a store there is never read, so none is made.
 _relay_approve() {
   [ -n "$PY3" ] || return 1
-  "$PY3" "$LIB_DIR/hmd_relay_approval.py" approve --relay="$1" >/dev/null 2>&1
+  "$PY3" "$LIB_DIR/hmd_relay_approval.py" approve --relay="$1" --repo="$2" >/dev/null 2>&1
 }
 
 # _relay_shown RELAY -- RELAY for a message: it came from the environment, so it is data and never raw terminal bytes, and it is cut short.
@@ -2249,8 +2252,8 @@ cmd_connect_relay() {
   # the repo), so a session start may send the token there too. A relay only the ENVIRONMENT names (HMD_RELAY_URL: a cloned repository sets it for the session it
   # is opened in) is not trusted with the token unless it is the default or approved: no token is read, and the QR pairs as it always did.
   if [ "$RELAY_FLAG" = true ]; then
-    if [ "$NO_CODE" != true ] && [ "$RELAY_URL" != "$DEFAULT_RELAY_URL" ] && ! _relay_approve "$RELAY_URL"; then
-      echo "hmd app: could not record $(_relay_shown "$RELAY_URL") as an approved relay (it must be a plain http(s) scheme://host[:port], and HEIMDALL_HOME writable) -- a session start will not send your GitHub token there" >&2
+    if [ "$NO_CODE" != true ] && [ "$RELAY_URL" != "$DEFAULT_RELAY_URL" ] && ! _relay_approve "$RELAY_URL" "$REPO"; then
+      echo "hmd app: could not record $(_relay_shown "$RELAY_URL") as an approved relay (it must be a plain http(s) scheme://host[:port], and HEIMDALL_HOME an absolute, writable path outside this repo and every git work tree) -- a session start will not send your GitHub token there" >&2
     fi
   elif [ "$RELAY_URL" != "$DEFAULT_RELAY_URL" ] && ! _relay_trusted "$RELAY_URL" "$REPO"; then
     token_relay_ok=false
@@ -3130,11 +3133,15 @@ cmd_identity_revoke() {
   local RELAY_FLAG=false
   [ -z "$RELAY_URL" ] || RELAY_FLAG=true  # --relay URL typed: the operator named the relay for this command
   RELAY_URL="${RELAY_URL:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
+  # the repo the trust check is asked about is the one every other command resolves -- never the working directory, which inside a subdirectory of the repo is not
+  # the repo: a HEIMDALL_HOME inside the repo would pass as outside it
+  local REPO
+  REPO="$(resolve_repo_value "")"
   if [ ! -x "$RELAY_CLIENT_BIN" ]; then
     echo "hmd app identity revoke: heimdall-relay-client not found at $RELAY_CLIENT_BIN" >&2
     return 2
   fi
-  if [ "$RELAY_FLAG" != true ] && [ "$RELAY_URL" != "$DEFAULT_RELAY_URL" ] && ! _relay_trusted "$RELAY_URL" "$PWD"; then
+  if [ "$RELAY_FLAG" != true ] && [ "$RELAY_URL" != "$DEFAULT_RELAY_URL" ] && ! _relay_trusted "$RELAY_URL" "$REPO"; then
     echo "hmd app identity revoke: HMD_RELAY_URL names $(_relay_shown "$RELAY_URL"), which is not the default relay and was not approved here, so your GitHub token is not sent to it -- pass --relay $(_relay_shown "$RELAY_URL") to use it for this command" >&2
     return 2
   fi

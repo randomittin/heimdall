@@ -40,6 +40,13 @@ relay it names gets it only when it is the default or one the operator approved 
   E6  `hmd app add-device` and `hmd app identity revoke` refuse an environment relay they do not trust (exit 2, gh not asked); `--relay URL` names it
       for that one command and approves nothing
   E7  the matching is exact: scheme, host and port, compared as written once normalised; no path, no credentials, no lookalike character
+  E8  `hmd app identity revoke` asks about the repo's root, never the working directory: run from a subdirectory of the repo (or of a CLAUDE_PROJECT_DIR that is no git
+      work tree), a HEIMDALL_HOME inside it with the relay approved there is not honoured
+  E9  a store inside ANY git work tree is not read, not only inside the repo the question names -- nested, spelled through a link, a `.git` that is a file or a link
+      to nowhere; `approve` makes none (nothing is created), `list` shows none, `forget` touches none; a name that only looks like `.git` does not count
+  E10 the directory that is read is the directory that is judged: $HEIMDALL_HOME/app (or app/relay-approved) a link into the repo is not honoured, and the judge
+      walks the ancestors of the directory it was handed by device and inode, so one reached through a link is judged where it is
+  E11 a store outside every work tree is honoured -- from the repo, from a subdirectory of it, with no --repo -- and what makes a record believable is unchanged
 Scaled like the other pair-window cases: the relay keeps a registration 2 s (the real one 360 s), the floor is 0.5 s (300 s) and the lead 0.2 s
 (10 s). The window this replaces registered the code again about every 1.8 s here; WAIT seconds are about 4.5 lifetimes -- 27 minutes of the
 real relay's 6 -- and the old schedule would have made five or six registrations (each one a send of the token) in them.
@@ -138,6 +145,26 @@ class Scn:
         extra = {"HEIMDALL_HOME": home} if home else {}
         argv = [sys.executable, APPROVAL_PY, "trusted", "--relay", url, "--default", DEFAULT_RELAY, "--repo", self.repo]
         return C.run(argv, self.env(**extra), timeout=60).returncode == 0
+
+    def trusted_in(self, home, repo, cwd=None):
+        """Whether the helper would let the token go to the loopback relay with `home` as HEIMDALL_HOME, asked about `repo` (None: no --repo at all), run from `cwd`."""
+        argv = [sys.executable, APPROVAL_PY, "trusted", "--relay", self.relay.url, "--default", DEFAULT_RELAY] + (["--repo", repo] if repo else [])
+        return C.run(argv, self.env(HEIMDALL_HOME=home), timeout=60, cwd=cwd).returncode == 0
+
+    def plant_approval(self, home, url=None):
+        """What a repository that carries its own approval store has in its tree: the record `approve` writes (the same bytes, 0600 in a 0700 directory), put in
+        `home` without asking where that is -- `approve` itself refuses a store inside a git work tree, so a plant cannot be made with it."""
+        approval = H.load_module("hmd_relay_approval_plant", APPROVAL_PY)
+        origin = approval.normalize(url or self.relay.url)
+        body = json.dumps({"v": approval.VERSION, "relay": origin, "approved_at": int(time.time())}, sort_keys=True, separators=(",", ":"))
+        os.makedirs(home, mode=0o700, exist_ok=True)
+        approval.PRIVATE.write(home, approval.REL, approval._name(origin), body.encode("utf-8"))
+
+    @staticmethod
+    def records_in(home):
+        """How many files the approval store of `home` holds."""
+        folder = os.path.join(home, "app", "relay-approved")
+        return len(os.listdir(folder)) if os.path.isdir(folder) else 0
 
     def recorder(self):
         """The extra environment that puts a recorder where the relay client goes (HEIMDALL_RELAY_CLIENT_BIN, bin/heimdall-app's documented override)."""
@@ -526,8 +553,10 @@ def case_approval_planted_in_the_repo_is_not_honoured():
         # what the helper writes, in each place a repository's own tree has -- the state tree hmd keeps in a repo, a dot directory, its top level --
         # valid in every respect but where it is
         homes = [os.path.join(s.repo, ".heimdall"), os.path.join(s.repo, ".hmd-home"), s.repo]
-        planted = [s.approve_relay(home=home) for home in homes]
-        T.check(planted == [0, 0, 0] and not s.trusted(s.relay.url) and [s.trusted(s.relay.url, home=home) for home in homes] == [False, False, False],
+        for home in homes:
+            s.plant_approval(home)  # not `approve`: it refuses to make a store inside a git work tree, and a repository does not ask it anyway
+        planted = [s.records_in(home) for home in homes]
+        T.check(planted == [1, 1, 1] and not s.trusted(s.relay.url) and [s.trusted(s.relay.url, home=home) for home in homes] == [False, False, False],
                 "E4. approvals planted inside the repository (under .heimdall, in a dot directory, at its top level) are not read: the relay is still not trusted, "
                 "and a store inside the repository is not believed even when it is named as HEIMDALL_HOME",
                 "planted %r trusted %r" % (planted, [s.trusted(s.relay.url), [s.trusted(s.relay.url, home=home) for home in homes]]))
@@ -555,14 +584,15 @@ def case_home_in_the_repo_is_not_honoured_in_any_spelling():
     with Scn(approve=False) as s:
         real = os.path.realpath(s.repo)
         home = os.path.join(real, ".hmd-home")
-        planted = s.approve_relay(home=home)  # a valid store, inside the repository
+        s.plant_approval(home)  # a valid store, inside the repository
+        planted = s.records_in(home)
         # the same directory spelled in another case: on a case-insensitive volume (the macOS default, APFS) /Users/RJ/x and /Users/rj/x are one place and a
         # comparison of path strings reads them as two -- and the HEIMDALL_HOME the environment gives is the attacker's to spell
         spelled = os.path.join(os.path.dirname(real), os.path.basename(real).upper(), ".hmd-home")
         reaches = os.path.exists(spelled) and os.path.samefile(spelled, home)
         out = C.run([H.APP_PATH, "pair-window", "--session", C.SID1, "--pid", str(os.getpid()), "--repo", s.repo], s.env(HEIMDALL_HOME=spelled), timeout=60,
                     cwd=s.repo)
-        T.check(planted == 0 and out.returncode == 0 and not s.trusted(s.relay.url, home=spelled) and s.gh_calls() == [] and s.relay.requests == []
+        T.check(planted == 1 and out.returncode == 0 and not s.trusted(s.relay.url, home=spelled) and s.gh_calls() == [] and s.relay.requests == []
                 and s.window_state() is None,
                 "E4. a HEIMDALL_HOME inside the repository, spelled in another case (%s), is not honoured either: a store is judged by what it IS -- below the repo "
                 "directory, by device and inode -- not by how its path is written: no gh call, no relay request, no window"
@@ -577,6 +607,19 @@ def case_home_in_the_repo_is_not_honoured_in_any_spelling():
         T.check(by_absolute == 0 and by_relative == 1,
                 "E4. ...and a relative HEIMDALL_HOME is refused: the operator's own approved store, named relative to the directory the process runs in, is not read "
                 "(the same store named by its absolute path is)", "absolute rc %r relative rc %r (%s)" % (by_absolute, by_relative, relative))
+        # the repo a question names need not be a git work tree. For a plain project directory only its own identity can refuse a store inside it, so this is the
+        # case that proves the device-and-inode comparison (with a work tree around it, the `.git` entry refuses the store whatever the repo is)
+        project = os.path.join(os.path.realpath(s.sb.root), "Project")
+        os.makedirs(project)
+        plain_home = os.path.join(project, ".hmd-home")
+        s.plant_approval(plain_home)
+        plain_spelled = os.path.join(os.path.dirname(project), "PROJECT", ".hmd-home")
+        in_plain = [s.trusted_in(plain_home, project), s.trusted_in(plain_spelled, project)]
+        unnamed = s.trusted_in(plain_home, None)
+        T.check(in_plain == [False, False] and unnamed,
+                "E4. ...and for a project directory that is no git work tree (so nothing but the repo's own identity can refuse): a store inside it is refused by device and inode, "
+                "also with its path spelled in another case, while the same store asked about no repo at all is honoured (the record is valid: what refused it was where it is)",
+                "refused %r unnamed %r" % (in_plain, unnamed))
 
 
 # -- E5 ------------------------------------------------------------------------------------------------------------
@@ -692,13 +735,195 @@ def case_relay_matching_is_exact():
         sb.close()
 
 
+# -- E8 ------------------------------------------------------------------------------------------------------------
+def case_identity_revoke_asks_about_the_repo_root_not_the_working_directory():
+    with Scn(approve=False) as s:
+        revoke = [H.APP_PATH, "identity", "revoke"]
+        # a subdirectory of the repo, and a HEIMDALL_HOME inside the repo with the relay approved in it
+        sub = os.path.join(s.repo, "pkg", "deeper")
+        os.makedirs(sub)
+        planted = os.path.join(s.repo, ".hmd-home")
+        s.plant_approval(planted)
+        inside = C.run(revoke, s.env(HEIMDALL_HOME=planted), timeout=60, cwd=sub)
+        T.check(inside.returncode == 2 and "HMD_RELAY_URL" in inside.stderr and s.gh_calls() == [] and s.relay.identity_revokes == [],
+                "E8. `hmd app identity revoke` run from a subdirectory of the repo, with a HEIMDALL_HOME inside the repo that holds an approval for the relay HMD_RELAY_URL names: "
+                "refused (exit 2, gh not asked, nothing sent to the relay) -- the trust check is asked about the repo's root, not about the working directory",
+                "rc %r err %r gh %r revokes %r" % (inside.returncode, inside.stderr, s.gh_calls(), s.relay.identity_revokes))
+        # a project directory that is no git work tree, named by CLAUDE_PROJECT_DIR, run from a subdirectory of it: no `.git` refuses its store, only the project's own identity can
+        project = os.path.join(s.sb.root, "project")
+        os.makedirs(os.path.join(project, "src"))
+        s.plant_approval(os.path.join(project, ".hmd-home"))
+        plain = C.run(revoke, s.env(HEIMDALL_HOME=os.path.join(project, ".hmd-home"), CLAUDE_PROJECT_DIR=project), timeout=60, cwd=os.path.join(project, "src"))
+        T.check(plain.returncode == 2 and "HMD_RELAY_URL" in plain.stderr and s.gh_calls() == [] and s.relay.identity_revokes == [],
+                "E8. ...and so is one run from a subdirectory of a CLAUDE_PROJECT_DIR that is no git work tree (nothing but the project's own identity can refuse that store)",
+                "rc %r err %r gh %r revokes %r" % (plain.returncode, plain.stderr, s.gh_calls(), s.relay.identity_revokes))
+        s.approve_relay()  # the operator's own HEIMDALL_HOME
+        honoured = C.run(revoke, s.env(), timeout=60, cwd=sub)
+        T.check(honoured.returncode == 0 and len(s.relay.identity_revokes) == 1 and s.relay.identity_revokes[0]["token_ok"],
+                "E8. ...while the approval in the operator's own HEIMDALL_HOME is honoured from that same subdirectory: the token goes once (so what refused the others was where the store is)",
+                "rc %r err %r revokes %r" % (honoured.returncode, honoured.stderr, s.relay.identity_revokes))
+
+
+# -- E9 ------------------------------------------------------------------------------------------------------------
+def case_a_store_inside_any_git_work_tree_is_not_honoured():
+    with Scn(approve=False) as s:
+        root = s.sb.root
+        shown = H.load_module("hmd_relay_approval_listing", APPROVAL_PY).normalize(s.relay.url)
+        # a work tree that is not the repo the question names, and the other shapes a place with a `.git` entry takes
+        other = os.path.join(root, "other")
+        made = C.run(["git", "init", "-q", other], s.env(), timeout=60)
+        linked = os.path.join(root, "linked-work-tree")  # a linked work tree or a submodule: its .git is a file
+        os.makedirs(linked)
+        C.write_private(os.path.join(linked, ".git"), "gitdir: %s\n" % os.path.join(other, ".git"), 0o644)
+        dangling = os.path.join(root, "dangling")  # a .git that is a link to nowhere: it is not followed, and it is there
+        os.makedirs(dangling)
+        os.symlink(os.path.join(root, "no-such-directory"), os.path.join(dangling, ".git"))
+        through = os.path.join(root, "link-to-other")
+        os.symlink(other, through)
+        homes = {"at the work tree's top": os.path.join(other, ".hmd-home"), "four directories down": os.path.join(other, "a", "b", "c", "home"),
+                 "spelled through a link to the work tree": os.path.join(through, ".hmd-home-2"), "in a work tree whose .git is a file": os.path.join(linked, "home"),
+                 "in a directory whose .git is a link to nowhere": os.path.join(dangling, "home")}
+        for home in homes.values():
+            s.plant_approval(home)
+        answers = {where: s.trusted_in(home, s.repo) for where, home in homes.items()}
+        T.check(made.returncode == 0 and not any(answers.values()),
+                "E9. a store inside a git work tree that is not the repo the question names is not honoured, wherever in it: at its top, four directories down, spelled through a link, "
+                "in a work tree whose .git is a file, in a directory whose .git is a link to nowhere",
+                "init rc %r honoured %r" % (made.returncode, [where for where, yes in answers.items() if yes]))
+        plain = os.path.join(root, "plain-home")
+        s.plant_approval(plain)
+        lookalike = os.path.join(root, "lookalike")  # names that only look like it
+        os.makedirs(os.path.join(lookalike, ".github"))
+        os.makedirs(os.path.join(lookalike, "x.git"))
+        C.write_private(os.path.join(lookalike, ".gitignore"), "*\n", 0o644)
+        s.plant_approval(os.path.join(lookalike, "home"))
+        T.check(s.trusted_in(plain, s.repo) and s.trusted_in(os.path.join(lookalike, "home"), s.repo),
+                "E9. ...while the same record outside every work tree is honoured, and so is one below a directory that holds only names that look like .git (.gitignore, .github, x.git)",
+                "plain %r lookalike %r" % (s.trusted_in(plain, s.repo), s.trusted_in(os.path.join(lookalike, "home"), s.repo)))
+        top = homes["at the work tree's top"]
+        fresh = os.path.join(other, ".hmd-fresh")
+        project = os.path.join(root, "project")  # no git work tree here: only the repo the question names can refuse a store in it
+        os.makedirs(project)
+        fresh_in_project = os.path.join(project, ".hmd-fresh")
+        in_tree = C.run([sys.executable, APPROVAL_PY, "approve", "--relay", s.relay.url], s.env(HEIMDALL_HOME=fresh), timeout=60)
+        in_repo = C.run([sys.executable, APPROVAL_PY, "approve", "--relay", s.relay.url, "--repo", project], s.env(HEIMDALL_HOME=fresh_in_project), timeout=60)
+        T.check(in_tree.returncode == 1 and "git work tree" in in_tree.stderr and not os.path.exists(fresh)
+                and in_repo.returncode == 1 and not os.path.exists(fresh_in_project),
+                "E9. `approve` refuses to make a store inside a git work tree, or inside the repo it is asked for, says why on stderr and creates nothing (not even the directories)",
+                "tree rc %r err %r made %r | repo rc %r made %r" % (in_tree.returncode, in_tree.stderr, os.path.exists(fresh), in_repo.returncode, os.path.exists(fresh_in_project)))
+        listed_in = C.run([sys.executable, APPROVAL_PY, "list"], s.env(HEIMDALL_HOME=top), timeout=60)
+        listed_out = C.run([sys.executable, APPROVAL_PY, "list"], s.env(HEIMDALL_HOME=plain), timeout=60)
+        T.check(listed_in.returncode == 0 and listed_in.stdout.strip() == "" and listed_out.stdout.split() == [shown],
+                "E9. `list` shows none of the approvals in a store inside a git work tree, and shows the one in a store outside",
+                "inside %r outside %r" % (listed_in.stdout, listed_out.stdout))
+        started = s.pair_window(C.SID1, HEIMDALL_HOME=top)
+        T.check(started.returncode == 0 and s.gh_calls() == [] and s.relay.requests == [] and s.window_state() is None,
+                "E9. ...and a session start with such a HEIMDALL_HOME reads no token, makes no relay request and opens no window",
+                "rc %r err %r gh %r requests %r window %r" % (started.returncode, started.stderr, s.gh_calls(), s.relay.requests, s.window_state()))
+        forgot_in = C.run([sys.executable, APPROVAL_PY, "forget", "--relay", s.relay.url], s.env(HEIMDALL_HOME=top), timeout=60)
+        forgot_out = C.run([sys.executable, APPROVAL_PY, "forget", "--relay", s.relay.url], s.env(HEIMDALL_HOME=plain), timeout=60)
+        T.check(forgot_in.returncode == 0 and s.records_in(top) == 1 and forgot_out.returncode == 0 and s.records_in(plain) == 0 and not s.trusted_in(plain, s.repo),
+                "E9. `forget` takes an approval back from a store outside every work tree and leaves a store inside one untouched",
+                "inside rc %r records %r | outside rc %r records %r" % (forgot_in.returncode, s.records_in(top), forgot_out.returncode, s.records_in(plain)))
+
+
+# -- E10 -----------------------------------------------------------------------------------------------------------
+def case_a_store_directory_that_is_a_link_is_judged_where_it_is():
+    with Scn(approve=False) as s:
+        root = s.sb.root
+        approval = H.load_module("hmd_relay_approval_judge", APPROVAL_PY)
+        hidden = os.path.join(s.repo, "hidden-home")
+        s.plant_approval(hidden)  # <repo>/hidden-home/app/relay-approved/<record>: valid in every respect but where it is
+        by_app = os.path.join(root, "home-with-linked-app")  # $HEIMDALL_HOME/app is a link into the repository
+        os.makedirs(by_app, mode=0o700)
+        os.symlink(os.path.join(hidden, "app"), os.path.join(by_app, "app"))
+        by_store = os.path.join(root, "home-with-linked-store")  # $HEIMDALL_HOME/app/relay-approved is a link into the repository
+        os.makedirs(os.path.join(by_store, "app"), mode=0o700)
+        os.symlink(os.path.join(hidden, "app", "relay-approved"), os.path.join(by_store, "app", "relay-approved"))
+        answers = [s.trusted_in(by_app, s.repo), s.trusted_in(by_store, s.repo), s.trusted_in(by_app, None), s.trusted_in(by_store, None)]
+        started = s.pair_window(C.SID1, HEIMDALL_HOME=by_app)
+        T.check(answers == [False] * 4 and started.returncode == 0 and s.gh_calls() == [] and s.relay.requests == [] and s.window_state() is None,
+                "E10. a HEIMDALL_HOME whose app (or app/relay-approved) is a link into the repository is not honoured -- whether or not the question names the repo -- and a "
+                "session start with it reads no token, makes no relay request and opens no window",
+                "answers %r rc %r gh %r requests %r window %r" % (answers, started.returncode, s.gh_calls(), s.relay.requests, s.window_state()))
+        # the judge itself: handed the directory a link leads to, it answers for where that directory IS (its ancestors, by device and inode), not for the path it was reached by
+        project = os.path.join(os.path.realpath(root), "project")  # no git work tree
+        os.makedirs(project)
+        s.plant_approval(os.path.join(project, "hidden"))
+        by_project = os.path.join(root, "home-linked-into-project")
+        os.makedirs(os.path.join(by_project, "app"), mode=0o700)
+        os.symlink(os.path.join(project, "hidden", "app", "relay-approved"), os.path.join(by_project, "app", "relay-approved"))
+        plain = os.path.join(root, "plain-home")
+        s.plant_approval(plain)
+
+        def judged(home, repo):
+            fd = os.open(os.path.join(home, "app", "relay-approved"), os.O_RDONLY | os.O_DIRECTORY)  # follows the links: the directory they lead to
+            try:
+                return approval.in_a_repo(fd, repo)
+            finally:
+                os.close(fd)
+
+        verdicts = [judged(by_store, s.repo), judged(by_store, None), judged(by_project, project), judged(by_project, None), judged(plain, s.repo), judged(plain, None)]
+        T.check(verdicts == [True, True, True, False, False, False],
+                "E10. ...the judge (in_a_repo) answers for where a directory is, not for how it was reached: one a link leads to inside the repository is inside it, and inside a work tree "
+                "(when the repo is not named); one inside a plain project directory is inside it only when it is named; one outside every repo and work tree is neither",
+                "verdicts %r" % verdicts)
+
+
+# -- E11 -----------------------------------------------------------------------------------------------------------
+def case_a_store_outside_every_work_tree_is_honoured():
+    with Scn(approve=False) as s:
+        s.approve_relay()  # the sandbox's own HEIMDALL_HOME: what `hmd app connect --relay URL` records
+        sub = os.path.join(s.repo, "pkg")
+        os.makedirs(sub)
+        other = os.path.join(s.sb.root, "other")  # a work tree beside the store, which the store is not in
+        made = C.run(["git", "init", "-q", other], s.env(), timeout=60)
+        answers = [s.trusted_in(s.home, s.repo), s.trusted_in(s.home, s.repo, cwd=sub), s.trusted_in(s.home, sub), s.trusted_in(s.home, None), s.trusted_in(s.home, other)]
+        T.check(made.returncode == 0 and all(answers),
+                "E11. a store in the operator's own HEIMDALL_HOME, outside every git work tree, is honoured: asked about the repo, from a subdirectory of it, about a subdirectory, "
+                "about no repo, and about another work tree",
+                "init rc %r answers %r" % (made.returncode, answers))
+        # what makes a record believable is unchanged: each of these, in place of the record, is not believed
+        store = os.path.join(s.home, "app", "relay-approved")
+        record = os.path.join(store, os.listdir(store)[0])
+        parked = record + ".parked"
+        with open(record, encoding="utf-8") as f:
+            good = f.read()
+
+        def asked_with(make):
+            os.rename(record, parked)
+            try:
+                make()
+                return s.trusted_in(s.home, s.repo)
+            finally:
+                if os.path.lexists(record):
+                    os.remove(record)
+                os.rename(parked, record)
+
+        os.chmod(store, 0o755)
+        loose_dir = s.trusted_in(s.home, s.repo)
+        os.chmod(store, 0o700)
+        believed = {"a record with group and other permission bits": asked_with(lambda: C.write_private(record, good, 0o644)),
+                    "a link to a good record": asked_with(lambda: os.symlink(parked, record)),
+                    "a FIFO": asked_with(lambda: os.mkfifo(record, 0o600)),
+                    "a record over the size limit": asked_with(lambda: C.write_private(record, good + " " * 5000)),
+                    "something that is not a JSON object": asked_with(lambda: C.write_private(record, "[]")),
+                    "a record about another relay": asked_with(lambda: C.write_private(record, good.replace(s.relay.url, "http://127.0.0.1:1")))}
+        restored = s.trusted_in(s.home, s.repo)
+        T.check(not loose_dir and not any(believed.values()) and restored,
+                "E11. ...and none of these is believed in its place: a store directory with group or other bits, a record with them, a link to a good record, a FIFO, a record over "
+                "the size limit, something that is not a JSON object, a record about another relay (and the good record is believed again once restored)",
+                "loose dir %r believed %r restored %r" % (loose_dir, [what for what, yes in believed.items() if yes], restored))
+
+
 CASES = [case_switched_off_nothing_sent, case_connect_is_an_explicit_yes, case_default_repo_registers_once, case_paired_phone_needs_no_code,
          case_no_code_switches_it_off, case_record_is_outside_the_repo, case_replacement_client_resumes_without_a_token, case_machine_wide_off,
          case_gh_signed_out_starts_nothing, case_env_relay_nobody_approved_gets_nothing, case_default_relay_gets_the_token,
          case_approved_relay_gets_the_token, case_approval_planted_in_the_repo_is_not_honoured, case_home_in_the_repo_is_not_honoured_in_any_spelling,
          case_connect_env_relay_pairs_by_qr_without_the_token,
          case_connect_relay_flag_names_the_relay, case_connect_no_code_approves_nothing, case_add_device_and_identity_revoke_refuse_an_env_relay,
-         case_relay_matching_is_exact]
+         case_relay_matching_is_exact, case_identity_revoke_asks_about_the_repo_root_not_the_working_directory, case_a_store_inside_any_git_work_tree_is_not_honoured,
+         case_a_store_directory_that_is_a_link_is_judged_where_it_is, case_a_store_outside_every_work_tree_is_honoured]
 
 
 def main():
