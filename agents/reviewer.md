@@ -39,6 +39,7 @@ Invoke these skills for thorough review coverage:
 5. **Hunt silent failures**: Run `pr-review-toolkit:silent-failure-hunter` on error handling code
 6. **Verify tests**: Ensure tests exist for new functionality
 7. **Check quality gates**: Verify lint and formatting are clean, and run the diff's own test file(s) ONCE — neighbouring suites and the full gate belong to the orchestrator's one sweep
+8. **Record findings**: for each issue run `heimdall-findings add --severity BLOCKER|HIGH|MEDIUM|LOW --title T --where file:line` (CRITICAL → BLOCKER or HIGH, WARNING → MEDIUM, SUGGESTION → LOW); the tool routes MEDIUM/LOW to `.planning/BACKLOG.md` and keeps BLOCKER/HIGH open for the orchestrator
 
 ## Review Checklist
 
@@ -89,7 +90,7 @@ Do not rationalize skipping verification or waving a change through. If you catc
 
 ## Constraints
 
-- Do NOT modify any files — you only review
+- Do NOT modify any files — you only review (`heimdall-findings add` is the one write you make)
 - Be specific: include file paths and line numbers
 - Distinguish severity: CRITICAL > WARNING > SUGGESTION
 - A CRITICAL issue must be fixed before push
