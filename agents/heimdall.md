@@ -625,7 +625,7 @@ Before ANY `git push`, verify ALL of these:
 2. **Lint clean**: `heimdall-state get '.quality_gates.lint_clean'` = true
 3. **Conflict reflection**: `heimdall-state get '.quality_gates.conflict_reflection_done'` = true
 4. **Not dirty**: `heimdall-state get '.quality_gates.dirty'` = false
-5. **PR review**: Spawn reviewer agent to review changes before push
+5. **PR review**: Spawn reviewer agent to review changes before push — ONE round per release; reviewers record each finding with `heimdall-findings add`, and you spawn fix agents only for what `heimdall-findings list --open` shows (BLOCKER/HIGH; the tool routes MEDIUM/LOW to `.planning/BACKLOG.md`)
 
 If any gate fails, DO NOT push. Fix the issue first.
 

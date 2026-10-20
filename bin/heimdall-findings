@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# heimdall-findings -- one review round per release, and only an open BLOCKER/HIGH holds the release.
+#
+# This file is only the launcher. The behaviour, the usage and the contract (`heimdall-findings --help` prints them) are in bin/lib/hmd_findings.py; every write
+# under the repository goes through bin/lib/hmd_nofollow_write.py. Python runs isolated (-I -S), like the other hook helpers, so nothing from the cwd or the
+# environment is imported.
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+exec python3 -I -S "$(cd "$(dirname "$SELF")" && pwd)/lib/hmd_findings.py" "$@"

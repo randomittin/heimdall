@@ -1085,6 +1085,18 @@ require_full_sweep_receipt() {
   ok "green FULL sweep receipt at HEAD (${head:0:12})"
 }
 
+# require_no_open_findings — bin/heimdall-findings keeps the findings of the ONE review round of a release (.heimdall/findings/, one store per release base = the last release tag).
+# An open BLOCKER/HIGH refuses; MEDIUM/LOW never do (they were routed to .planning/BACKLOG.md when recorded). A repo with no store for the base does not use it, and a checkout
+# without the tool has none: nothing applies. Called beside the receipt check by the runs that CREATE the tag (a full ship, --release-only before its tag); a post-tag run's base is
+# the tag it publishes, whose findings were settled before that tag existed.
+require_no_open_findings() {
+  local hf="$REPO_ROOT/bin/heimdall-findings" out rc=0
+  [ -x "$hf" ] || return 0
+  out="$("$hf" gate --repo "$REPO_ROOT" 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] || die "the findings gate is not green (bin/heimdall-findings gate, exit $rc): $out"
+  ok "$out"
+}
+
 # reconcile_orphan_release — the recovery path the old flow never had. If the CURRENT manifest
 # version has no tag and no Release, a prior ship died between the bump commit and the tag.
 # Bumping past it would orphan it permanently (the v2.2.3 defect). Refuse, and name the fix.
@@ -1276,6 +1288,7 @@ if [ "$RELEASE_ONLY" -eq 1 ]; then
     # No tag yet: this run creates it at HEAD, so there is no tagged commit to grade instead and HEAD itself must be covered, as for a full ship.
     warn "tag $TAG does not exist yet — this run creates it at HEAD, so the receipt must cover HEAD itself"
     require_full_sweep_receipt "" "$RO_VERSION"
+    require_no_open_findings
     RELEASE_COMMIT="$(git rev-parse HEAD)"
   fi
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-ro.XXXXXX")" || die "mktemp failed"
@@ -1348,6 +1361,7 @@ if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
   # of a ship leaves a bumped, tagged, released version that `npx runheimdall` cannot install.
   preflight_release_prereqs
   require_full_sweep_receipt "" "$(compute_next "$(read_version)" "$BUMP_KIND" "$EXPLICIT_VERSION")"
+  require_no_open_findings
   if [ "$DO_NPM" -eq 1 ]; then
     preflight_npm_prereqs
   else
