@@ -589,6 +589,51 @@ elif [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
 fi
 # -- end context gate fence ----------------------------------------------------
 
+# -- fix-chain advisory (2026-10-21) --------------------------------------------
+# CLAUDE.md "Release convergence" (operator directive 2026-10-21): one review round per release, only BLOCKER/HIGH findings get a fix agent, MEDIUM/LOW go to the backlog, and an agent is
+# never chained per finding. Measured on 2.4.9: six chained rounds in one evening, each spawning a fix agent for a MEDIUM/LOW finding that only existed because of the previous fix. This
+# section is the spawn-time half of that rule (bin/heimdall-conformance `fix-chain` is the after-the-fact half, read from the transcript): when the spawn being made is past
+# HMD_FIX_CHAIN_MAX (default 3) finding-fix spawns of this session, it prints ONE line on stderr naming the triage rule. ADVICE ONLY: nothing in this section ends the hook or writes
+# to stdout, so it can never deny a spawn.
+#
+# WHAT COUNTS. bin/lib/hmd_fix_chain.sh holds the one definition (the transcript gate reads the same text): the description or prompt names a fix AND a review or security finding. The
+# count is per SESSION (the payload's session_id): one line per finding-fix spawn in $HEIMDALL_HOME/fix-chain/<session_id>, appended (O_APPEND) so the parallel spawns of one turn cannot
+# lose each other's line. It does not restart on an unrelated spawn or at a release tag (the hook sees neither; the transcript gate does), it over-counts a spawn that a LATER section
+# refuses, and it under-counts when a state write fails: every error leans toward silence.
+#
+# CHEAP. A bash glob over the payload is the pre-filter: a spawn whose payload does not even contain "fix" (any case) pays that one comparison and nothing else. Only the rest source the
+# lib and run ONE jq call, and only a classified spawn with a usable session id touches the filesystem.
+#
+# FAILS OPEN on everything: no jq, no lib next to this script (a sandbox copy), an unparsable payload, no session_id (never grade a spawn against another session's count: the context
+# fence's measured lesson), an unwritable or occupied state dir, a counter path that is not a file. HMD_FIX_CHAIN_ALLOW=1 silences it and skips the whole section, counting included; set
+# it in the environment Claude Code runs in (this hook reads its own environment), and only exactly 1 lifts it.
+if [ "${HMD_FIX_CHAIN_ALLOW:-}" != "1" ] && [ -n "$INPUT" ]; then
+  case "$INPUT" in
+    *[Ff][Ii][Xx]*)
+      FIXCHAIN_LIB="$BIN_DIR/lib/hmd_fix_chain.sh"
+      # shellcheck source=lib/hmd_fix_chain.sh disable=SC1091  # path is $BIN_DIR-derived at runtime; the default run never opens sourced files, source= is for -x
+      if command -v jq >/dev/null 2>&1 && [ -r "$FIXCHAIN_LIB" ] && . "$FIXCHAIN_LIB" 2>/dev/null && command -v hmd_fix_chain_max >/dev/null 2>&1; then
+        FIXCHAIN_SID="$(printf '%s' "$INPUT" | jq -r "$HMD_FIX_CHAIN_JQ"' (.tool_input // {}) as $t | if hmd_finding_fix($t.description; $t.prompt) then (.session_id // "" | tostring) else empty end' 2>/dev/null)" || FIXCHAIN_SID=""
+        case "$FIXCHAIN_SID" in
+          ''|.*|*[!A-Za-z0-9._-]*) ;;
+          *)
+            FIXCHAIN_DIR="${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}/fix-chain"
+            FIXCHAIN_FILE="$FIXCHAIN_DIR/$FIXCHAIN_SID"
+            FIXCHAIN_PRIOR=0
+            [ -f "$FIXCHAIN_FILE" ] && FIXCHAIN_PRIOR="$(wc -l < "$FIXCHAIN_FILE" 2>/dev/null | tr -d ' ')"
+            case "$FIXCHAIN_PRIOR" in ''|*[!0-9]*) FIXCHAIN_PRIOR=0 ;; esac
+            { mkdir -p "$FIXCHAIN_DIR" && printf '1\n' >> "$FIXCHAIN_FILE"; } 2>/dev/null
+            if [ "$FIXCHAIN_PRIOR" -ge "$(hmd_fix_chain_max)" ]; then
+              printf 'BIFROST - Heimdall fix-chain warning: fix-chain: %s finding-fix agents this cycle; triage by severity (heimdall-findings) — only BLOCKER/HIGH get a fix agent; MEDIUM/LOW go to the backlog. This spawn is finding-fix agent %s of the chain (limit HMD_FIX_CHAIN_MAX=%s); advisory only, nothing is blocked. Set HMD_FIX_CHAIN_ALLOW=1 in the environment Claude Code runs in to silence this warning. Rule: CLAUDE.md "Release convergence".\n' "$FIXCHAIN_PRIOR" "$((FIXCHAIN_PRIOR + 1))" "$(hmd_fix_chain_max)" >&2
+            fi
+            ;;
+        esac
+      fi
+      ;;
+  esac
+fi
+# -- end fix-chain advisory ------------------------------------------------------
+
 # -- brief-adoption gate -------------------------------------------------------
 allow() { exit 0; }
 

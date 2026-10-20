@@ -46,6 +46,18 @@
 #                     merge every pending agent result FIRST, then run ONE sweep).
 #   sweeps-overlap    two full-gate runs whose start/end intervals overlap — a second
 #                     sweep started while the first was still running.
+#   full-sweep-after-red  a FULL `run-all.sh` (no --failed / --since-green / --filter) started
+#                     after a red sweep with no green in between. Operator directive,
+#                     2026-10-21 (CLAUDE.md "Release convergence"): after a red the way back is
+#                     fix, commit, `run-all.sh --failed` — never a second full sweep. A red is a
+#                     verdict: a foreground call the harness prefixed "Exit code N", a background
+#                     task that failed. A call a hook refused, a TaskStop and a killed task are not.
+#   fix-chain         more than HMD_FIX_CHAIN_MAX (default 3) CONSECUTIVE Agent spawns that name a
+#                     fix AND a review/security finding, inside one release cycle (a release tag or
+#                     release/ship.sh ends it; an unrelated Agent spawn ends the run). Same
+#                     directive: only BLOCKER/HIGH findings get a fix agent, never chain an agent
+#                     per finding. bin/lib/hmd_fix_chain.sh is the one definition of a finding-fix
+#                     spawn, shared with the spawn-time warning in bin/heimdall-precheck-agent.
 #
 # FAIL-CLOSED, ALWAYS
 # Repo rule: "gates must fail closed: an unreachable verifier is NON_VERIFIED,
@@ -98,6 +110,12 @@ REPO="${HMD_CONF_REPO:-$(_main_worktree "$(cd "$SELF_DIR/.." && pwd)")}"
 # answer would drift — the exact failure PROTOCOL.md cites brief-core.sh for.
 # shellcheck source=lib/session-liveness.sh
 . "$SELF_DIR/lib/session-liveness.sh"
+
+# The one definition of "a finding-fix spawn" and of HMD_FIX_CHAIN_MAX, shared with the Agent hook's spawn-time warning (bin/heimdall-precheck-agent): a second copy would let the gate and
+# the warning disagree about what a chain is. Its jq text is prepended to the transcript program below, so a missing lib is a dependency error (exit 2), never a classifier that cannot compile.
+# shellcheck source=lib/hmd_fix_chain.sh
+[ -r "$SELF_DIR/lib/hmd_fix_chain.sh" ] && . "$SELF_DIR/lib/hmd_fix_chain.sh" \
+  || { printf 'heimdall-conformance: cannot read %s/lib/hmd_fix_chain.sh\n' "$SELF_DIR" >&2; exit 2; }
 
 command -v jq >/dev/null 2>&1 || { printf 'heimdall-conformance: jq is required\n' >&2; exit 2; }
 
@@ -202,11 +220,11 @@ EOF
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-# THE SESSION TRANSCRIPT CLASSIFIER  (shared by checks 3 to 7)
+# THE SESSION TRANSCRIPT CLASSIFIER  (shared by checks 3 to 9)
 # ═════════════════════════════════════════════════════════════════════════════
 # Ground truth for "what did this session actually do" is the Claude Code
 # transcript: ~/.claude/projects/<slug>/<session>.jsonl, one JSON object per
-# line. We classify seven event kinds and ignore everything else:
+# line. We classify nine event kinds and ignore everything else:
 #
 #   GATE    a Bash tool_use whose command runs the FULL gate (test/run-all.sh
 #           with no --filter). A filtered run is a targeted re-run, not the
@@ -232,9 +250,19 @@ EOF
 #           ends. Newer harnesses name only the TASK in it, so the ack's task id is the
 #           join key. A TaskStop/KillShell call is a NOTIFY too (error): a stopped run
 #           is over.
+#   SPAWN   an Agent (or, by its older name, Task) tool_use: ts, a label (the description, else
+#           the start of the prompt), and fix|other — whether it is a FINDING-FIX spawn, by the
+#           one definition in bin/lib/hmd_fix_chain.sh (read by the spawn-time warning too).
+#   RELEASE a release boundary: `git tag vX.Y.Z` that creates a tag (not -d / -l / -v), or
+#           release/ship.sh unless it stops short of the tag or only publishes an existing one.
 # GATE rows also carry the tool_use id, fg|bg, and whether the gate was the LAST command
 # of its call (1/0): RESULT/NOTIFY are joined to them by id, and the exit status can only
-# be read as the gate's own when nothing follows it in the call.
+# be read as the gate's own when nothing follows it in the call. A GATE row's seventh column
+# is the kind of sweep: full, scoped (--failed / --since-green: the sanctioned re-runs after a
+# red) or dry (--dry-run: nothing ran); a --filter run is not a GATE at all. A RESULT row's sixth
+# column is the exit code the harness printed ("Exit code N") or empty, a NOTIFY row's the task
+# status (completed, failed, killed, ... or stopped for a TaskStop): what lets full-sweep-after-red
+# tell a sweep that came back red from a call that never ran one.
 #
 # Parsing is done entirely in jq. Shelling the command string out to grep would
 # reintroduce the /bin/sh echo-escape trap that test/gate-echo-parser-guard.sh
@@ -255,6 +283,7 @@ EOF
 # and `test/run-all.sh` carries no `.test.sh` suffix, so the full gate can never
 # be mistaken for one.
 _classify_program() {
+  printf '%s\n' "$HMD_FIX_CHAIN_JQ"
   cat <<'JQ'
 def segments:
   [splits("(;|&&|\\|\\||\\||\n)")] | map(sub("^\\s+";"") | sub("\\s+$";""));
@@ -302,6 +331,27 @@ def git_row($ts; $hook_only):
 def ship_row($ts):
   select(unwrap | test("^((bash|sh|zsh)\\s+)?(\\./)?[^ ]*release/ship\\.sh(\\s|$)"))
   | [$ts, "PUSH", .[0:100]];
+# Which sweep? `--dry-run` runs nothing; `--failed` and `--since-green` are the sanctioned re-runs after a red; anything else is a full sweep.
+def gate_kind:
+  if test("(^|\\s)--dry-run(\\s|$)") then "dry"
+  elif test("(^|\\s)(--failed|--since-green)(\\s|=|$)") then "scoped"
+  else "full" end;
+# A release ends a release cycle: release/ship.sh (it tags) unless it stops short of the tag or only publishes one that exists, and a `git tag vX.Y.Z` that creates a tag (not -d, -l, -v).
+def ship_release_row($ts):
+  select(unwrap | test("^((bash|sh|zsh)\\s+)?(\\./)?[^ ]*release/ship\\.sh(\\s|$)"))
+  | select(test("(^|\\s)(--dry-run|--check|--print-next|--npm-only|--release-only|-h|--help)(\\s|$)") | not)
+  | [$ts, "RELEASE", .[0:100]];
+def tag_row($ts):
+  git_cmd | select(.sub == "tag")
+  | select(.rest | test("(^|\\s)(-d|--delete|-l|--list|-v|--verify)(\\s|$)") | not)
+  | select(.rest | test("(^|\\s)v?[0-9]+\\.[0-9]+\\.[0-9]+"))
+  | [$ts, "RELEASE", .line[0:100]];
+# An Agent spawn. The label names it (the description, else the start of the prompt); the flag says whether it is a finding-fix spawn. hmd_finding_fix comes from bin/lib/hmd_fix_chain.sh, prepended above.
+def spawn_row($ts):
+  ((.input.description // "") | tostring) as $d
+  | ((.input.prompt // "") | tostring) as $p
+  | (if ($d | length) > 0 then $d else $p end | gsub("[\\t\\r\\n]+";" ") | .[0:60]) as $label
+  | [$ts, "SPAWN", $label, (if hmd_finding_fix($d; $p) then "fix" else "other" end)];
 def assistant_rows:
   select(.type == "assistant") | .timestamp as $ts
   | .message.content[]? | select(.type == "tool_use")
@@ -314,15 +364,19 @@ def assistant_rows:
       | ($segs | to_entries[]) as $e
       | $e.value as $seg
       | (($seg | select(is_full_gate)
-          | [$ts, "GATE", (.[0:100]), $id, $mode, (if $e.key == $n - 1 then "1" else "0" end)]),
+          | [$ts, "GATE", (.[0:100]), $id, $mode, (if $e.key == $n - 1 then "1" else "0" end), gate_kind]),
          ($seg | suite_of | [$ts, "SUITE", .]),
          ($seg | git_row($ts; $hook_only)),
-         ($seg | ship_row($ts)))
+         ($seg | ship_row($ts)),
+         ($seg | ship_release_row($ts)),
+         ($seg | tag_row($ts)))
     elif (.name == "Write" or .name == "Edit" or .name == "NotebookEdit") then
       ((.input.file_path // "?") | tostring) as $p
       | [$ts, "MUTATE", $p, (if ($p | hook_path) then "hook" else "work" end)]
+    elif (.name == "Agent" or .name == "Task") then
+      spawn_row($ts)
     elif (.name == "TaskStop" or .name == "KillShell") then
-      [$ts, "NOTIFY", (.input.task_id // .input.shell_id // ""), "", "error"]
+      [$ts, "NOTIFY", (.input.task_id // .input.shell_id // ""), "", "error", "stopped"]
     else empty end;
 def user_rows:
   select(.type == "user") | .timestamp as $ts
@@ -331,15 +385,17 @@ def user_rows:
          elif (.content | type) == "array" then ([.content[] | objects | .text? | strings] | join(""))
          else "" end) as $body
       | [$ts, "RESULT", (.tool_use_id // ""), (if .is_error == true then "error" else "ok" end),
-         (($body | capture("Command running in background with ID: (?<t>[A-Za-z0-9_-]+)") | .t) // "")]),
+         (($body | capture("Command running in background with ID: (?<t>[A-Za-z0-9_-]+)") | .t) // ""),
+         (($body | capture("^Exit code (?<c>[0-9]+)") | .c) // "")]),
      (((.message.content | strings),
        (.message.content | arrays | .[] | select(type == "object" and .type == "text") | .text | strings))
       | select(test("<task-notification>"))
       | ((capture("<task-id>(?<t>[^<]+)</task-id>") | .t) // "") as $task
       | ((capture("<tool-use-id>(?<u>[^<]+)</tool-use-id>") | .u) // "") as $use
       | select($task != "" or $use != "")
+      | ((capture("<status>(?<s>[^<]+)</status>") | .s) // "") as $status
       | [$ts, "NOTIFY", $task, $use,
-         (if test("<status>completed</status>") and (test("exit code [1-9]") | not) then "ok" else "error" end)]));
+         (if test("<status>completed</status>") and (test("exit code [1-9]") | not) then "ok" else "error" end), $status]));
 (assistant_rows, user_rows) | @tsv
 JQ
 }
@@ -689,6 +745,123 @@ EOF
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+# CHECK 8 — full-sweep-after-red
+# ═════════════════════════════════════════════════════════════════════════════
+# Operator directive (2026-10-21, CLAUDE.md "Release convergence"): "A red suite after [the one sweep]: fix, commit, `run-all.sh --failed` (never a second full sweep)."
+# Measured on 2.4.9: a fix -> finding -> fix loop of six rounds in one evening, each round re-reaching ~500 suites; --failed re-runs only the red suites, what the fix reached and
+# the audit sample, and files a gate-grade receipt.
+#
+# The pattern: a sweep COMES BACK RED -> a FULL sweep (no --failed, --since-green, --dry-run or --filter) STARTS with no green between. An edit between does not excuse it:
+# fixing is exactly what precedes the sanctioned --failed.
+#
+# What is a red, so the check cannot cry wolf (a check that cries wolf gets muted): a VERDICT only. A FOREGROUND call whose result the harness prefixed "Exit code N" (N >= 1),
+# or a BACKGROUND task whose notification says failed (or completed with a non-zero exit code). NOT a red: an error result without "Exit code" (a call a hook refused, one the
+# user rejected, a tool error: no sweep ran), a TaskStop, a killed task, a run whose outcome is not on the record. --failed and --since-green are the sanctioned re-runs, a
+# --dry-run runs nothing (and is neither accused nor a green), and a --filter run is not a gate (the classifier skips it), so none of them is accused.
+#
+# State: `red` is set when a sweep ends red and cleared when ANY later full / --failed / --since-green sweep STARTS, once that start has been judged; the run own outcome then
+# decides. So a green --failed clears the red, a RED --failed puts it back (a full sweep after it is flagged, naming the --failed run), and a re-run whose outcome never reached
+# the record gets the benefit of the doubt (it may well have been green; an unreported run is sweeps-overlap business, not this check).
+#
+# LIMIT, stated plainly (the mirror of sweep-staled-by-merge): "red" is the status the harness reports for the CALL. When the sweep is the last command of its call that is the
+# gate own status (red_exit=gate). When commands follow it (`; echo "exit $?"; tail ...`) the status is theirs, a trailing failure can read as a red sweep and a trailing success
+# can hide one, so the violation says red_exit=call and wants a human glance before it is believed. Run the sweep as the last command of its call for an exact verdict.
+#
+# Row order in the append-only transcript is the clock, so the verdict is arithmetic on order and never parses a timestamp.
+check_full_sweep_after_red() {
+  _load_events 'GATE|MUTATE' 'gate/edit' 'GATE|RESULT|NOTIFY'
+  local rows tag a b c gates=0 flagged=0
+  rows="$(printf '%s\n' "$EV" | awk -F'\t' '
+    function ts(x) { return x == "" ? "?" : x }
+    function gate_of(kind, a, b) {
+      if (kind == "RESULT") return (a in mode) ? a : ""
+      if (b != "" && (b in mode)) return b
+      return (a in task2gate) ? task2gate[a] : ""
+    }
+    function ends(kind, g) { return g != "" && ((kind == "RESULT" && mode[g] == "fg") || (kind == "NOTIFY" && mode[g] == "bg")) }
+    function red_verdict(kind, out, x) {
+      if (out == "ok") return 0
+      if (kind == "RESULT") return (x != "" && x != "0")
+      return (x == "failed" || x == "completed")
+    }
+    $2 == "GATE" {
+      gates++
+      if ($7 == "dry") next
+      if ($7 == "full" && red) printf "V\t%s\t%s\t%s\n", red_at, ts($1), red_exit
+      red = 0
+      mode[$4] = $5; last[$4] = $6; started[$4] = ts($1)
+    }
+    $2 == "RESULT" && ($3 in mode) && $5 != "" { mode[$3] = "bg"; task2gate[$5] = $3 }
+    $2 == "RESULT" || $2 == "NOTIFY" {
+      g = gate_of($2, $3, $4); out = ($2 == "RESULT") ? $4 : $5
+      if (ends($2, g) && red_verdict($2, out, $6)) { red = 1; red_at = started[g]; red_exit = (last[g] == 1 ? "gate" : "call") }
+    }
+    END { printf "T\t%d\n", gates }
+  ')" || nonverified "full-sweep-after-red: could not read the sweep history (awk failed) — no verdict"
+  while IFS=$'\t' read -r tag a b c; do
+    case "$tag" in
+      V) viol "a full sweep started after a red one with no green between — after a red the way back is fix, commit, run-all.sh --failed, never a second full sweep	red=$a	next_sweep=$b	red_exit=$c"
+         flagged=$((flagged + 1)) ;;
+      T) gates="$a" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  _selfcheck_detector "$gates"
+  [ "$flagged" -gt 0 ] || okline "no full sweep started after a red one with no green between	gate_runs=$gates"
+  note "full-sweep-after-red saw $gates full-gate invocation(s)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 9 — fix-chain
+# ═════════════════════════════════════════════════════════════════════════════
+# Operator directive (2026-10-21, CLAUDE.md "Release convergence"): one review round per release; only BLOCKER/HIGH findings get a fix agent, MEDIUM/LOW go to
+# .planning/BACKLOG.md; "never chain an agent per finding". Measured on 2.4.9: six chained rounds in one evening, each spawning a fix agent for a MEDIUM/LOW finding that only
+# existed because of the previous fix.
+#
+# A FINDING-FIX SPAWN is an Agent spawn (the Agent tool_use, or its older name Task) whose description or prompt names a fix AND references a review or security finding.
+# bin/lib/hmd_fix_chain.sh is the one definition, shared with the spawn-time warning in bin/heimdall-precheck-agent so the two cannot disagree.
+#
+# The rule: more than HMD_FIX_CHAIN_MAX (default 3) CONSECUTIVE finding-fix spawns inside ONE release cycle is a violation, reported once, when the run ends, with its full count
+# and every spawn named (timestamp:description). What does and does not break a run, so the check cannot cry wolf:
+#   * an Agent spawn that is NOT a finding-fix spawn ends the run: a chain is a run of the same loop, and unrelated work in between is not the loop;
+#   * merges, edits, sweeps and every other tool call do NOT: they are the loop itself (spawn -> merge -> sweep -> finding -> spawn);
+#   * a release ends the cycle: `git tag vX.Y.Z` (creating one: not -d / -l / -v), or release/ship.sh (it tags) unless it stops short of the tag (--dry-run, --check, --print-next,
+#     -h) or only publishes a tag that exists (--npm-only, --release-only). The session start is the other end of a cycle.
+# Only tool calls are read, never prose, like every transcript check. A session with no Agent spawn is clean (no chain); NON_VERIFIED only when the transcript holds nothing the
+# classifier reads at all (no gate, edit or spawn).
+check_fix_chain() {
+  _load_events 'GATE|MUTATE|SPAWN' 'gate/edit/spawn' 'SPAWN|RELEASE'
+  local max rows tag a b spawns=0 chained=0 flagged=0
+  max="$(hmd_fix_chain_max)"
+  rows="$(printf '%s\n' "$EV" | awk -F'\t' -v max="$max" '
+    function ts(x) { return x == "" ? "?" : x }
+    function flush(   i, s) {
+      if (run > max) {
+        s = ""
+        for (i = 1; i <= run; i++) s = s (i > 1 ? " | " : "") lab[i]
+        printf "V\t%d\t%s\n", run, s
+      }
+      run = 0
+    }
+    $2 == "SPAWN" { n++; if ($4 == "fix") { ff++; run++; lab[run] = ts($1) ":" $3 } else flush() }
+    $2 == "RELEASE" { flush() }
+    END { flush(); printf "T\t%d\t%d\n", n, ff }
+  ')" || nonverified "fix-chain: could not read the spawn history (awk failed) — no verdict"
+  while IFS=$'\t' read -r tag a b; do
+    case "$tag" in
+      V) viol "fix-chain: $a consecutive finding-fix agent spawns inside one release cycle (limit $max) — triage by severity: only BLOCKER/HIGH findings get a fix agent, MEDIUM/LOW go to the backlog	count=$a	max=$max	spawns=$b"
+         flagged=$((flagged + 1)) ;;
+      T) spawns="$a"; chained="$b" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  [ "$flagged" -gt 0 ] || okline "no more than $max consecutive finding-fix agent spawns inside one release cycle	spawns=$spawns	finding_fix=$chained"
+  note "fix-chain saw $spawns agent spawn(s), $chained of them finding-fix"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
 # inventory — THE HONESTY LINE
 # ═════════════════════════════════════════════════════════════════════════════
 # See bin/lib/rule-inventory.sh for the extractor and the classification rules.
@@ -707,7 +880,9 @@ checks
   suite-runs-once   one suite run 3+ times with no edit between (one solo re-run is allowed)
   sweep-staled-by-merge  a green full-gate run, a merge/commit of real work before the next push, then another full-gate run
   sweeps-overlap    a second full-gate run started while the first was still running
-  all               all seven, aggregated
+  full-sweep-after-red  a full-gate run started after a red one with no green between (the way back is --failed)
+  fix-chain         more than HMD_FIX_CHAIN_MAX (3) consecutive finding-fix Agent spawns in one release cycle
+  all               all nine, aggregated
 
 inventory
   inventory         print every normative rule with a CHECKED/UNCHECKABLE verdict
@@ -728,6 +903,8 @@ main() {
     suite-runs-once) check_suite_runs_once ;;
     sweep-staled-by-merge) check_sweep_staled_by_merge ;;
     sweeps-overlap)  check_sweeps_overlap ;;
+    full-sweep-after-red) check_full_sweep_after_red ;;
+    fix-chain)       check_fix_chain ;;
     all)
       check_commit_per_unit
       check_brief_routing
@@ -736,6 +913,8 @@ main() {
       check_suite_runs_once
       check_sweep_staled_by_merge
       check_sweeps_overlap
+      check_full_sweep_after_red
+      check_fix_chain
       ;;
     inventory)       shift; rule_inventory "$@"; return $? ;;
     ''|-h|--help)    usage ;;

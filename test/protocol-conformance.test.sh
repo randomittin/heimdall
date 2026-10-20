@@ -72,8 +72,16 @@
 #                            (start/end read from the tool_result / task-notification); the
 #                            immediate background ack is NOT an end; a foreground run with no
 #                            recorded result is never an accusation.
-#   M. MUTATION PROOFS       nineteen mutants of the tool, each disarming one rule, each
-#                            required to flip a verdict.
+#   P. FULL SWEEP AFTER A RED  a full-gate run started after a red one with no green between
+#                            (2026-10-21 "Release convergence"): the way back is --failed. A red
+#                            is a verdict (foreground "Exit code N", background failed); a refused
+#                            call, a TaskStop and a killed task are not. --failed / --since-green
+#                            are sanctioned, --dry-run runs nothing, --filter is not a gate.
+#   Q. FIX CHAIN             more than HMD_FIX_CHAIN_MAX (3) consecutive finding-fix Agent spawns
+#                            in one release cycle (a release tag or release/ship.sh ends it; an
+#                            unrelated spawn ends the run; merges/edits/sweeps do not).
+#   M. MUTATION PROOFS       a mutant of the tool (or of lib/hmd_fix_chain.sh) per rule, each
+#                            disarming one rule, each required to flip a verdict.
 #
 # HERMETIC BY CONSTRUCTION
 # Every verdict below is read from a fixture whose expected answer is known by
@@ -811,9 +819,10 @@ PATH="$WORK/awkshim:$PATH" HMD_CONF_TRANSCRIPT="$T_S2" conf suite-runs-once
   || bad "(L) a failing counter was not fail-closed (rc=$RC): $OUT$ERR"
 
 conf --help
-has "$ERR" 'suite-runs-once.*3[+]' && has "$ERR" 'all  *all seven' \
+has "$ERR" 'suite-runs-once.*3[+]' && has "$ERR" 'all  *all nine' \
   && has "$ERR" 'sweep-staled-by-merge' && has "$ERR" 'sweeps-overlap' \
-  && ok "(L) --help documents suite-runs-once and the two sweep checks, and says \`all\` aggregates seven checks" \
+  && has "$ERR" 'full-sweep-after-red' && has "$ERR" 'fix-chain.*HMD_FIX_CHAIN_MAX' \
+  && ok "(L) --help documents suite-runs-once, the sweep checks and the release-convergence checks, and says \`all\` aggregates nine checks" \
   || bad "(L) the usage text does not mention the new checks: $ERR"
 
 # ═══ (N) SWEEP STALED BY AN UNBATCHED MERGE ════════════════════════════════════════
@@ -974,8 +983,8 @@ HMD_CONF_TRANSCRIPT="$T_O_BG" HMD_CONF_REPO="$FR" conf all
   && ok "(O) \`all\` runs sweeps-overlap too — its violation surfaces in the aggregate" \
   || bad "(O) the aggregate run lost the sweeps-overlap check (rc=$RC): $OUT$ERR"
 
-# Both new checks fail closed and carry the detector self-check, like every transcript check.
-for c in sweep-staled-by-merge sweeps-overlap; do
+# These transcript checks fail closed and carry the detector self-check, like every transcript check.
+for c in sweep-staled-by-merge sweeps-overlap full-sweep-after-red; do
   HMD_CONF_TRANSCRIPT="$WORK/absent.jsonl" conf "$c"
   [ "$RC" = 3 ] && has "$ERR" '^NON_VERIFIED' && [ -z "$OUT" ] \
     && ok "($c) a missing transcript is NON_VERIFIED — never an assumed-clean session" \
@@ -989,6 +998,176 @@ for c in sweep-staled-by-merge sweeps-overlap; do
     && ok "($c) carries the detector self-check: under the full gate, 0 parsed gate runs is a violation" \
     || bad "($c) the self-check did not fire (rc=$RC): $OUT$ERR"
 done
+
+# ═══ (P) A FULL SWEEP AFTER A RED ONE ══════════════════════════════════════════════
+# Operator directive (2026-10-21, CLAUDE.md "Release convergence"): after a RED sweep the way
+# back is fix, commit, `run-all.sh --failed` — never a second FULL sweep. Measured on 2.4.9:
+# six chained rounds in one evening, each re-reaching ~500 suites. A red is a VERDICT: a
+# foreground call whose result the harness prefixed "Exit code N", or a background task that
+# failed (or completed with a non-zero exit code). A call a hook refused, a TaskStop and a
+# killed task say nothing about the tree, so none is a red. --failed and --since-green are the
+# sanctioned re-runs, --dry-run runs nothing, a --filter run is not a gate at all. The red is
+# cleared when ANY later full / --failed / --since-green sweep STARTS and that run's own
+# outcome then decides, so a re-run whose outcome never reached the record gets the benefit
+# of the doubt (a check that cries wolf gets muted).
+ev_exit() { # ev_exit <ts> <tool_use id> <exit code>   the result of a FOREGROUND call that exited non-zero: the harness prefixes the body "Exit code N"
+  jq -nc --arg ts "$1" --arg id "$2" --arg b "Exit code $3"$'\n'"=== run-all: 2 suite(s) FAILED" \
+    '{type:"user",timestamp:$ts,message:{content:[{type:"tool_result",tool_use_id:$id,content:$b,is_error:true}]}}'
+}
+red_fg() { ev_run "$1" "$2" fg "${3:-bash test/run-all.sh}"; ev_exit "${1}e" "$2" 1; }   # a foreground sweep that came back red
+ok_fg()  { ev_run "$1" "$2" fg "${3:-bash test/run-all.sh}"; ev_result "${1}e" "$2"; }   # ... and one that came back green
+
+T_P_BAD="$WORK/p-bad.jsonl"          # RED sweep, the fix (an edit), a SECOND full sweep -> the loop itself
+{ ev_edit e1 a.sh; red_fg g1 id1; ev_edit e2 src/fix.sh; ok_fg g2 id2; } > "$T_P_BAD"
+T_P_FAILED="$WORK/p-failed.jsonl"    # RED sweep, fix, run-all.sh --failed -> the sanctioned path
+{ ev_edit e1 a.sh; red_fg g1 id1; ev_edit e2 src/fix.sh; ok_fg g2 id2 'bash test/run-all.sh --failed'; } > "$T_P_FAILED"
+T_P_SINCE="$WORK/p-since.jsonl"      # ... --since-green is the older sanctioned re-run
+{ ev_edit e1 a.sh; red_fg g1 id1; ok_fg g2 id2 'bash test/run-all.sh --since-green'; } > "$T_P_SINCE"
+T_P_FILTER="$WORK/p-filter.jsonl"    # a --filter run is not a gate at all
+{ ev_edit e1 a.sh; red_fg g1 id1; ev_bash f1 'bash test/run-all.sh --filter conformance'; } > "$T_P_FILTER"
+T_P_GREEN1="$WORK/p-green1.jsonl"    # a GREEN sweep, an edit, another full sweep: not after a red
+{ ev_edit e1 a.sh; ok_fg g1 id1; ev_edit e2 b.sh; ok_fg g2 id2; } > "$T_P_GREEN1"
+T_P_GREEN2="$WORK/p-green2.jsonl"    # red, --failed GREEN, new work, a full sweep: the green in between cleared it
+{ ev_edit e1 a.sh; red_fg g1 id1; ok_fg g2 id2 'bash test/run-all.sh --failed'; ev_edit e2 b.sh; ok_fg g3 id3; } > "$T_P_GREEN2"
+T_P_BG="$WORK/p-bg.jsonl"            # a RED background sweep (notification: failed, exit code 1), then a full one
+{ ev_edit e1 a.sh; gate_bg g1 id1; ev_notify g1n id1 failed 1; gate_bg g2 id2; ev_notify g2n id2 completed 0; } > "$T_P_BG"
+T_P_AUTO="$WORK/p-auto.jsonl"        # the real shape: a harness-backgrounded compound call, a task-only notification, red
+{ ev_edit e1 a.sh; auto_gate g1 id1 tq1; ev_notify_task g1n tq1 failed 1; ok_fg g2 id2; } > "$T_P_AUTO"
+T_P_CALL="$WORK/p-call.jsonl"        # a FOREGROUND compound call (the sweep is not its last command) that exited non-zero
+{ ev_edit e1 a.sh; ev_run g1 id1 fg 'bash test/run-all.sh > /tmp/s.log 2>&1; echo "exit $?"; tail -2 /tmp/s.log'; ev_exit g1e id1 1; ok_fg g2 id2; } > "$T_P_CALL"
+T_P_KILLED="$WORK/p-killed.jsonl"    # a background sweep that was KILLED: no verdict
+{ ev_edit e1 a.sh; gate_bg g1 id1; ev_notify g1n id1 killed 137; ok_fg g2 id2; } > "$T_P_KILLED"
+T_P_STOP="$WORK/p-stop.jsonl"        # a sweep the orchestrator stopped with TaskStop: no verdict
+{ ev_edit e1 a.sh; auto_gate g1 id1 tq1; ev_stop s1 tq1; ok_fg g2 id2; } > "$T_P_STOP"
+T_P_DENIED="$WORK/p-denied.jsonl"    # a call a hook refused: is_error, but no "Exit code" — it never ran a sweep
+{ ev_edit e1 a.sh; ev_run g1 id1 fg 'bash test/run-all.sh'; ev_result g1e id1 error; ok_fg g2 id2; } > "$T_P_DENIED"
+T_P_DRY="$WORK/p-dry.jsonl"          # red, a --dry-run, a full sweep: the dry run is neither accused nor a green
+{ ev_edit e1 a.sh; red_fg g1 id1; ok_fg d1 idd 'bash test/run-all.sh --dry-run'; ok_fg g2 id2; } > "$T_P_DRY"
+T_P_FAILEDRED="$WORK/p-failedred.jsonl"  # red, a RED --failed, a full sweep: the --failed run is where the red now stands
+{ ev_edit e1 a.sh; red_fg g1 id1; red_fg g2 id2 'bash test/run-all.sh --failed'; ok_fg g3 id3; } > "$T_P_FAILEDRED"
+T_P_UNKNOWN="$WORK/p-unknown.jsonl"  # red, a --failed run that never reported, a full sweep: benefit of the doubt
+{ ev_edit e1 a.sh; red_fg g1 id1; ev_run g2 id2 bg 'bash test/run-all.sh --failed > /tmp/f.out 2>&1'; ev_result g2a id2; ok_fg g3 id3; } > "$T_P_UNKNOWN"
+T_P_CHAIN="$WORK/p-chain.jsonl"      # red, a full sweep that is red again, a full sweep: each is flagged against the red before it
+{ ev_edit e1 a.sh; red_fg g1 id1; red_fg g2 id2; ok_fg g3 id3; } > "$T_P_CHAIN"
+
+nchk P full-sweep-after-red "a full sweep after a RED one — the fix in between does not excuse it — is flagged, naming both sweeps" "$T_P_BAD" 1 '^VIOLATION.*red=g1.*next_sweep=g2.*red_exit=gate'
+nchk P full-sweep-after-red "run-all.sh --failed after a red is the sanctioned path — clean" "$T_P_FAILED" 0 '^OK.*gate_runs=2'
+nchk P full-sweep-after-red "--since-green is a sanctioned re-run too — clean" "$T_P_SINCE" 0
+nchk P full-sweep-after-red "a --filter run is not a gate: nothing is accused" "$T_P_FILTER" 0
+nchk P full-sweep-after-red "a full sweep after a GREEN one is not after a red — clean" "$T_P_GREEN1" 0 '^OK.*gate_runs=2'
+nchk P full-sweep-after-red "a green --failed between the red and the next full sweep clears the red — clean" "$T_P_GREEN2" 0
+nchk P full-sweep-after-red "a RED background sweep counts the same (notification: failed, exit code 1)" "$T_P_BG" 1 'red=g1.*next_sweep=g2.*red_exit=gate'
+nchk P full-sweep-after-red "a harness-backgrounded compound sweep is red through its task-only notification, and says red_exit=call (a trailing command owns the call's status)" "$T_P_AUTO" 1 'red=g1.*next_sweep=g2.*red_exit=call'
+nchk P full-sweep-after-red "a foreground compound sweep that exited non-zero reports red_exit=call" "$T_P_CALL" 1 'red=g1.*next_sweep=g2.*red_exit=call'
+nchk P full-sweep-after-red "a KILLED background sweep is no verdict — clean" "$T_P_KILLED" 0
+nchk P full-sweep-after-red "a sweep stopped with TaskStop is no verdict — clean" "$T_P_STOP" 0
+nchk P full-sweep-after-red "a call a hook refused (an error with no 'Exit code') never ran a sweep, so it is not a red — clean" "$T_P_DENIED" 0
+nchk P full-sweep-after-red "a --dry-run runs nothing: not accused, and not a green that clears the red" "$T_P_DRY" 1 'red=g1.*next_sweep=g2'
+nchk P full-sweep-after-red "a RED --failed re-run keeps the red: the next FULL sweep is flagged against the --failed run" "$T_P_FAILEDRED" 1 'red=g2.*next_sweep=g3'
+nchk P full-sweep-after-red "a --failed run whose outcome never reached the record gets the benefit of the doubt — clean" "$T_P_UNKNOWN" 0
+nchk P full-sweep-after-red "red, a full sweep that is red again, a full sweep: both later full sweeps are flagged, each against the red before it" "$T_P_CHAIN" 2
+
+HMD_CONF_TRANSCRIPT="$T_P_BAD" HMD_CONF_REPO="$FR" conf all
+[ "$RC" = 1 ] && has "$OUT" '^VIOLATION.*red=g1.*next_sweep=g2' \
+  && ok "(P) \`all\` runs full-sweep-after-red too — its violation surfaces in the aggregate" \
+  || bad "(P) the aggregate run lost the full-sweep-after-red check (rc=$RC): $OUT$ERR"
+
+# ═══ (Q) A FIX CHAIN ═══════════════════════════════════════════════════════════════
+# Operator directive (2026-10-21): one review round per release, only BLOCKER/HIGH get a fix
+# agent, "never chain an agent per finding". Measured on 2.4.9: six chained rounds in one
+# evening, each spawning a fix agent for a MEDIUM/LOW finding that only existed because of the
+# previous fix. A finding-fix spawn is an Agent spawn whose description or prompt names a fix
+# AND a review or security finding (bin/lib/hmd_fix_chain.sh holds the one definition, the
+# spawn-time warning in bin/heimdall-precheck-agent reads the same). More than
+# HMD_FIX_CHAIN_MAX (3) CONSECUTIVE ones inside one release cycle is the violation: an
+# unrelated Agent spawn ends the run; merges, edits and sweeps between the spawns are the loop
+# itself and do not; a release tag (git tag vX.Y.Z, release/ship.sh) ends the cycle. A run is
+# reported once, when it ends, with its full count and the spawns named.
+ev_spawn() { # ev_spawn <ts> <description> [prompt] [tool name]   an Agent spawn, as the harness records the tool_use
+  jq -nc --arg ts "$1" --arg d "$2" --arg p "${3:-}" --arg n "${4:-Agent}" \
+    '{type:"assistant",timestamp:$ts,message:{content:[{type:"tool_use",id:("sp-"+$ts),name:$n,input:{description:$d,prompt:$p,subagent_type:"hmd:coder"}}]}}'
+}
+mk_spawns() { # mk_spawns <count> <description> [prompt] [tool name]   <count> identical spawn rows
+  local i=1
+  while [ "$i" -le "$1" ]; do ev_spawn "s$i" "$2" "${3:-}" "${4:-Agent}"; i=$((i + 1)); done
+}
+fx() { printf 'Fix security finding F%s' "$1"; }
+
+T_Q_BAD="$WORK/q-bad.jsonl"          # four finding-fix spawns in a row
+{ ev_spawn s1 "$(fx 1)"; ev_spawn s2 "$(fx 2)"; ev_spawn s3 "$(fx 3)"; ev_spawn s4 "$(fx 4)"; } > "$T_Q_BAD"
+T_Q_MAX="$WORK/q-max.jsonl"          # exactly three: the limit itself is allowed
+{ ev_spawn s1 "$(fx 1)"; ev_spawn s2 "$(fx 2)"; ev_spawn s3 "$(fx 3)"; } > "$T_Q_MAX"
+T_Q_1="$WORK/q-1.jsonl"
+{ ev_spawn s1 "$(fx 1)"; } > "$T_Q_1"
+T_Q_2="$WORK/q-2.jsonl"
+{ ev_spawn s1 "$(fx 1)"; ev_spawn s2 "$(fx 2)"; } > "$T_Q_2"
+T_Q_BROKEN="$WORK/q-broken.jsonl"    # 2 fix, an unrelated spawn, 2 fix: two runs of two, not one of four
+{ ev_spawn s1 "$(fx 1)"; ev_spawn s2 "$(fx 2)"; ev_spawn s3 'Write the release notes' 'Draft the notes for the next release'; ev_spawn s4 "$(fx 3)"; ev_spawn s5 "$(fx 4)"; } > "$T_Q_BROKEN"
+T_Q_BETWEEN="$WORK/q-between.jsonl"  # merges, an edit and a sweep between the spawns are the loop itself: the run goes on
+{ ev_spawn s1 "$(fx 1)"; ev_bash m1 'git merge worktree-agent-a'; ev_spawn s2 "$(fx 2)"; ev_edit e1 a.sh; ev_spawn s3 "$(fx 3)"; ok_fg g1 id1; ev_spawn s4 "$(fx 4)"; } > "$T_Q_BETWEEN"
+T_Q_REL="$WORK/q-rel.jsonl"          # 3 fix, release/ship.sh, 3 fix: two release cycles
+{ mk_spawns 3 "$(fx 1)"; ev_bash r1 'bash release/ship.sh --minor'; mk_spawns 3 "$(fx 2)"; } > "$T_Q_REL"
+T_Q_TAG="$WORK/q-tag.jsonl"          # ... and a git tag vX.Y.Z ends the cycle the same way
+{ mk_spawns 3 "$(fx 1)"; ev_bash r1 'git tag -a v2.5.0 -m "release 2.5.0"'; mk_spawns 3 "$(fx 2)"; } > "$T_Q_TAG"
+T_Q_NOREL="$WORK/q-norel.jsonl"      # things that look like a release and are not: one chain of six
+{ mk_spawns 3 "$(fx 1)"; ev_bash n1 'git tag -l "v*"'; ev_bash n2 'git tag -d v9.9.9'; ev_bash n3 'bash release/ship.sh --dry-run'
+  ev_bash n4 'bash release/ship.sh --check'; ev_bash n5 'git tag --list'; ev_bash n6 'echo git tag v2.5.0'; mk_spawns 3 "$(fx 2)"; } > "$T_Q_NOREL"
+T_Q_PROMPT="$WORK/q-prompt.jsonl"    # a generic description: the prompt carries the fix and the finding
+mk_spawns 4 'Wave 3 task' 'Fix the HIGH finding from the security review in bin/x' > "$T_Q_PROMPT"
+T_Q_DESC="$WORK/q-desc.jsonl"        # a description alone is enough, with no prompt
+mk_spawns 4 'Fix reviewer finding F1' > "$T_Q_DESC"
+T_Q_CASE="$WORK/q-case.jsonl"        # the match is case-insensitive
+mk_spawns 4 'FIX SECURITY FINDING F1' > "$T_Q_CASE"
+T_Q_HOT="$WORK/q-hot.jsonl"          # hotfix is a fix
+mk_spawns 4 'Hotfix for the reviewer finding' > "$T_Q_HOT"
+T_Q_TASK="$WORK/q-task.jsonl"        # the older name of the Agent tool is a spawn too
+mk_spawns 4 'Fix security finding F1' '' Task > "$T_Q_TASK"
+T_Q_NOFIX="$WORK/q-nofix.jsonl"      # a finding with no fix is a review, not a fix round
+mk_spawns 5 'Review the security finding F2' 'Review it' > "$T_Q_NOFIX"
+T_Q_NOFIND="$WORK/q-nofind.jsonl"    # a fix with no finding is ordinary work
+mk_spawns 5 'Fix lint errors in bin/x' 'Fix the lint errors' > "$T_Q_NOFIND"
+T_Q_WORDS="$WORK/q-words.jsonl"      # fixture / prefix / suffix are not the verb fix
+mk_spawns 5 'Update the fixture and prefix files' 'Keep the reviewer finding intact. Prefix the suffix.' > "$T_Q_WORDS"
+T_Q_ALL="$WORK/q-all.jsonl"          # for `all`: the earlier checks need a gate or an edit to read
+{ ev_edit e1 a.sh; ev_spawn s1 "$(fx 1)"; ev_spawn s2 "$(fx 2)"; ev_spawn s3 "$(fx 3)"; ev_spawn s4 "$(fx 4)"; } > "$T_Q_ALL"
+
+nchk Q fix-chain "four consecutive finding-fix spawns are flagged: ONE violation, the count, the limit and the spawns named" "$T_Q_BAD" 1 '^VIOLATION.*count=4.*max=3.*spawns=s1:Fix security finding F1.*s4:Fix security finding F4'
+nchk Q fix-chain "exactly three — the limit itself — is clean" "$T_Q_MAX" 0 '^OK.*spawns=3.*finding_fix=3'
+nchk Q fix-chain "an unrelated spawn ends the run: two runs of two are clean" "$T_Q_BROKEN" 0 '^OK.*spawns=5.*finding_fix=4'
+nchk Q fix-chain "merges, an edit and a sweep between the spawns do not end the run" "$T_Q_BETWEEN" 1 'count=4.*max=3'
+nchk Q fix-chain "release/ship.sh ends the release cycle: 3 + 3 is clean" "$T_Q_REL" 0
+nchk Q fix-chain "a git tag vX.Y.Z ends the release cycle: 3 + 3 is clean" "$T_Q_TAG" 0
+nchk Q fix-chain "tag listing/deleting, ship.sh --dry-run/--check and an echo are not a release: one run of six" "$T_Q_NOREL" 1 'count=6.*max=3'
+nchk Q fix-chain "the prompt classifies a spawn when the description is generic" "$T_Q_PROMPT" 1 'count=4'
+nchk Q fix-chain "a description alone classifies a spawn" "$T_Q_DESC" 1 'count=4'
+nchk Q fix-chain "the match is case-insensitive" "$T_Q_CASE" 1 'count=4'
+nchk Q fix-chain "hotfix counts as a fix" "$T_Q_HOT" 1 'count=4'
+nchk Q fix-chain "a spawn recorded under the older tool name Task counts" "$T_Q_TASK" 1 'count=4'
+nchk Q fix-chain "a finding with no fix is not a finding-fix spawn: five of them are clean" "$T_Q_NOFIX" 0 '^OK.*spawns=5.*finding_fix=0'
+nchk Q fix-chain "a fix with no review or security finding is not one either" "$T_Q_NOFIND" 0 '^OK.*finding_fix=0'
+nchk Q fix-chain "look-alike words (fixture, prefix, suffix) are not the verb fix" "$T_Q_WORDS" 0 '^OK.*finding_fix=0'
+HMD_FIX_CHAIN_MAX=1 nchk Q fix-chain "HMD_FIX_CHAIN_MAX=1: two spawns are over the limit" "$T_Q_2" 1 'count=2.*max=1'
+HMD_FIX_CHAIN_MAX=4 nchk Q fix-chain "HMD_FIX_CHAIN_MAX=4 raises the limit: four are allowed" "$T_Q_BAD" 0
+HMD_FIX_CHAIN_MAX=abc nchk Q fix-chain "a value that is not a number is the default limit (3), never off: four are flagged" "$T_Q_BAD" 1 'max=3'
+HMD_FIX_CHAIN_MAX=0 nchk Q fix-chain "HMD_FIX_CHAIN_MAX=0: a single finding-fix spawn is over the limit" "$T_Q_1" 1 'count=1.*max=0'
+
+HMD_CONF_TRANSCRIPT="$T_Q_ALL" HMD_CONF_REPO="$FR" conf all
+[ "$RC" = 1 ] && has "$OUT" '^VIOLATION.*count=4.*max=3' \
+  && ok "(Q) \`all\` runs fix-chain too — its violation surfaces in the aggregate" \
+  || bad "(Q) the aggregate run lost the fix-chain check (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$WORK/absent.jsonl" conf fix-chain
+[ "$RC" = 3 ] && has "$ERR" '^NON_VERIFIED' && [ -z "$OUT" ] \
+  && ok "(Q) a missing transcript is NON_VERIFIED — never an assumed-clean session" \
+  || bad "(Q) a missing transcript exited $RC stdout[$OUT] stderr[$ERR]"
+HMD_CONF_TRANSCRIPT="$WORK/eventfree.jsonl" conf fix-chain
+[ "$RC" = 3 ] && has "$ERR" 'yielded 0 gate/edit/spawn events' && [ -z "$OUT" ] \
+  && ok "(Q) a transcript with nothing to inspect is NON_VERIFIED" \
+  || bad "(Q) an event-free transcript exited $RC stdout[$OUT] stderr[$ERR]"
+HMD_CONF_TRANSCRIPT="$WORK/corrupt.jsonl" conf fix-chain
+[ "$RC" = 3 ] && has "$ERR" 'could not parse' && [ -z "$OUT" ] \
+  && ok "(Q) a corrupt transcript is NON_VERIFIED, with nothing green on stdout" \
+  || bad "(Q) a corrupt transcript exited $RC stdout[$OUT] stderr[$ERR]"
 
 # ═══════════════════════════════════════════════════════════════════════════════════
 # (M) MUTATION PROOFS — break the rule, prove the tool goes RED
@@ -1214,6 +1393,55 @@ mut_flips M21 's#"NOTIFY", (.input.task_id#"NOSUCH", (.input.task_id#' sweeps-ov
   "a TaskStop that does not end its run makes the stopped sweep overlap its successor -> (O)'s TaskStop assertion is real"
 mut_flips M22 's#; reported\[j\] = 1##' sweeps-overlap "$T_O_CHAIN" 1 1 \
   "re-reporting one lost run against every later run buries the signal -> (O)'s report-once assertion is real" 2 3
+
+# ── M23..M35 — the release-convergence checks (P, Q): disarm one rule, the verdict must flip ──
+mut_flips M23 's#if (run > max)#if (run > max + 1)#' fix-chain "$T_Q_BAD" 1 0 \
+  "the limit is 'more than N': one more allowed spawn hides the fourth -> (Q)'s boundary assertion is real"
+mut_flips M24 's#} else flush() }#} }#' fix-chain "$T_Q_BROKEN" 0 1 \
+  "an unrelated spawn that does not end the run pools two runs of two -> (Q)'s consecutive assertion is real"
+mut_flips M25 's#\$2 == "RELEASE" { flush() }#$2 == "NEVER" { flush() }#' fix-chain "$T_Q_REL" 0 1 \
+  "a release that does not end the cycle pools two cycles -> (Q)'s release assertion is real"
+mut_flips M26 's#def ship_release_row(\$ts):#def ship_release_row($ts): empty |#' fix-chain "$T_Q_REL" 0 1 \
+  "a release/ship.sh that is not read as a release pools two cycles -> (Q)'s ship.sh assertion is real"
+mut_flips M27 's#def tag_row(\$ts):#def tag_row($ts): empty |#' fix-chain "$T_Q_TAG" 0 1 \
+  "a git tag that is not read as a release pools two cycles -> (Q)'s tag assertion is real"
+mut_flips M28 's#(--dry-run|--check|--print-next|--npm-only|--release-only|-h|--help)#(--never)#' fix-chain "$T_Q_NOREL" 1 0 \
+  "counting ship.sh --dry-run/--check as a release splits one run of six -> (Q)'s not-a-release assertion is real"
+mut_flips M29 's#(-d|--delete|-l|--list|-v|--verify)#(--never)#' fix-chain "$T_Q_NOREL" 1 0 \
+  "counting git tag -d as a release splits one run of six -> (Q)'s tag-listing/deleting assertion is real"
+mut_flips M30 's#if (\$7 == "full" [&][&] red)#if (0)#' full-sweep-after-red "$T_P_BAD" 1 0 \
+  "a check that never accuses lets the second full sweep through -> (P)'s violation assertion is real"
+mut_flips M31 's#^ *red = 0$#      if (0) red = 0#' full-sweep-after-red "$T_P_GREEN2" 0 1 \
+  "a red that no later sweep clears accuses the full sweep that follows a green --failed -> (P)'s green-clears assertion is real"
+mut_flips M32 's#return (x != "" [&][&] x != "0")#return 1#' full-sweep-after-red "$T_P_DENIED" 0 1 \
+  "treating any foreground error as a red accuses the sweep after a refused call -> (P)'s Exit-code assertion is real"
+mut_flips M33 's#return (x == "failed" || x == "completed")#return 1#' full-sweep-after-red "$T_P_KILLED" 0 1 \
+  "treating a killed sweep as a red accuses the sweep after it -> (P)'s killed-is-no-verdict assertion is real"
+mut_flips M34 's#if (\$7 == "dry") next#if (0) next#' full-sweep-after-red "$T_P_DRY" 1 0 \
+  "a --dry-run that counts as a sweep clears the red -> (P)'s dry-run assertion is real"
+mut_flips M35 's#(--failed|--since-green)#(--never)#' full-sweep-after-red "$T_P_FAILED" 0 1 \
+  "a --failed run read as a full sweep accuses the sanctioned path -> (P)'s --failed assertion is real"
+
+# ── M36/M37 — the shared definition (bin/lib/hmd_fix_chain.sh): disarm one half, the verdict must flip ──
+# The tool resolves its libs next to itself, so a mutant of a LIB needs a tool copy of its own beside a lib
+# directory whose one different file is the mutant.
+MUTL="$WORK/mutlib"
+mkdir -p "$MUTL/lib"
+for f in "$ROOT"/bin/lib/*; do ln -s "$f" "$MUTL/lib/$(basename "$f")"; done
+rm -f "$MUTL/lib/hmd_fix_chain.sh"
+cp "$CONF" "$MUTL/conf"
+mut_lib_flips() { # mut_lib_flips <id> <sed-script> <transcript> <rc-shipped> <rc-mutant> <what it disarms>
+  local id="$1" script="$2" t="$3" before="$4" after="$5" what="$6" real_rc=""
+  sed "$script" "$ROOT/bin/lib/hmd_fix_chain.sh" > "$MUTL/lib/hmd_fix_chain.sh"
+  if cmp -s "$MUTL/lib/hmd_fix_chain.sh" "$ROOT/bin/lib/hmd_fix_chain.sh"; then bad "$id NOT APPLIED: the sed pattern no longer matches bin/lib/hmd_fix_chain.sh ($what)"; return 0; fi
+  HMD_CONF_TRANSCRIPT="$t" confx "$CONF" fix-chain; real_rc="$RC"
+  HMD_CONF_TRANSCRIPT="$t" confx "$MUTL/conf" fix-chain
+  if [ "$real_rc" = "$before" ] && [ "$RC" = "$after" ]; then ok "$id KILLED: $what"; else bad "$id SURVIVED: shipped rc=$real_rc (want $before), mutant rc=$RC (want $after) — $what"; fi
+}
+mut_lib_flips M36 's#^.*fix(es|ed|ing|er)?.*$#  | true#' "$T_Q_NOFIX" 0 1 \
+  "a definition that no longer needs a fix verb makes reviews into fix rounds -> (Q)'s finding-with-no-fix assertion is real"
+mut_lib_flips M37 's#^.*findings?|security.*$#    and true;#' "$T_Q_NOFIND" 0 1 \
+  "a definition that no longer needs a finding makes ordinary fixes into fix rounds -> (Q)'s fix-with-no-finding assertion is real"
 
 # ── the mutants must not have leaked into the real tool ────────────────────────────
 cmp -s "$CONF" "$MUT/conf.m1" 2>/dev/null \
