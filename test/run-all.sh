@@ -145,6 +145,9 @@
 # because any new commit staled the last green receipt. Receipts now carry a kind:
 #   full         every suite. A GREEN, clean one is also kept as receipts/last-full-green.json -- the chain anchor -- and, for good, as receipts/full-green/<head_sha>.json (the newest 20 are kept):
 #                the anchor moves to every later green sweep, but release/ship.sh --npm-only and --release-only grade the commit a TAG names, after the fact, and need the receipt that graded it.
+#                head_sha is the commit the sweep STARTED on, and tree_clean also needs the tree to have been clean when it started. A sweep during which HEAD moved (a commit landed mid-run) still
+#                writes its receipt, naming that start commit, with head_moved_to = where HEAD was at the end; it prints one line saying so and is neither anchored nor archived, in any mode.
+#                Proof: test/run-all-head-moved.test.sh.
 #   incremental  base = the anchor's HEAD; diff base..HEAD (hook-owned paths excluded; the tree must be clean). A suite is
 #                selected when it names a changed path or the basename of a changed bin/ script or module (the suite and the
 #                test/lib helpers it uses are searched; scripts that call a changed script widen the set; a name matches only as
@@ -566,6 +569,13 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 # A dry run executes nothing and writes nothing, so it neither needs the lock nor may be refused by a sweep that holds it.
 [ "$DRY_RUN" -eq 1 ] || _sweep_lock_acquire
+
+# ── THE COMMIT THIS SWEEP STARTS ON ───────────────────────────────────────────────────────
+# Read once, here, before the selection, the cache plan and every suite: it is the commit the sweep grades and the ONLY sha its receipt ever names. HEAD is read again where the receipt is written
+# (SWEEP RECEIPT) and only COMPARED with this one. A commit that lands in between (a person, an agent, a hook) means the suites after it ran against another tree, and a receipt naming the NEW HEAD
+# would hand a green to a commit nothing graded -- then anchor it (last-full-green.json) and archive it (full-green/) for release/ship.sh to trust. The tree the sweep starts on is the snapshot
+# REPO INTEGRITY takes before the first suite (status-before.txt). Proof: test/run-all-head-moved.test.sh.
+SWEEP_HEAD_START="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "")"
 
 # ── INCREMENTAL SELECTION (--since-green) ─────────────────────────────────────────────────
 # Narrows ALL to the suites a diff since the last green FULL sweep can affect, or leaves it whole and says why (an escalation is
@@ -1764,7 +1774,11 @@ RECEIPT_RC=0; [ "$BAD" -gt 0 ] && RECEIPT_RC=1
 # anchor an incremental chain, so its receipt goes to a file of its own.
 [ "$SWEEP_KIND" = filtered ] && RECEIPT_FILE="$RECEIPT_DIR/last-filtered.json"
 if command -v jq >/dev/null 2>&1; then
-  RECEIPT_HEAD_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "")"
+  # head_sha is the commit the sweep STARTED on (SWEEP_HEAD_START), never the HEAD read now. When the two differ a commit landed mid-sweep: the receipt keeps naming the start commit, records where HEAD
+  # went (head_moved_to), and is neither anchored nor archived below.
+  RECEIPT_HEAD_NOW="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "")"
+  RECEIPT_HEAD_SHA="$SWEEP_HEAD_START"
+  HEAD_MOVED=false; [ "$RECEIPT_HEAD_NOW" = "$SWEEP_HEAD_START" ] || HEAD_MOVED=true
   # Canonical (symlink-resolved) toplevel, NOT a bare `cd && pwd` value: the reader
   # (bin/heimdall-state, bin/heimdall-delivery-audit) compares against its own
   # `git rev-parse --show-toplevel`, which resolves symlinks. Under macOS $TMPDIR
@@ -1820,13 +1834,14 @@ if command -v jq >/dev/null 2>&1; then
   # This first grep's pattern now comes from the shared _hook_owned_path (defined next to
   # _status_snapshot above) instead of a separately hand-maintained copy — see that
   # function's own comment for the full 2026-09-21 incident this de-duplication fixes.
+  # _receipt_dirty_lines filters the git-status snapshot it is handed on stdin. tree_clean is the AND of two readings: the tree NOW, and the tree the sweep STARTED on (the snapshot taken before the first
+  # suite, status-before.txt). A sweep that began on a dirty tree graded that tree for part of its run, whatever the tree looks like once the dirt is gone (an unreadable snapshot is not clean).
   _receipt_dirty_lines() {
-    _status_snapshot \
-      | grep -Ev "$(_hook_owned_path)" \
+    grep -Ev "$(_hook_owned_path)" \
       | grep -Ev '^\?\? \.heimdall/(receipts/)?$'
   }
   RECEIPT_TREE_CLEAN=false
-  [ -z "$(_receipt_dirty_lines)" ] && RECEIPT_TREE_CLEAN=true
+  if [ -r "$WORK/status-before.txt" ] && [ -z "$(_receipt_dirty_lines < "$WORK/status-before.txt")" ] && [ -z "$(_status_snapshot | _receipt_dirty_lines)" ]; then RECEIPT_TREE_CLEAN=true; fi
   # New receipt fields. non_green_suites feeds the NEXT incremental run's carry-forward; flaky_under_load keeps what the parallel
   # run printed for a suite that then passed alone, so "counted green" never means "hidden"; an incremental receipt records
   # exactly what the push gate re-checks (see bin/lib/sweep-chain.sh).
@@ -1910,6 +1925,7 @@ if command -v jq >/dev/null 2>&1; then
       --arg finished_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
       --arg repo "$RECEIPT_REPO_CANON" \
       --arg head_sha "$RECEIPT_HEAD_SHA" \
+      --arg head_end "$RECEIPT_HEAD_NOW" --argjson head_moved "$HEAD_MOVED" \
       --argjson tree_clean "$RECEIPT_TREE_CLEAN" \
       --argjson exit_code "$RECEIPT_RC" \
       --argjson suites_total "$SUITES_TOTAL" \
@@ -1956,11 +1972,17 @@ if command -v jq >/dev/null 2>&1; then
        + (if $kind == "aborted" then {aborted:$aborted} else {} end)
        + (if $cache != null then {cache:$cache, full_equivalent:$fulleq} else {} end)
        + (if $amend_from != "" then {amended_from:$amend_from, amended:$amended} else {} end)
+       + (if $head_moved then {head_moved_to:$head_end} else {} end)
        + {suite_durations:$durs}' > "$RECEIPT_TMP" 2>/dev/null; then
       if mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null; then
         echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})"
+        # HEAD moved under the run (see SWEEP_HEAD_START): the receipt above names the commit the sweep STARTED on and stays a plain record. What makes a receipt release-grade is the anchor and the archive, and a
+        # sweep that did not see one tree from its first suite to its last gets neither, green or not -- in every mode (suite cache, --cold, --failed, --no-cache): the cache path's own FULL_EQ only noticed it
+        # through the entries its epilogue drops, and the receipt still named the new HEAD.
+        if [ "$HEAD_MOVED" = true ]; then
+          echo "${YEL}run-all: HEAD moved during the sweep (${RECEIPT_HEAD_SHA:0:12} -> ${RECEIPT_HEAD_NOW:0:12}): the receipt names ${RECEIPT_HEAD_SHA:0:12}, the commit the sweep started on, and is not release-grade -- it is not anchored or archived; sweep again on the final tree${OFF}"
         # The chain anchor: ONLY a green, clean, genuinely FULL sweep. Reds, incrementals and filtered runs never touch it.
-        if [ "$SWEEP_KIND" = full ] && [ "$RECEIPT_RC" = 0 ] && [ "$RECEIPT_TREE_CLEAN" = true ] && { [ "$CACHE_ON" -eq 0 ] || [ "$FULL_EQ" = true ]; }; then
+        elif [ "$SWEEP_KIND" = full ] && [ "$RECEIPT_RC" = 0 ] && [ "$RECEIPT_TREE_CLEAN" = true ] && { [ "$CACHE_ON" -eq 0 ] || [ "$FULL_EQ" = true ]; }; then
           if cp "$RECEIPT_FILE" "$RECEIPT_DIR/.last-full-green.$$" 2>/dev/null && mv "$RECEIPT_DIR/.last-full-green.$$" "$RECEIPT_DIR/last-full-green.json" 2>/dev/null; then
             echo "full-green anchor: ${RECEIPT_DIR}/last-full-green.json (incremental sweeps chain to this; a release needs it)"
           else
