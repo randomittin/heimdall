@@ -75,8 +75,9 @@
 #                              keeps it 360 s, so the code is claimable for about 6 minutes and then no longer; nothing renews it. A
 #                              connect whose code and QR lapse with no phone paired ends, and `hmd app connect` run again offers them
 #                              again; a phone that paired is kept connected (a replacement client resumes it, with no code and no
-#                              token). Running connect is also this repo's opt-in to the SessionStart pair window (below); --no-code
-#                              takes it back. With HMD_PAIR_WINDOW_RENEW=1 (exactly 1, the explicit opt-in to the old behavior,
+#                              token). Running connect also records this repo as ON for the SessionStart pair window (below), which is on
+#                              for every repo until one is switched off, so it undoes an earlier off; --no-code records the repo as OFF.
+#                              With HMD_PAIR_WINDOW_RENEW=1 (exactly 1, the explicit opt-in to the old behavior,
 #                              described next) the code is kept
 #                              registered while this runs -- the relay holds a
 #                              registration 360 s and connect renews it on the pair
@@ -151,14 +152,18 @@
 #                              Delegates to bin/heimdall-inbox-wake (`optin` checks, `watch` types).
 #   hmd app pair-window --session SID [--pid N] [--repo DIR] [--relay URL] [--transcript FILE]
 #   hmd app pair-window --stop --session SID [--repo DIR]
-#                              OPT-IN: for a repo that `hmd app connect` has not been run for this offers no code -- no gh call, no token, no
-#                              relay call for one (the opt-in is a record in $HEIMDALL_HOME that connect writes and
-#                              `hmd app disconnect` removes; a session ending never does, and a repo cannot write it) -- and with no phone
-#                              paired there either it starts nothing at all, no supervisor. RESUMING a paired phone is no part of that: it
-#                              needs neither the opt-in nor a token nor gh, so a repo with a stored login (a phone paired under an earlier
-#                              version, which wrote no opt-in, included) has its phone resumed at every session start, and only offering
-#                              a NEW code asks for the opt-in. For a connected repo the window registers the code ONCE when it opens, and
-#                              only while no phone is paired: the token goes out with that registration and no other. Nothing renews it
+#                              ON BY DEFAULT, for every repo: no `hmd app connect` is needed first. A session start opens the window and
+#                              offers the repo's code unless that repo was switched off -- `hmd app disconnect` and `hmd app connect
+#                              --no-code` record it in $HEIMDALL_HOME, outside the repo, so a checkout can neither write nor clear it; a
+#                              session ending never does; `hmd app connect` records the repo as on again -- or the machine was (see
+#                              HMD_PAIR_WINDOW=0 and `hmd hooks disable pair-window-start` below). A repo that is off offers no code -- no
+#                              gh call, no token, no relay call for one -- and with no phone paired there either it starts nothing at all,
+#                              no supervisor; a record that cannot be read counts as off, so no token goes out against a no that was lost.
+#                              RESUMING a paired phone is no part of that: it needs neither the choice nor a token nor gh, so a repo with a
+#                              stored login (a phone paired under an earlier version included) has its phone resumed at every session
+#                              start, switched off or not, and only offering a NEW code asks the choice. The window registers the code ONCE
+#                              when it opens, and only while no phone is paired: the token goes out with that registration and no other.
+#                              Nothing renews it
 #                              (HMD_PAIR_WINDOW_RENEW=1 is the explicit opt-in to the schedule described below), and a lapsed code is
 #                              offered again by `hmd app connect` or `hmd app add-device`, under the same code (a repo with a paired phone
 #                              keeps the one that phone was paired under, in its pairing record). The window then stays only to bring back
@@ -201,11 +206,11 @@
 #                              from the phone or a login the relay refuses ends a
 #                              pairing; each stop of a window or a client leaves a line in
 #                              $HEIMDALL_HOME/logs/app.log saying what ended it. A phone that types the code pairs at once,
-#                              with the notice and no compare. gh signed out prints one
-#                              line (scan the QR) and opens nothing; HMD_PAIR_WINDOW=0
-#                              turns it off; an unattended session (claude -p, an hmd
-#                              sub-session) gets none. `hmd hooks disable
-#                              pair-window-start` opts out of the hook.
+#                              with the notice and no compare. gh not signed in (not installed, or silent for 10 s) starts nothing
+#                              and prints ONE line on stderr that names `gh auth login` -- the session goes on (exit 0) and a paired
+#                              phone is still resumed; HMD_PAIR_WINDOW=0 (also off, false, no) turns the window off for the machine;
+#                              an unattended session (claude -p, an hmd sub-session) gets none. `hmd hooks disable pair-window-start`
+#                              opts out of the hook.
 #                              With HMD_PAIR_WINDOW_RENEW=1 every registration of the code sends the laptop's gh token
 #                              to the relay (on a pipe, over TLS). The relay keeps a
 #                              registration 360 s, so the window registers no more often
@@ -1109,10 +1114,11 @@ _gh_token_into() {
   printf -v "$__var" '%s' "$__tok"
 }
 
-# _pair_optin set|clear|check REPO -- the repo's opt-in to pairing by code (bin/lib/hmd_pair_optin.py): a record in $HEIMDALL_HOME that an explicit
-# `hmd app connect` makes and `hmd app disconnect` removes -- a session's start or end never does either. A repository cannot make it (it is not
-# in the tree a repo controls), and the SessionStart pair window reads no token, asks gh nothing and calls no relay for a repo without it.
-# `check` is 0 when it is set.
+# _pair_optin set|off|check REPO -- the repo's choice about pairing by code (bin/lib/hmd_pair_optin.py), a record in $HEIMDALL_HOME. Pairing by code is ON for
+# every repo, with no record: `set` is what `hmd app connect` records (on), `off` what `hmd app disconnect` and `hmd app connect --no-code` record --
+# a session's start or end never records either. A repository cannot make it (it is not in the tree a repo controls), and the SessionStart pair
+# window reads no token, asks gh nothing and calls no relay for a repo that is off. `check` is 0 unless the repo is off (a record that cannot be
+# read is off), so it answers "may this window offer a code here".
 _pair_optin() {
   [ -n "$PY3" ] || return 1
   "$PY3" "$LIB_DIR/hmd_pair_optin.py" "$1" --repo "$2" >/dev/null 2>&1
@@ -2192,12 +2198,13 @@ cmd_connect_relay() {
   REPO_REAL="$(_real_dir "$REPO")"
   STATE_REPO="$REPO"
 
-  # Running connect is the operator's consent to pair this repo by code: recorded outside the repo, it is what lets the SessionStart pair window
-  # register the code here (hmd app disconnect takes it back). --no-code is the opposite statement -- no token for this repo -- and removes it.
+  # The SessionStart pair window is on for every repo; running connect says so for this one, recorded outside the repo (hmd app disconnect says off,
+  # and a later connect says on again). --no-code is the opposite statement -- no token for this repo, from this run or from any session start --
+  # and records it as off.
   if [ "$NO_CODE" = true ]; then
-    _pair_optin clear "$REPO"
+    _pair_optin off "$REPO" || echo "hmd app: could not record that this repo pairs by QR only -- the SessionStart pair window may still offer a code here" >&2
   elif ! _pair_optin set "$REPO"; then
-    echo "hmd app: could not record that this repo pairs by code -- the SessionStart pair window stays off here" >&2
+    echo "hmd app: could not record that this repo pairs by code -- a switch-off recorded earlier may keep the SessionStart pair window off here" >&2
   fi
 
   # Pair by code (see the usage block). The token lives in gh_tok only until it has been written to the client's
@@ -2377,7 +2384,7 @@ cmd_connect_relay() {
 
 # cmd_pair_window: `hmd app pair-window [--stop] --session SID ...` -- see the usage block. Both forms are what the
 # SessionStart / SessionEnd hooks run, so they print nothing a hook would put in front of the model except the one
-# line the usage block promises for a signed-out gh, and they never fail a session: every refusal is exit 0 except a
+# line (on stderr) the usage block promises for a gh that is not signed in, and they never fail a session: every refusal is exit 0 except a
 # call that is itself malformed (2).
 cmd_pair_window() {
   local SID="" OWNER="" REPO="" RELAY_URL="" TRANSCRIPT="" STOP=false
@@ -2482,11 +2489,13 @@ _pw_stop() {
 # be. The record comes first and stands on its own: it is what keeps the window alive while the session lives. The window
 # is the repo's, so a second session finds it open and only joins it. TRANSCRIPT is the session's transcript, whose
 # modification time is the session's activity for the idle stop (an absolute path, or none -- a relative one is ignored
-# here as the record ignores it, never a reason not to open). A window opens for one of two reasons: the repo opted in
-# (`hmd app connect`), so it may offer a code, or a phone is paired to it (a stored login), so it must be resumed -- the
-# second needs neither the opt-in nor gh. For a repo with neither nothing starts and nothing is asked of gh or the relay.
+# here as the record ignores it, never a reason not to open). A window opens for one of two reasons: the repo may offer a code
+# (every repo may, unless it was switched off with `hmd app disconnect` / `hmd app connect --no-code`, or HMD_PAIR_WINDOW=0 says no for the
+# machine), or a phone is paired to it (a stored login), so it must be resumed -- the second needs neither the choice nor gh. A repo that is off
+# with no phone paired starts nothing, and nothing is asked of gh or the relay. A gh that is not signed in starts nothing either and says so once,
+# on stderr: nothing here fails or waits on it (the probe is bounded to 10 s and every refusal is exit 0), so a session never blocks.
 _pw_start() {
-  local repo="$1" sid="$2" owner="$3" relay="$4" transcript="$5" code pid="" i=0 probe="" kept=0 paired=0 optin=false
+  local repo="$1" sid="$2" owner="$3" relay="$4" transcript="$5" code pid="" i=0 probe="" kept=0 paired=0 offer=false
   case "$transcript" in /*) ;; *) transcript="" ;; esac
   if [ -n "$PY3" ]; then
     "$PY3" "$LIB_DIR/hmd_session_code.py" --record-session --repo "$repo" --session-id "$sid" --pid "$owner" ${transcript:+--transcript "$transcript"} >/dev/null 2>&1 || true
@@ -2497,14 +2506,14 @@ _pw_start() {
   _session_attended || return 0
   [ -n "$PY3" ] && [ -x "$RELAY_CLIENT_BIN" ] || return 0
   relay="${relay:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
-  # Two different things start from here, and only one of them needs consent. OFFERING a code sends the laptop's gh token to the relay, so it
-  # needs the opt-in `hmd app connect` records (_pair_optin). RESUMING a paired phone sends none: the phone comes back from the login stored for
-  # it, so a repo with a stored login (a phone paired under 2.4.7, which wrote no opt-in, included) resumes at every session start with or
-  # without the opt-in and with or without gh. A repo with neither -- never connected, nothing paired -- gets nothing started: no gh call, no
-  # token, no relay call, no supervisor.
-  _pair_optin check "$repo" && optin=true
+  # Two different things start from here, and only one of them can be said no to. OFFERING a code sends the laptop's gh token to the relay: every repo
+  # does it by default, unless the person switched this one off (_pair_optin: `hmd app disconnect`, `hmd app connect --no-code`; a choice that cannot
+  # be read counts as off). RESUMING a paired phone sends none: the phone comes back from the login stored for it, so a repo with a stored login (a
+  # phone paired under 2.4.7 included) resumes at every session start whatever the choice and with or without gh. A repo that is off with nothing
+  # paired gets nothing started: no gh call, no token, no relay call, no supervisor.
+  _pair_optin check "$repo" && offer=true
   kept="$(_pw_phones "$repo" "$relay")"
-  [ "$optin" = true ] || [ "$kept" -gt 0 ] || return 0
+  [ "$offer" = true ] || [ "$kept" -gt 0 ] || return 0
   code="$("$PY3" "$LIB_DIR/hmd_session_code.py" --repo "$repo" 2>/dev/null)" || return 0
   printf '%s' "$code" | grep -Eq "$SESSION_CODE_RE" || return 0
   if _pw_live "$repo" >/dev/null; then
@@ -2517,19 +2526,21 @@ _pw_start() {
   fi
   # a state directory that cannot be used link-free (a link, another account's) takes no window: nothing is started, and a hook says nothing
   "$PY3" "$LIB_DIR/hmd_private_state.py" ensure --root "$repo" --rel "$APP_REL" >/dev/null 2>&1 || return 0
-  # gh is asked whether it can give a token only when the window could offer a code: the repo opted in and either no phone is paired (a stored login,
+  # gh is asked whether it can give a token only when the window could offer a code: the repo is not off and either no phone is paired (a stored login,
   # or a live client with a device record) or the operator asked for the old schedule (HMD_PAIR_WINDOW_RENEW=1), which offers beside a paired phone.
-  # A paired phone needs no code, so a repo with one starts its supervisor with no gh call at all.
+  # A paired phone needs no code, so a repo with one starts its supervisor with no gh call at all. The one thing asked is `gh auth token`, read from its
+  # own pipe with stdin closed and a 10 s bound (_gh_token_into): no login, no prompt, and nothing here reads the Keychain itself.
   paired="$kept"
   [ "$paired" -gt 0 ] || paired="$(_dev_count "$repo")"
-  if [ "$optin" = true ] && { [ "$paired" -eq 0 ] || _code_renewal_on; } && { ! _gh_token_into probe || [ -z "$probe" ]; }; then
-    # gh being signed out costs no paired phone its session: the supervisor still starts, resumes every stored login and holds it (it offers
-    # no code while gh gives no token). With no phone paired there is nothing to hold, and nothing is started.
+  if [ "$offer" = true ] && { [ "$paired" -eq 0 ] || _code_renewal_on; } && { ! _gh_token_into probe || [ -z "$probe" ]; }; then
+    # gh not signed in costs no paired phone its session: the supervisor still starts, resumes every stored login and holds it (it offers
+    # no code while gh gives no token). With no phone paired there is nothing to hold, and nothing is started. The hint is ONE line on stderr, never
+    # stdout (a hook's stdout can reach the model), and the session goes on: this returns 0.
     if [ "$kept" -eq 0 ]; then
-      echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
+      echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR." >&2
       return 0
     fi
-    echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login) -- the $kept paired phone(s) are resumed and kept"
+    echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login) -- the $kept paired phone(s) are resumed and kept" >&2
   fi
   printf -v probe '%s' ""  # the probe only asked whether gh can give a token; the supervisor reads its own
   # the supervisor is this script run again as its own top-level process: its $$ is its real pid (a subshell's is the
@@ -2543,12 +2554,12 @@ _pw_start() {
     sleep 0.1
   done
   if _pid_is_pair_window "$pid" "$repo"; then
-    if [ "$optin" = true ]; then
+    if [ "$offer" = true ]; then
       echo "hmd app: pair window open -- session code $code"
     else
-      echo "hmd app: pair window open -- the $kept paired phone(s) are resumed and kept; no code is offered (hmd app connect was never run for this repo)"
+      echo "hmd app: pair window open -- the $kept paired phone(s) are resumed and kept; no code is offered (this repo is switched off: hmd app connect turns it on)"
     fi
-  elif [ "$optin" = true ]; then
+  elif [ "$offer" = true ]; then
     echo "hmd app: pair window not confirmed -- if the code does not pair, run: hmd app connect"
   else
     echo "hmd app: pair window not confirmed -- if the paired phone does not come back, run: hmd app connect"
@@ -2654,14 +2665,14 @@ _pw_hold() {
   _pw_nap "$1"
 }
 
-# _pw_write_offered_state -- this supervisor offers no code (its one registration is spent, a phone is paired, or this repo never asked for a code): say which
+# _pw_write_offered_state -- this supervisor offers no code (its one registration is spent, a phone is paired, or this repo is switched off): say which
 # way it stands in its state file -- `paired` while a phone is paired, `lapsed` otherwise. Neither holds the code at the relay (_pair_window_holds), so
 # `hmd app connect` offers it itself.
 _pw_write_offered_state() {
   if _pw_paired; then
     _pw_write_state paired "a phone is paired: no code is offered (hmd app add-device offers it for one more)"
   else
-    _pw_write_state lapsed "no code is offered: its one registration is spent, or hmd app connect was never run for this repo (hmd app connect offers it)"
+    _pw_write_state lapsed "no code is offered: its one registration is spent, or this repo is switched off (hmd app connect offers it)"
   fi
 }
 
@@ -2877,8 +2888,8 @@ _pw_launch_client() {
 # ONE REGISTRATION is the default (everything above about retrying and renewing is HMD_PAIR_WINDOW_RENEW=1): one client whose own window is
 # as long as the floor, the token read for it and for no other. Once that is spent -- it lapsed, was refused, or its phone came and went --
 # `offered` is set and nothing offers a code again: the loop only looks (_resume_phones) for a paired phone whose client died. `offered` is
-# also how a window that must not offer a code at all behaves, whichever the schedule: a repo that never opted in (the supervisor then exists
-# only to RESUME the phones a stored login names, which needs neither the opt-in nor a token), and, by default, a repo with a phone paired.
+# also how a window that must not offer a code at all behaves, whichever the schedule: a repo that is switched off (the supervisor then exists
+# only to RESUME the phones a stored login names, which needs neither the choice nor a token), and, by default, a repo with a phone paired.
 cmd_pair_window_loop() {
   local fails=0 started rc ran delay tok="" restart_s retry_s poll_s idle_h full_noted=false limit offered=false
   while [ $# -gt 0 ]; do
@@ -2934,9 +2945,10 @@ cmd_pair_window_loop() {
       break
     fi
     if [ "$offered" != true ]; then
-      # Whether this window offers a code at all is settled here, before any gh call. Two things say no, and neither is a failure: this repo never
-      # opted in (`hmd app connect` was not run for it: the supervisor then exists only to RESUME a phone paired before the opt-in existed -- resuming
-      # needs neither the opt-in nor a token), or a phone is paired (the default: a code is for a pairing that is waiting for a phone).
+      # Whether this window offers a code at all is settled here, before any gh call. Two things say no, and neither is a failure: this repo is
+      # switched off (`hmd app disconnect` or `connect --no-code`, also after this supervisor started: it then exists only to RESUME the phones a
+      # stored login names -- resuming needs neither the choice nor a token), or a phone is paired (the default: a code is for a pairing that is
+      # waiting for a phone).
       if ! _pair_optin check "$PW_REPO" || { ! _code_renewal_on && _pw_paired; }; then
         offered=true
         _pw_write_offered_state
@@ -3559,8 +3571,8 @@ cmd_disconnect() {
     return $?
   fi
   local connect_doc repo_real vrc pw_stopped devs=""
-  # the opt-in goes FIRST: a session starting while this runs finds no consent to open a pair window with
-  _pair_optin clear "$REPO" || true
+  # the switch-off goes FIRST: a session starting while this runs finds the repo off and opens no pair window (it stays off until `hmd app connect`)
+  _pair_optin off "$REPO" || echo "hmd app disconnect: could not record that this repo is switched off -- the next session start may open its pair window again" >&2
   connect_doc="$(_connect_doc "$REPO")"
   repo_real="$(_real_dir "$REPO")"
   # every phone paired right now, listed before anything below ends a client (the pair windows closed next end them too, and a list names
@@ -3578,7 +3590,7 @@ cmd_disconnect() {
   # supervisor, a client or the relay is touched. From then on no resume claims one: a periodic look, a respawn, the pair window and a client started
   # a moment ago all claim under that same lock and skip what is marked, and a live client of one ends itself.
   if [ -n "$PY3" ]; then "$PY3" "$LIB_DIR/hmd_session_login.py" mark --repo "$REPO" --all >/dev/null || true; fi
-  # a pair window is a way for a phone in, so disconnect closes it too (it is opened again by the next session)
+  # a pair window is a way for a phone in, so disconnect closes it too (the repo is off now: no session opens it again until `hmd app connect`)
   pw_stopped="$(_pair_window_stop_all "$REPO")"
   [ "${pw_stopped:-0}" -gt 0 ] && echo "hmd app disconnect: stopped $pw_stopped pair window(s)"
   # The connect supervisor goes next, BEFORE any client: it respawns a client that ends and looks for phones whose client is gone, so left running it

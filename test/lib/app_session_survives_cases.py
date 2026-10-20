@@ -28,23 +28,24 @@ scenario started are ever signalled (those whose command line names its private 
 
 S1 - S8 run the schedule C.Scn gives by default (HMD_PAIR_WINDOW_RENEW=1, the code kept registered, the old behavior). The cases below run the
 schedule a user gets (DEFAULT: one registration per window, the gh token sent once) and are where the two 2.4.8 rules meet -- a paired phone is
-never let go of, and the gh token goes out only after `hmd app connect` for that repo and only when pairing needs it:
-  U1  the 2.4.7 -> 2.4.8 upgrade: a phone paired earlier, the repo with its stored login and NOTHING else (2.4.7 wrote no opt-in record and no
+never let go of, and the gh token goes out once per window and only when pairing needs it (pairing by code is on for every repo; a repo or a machine
+can say no -- test/pair-window-token-optin.test.sh proves the default repo and the no):
+  U1  the 2.4.7 -> 2.4.8 upgrade: a phone paired earlier, the repo with its stored login and NOTHING else (2.4.7 wrote no record of the choice and no
       per-repo pairing record), the login three days old, everything dead: a new session's SessionStart hook resumes the phone -- the SAME relay
       session (its stream attached again, no /pair/init), the same code, the phone's frames open under the key it holds with seqs above everything
       sent before
   U2  ...and in doing so the laptop's `gh` is never called and no registration of any kind reaches the relay: zero token sends; the session start made
-      no opt-in record either (only `hmd app connect` does), and the supervisor holds the phone, offering no code
+      no record either (only `hmd app connect`, `connect --no-code` and `disconnect` do), and the supervisor holds the phone, offering no code
   R1  a repo paired under 2.4.8 keeps ITS code through a restart: with the machine's seed deleted (a new seed would give another code) the SessionStart
       hook resumes the phone and the repo still shows the code the phone was paired under
-  R2  ...and `hmd app connect`, the opt-in, offers that code again (a registration under it, the token sent once, for that registration), the phone's
+  R2  ...and `hmd app connect` offers that code again (a registration under it, the token sent once, for that registration), the phone's
       own relay session left alone
-  O1  an opted-in repo with NO phone paired: SessionStart registers the code once and sends the token once
+  O1  a repo recorded as on (C.Scn's explicit yes) with NO phone paired: SessionStart registers the code once and sends the token once
   O2  ...and across about 4.5 lifetimes of the relay's registration (27 of the real relay's six minutes) and six idle hours there is no second
       registration, no second send and no further gh read; the window says it lapsed and stays up
   O3  ...and a second session start finds the window open and sends nothing
-  X1  a repo that was never connected and has no phone paired: SessionStart records the session and does nothing else -- no gh call, no request of any
-      kind to the relay, no window, no opt-in record
+  X1  a repo switched OFF (what `hmd app disconnect` leaves) with no phone paired: SessionStart records the session and does nothing else -- no gh
+      call, no request of any kind to the relay, no window
 """
 import glob
 import json
@@ -202,13 +203,15 @@ def token_sends(s):
     return sum(1 for reg in list(s.relay.registrations) if reg["token_ok"])
 
 
-def opted_in(s):
-    """True when `hmd app connect` has made this repo's opt-in record (bin/lib/hmd_pair_optin.py)."""
-    return C.run([sys.executable, C.OPTIN_PY, "check", "--repo", s.repo], s.env(), timeout=60).returncode == 0
+def choice(s):
+    """What this repo's record of the pairing-by-code choice says (bin/lib/hmd_pair_optin.py): "on" (`hmd app connect` made it), "off" (`hmd app
+    disconnect` or `connect --no-code` did), or "default" -- nothing recorded, which is on."""
+    return C.run([sys.executable, C.OPTIN_PY, "state", "--repo", s.repo], s.env(), timeout=60).stdout.strip()
 
 
-def opt_out(s):
-    C.run([sys.executable, C.OPTIN_PY, "clear", "--repo", s.repo], s.env(), timeout=60)
+def record(s, action):
+    """`set` (on), `off` or `clear` (back to the default) this repo's record, through the helper connect and disconnect use."""
+    C.run([sys.executable, C.OPTIN_PY, action, "--repo", s.repo], s.env(), timeout=60)
 
 
 def drop_pairing_record(s):
@@ -441,8 +444,8 @@ def case_no_other_hook_stops_it():
             "disconnects, kills or signals anything", str(sorted(found)))
 
 
-def case_upgrade_resumes_without_opt_in():
-    """U1, U2: a repo paired under 2.4.7 has a stored login and no opt-in record -- its phone must still be resumed, asking gh and the relay nothing."""
+def case_upgrade_resumes_without_a_record():
+    """U1, U2: a repo paired under 2.4.7 has a stored login and no record of the choice -- its phone must still be resumed, asking gh and the relay nothing."""
     with C.Scn() as s:
         gh_log = logging_gh(s)
         a = Claude(s, C.SID1, **DEFAULT)
@@ -464,10 +467,10 @@ def case_upgrade_resumes_without_opt_in():
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(meta, f)
             drop_pairing_record(s)  # 2.4.7 made no pairing record ...
-            opt_out(s)  # ... and no opt-in record: `hmd app connect` of that version wrote nothing of the kind
-            ready = ack is not None and session_ids(s) == [sid] and show(s)[0] == 3 and not opted_in(s) and token_sends(s) == 1
-            T.check(ready, "U1. (setup) the repo is as 2.4.7 leaves a paired one: the phone's stored login, three days old, and nothing else -- no opt-in "
-                           "record, no pairing record", "ack %r logins %s record rc %r opted in %r" % (ack, session_ids(s), show(s)[0], opted_in(s)))
+            record(s, "clear")  # ... and no record of the choice: `hmd app connect` of that version wrote nothing of the kind
+            ready = ack is not None and session_ids(s) == [sid] and show(s)[0] == 3 and choice(s) == "default" and token_sends(s) == 1
+            T.check(ready, "U1. (setup) the repo is as 2.4.7 leaves a paired one: the phone's stored login, three days old, and nothing else -- no record of "
+                           "the choice, no pairing record", "ack %r logins %s record rc %r choice %r" % (ack, session_ids(s), show(s)[0], choice(s)))
             if not ready:
                 return
             gh_before, regs, before, reqs = len(gh_calls(gh_log)), len(s.relay.registrations), M.snap(s, phones), len(s.relay.requests)
@@ -480,7 +483,7 @@ def case_upgrade_resumes_without_opt_in():
             sup = C.window_pid(s)
             T.check(recorded and back and untouched(s, sid) and len(s.relay.pair_inits) == p["inits"] and session_ids(s) == [sid]
                     and code_now(s) == p["code"],
-                    "U1. a repo paired under 2.4.7 (a stored login, no opt-in, no pairing record) has its phone resumed by the SessionStart hook: the SAME relay "
+                    "U1. a repo paired under 2.4.7 (a stored login, no record of the choice, no pairing record) has its phone resumed by the SessionStart hook: the SAME relay "
                     "session -- its stream attached again, no /pair/init, nothing revoked -- and the same code",
                     "recorded %r back %r revokes %r inits %d->%d logins %s code %r/%r" % (recorded, back, s.relay.revokes, p["inits"], len(s.relay.pair_inits),
                                                                                          session_ids(s), code_now(s), p["code"]))
@@ -490,11 +493,11 @@ def case_upgrade_resumes_without_opt_in():
                     "command is acked", "ack %r" % (ack,))
             code_posts = [r for r in s.relay.requests[reqs:] if r.endswith("/code")]
             T.check(gh_calls(gh_log)[gh_before:] == [] and len(s.relay.registrations) == regs and token_sends(s) == 1 and not code_posts
-                    and not opted_in(s) and isinstance(sup, int) and C.alive(sup) and bool(holding),
+                    and choice(s) == "default" and isinstance(sup, int) and C.alive(sup) and bool(holding),
                     "U2. ...and it did so with zero gh calls and zero token sends (no registration of a code reached the relay): the session start made no "
-                    "opt-in record, and the supervisor holds the phone, offering no code",
-                    "gh calls %r registrations %d->%d sends %d code posts %r opted in %r supervisor %r state %r" % (
-                        gh_calls(gh_log)[gh_before:], regs, len(s.relay.registrations), token_sends(s), code_posts, opted_in(s), sup, s.window_state()))
+                    "record, and the supervisor holds the phone, offering no code",
+                    "gh calls %r registrations %d->%d sends %d code posts %r choice %r supervisor %r state %r" % (
+                        gh_calls(gh_log)[gh_before:], regs, len(s.relay.registrations), token_sends(s), code_posts, choice(s), sup, s.window_state()))
         finally:
             a.gone()
             if c is not None:
@@ -553,8 +556,9 @@ def case_record_keeps_the_code_and_connect_reoffers_it():
             M.laptop_down(s)
 
 
-def case_opted_in_unpaired_one_token_send():
-    """O1 - O3: an opted-in repo with no phone paired registers the code once, and the token goes out with that registration and no other."""
+def case_connected_unpaired_one_token_send():
+    """O1 - O3: a repo recorded as on (C.Scn's explicit yes, as `hmd app connect` leaves it) with no phone paired registers the code once, and the
+    token goes out with that registration and no other."""
     with C.Scn(ttl=2) as s:
         gh_log = logging_gh(s)
         clock = C.Clock(s.sb.root)
@@ -563,8 +567,8 @@ def case_opted_in_unpaired_one_token_send():
         b = None
         try:
             registered = a.recorded() and C.wait_until(lambda: s.relay.registrations, 40)
-            T.check(registered and len(s.relay.registrations) == 1 and token_sends(s) == 1 and opted_in(s),
-                    "O1. an opted-in repo with no phone paired: the SessionStart hook's window registers the code once and sends the token once",
+            T.check(registered and len(s.relay.registrations) == 1 and token_sends(s) == 1 and choice(s) == "on",
+                    "O1. a repo recorded as on with no phone paired: the SessionStart hook's window registers the code once and sends the token once",
                     "registered %r registrations %d sends %d" % (registered, len(s.relay.registrations), token_sends(s)))
             if not registered:
                 return
@@ -590,10 +594,10 @@ def case_opted_in_unpaired_one_token_send():
             M.laptop_down(s)
 
 
-def case_not_opted_in_unpaired_does_nothing():
-    """X1: nobody ever connected this repo and no phone is paired: a session start must cost nothing -- no gh call, no relay request."""
+def case_switched_off_unpaired_does_nothing():
+    """X1: this repo was switched off (`hmd app disconnect`) and no phone is paired: a session start must cost nothing -- no gh call, no relay request."""
     with C.Scn() as s:
-        opt_out(s)  # C.Scn opts every repo in; this one never was
+        record(s, "off")  # C.Scn records every repo as on; this one was switched off, as `hmd app disconnect` leaves it
         gh_log = logging_gh(s)
         a = Claude(s, C.SID1, **DEFAULT)
         b = None
@@ -604,11 +608,11 @@ def case_not_opted_in_unpaired_does_nothing():
             recorded_again = b.recorded()
             time.sleep(3)
             T.check(recorded and recorded_again and gh_calls(gh_log) == [] and s.relay.requests == [] and not s.relay.registrations
-                    and s.window_state() is None and not opted_in(s),
-                    "X1. a repo `hmd app connect` was never run for, with no phone paired: two session starts record the sessions and do nothing else -- zero "
-                    "gh calls (not even to ask whether it is signed in), zero requests of any kind to the relay, no window, no opt-in record",
-                    "recorded %r/%r gh %r requests %r registrations %d window %r opted in %r" % (
-                        recorded, recorded_again, gh_calls(gh_log), s.relay.requests, len(s.relay.registrations), s.window_state(), opted_in(s)))
+                    and s.window_state() is None and choice(s) == "off",
+                    "X1. a repo that was switched off, with no phone paired: two session starts record the sessions and do nothing else -- zero "
+                    "gh calls (not even to ask whether it is signed in), zero requests of any kind to the relay, no window",
+                    "recorded %r/%r gh %r requests %r registrations %d window %r choice %r" % (
+                        recorded, recorded_again, gh_calls(gh_log), s.relay.requests, len(s.relay.registrations), s.window_state(), choice(s)))
         finally:
             a.gone()
             if b is not None:
@@ -620,8 +624,8 @@ def main():
     H.CASE_JOBS = 2  # ten scenarios, each with a supervisor, a client and a relay: two at a time keeps the machine light
     return H.run_main(T, os.path.abspath(__file__), [case_session_end_restart_idle, case_default_never_idles, case_laptop_restart_gh_signed_out,
                                                     case_disconnect_ends_it, case_phone_revoke_ends_it, case_no_other_hook_stops_it,
-                                                    case_upgrade_resumes_without_opt_in, case_record_keeps_the_code_and_connect_reoffers_it,
-                                                    case_opted_in_unpaired_one_token_send, case_not_opted_in_unpaired_does_nothing])
+                                                    case_upgrade_resumes_without_a_record, case_record_keeps_the_code_and_connect_reoffers_it,
+                                                    case_connected_unpaired_one_token_send, case_switched_off_unpaired_does_nothing])
 
 
 if __name__ == "__main__":

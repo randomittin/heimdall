@@ -3,13 +3,13 @@
 This is the whole, specified, minimal contract for every byte Heimdall records or
 sends. It is the receipt behind the scoped claims in the README: *gates run
 locally, presence is opt-out, telemetry is documented and killable, the phone
-companion is opt-in.* If the code and this file ever disagree, that is a bug —
+companion pairs by code by default and is switched off per repo or machine.* If the code and this file ever disagree, that is a bug —
 file it.
 
 Heimdall has exactly **eight** data surfaces. Six of them can put bytes on the
-network. Presence and the update check are on by default; the other four — `rr`
-and the three phone-companion surfaces (§9) — only ever do so because you ran
-`rr`, or ran `hmd app connect` and paired a phone.
+network. Presence, the update check and the pair-by-code window (it registers a
+code with the relay at a session start, §9) are on by default; the other three —
+`rr` and the phone companion's sealed frames and push — only ever do so because you ran `rr`, or paired a phone.
 
 | Surface | Leaves your machine? | Default | Kill switch |
 |---|---|---|---|
@@ -18,9 +18,9 @@ and the three phone-companion surfaces (§9) — only ever do so because you ran
 | **Telemetry / Pre-Merge Corpus** (`bin/heimdall-telemetry`, `bin/heimdall-telemetry-corpus`) | **Not in this release.** Written to a LOCAL spool only; the control-plane ingest is a future step (see "Send status" below). | on (T0) | `hmd telemetry off` |
 | **Auto-update version check** (`bin/heimdall-autoupdate`) | Yes — one unauthenticated GET to the public GitHub Releases API. No body, no credential, no code. | on (throttled ~24h) | `HEIMDALL_NO_AUTOUPDATE=1` or `~/.heimdall/no-autoupdate` |
 | **`rr` cloud maintainer** (`bin/rr`) | Yes — **only when you run it.** Sends your BYO Claude credential, your GitHub App installation id, and the literal task text you typed. | off — inert unless invoked | don't run `rr` (`RR_NO_CONTEXT=1` drops the context capsule) |
-| **Phone companion relay** (`bin/heimdall-relay-client`) | Yes — **only while you run `hmd app connect`.** End-to-end sealed frames to *your own* paired phone through the hosted relay (`https://hmd-relay.therishabh16.workers.dev`): session state with repo-relative paths, and — only when the phone asks — a file diff, transcript tail or PR summary. The relay forwards ciphertext and cannot read it (§9). | off — nothing runs until `hmd app connect` | `hmd app disconnect` (or Ctrl-C); `hmd app controls off` / `HMD_UI_CONTROLS=0` refuse phone views and controls; `--relay URL` / `HMD_RELAY_URL` to self-host |
+| **Phone companion relay** (`bin/heimdall-relay-client`) | Yes — **only once a phone is paired** (by `hmd app connect`, or by typing the pair window's code, §9). End-to-end sealed frames to *your own* paired phone through the hosted relay (`https://hmd-relay.therishabh16.workers.dev`): session state with repo-relative paths, and — only when the phone asks — a file diff, transcript tail or PR summary. The relay forwards ciphertext and cannot read it (§9). | off — no frame is sent until a phone pairs | `hmd app disconnect` (or Ctrl-C); `hmd app controls off` / `HMD_UI_CONTROLS=0` refuse phone views and controls; `--relay URL` / `HMD_RELAY_URL` to self-host |
 | **Phone push notifications** (`bin/lib/companion_push.py`) | Yes — **only once a paired phone registered an Expo push token.** hmd POSTs straight to `exp.host`: not through the relay, and **not end-to-end sealed** — Expo, and Apple or Google behind it, can read the text. Title ≤ 48 and body ≤ 120 UTF-16 units: fixed templates plus allowlisted fields (§9). | off — nothing is sent until a phone registers | `HMD_PUSH=0` (exactly `0`); `hmd app disconnect`; delete `<repo>/.heimdall/app/push.json` |
-| **Pair-by-code** (`hmd app connect`) | Yes — **while the 10-minute code window is open.** Your `gh auth token` goes to the relay in a TLS request body; the relay spends it on one `GET /user` to GitHub to learn your numeric GitHub id and, by its INV-39, never stores or logs it (§9). | on whenever `gh auth token` yields a token | `hmd app connect --no-code` (QR pairing — no token leaves); `hmd app identity revoke` |
+| **Pair-by-code** (a session start, `hmd app connect`, `hmd app add-device`) | Yes — **once for each code registered; the relay keeps it about six minutes.** Your `gh auth token` goes to the relay in a TLS request body; the relay spends it on one `GET /user` to GitHub to learn your numeric GitHub id and, by its INV-39, never stores or logs it (§9). | on for every repo, whenever `gh auth token` yields a token | `HMD_PAIR_WINDOW=0` (the machine); `hmd app disconnect` or `hmd app connect --no-code` (one repo; `--no-code` also pairs by QR, no token leaves); `hmd app identity revoke` |
 
 Everything below documents the *real* shapes emitted by the code, field by field.
 
@@ -488,9 +488,11 @@ Unset, empty or any other value leaves it on, so a typo cannot silently disable 
 
 ## 9. Phone companion — relay, push, pair-by-code
 
-Three surfaces in the table exist only because you started `hmd app connect` and paired a
-phone. Nothing starts them for you: no hook, installer step or session start runs `hmd app
-connect`. (Phone deny, §8, is the approval path of this same session.)
+Two of the three surfaces in the table, the relay's sealed frames and push, exist only once a
+phone is paired. The third, pair-by-code, is on by default: a session start opens the repo's
+pair window and registers its code with no `hmd app connect` first, and sends nothing of your
+session until a phone pairs. No hook, installer step or session start runs `hmd app connect`
+itself. (Phone deny, §8, is the approval path of this same session.)
 
 ### The relay leg (`bin/heimdall-relay-client`)
 
@@ -607,13 +609,16 @@ per 10 s, and 20 non-approval plus 20 approval per device per rolling hour.
 
 ### Pair-by-code (`hmd app connect`, the relay's `/session/:id/code`)
 
-Opt-in, per repo. Nothing here runs for a repo until you have run `hmd app connect` in it: that run writes a
-small record in `$HEIMDALL_HOME` (`app/pair-optin/<hash of the repo's path>.json`: the repo's path and the
-time, outside the repo so a repository cannot write it for you), and `hmd app disconnect` removes it (a
-session ending does not). `hmd app connect --no-code` pairs by QR, sends no token and removes it too. With
-the record, and while `gh auth token` yields a token, the 5-character session code `hmd ui` shows is
-registered with the relay under your GitHub identity, so a phone signed in to GitHub as the same user can
-pair by typing it.
+On by default, for every repo. A session start in any repo opens that repo's pair window (the SessionStart
+hook `pair-window-start`, in an attended session) and registers its code with no `hmd app connect` first.
+Saying no is yours to do, per repo or for the machine: `hmd app disconnect` and `hmd app connect --no-code`
+record the repo as off in a small record in `$HEIMDALL_HOME` (`app/pair-optin/<hash of the repo's path>.json`:
+the repo's path, the state and the time, outside the repo so a repository can neither write nor clear it),
+`hmd app connect` records it as on again, a session ending writes nothing, and a record that cannot be read
+counts as off. `HMD_PAIR_WINDOW=0` turns the window off for the whole machine. For a repo that is not off,
+and while `gh auth token` yields a token, the 5-character session code `hmd ui` shows is registered with
+the relay under your GitHub identity, so a phone signed in to GitHub as the same user can pair by typing it;
+with no gh sign-in nothing is registered and one line on stderr names `gh auth login`.
 
 ```
 POST /session/:id/code      Authorization: Bearer <relay session token>
@@ -630,10 +635,11 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
   the client can verify. **It goes out once for each registration of the code, and a code is registered only for a pairing that
   is waiting for a phone:** when you run `hmd app connect`, when you run `hmd app add-device` (a phone is
   paired and you want one more), and when the SessionStart hook `pair-window-start` opens a repo's pair
-  window -- for a repo you connected, in an attended session with `gh` signed in, and only while no phone
-  is paired (a restart resumes a paired phone from its stored session login, which involves neither the
-  token nor the opt-in record: a phone paired before the record existed is resumed too, with no gh call and
-  no request that carries a token, and a repo you never connected that has no paired phone starts nothing).
+  window -- in an attended session with `gh` signed in, for a repo that was not switched off, and only
+  while no phone is paired (a restart resumes a paired phone from its stored session login, which involves
+  neither the token nor the record of the choice: a phone paired under an earlier version is resumed too,
+  with no gh call and no request that carries a token, and a repo that is switched off with no paired
+  phone starts nothing).
   The relay keeps a registration 360 s, so the code can be typed for about six minutes and then
   no longer: nothing registers it again (no timer, no restarted client, no later session start while the
   window is open), and a registration the relay refuses or cannot take is not retried, so no second
@@ -661,9 +667,9 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
 
 | Switch | Effect |
 |---|---|
-| `hmd app connect --no-code` | no token leaves; pair by QR |
-| `hmd app disconnect` | ends the opt-in: the pair window registers no code and sends no token for the repo until `hmd app connect` is run in it again |
-| `HMD_PAIR_WINDOW=0`, `hmd hooks disable pair-window-start` | the SessionStart hook opens no window |
+| `hmd app connect --no-code` | no token leaves, and the repo is recorded as off; pair by QR |
+| `hmd app disconnect` | records the repo as off: the pair window registers no code and sends no token for it until `hmd app connect` is run in it again |
+| `HMD_PAIR_WINDOW=0`, `hmd hooks disable pair-window-start` | the SessionStart hook opens no window, in any repo of the machine |
 | `hmd app identity revoke` | sends your `gh auth token` to the relay once more (same pipe, same https rule) and invalidates every phone sign-in made with your GitHub identity — each phone signs in again. Revoking the GitHub App at github.com does not do this by itself |
 
 ---

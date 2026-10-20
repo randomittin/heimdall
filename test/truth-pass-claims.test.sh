@@ -145,7 +145,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # line and Guarantee B must name it, or B would be vacuous for the one sentence that
   # discloses the relay, Expo push and the gh-token leg.
   cp -R "$REPO/." "$TMP/" 2>/dev/null
-  grep -v 'The phone companion is opt-in' "$REPO/README.md" > "$TMP/README.md"
+  grep -v 'The phone companion is on by default for pairing' "$REPO/README.md" > "$TMP/README.md"
   out="$(TRUTH_PASS_REPO="$TMP" HEIMDALL_SITE_DIR="$NO_SITE" bash "$SELF_DIR/truth-pass-claims.test.sh" 2>&1)"; rc=$?
   if [ "$rc" -eq 0 ] || ! grep -q 'scoped claim S7 MISSING' <<<"$out"; then
     echo "  ✗ SELF-TEST FAILED: gate did not flag scoped claim S7 as missing (rc=$rc)" >&2
@@ -264,7 +264,7 @@ S4='Auto-update checks GitHub Releases for new signed versions. HEIMDALL_NO_AUTO
 S5='# gates local · presence opt-out · telemetry documented & killable · the watchman does not sleep'
 # shellcheck disable=SC2016 # literal claim text: the backticks around rr are prose, nothing should expand
 S6='`rr` sends on purpose, and only when you run it: your BYO Claude credential (write-only), your GitHub App installation id, and the literal task text you typed — because that text is the job. It never uploads your working tree; the worker clones your repo from GitHub.'
-S7='The phone companion is opt-in (nothing is sent until you run hmd app connect for a repo; hmd app disconnect stops it and ends the opt-in): by default your session state, and any diff you open on the phone, travel end-to-end sealed through a relay that sees only ciphertext; push notifications send short scrubbed text to Expo (HMD_PUSH=0 turns them off); pairing by code sends your gh auth token to the relay once for each code registered for a phone to claim (hmd app connect, hmd app add-device, or the pair window a session of a repo you connected opens while no phone is paired), not on a timer (--no-code pairs by QR instead and sends no token).'
+S7='The phone companion is on by default for pairing (a session start in any repo registers a six-minute code with the relay, and nothing of your session is sent until a phone pairs; HMD_PAIR_WINDOW=0 turns that off for the machine, and hmd app disconnect or hmd app connect --no-code for one repo): once a phone is paired, your session state, and any diff you open on the phone, travel end-to-end sealed through a relay that sees only ciphertext; push notifications send short scrubbed text to Expo (HMD_PUSH=0 turns them off); pairing by code sends your gh auth token to the relay once for each code registered for a phone to claim (a session start of a repo with no phone paired, hmd app connect, or hmd app add-device), not on a timer and never while gh is signed out (--no-code pairs by QR instead and sends no token).'
 ALLOWLIST=("$S1" "$S2" "$S3" "$S4" "$S5" "$S6" "$S7")
 
 echo "truth-pass-claims harness  repo=$REPO"
