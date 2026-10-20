@@ -46,6 +46,13 @@
 #   - Non-destructive: a manual (marker-less) CHECKPOINT.md is preserved; the auto
 #     block is inserted around it.
 #   - .planning/ is gitignored — we write to disk only, never `git add`.
+#   - Link-safe: this runs unattended (SessionEnd worker, PreCompact hook) in whatever repo the session is
+#     in, and a repository controls every name below its root. `write` REFUSES — skips the whole save, one
+#     stderr line, exit 0 (fail open: a hook is never hurt by it) — when `.planning`, CHECKPOINT.md,
+#     RESUME-KEY.json or settings.json is a symlink (a dangling one too) or not a plain directory / regular
+#     file. Every write goes through bin/lib/hmd_nofollow_write.py (a temp file beside the target, then a
+#     rename: no link followed, none replaced). The team record under .planning/ledger is written by
+#     checkpoint_share.py through the same helper: a link there skips only that record.
 #
 # USAGE
 #   heimdall-checkpoint write [project_dir]   # write/update .planning/CHECKPOINT.md
@@ -55,6 +62,8 @@
 #
 # EXIT STATUS
 #   0  saved, complete, answer key published
+#   0  (also) refused on purpose — a path it writes is a link or not a plain entry; nothing was
+#      written, one line on stderr says which (fail open: the hooks must not be hurt)
 #   3  saved but INCOMPLETE — a contract field did not survive the write (loud)
 #   1  usage error
 #
@@ -112,6 +121,23 @@ _bounded() {
   else
     "$@"
   fi
+}
+
+# The ONE no-follow helper every write under the repo goes through (bin/lib/hmd_nofollow_write.py): a
+# repository controls every name below its root, and a plain mkdir / redirection / mv follows a symlink
+# planted there. Found by this script's own location, like resume-contract.sh. python3 is required — a path
+# this script cannot vet is a path it does not write (127 and one line say so).
+_nofollow() { # <helper args…>; stdout/stderr are the helper's
+  local py
+  py="$(command -v python3)" || { echo "python3 not found: cannot tell whether a path is a link" >&2; return 127; }
+  "$py" -I "$_CKPT_BIN/lib/hmd_nofollow_write.py" "$@"
+}
+
+# Replace .planning/<name> with the bytes of <src-file>, atomically, never through or over a link.
+# <mode> is the new file's octal creation mode, umask applied (default 600, what mktemp gave it before).
+_put() { # <project_dir> <name> <src-file> [mode]
+  local mode="${4:-600}"
+  _nofollow write --root "$1" --rel .planning --name "$2" --mode "$mode" < "$3"
 }
 
 # Resolve a sibling bin/ tool by this script's OWN location, not PATH — same
@@ -535,8 +561,9 @@ _build_block() {
 #   - has markers    -> replace between begin/end (update in place)
 #   - marker-less    -> prepend block, preserve existing (manual save protected)
 _write_checkpoint() {
-  local ckpt="$1" block="$2"
-  local tmp
+  local project_dir="$1" block="$2"
+  local ckpt tmp put_rc
+  ckpt="$(rc_ckpt_path "$project_dir")"
   tmp=$(mktemp) || return 1
 
   # Line numbers of an existing auto block, if any. Both markers must be present
@@ -570,13 +597,17 @@ _write_checkpoint() {
     } > "$tmp"
   fi
 
-  mv "$tmp" "$ckpt" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  _put "$project_dir" CHECKPOINT.md "$tmp"
+  put_rc=$?
+  rm -f "$tmp"
+  return "$put_rc"
 }
 
 # Persist goal + phase + last-checkpoint timestamp into .planning/settings.json.
 # Best-effort: needs jq; a "none" goal is not written as a fake condition.
 _update_settings() {
-  local settings="$1" goal="$2" phase="$3" ts="$4"
+  local project_dir="$1" goal="$2" phase="$3" ts="$4"
+  local settings="$project_dir/.planning/settings.json"
   command -v jq >/dev/null 2>&1 || return 0
 
   local base tmp
@@ -592,12 +623,13 @@ _update_settings() {
   if [ "$goal" = "none" ] || [ -z "$goal" ]; then
     printf '%s' "$base" | jq --arg p "$phase" --arg ts "$ts" \
       '.phase = $p | .auto_checkpoint_at = $ts' > "$tmp" 2>/dev/null \
-      && mv "$tmp" "$settings" 2>/dev/null || rm -f "$tmp"
+      && _put "$project_dir" settings.json "$tmp"
   else
     printf '%s' "$base" | jq --arg g "$goal" --arg p "$phase" --arg ts "$ts" \
       '.goal = ((.goal // {}) + {condition: $g}) | .phase = $p | .auto_checkpoint_at = $ts' > "$tmp" 2>/dev/null \
-      && mv "$tmp" "$settings" 2>/dev/null || rm -f "$tmp"
+      && _put "$project_dir" settings.json "$tmp"
   fi
+  rm -f "$tmp"
 }
 
 # Publish the SHAREABLE team checkpoint (TEAM MODE P4) — best-effort, non-fatal, consent-gated.
@@ -746,9 +778,8 @@ _stamp_incomplete() { # <block> -> stamped block on stdout
 # ---------------------------------------------------------------------------
 _write_key() { # <project_dir> <ts>
   local project_dir="$1" ts="$2"
-  local key tmp id label layer live dig len notes ncount first now
-  key="$(rc_key_path "$project_dir")"
-  tmp="$key.$$.tmp"
+  local tmp id label layer live dig len notes ncount first now put_rc
+  tmp="$(mktemp)" || return 1
   notes="$(rc_notes_path "$project_dir")"
   ncount="$(rc_notes_count "$project_dir")"
   now="$(date +%s 2>/dev/null || echo 0)"
@@ -785,7 +816,10 @@ _write_key() { # <project_dir> <ts>
     printf '  }\n'
     printf '}\n'
   } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
-  mv "$tmp" "$key" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  _put "$project_dir" RESUME-KEY.json "$tmp" 666
+  put_rc=$?
+  rm -f "$tmp" 2>/dev/null
+  return "$put_rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -830,6 +864,17 @@ cmd_write() {
   project_dir=$(cd "$project_dir" 2>/dev/null && pwd) || return 0
   local planning="$project_dir/.planning"
 
+  # LINK SAFETY, before anything under .planning is read or written: a repository controls every name below
+  # its root, and this runs unattended. A link (a dangling one too) or a non-plain entry at .planning or at a
+  # file written below is REFUSED — the whole save is skipped (a key beside a checkpoint that was not written
+  # would grade the old one), one line on stderr, exit 0 so no hook is hurt. A missing path is plain.
+  local refusal
+  if ! refusal="$(_nofollow check "$project_dir" .planning/ .planning/CHECKPOINT.md .planning/RESUME-KEY.json .planning/settings.json 2>&1)"; then
+    refusal="$(printf '%s' "${refusal#hmd_nofollow_write: }" | tr '\n' ' ')"
+    echo "[heimdall-checkpoint] write skipped — ${refusal}; nothing was saved" >&2
+    return 0
+  fi
+
   mkdir -p "$planning" 2>/dev/null || return 0
 
   local ts block probe
@@ -852,7 +897,7 @@ cmd_write() {
   else
     rm -f "$probe"
     block="$(_stamp_incomplete "$block")"
-    _write_checkpoint "$planning/CHECKPOINT.md" "$block" || true
+    _write_checkpoint "$project_dir" "$block" || true
     # Revoke any earlier key: grading damaged state against a stale key is how a
     # broken save scores green. No key means the probe reads RED, which is right.
     rm -f "$(rc_key_path "$project_dir")" 2>/dev/null
@@ -866,7 +911,7 @@ cmd_write() {
     return 3
   fi
 
-  _write_checkpoint "$planning/CHECKPOINT.md" "$block" || return 0
+  _write_checkpoint "$project_dir" "$block" || return 0
 
   # The key is published only AFTER the checkpoint is proven whole. Order matters:
   # a key beside a damaged checkpoint would let a resume grade itself green.
@@ -876,7 +921,7 @@ cmd_write() {
     return 3
   fi
 
-  _update_settings "$planning/settings.json" "$FT_GOAL" "$FT_PHASE" "$ts"
+  _update_settings "$project_dir" "$FT_GOAL" "$FT_PHASE" "$ts"
 
   # Publish the shareable team checkpoint (P4) — consent-gated + non-fatal, inside publish().
   _publish_shared "$project_dir" "$FT_PHASE" "$FT_GOAL"
@@ -913,6 +958,11 @@ Exit status of `write`:
   0  saved, all six resume fields verified present, key published
   3  INCOMPLETE — a required field did not survive the write. The checkpoint is
      stamped, the key is revoked, and stderr names the field. Do not resume from it.
+
+Link safety: `write` refuses — saves nothing, prints one line on stderr, exits 0 — when
+.planning, CHECKPOINT.md, RESUME-KEY.json or settings.json is a symlink (a dangling one too)
+or not a plain directory / regular file. A cloned repo can plant one and this runs unattended.
+Every write goes through bin/lib/hmd_nofollow_write.py: temp file beside the target, rename.
 
 Invoked automatically by the SessionEnd hook, and graded on the next restart by
 heimdall-resume-probe. The rich, human-authored handoff is /hmd:save
