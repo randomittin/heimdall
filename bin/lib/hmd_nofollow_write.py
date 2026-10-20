@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""hmd_nofollow_write.py -- vet, write and append to files under a directory a repository controls, never following a
-link (stdlib only).
+"""hmd_nofollow_write.py -- vet, write, append to and read files under a directory a repository controls, never following
+a link (stdlib only).
 
 WHY THIS EXISTS. bin/heimdall-checkpoint writes .planning/CHECKPOINT.md, RESUME-KEY.json, settings.json and the team
 record under .planning/ledger by itself -- from the SessionEnd worker and the PreCompact hook -- and appends its session
@@ -9,7 +9,10 @@ repository the session was started in, and a cloned repository controls every na
 `.heimdall`, `.planning/ledger` or one of the files in them can be a symlink to anywhere the user can write (a dangling
 one is created through), or a FIFO. A plain mkdir -p, redirection or mv follows such a link, so a hostile repo could send
 an automatic write -- or a read it then copies into a new file -- to a path of its choosing. The JSON stores of
-bin/lib/pmr_corpus.py go through it too: the issue security lane lives in the repository (.planning/security-signals).
+bin/lib/pmr_corpus.py go through it too: the issue security lane lives in the repository (.planning/security-signals). The
+notes file is READ back through it as well (the checkpoint folds its lines into CHECKPOINT.md, the resume probe counts
+them): `[ -f ]` and grep follow a link, so a repository that linked the file to one outside it got that file's note-shaped
+lines copied into the checkpoint.
 
 This is the sibling of bin/lib/hmd_private_state.py (the same walk: one component at a time, each opened O_NOFOLLOW
 relative to the one before, so no path string is resolved twice between the check and the use) with the policy .planning
@@ -27,10 +30,16 @@ link there may be the user's own setup, and replacing it would destroy it.
                                      the target). Missing directories are made (mkdir's usual mode). Refused, with
                                      nothing written, when the way down or the name is not plain.
   append(root, rel, name, data, mode) <root>/<rel>/<name> += data: opened O_APPEND|O_NOFOLLOW (never through a link) and
-                                     O_NONBLOCK (a FIFO cannot hang it), and checked to be a regular file ON THE
-                                     DESCRIPTOR that is written to; created with `mode` (umask applied) when it is
-                                     missing. Missing directories are made. Refused, with nothing written, when the way
-                                     down or the name is not plain.
+                                     O_NONBLOCK (a FIFO cannot hang it), and checked to be a regular file with ONE link ON
+                                     THE DESCRIPTOR that is written to (a hard link is a second name for a file the
+                                     repository may not own: a tarball can carry one, and no check of the NAME sees it);
+                                     created with `mode` (umask applied) when it is missing. Missing directories are made.
+                                     Refused, with nothing written, when the way down or the name is not plain.
+  read(root, rel, name, out)         the bytes of <root>/<rel>/<name> copied to the binary file `out`, a chunk at a time:
+                                     opened O_RDONLY|O_NOFOLLOW|O_NONBLOCK and checked like append's, on the descriptor it
+                                     reads from, so the check and the read cannot disagree. Nothing is made.
+                                     FileNotFoundError when the file or a directory of the way down is missing; Refused,
+                                     with nothing copied, when the way down or the name is not plain.
   open_dir(root, rel, make)          the descriptor of <root>/<rel> walked without following a link.
 
 A refusal is `Refused`, an OSError: a caller that catches OSError sees it, and `except Refused` tells it from a failure of
@@ -48,8 +57,9 @@ CLI (for the shell tools, so a state file never goes through a shell redirection
                                                                               creation mode, umask applied (default 600)
     python3 -I hmd_nofollow_write.py append --root DIR --rel REL --name NAME [--mode OCTAL]
                                                                               the bytes to append on stdin; same --mode
-exit 0 done / plain, 1 failed for another reason (an I/O error; the reason on stderr), 2 usage, 4 REFUSED (a link or an
-entry that is not plain; nothing was written; the reason on stderr).
+    python3 -I hmd_nofollow_write.py read --root DIR --rel REL --name NAME    the file's bytes on stdout; nothing is made
+exit 0 done / plain, 1 failed for another reason (an I/O error, or `read` of a file that is not there; the reason on
+stderr), 2 usage, 4 REFUSED (a link or an entry that is not plain; nothing was written or read; the reason on stderr).
 """
 import argparse
 import contextlib
@@ -61,6 +71,7 @@ import sys
 REFUSED = 4  # the exit status of a refusal: not 0 (done), not 1 (failed), not 2 (usage)
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_CHUNK = 1 << 16  # what read() copies at a time: a notes file a repository made huge must not be held in memory
 
 
 class Refused(OSError):
@@ -188,32 +199,68 @@ def write(root, rel, name, data, mode=0o600):
         os.close(dirfd)
 
 
+def _open_plain(dirfd, name, shown, flags, mode=0o600):
+    """Open `name` inside the open directory `dirfd` with `flags` and return its descriptor, which the caller closes, having
+    checked what was opened -- not what was named a moment ago -- ON THE DESCRIPTOR: a regular file with a single link. The
+    open is O_NOFOLLOW (a link planted since the lstat fails it) and O_NONBLOCK (a FIFO planted since cannot hang it).
+    Refused, with nothing left open, when the name is a link, a FIFO, a directory, or a regular file with another hard link:
+    the other name is a way to a file the repository may not own, which no check of THIS name can see."""
+    st = _lstat(name, dirfd)
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        raise _refusal(shown, st.st_mode, "a regular file")
+    try:
+        fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode, dir_fd=dirfd)
+    except OSError as exc:
+        planted = _lstat(name, dirfd) if exc.errno in (errno.ELOOP, errno.ENXIO) else None
+        if planted is None:
+            raise
+        raise _refusal(shown, planted.st_mode, "a regular file")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused("%s is not a regular file" % shown)
+        if st.st_nlink > 1:
+            raise Refused("%s has more than one hard link" % shown)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def append(root, rel, name, data, mode=0o600):
     """Add `data` (bytes) to the end of <root>/<rel>/<name>, never through a link; the file is created (`mode`, umask applied)
-    when it is not there. The name is refused, with nothing written, when it is there as anything but a regular file -- a
-    link included, which is not followed or replaced. The open is O_NOFOLLOW (a link planted since the check fails it) and
-    O_NONBLOCK (a FIFO planted since the check cannot hang it), and what it opened is checked to be a regular file before a
-    byte is written."""
+    when it is not there. The name is refused, with nothing written, when it is there as anything but a regular file with
+    one link -- a symbolic link included, which is not followed or replaced, and a hard-linked file, which would be written
+    through its other name. What it opened is checked before a byte is written (see _open_plain)."""
     _plain_name(name)
     shown = "/".join(_parts(rel) + [name])
     dirfd = open_dir(root, rel, True)
     try:
-        st = _lstat(name, dirfd)
-        if st is not None and not stat.S_ISREG(st.st_mode):
-            raise _refusal(shown, st.st_mode, "a regular file")
+        fd = _open_plain(dirfd, name, shown, os.O_WRONLY | os.O_APPEND | os.O_CREAT, mode)
         try:
-            fd = os.open(name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, mode, dir_fd=dirfd)
-        except OSError as exc:
-            planted = _lstat(name, dirfd) if exc.errno in (errno.ELOOP, errno.ENXIO) else None
-            if planted is None:
-                raise
-            raise _refusal(shown, planted.st_mode, "a regular file")
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise Refused("%s is not a regular file" % shown)
             view = memoryview(data)
             while view:
                 view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dirfd)
+
+
+def read(root, rel, name, out):
+    """Copy the bytes of <root>/<rel>/<name> to `out`, a binary file object, never through a link; nothing is made. The
+    name is refused, with nothing copied, when it is there as anything but a regular file with one link (see
+    _open_plain). FileNotFoundError when the file, or a directory of the way down, is not there."""
+    _plain_name(name)
+    shown = "/".join(_parts(rel) + [name])
+    dirfd = open_dir(root, rel)
+    try:
+        fd = _open_plain(dirfd, name, shown, os.O_RDONLY)
+        try:
+            chunk = os.read(fd, _CHUNK)
+            while chunk:
+                out.write(chunk)
+                chunk = os.read(fd, _CHUNK)
         finally:
             os.close(fd)
     finally:
@@ -232,10 +279,17 @@ def main(argv=None):
         wr.add_argument("--rel", default="")
         wr.add_argument("--name", required=True)
         wr.add_argument("--mode", default="600", help="octal creation mode, umask applied (default 600)")
+    rd = sub.add_parser("read", help="copy ROOT/REL/NAME to stdout")
+    rd.add_argument("--root", required=True)
+    rd.add_argument("--rel", default="")
+    rd.add_argument("--name", required=True)
     args = parser.parse_args(argv)
     try:
         if args.action == "check":
             check(args.root, args.paths)
+        elif args.action == "read":
+            read(args.root, args.rel, args.name, sys.stdout.buffer)
+            sys.stdout.buffer.flush()
         else:
             try:
                 mode = int(args.mode, 8)

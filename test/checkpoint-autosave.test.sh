@@ -33,6 +33,9 @@
 #      or session-end.log that is a symlink (a dangling one too) or a FIFO is skipped, never written
 #      through: the link's target stays byte-for-byte unchanged. RED before the guard (the notice
 #      lands in the target); a clean-repo control proves the notice is still logged when the path is real.
+#      A notice the repo's own path refuses is not dropped (nothing logged anywhere left a stale checkpoint
+#      silent): it goes to $HOME/.heimdall/logs/session-end.log behind the same guard (G1-G5 land there, G6-G9 refuse
+#      a link, a dangling link or a FIFO in that path), and G runs the worker with a throwaway HOME.
 #   H. LINK-SAFE WRITES      — the WRITER itself never writes through, or over, a link a cloned repo planted. A
 #      .planning, .planning/ledger, CHECKPOINT.md, RESUME-KEY.json or settings.json that is a symlink (a dangling
 #      one too) or a FIFO is REFUSED: the save is skipped, one stderr line says why, rc 4 (0 would read as saved,
@@ -42,9 +45,14 @@
 #   I. HONEST REFUSAL        — the PreCompact hook and the SessionEnd worker, run as hooks.json wires them, report a
 #      refused save as "checkpoint skipped: unsafe path", never as saved, and still exit 0 (they fail open).
 #   J. LINK-SAFE NOTES       — `heimdall-checkpoint note`, which the PreCompact hook runs, never appends through a
-#      symlinked .heimdall or resume-notes.ndjson (a dangling one too) or into a FIFO: refused, rc 4, target unchanged.
+#      symlinked .heimdall or resume-notes.ndjson (a dangling one too), into a FIFO or into a hard-linked file (J6):
+#      refused, rc 4, target unchanged.
 #   K. LINK-SAFE STORE WRITES — pmr_corpus._atomic_write_json, and the issue_corpus writers that call it, never write
 #      through or over a link: not at the file, not at a directory of the way down, not at the old temp name.
+#   L. LINK-SAFE NOTE READS  — the writer READS .heimdall/resume-notes.ndjson too (the four fields `note` feeds, the key's
+#      index layer) and the probe counts it (rc_notes_count). A symlinked .heimdall or notes file, a hard-linked
+#      file or a FIFO is SKIPPED, never followed: the save still lands (rc 0), one stderr line says the notes were
+#      skipped, the key records no store, and no line of the file a link points at reaches CHECKPOINT.md.
 #
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 
@@ -177,19 +185,29 @@ echo "G. LINK-SAFE LOG — the worker's notice log never writes through a link a
 # Each case runs the real hook against a fake plugin root whose checkpoint writer FAILS (so the worker
 # logs "checkpoint write failed") and whose summary-card -- the worker's step after both notice sites --
 # drops a marker: "the target is unchanged" is judged only once the worker has had its chance to write.
-HOOK_RC=0
+HOOK_RC=0; G_HOME=""
+# G_HOME is the HOME the worker runs with, so the fallback log ($HOME/.heimdall/logs/session-end.log) never lands in the
+# developer's own ~/.heimdall: a case that plants something there sets G_HOME first, any other case gets one made here;
+# the case removes it (g_done) when it is finished.
 run_failing_worker() {
   local p="$1" fake marker finished
+  [ -n "$G_HOME" ] || G_HOME="$(mktemp -d)"
   fake="$(mktemp -d)"; marker="$fake/worker-done"
   mkdir -p "$fake/bin"
   printf '#!/bin/sh\nexit 3\n' > "$fake/bin/heimdall-checkpoint"
   printf '#!/bin/sh\n: > "%s"\n' "$marker" > "$fake/bin/summary-card"
   chmod +x "$fake/bin/heimdall-checkpoint" "$fake/bin/summary-card"
-  ( cd "$p" && CLAUDE_PLUGIN_ROOT="$fake" bash -c "$CMD" </dev/null ) >/dev/null 2>&1
+  ( cd "$p" && HOME="$G_HOME" CLAUDE_PLUGIN_ROOT="$fake" bash -c "$CMD" </dev/null ) >/dev/null 2>&1
   HOOK_RC=$?
   wait_for "$marker"; finished=$?
   rm -rf "$fake"
   [ "$finished" -eq 0 ] && [ "$HOOK_RC" -eq 0 ]
+}
+g_done() { rm -rf "$G_HOME"; G_HOME=""; }
+home_logged() { # <phrase>: the notice the repo's own log path refused went to the fallback log in the worker's HOME instead
+  { grep -q -- "$1" "$G_HOME/.heimdall/logs/session-end.log" 2>/dev/null && grep -q -- "$(basename "$P")" "$G_HOME/.heimdall/logs/session-end.log" 2>/dev/null; } \
+    && ok "the refused notice was not lost: it went to \$HOME/.heimdall/logs/session-end.log, naming the repo" \
+    || bad "the repo's log path was refused and the notice went nowhere (a stale checkpoint stays silent); \$HOME holds: $(ls -AR "$G_HOME" 2>/dev/null | tr '\n' ' ')"
 }
 
 echo "  G0. control — a clean repo's notice IS logged (the link cases below judge a worker that reached the log):"
@@ -198,7 +216,10 @@ run_failing_worker "$P" || bad "G0: hook rc=$HOOK_RC, or the detached worker nev
 grep -q "checkpoint write failed (rc=3)" "$P/.heimdall/logs/session-end.log" 2>/dev/null \
   && ok "notice written to .heimdall/logs/session-end.log in a clean repo" \
   || bad "no notice in a clean repo's .heimdall/logs/session-end.log (control broken: the cases below prove nothing)"
-rm -rf "$P"
+[ ! -e "$G_HOME/.heimdall" ] \
+  && ok "nothing went to the \$HOME fallback: it is only for a repo path that was refused" \
+  || bad "a clean repo's notice also landed in the \$HOME fallback: $(ls -AR "$G_HOME" | tr '\n' ' ')"
+rm -rf "$P"; g_done
 
 echo "  G1. .heimdall/logs is a symlink to a directory holding a session-end.log:"
 P="$(make_project)"; T="$(mktemp -d)"
@@ -207,7 +228,8 @@ run_failing_worker "$P" || bad "G1: hook rc=$HOOK_RC, or the detached worker nev
 { [ "$(cat "$T/session-end.log")" = "precious" ] && [ "$(ls -A "$T")" = "session-end.log" ]; } \
   && ok "the target of the .heimdall/logs link is unchanged and nothing was added beside it" \
   || bad "the notice was written THROUGH the .heimdall/logs link"
-rm -rf "$P" "$T"
+home_logged "checkpoint write failed (rc=3)"
+rm -rf "$P" "$T"; g_done
 
 echo "  G2. .heimdall is a symlink to a directory holding logs/session-end.log:"
 P="$(make_project)"; T="$(mktemp -d)"
@@ -216,7 +238,8 @@ run_failing_worker "$P" || bad "G2: hook rc=$HOOK_RC, or the detached worker nev
 { [ "$(cat "$T/logs/session-end.log")" = "precious" ] && [ "$(ls -A "$T")" = "logs" ] && [ "$(ls -A "$T/logs")" = "session-end.log" ]; } \
   && ok "the target of the .heimdall link is unchanged and nothing was created in it" \
   || bad "the notice (or its directory) was written THROUGH the .heimdall link"
-rm -rf "$P" "$T"
+home_logged "checkpoint write failed (rc=3)"
+rm -rf "$P" "$T"; g_done
 
 echo "  G3. session-end.log is a symlink to an existing file:"
 P="$(make_project)"; T="$(mktemp -d)"
@@ -225,7 +248,8 @@ run_failing_worker "$P" || bad "G3: hook rc=$HOOK_RC, or the detached worker nev
 [ "$(cat "$T/target.txt")" = "precious" ] \
   && ok "the file the session-end.log link points at is unchanged" \
   || bad "the notice was appended THROUGH the session-end.log link"
-rm -rf "$P" "$T"
+home_logged "checkpoint write failed (rc=3)"
+rm -rf "$P" "$T"; g_done
 
 echo "  G4. session-end.log is a DANGLING symlink (>> would create its target):"
 P="$(make_project)"; T="$(mktemp -d)"
@@ -234,7 +258,8 @@ run_failing_worker "$P" || bad "G4: hook rc=$HOOK_RC, or the detached worker nev
 [ ! -e "$T/created-through-link" ] \
   && ok "the dangling link's target was not created" \
   || bad "the dangling session-end.log link was CREATED THROUGH"
-rm -rf "$P" "$T"
+home_logged "checkpoint write failed (rc=3)"
+rm -rf "$P" "$T"; g_done
 
 echo "  G5. session-end.log is a FIFO (not a regular file):"
 P="$(make_project)"
@@ -246,7 +271,61 @@ exec 3<&-
 [ -z "$LEAK" ] \
   && ok "nothing was written to the FIFO" \
   || bad "a notice was written to the FIFO: $LEAK"
-rm -rf "$P"
+home_logged "checkpoint write failed (rc=3)"
+rm -rf "$P"; g_done
+
+echo "  G6. the \$HOME fallback is link-safe too: the repo's .heimdall is a symlink (refused) and \$HOME/.heimdall/logs is a symlink to a directory holding a session-end.log:"
+P="$(make_project)"; T="$(mktemp -d)"; T2="$(mktemp -d)"; G_HOME="$(mktemp -d)"
+ln -s "$T" "$P/.heimdall"
+mkdir -p "$G_HOME/.heimdall"; printf 'precious\n' > "$T2/session-end.log"; ln -s "$T2" "$G_HOME/.heimdall/logs"
+run_failing_worker "$P" || bad "G6: hook rc=$HOOK_RC, or the detached worker never reached its last step"
+{ [ "$(cat "$T2/session-end.log")" = "precious" ] && [ "$(ls -A "$T2")" = "session-end.log" ] && [ -z "$(ls -A "$T")" ]; } \
+  && ok "the target of the \$HOME/.heimdall/logs link is unchanged, nothing was added beside it, and the repo's link target is empty" \
+  || bad "the notice was written THROUGH a link: $(ls -AR "$T2" | tr '\n' ' ')"
+rm -rf "$P" "$T" "$T2"; g_done
+
+echo "  G7. the \$HOME fallback: \$HOME/.heimdall itself is a symlink to a directory holding logs/session-end.log:"
+P="$(make_project)"; T="$(mktemp -d)"; T2="$(mktemp -d)"; G_HOME="$(mktemp -d)"
+ln -s "$T" "$P/.heimdall"
+mkdir -p "$T2/logs"; printf 'precious\n' > "$T2/logs/session-end.log"; ln -s "$T2" "$G_HOME/.heimdall"
+run_failing_worker "$P" || bad "G7: hook rc=$HOOK_RC, or the detached worker never reached its last step"
+{ [ "$(cat "$T2/logs/session-end.log")" = "precious" ] && [ "$(ls -A "$T2")" = "logs" ] && [ "$(ls -A "$T2/logs")" = "session-end.log" ]; } \
+  && ok "the target of the \$HOME/.heimdall link is unchanged and nothing was created in it" \
+  || bad "the notice (or its directory) was written THROUGH the \$HOME/.heimdall link: $(ls -AR "$T2" | tr '\n' ' ')"
+rm -rf "$P" "$T" "$T2"; g_done
+
+echo "  G8. the \$HOME fallback's session-end.log is a symlink to an existing file:"
+P="$(make_project)"; T="$(mktemp -d)"; T2="$(mktemp -d)"; G_HOME="$(mktemp -d)"
+ln -s "$T" "$P/.heimdall"
+mkdir -p "$G_HOME/.heimdall/logs"; printf 'precious\n' > "$T2/target.txt"; ln -s "$T2/target.txt" "$G_HOME/.heimdall/logs/session-end.log"
+run_failing_worker "$P" || bad "G8: hook rc=$HOOK_RC, or the detached worker never reached its last step"
+[ "$(cat "$T2/target.txt")" = "precious" ] \
+  && ok "the file the fallback session-end.log link points at is unchanged" \
+  || bad "the notice was appended THROUGH the fallback session-end.log link"
+rm -rf "$P" "$T" "$T2"; g_done
+
+echo "  G8b. the \$HOME fallback's session-end.log is a DANGLING symlink (>> would create its target):"
+P="$(make_project)"; T="$(mktemp -d)"; T2="$(mktemp -d)"; G_HOME="$(mktemp -d)"
+ln -s "$T" "$P/.heimdall"
+mkdir -p "$G_HOME/.heimdall/logs"; ln -s "$T2/created-through-link" "$G_HOME/.heimdall/logs/session-end.log"
+run_failing_worker "$P" || bad "G8b: hook rc=$HOOK_RC, or the detached worker never reached its last step"
+[ ! -e "$T2/created-through-link" ] \
+  && ok "the dangling fallback link's target was not created" \
+  || bad "the dangling fallback session-end.log link was CREATED THROUGH"
+rm -rf "$P" "$T" "$T2"; g_done
+
+echo "  G9. the \$HOME fallback's session-end.log is a FIFO (not a regular file):"
+P="$(make_project)"; T="$(mktemp -d)"; G_HOME="$(mktemp -d)"
+ln -s "$T" "$P/.heimdall"
+mkdir -p "$G_HOME/.heimdall/logs"; mkfifo "$G_HOME/.heimdall/logs/session-end.log"
+exec 3<>"$G_HOME/.heimdall/logs/session-end.log"   # the test holds the FIFO open, so a stray open cannot hang the worker
+run_failing_worker "$P" || bad "G9: hook rc=$HOOK_RC, or the detached worker never reached its last step"
+LEAK="$(perl -e 'use Fcntl; fcntl(STDIN, F_SETFL, O_NONBLOCK); sysread(STDIN, $b, 4096); print $b' <&3)"
+exec 3<&-
+[ -z "$LEAK" ] \
+  && ok "nothing was written to the fallback FIFO" \
+  || bad "a notice was written to the fallback FIFO: $LEAK"
+rm -rf "$P" "$T"; g_done
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "H. LINK-SAFE WRITES — the writer never writes through, or over, a link a cloned repo planted:"
@@ -431,18 +510,19 @@ run_precompact() { # <project>: what the wired PreCompact hook prints -> PC_OUT,
   PC_RC=$?
   rm -rf "$home"
 }
-run_worker_real_writer() { # <project>: the SessionEnd worker with the REAL writer; the hook's status -> HOOK_RC
-  local p="$1" fake marker finished home
-  fake="$(mktemp -d)"; marker="$fake/worker-done"; home="$(mktemp -d)"
+W_HOME=""
+run_worker_real_writer() { # <project>: the SessionEnd worker with the REAL writer; the hook's status -> HOOK_RC, its throwaway HOME -> W_HOME (the caller removes it)
+  local p="$1" fake marker finished
+  fake="$(mktemp -d)"; marker="$fake/worker-done"; W_HOME="$(mktemp -d)"
   mkdir -p "$fake/bin"
   printf '#!/bin/sh\nexec "%s" "$@"\n' "$CKPT" > "$fake/bin/heimdall-checkpoint"
   printf '#!/bin/sh\n: > "%s"\n' "$marker" > "$fake/bin/summary-card"
   chmod +x "$fake/bin/heimdall-checkpoint" "$fake/bin/summary-card"
-  ( cd "$p" && env -u HEIMDALL_HOME -u HEIMDALL_PLANNING_DIR -u HEIMDALL_PRESENCE_DIR HOME="$home" LC_ALL=C \
+  ( cd "$p" && env -u HEIMDALL_HOME -u HEIMDALL_PLANNING_DIR -u HEIMDALL_PRESENCE_DIR HOME="$W_HOME" LC_ALL=C \
       CLAUDE_PLUGIN_ROOT="$fake" bash -c "$CMD" </dev/null ) >/dev/null 2>&1
   HOOK_RC=$?
   wait_for "$marker"; finished=$?
-  rm -rf "$fake" "$home"
+  rm -rf "$fake"
   [ "$finished" -eq 0 ] && [ "$HOOK_RC" -eq 0 ]
 }
 
@@ -482,7 +562,7 @@ grep -q "checkpoint write failed" "$LOG" 2>/dev/null \
   || ok "the refusal is not logged as 'checkpoint write failed'"
 { [ "$(cat "$T/CHECKPOINT.md")" = "precious" ] && holds_only "$T" CHECKPOINT.md; } \
   && ok "the target of the .planning link is unchanged" || bad "the worker wrote through the .planning link"
-rm -rf "$P" "$T"
+rm -rf "$P" "$T" "$W_HOME"
 
 echo "  I3. the SessionEnd notice goes through the symlink-safe log: .heimdall is a symlink too:"
 P="$(make_project)"; T="$(mktemp -d)"; T2="$(mktemp -d)"
@@ -492,7 +572,11 @@ run_worker_real_writer "$P" || bad "I3: hook rc=$HOOK_RC, or the detached worker
 { [ "$(cat "$T2/logs/session-end.log")" = "precious" ] && [ "$(ls -A "$T2")" = "logs" ] && [ "$(ls -A "$T2/logs")" = "session-end.log" ]; } \
   && ok "the skipped-save notice was not written through the .heimdall link" \
   || bad "the notice was written THROUGH the .heimdall link: $(ls -AR "$T2" | tr '\n' ' ')"
-rm -rf "$P" "$T" "$T2"
+# The repo's own log path is refused, so the notice must not vanish: with the checkpoint skipped, nothing else says the file is stale.
+grep -q "checkpoint skipped: unsafe path" "$W_HOME/.heimdall/logs/session-end.log" 2>/dev/null \
+  && ok "the skipped-save notice went to \$HOME/.heimdall/logs/session-end.log instead" \
+  || bad "the skipped-save notice was lost: the repo's log path is refused and nothing was logged in \$HOME (got: $(ls -AR "$W_HOME" 2>/dev/null | tr '\n' ' '))"
+rm -rf "$P" "$T" "$T2" "$W_HOME"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "J. LINK-SAFE NOTES — heimdall-checkpoint note (the PreCompact hook runs it) never appends through a link:"
@@ -585,6 +669,21 @@ run_note "$P" HEIMDALL_HOME="$T/hmdhome"
 { [ "$J_RC" -eq "$REFUSED" ] && [ "$(cat "$T/target.ndjson")" = "precious" ] && [ -L "$T/hmdhome/resume-notes.ndjson" ]; } \
   && ok "rc $REFUSED, a link at the explicit store's file is refused and its target unchanged" \
   || bad "the explicit store's link was written through or replaced (rc=$J_RC)"
+rm -rf "$P" "$T"
+
+echo "  J6. resume-notes.ndjson is a HARD link to a file outside the repo (a regular file, so the lstat check passes it):"
+P="$(make_project)"; T="$(mktemp -d)"
+mkdir -p "$P/.heimdall"; printf 'precious\n' > "$T/target.ndjson"; ln "$T/target.ndjson" "$P/.heimdall/resume-notes.ndjson"
+run_note "$P"
+[ "$(cat "$T/target.ndjson")" = "precious" ] \
+  && ok "the file the hard link shares an inode with is unchanged" \
+  || bad "the note was appended THROUGH the hard link: $(cat "$T/target.ndjson")"
+{ [ "$J_RC" -eq "$REFUSED" ] && [ -f "$P/.heimdall/resume-notes.ndjson" ] && [ ! -L "$P/.heimdall/resume-notes.ndjson" ] \
+    && holds_only "$P/.heimdall" resume-notes.ndjson; } \
+  && ok "rc $REFUSED, the hard-linked name is left alone and nothing was created beside it" \
+  || bad "the hard-linked file was written or replaced (rc=$J_RC): $(ls -A "$P/.heimdall" | tr '\n' ' ')"
+printf '%s\n' "$J_ERR" | grep -q "hard link" \
+  && ok "stderr names the hard link" || bad "stderr should name the hard link (got: $J_ERR)"
 rm -rf "$P" "$T"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -758,6 +857,114 @@ while IFS= read -r line; do
   esac
 done <<<"$K_OUT"
 [ "$K_DONE" -eq 1 ] || bad "K: the store-write checks did not run to the end: $(printf '%s\n' "$K_OUT" | tail -6 | tr '\n' ' ')"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "L. LINK-SAFE NOTE READS — the writer never copies the target of a link into CHECKPOINT.md:"
+# `write` READS .heimdall/resume-notes.ndjson: the four fields `note` feeds (in progress, gated, warnings, refuted) and the
+# key's index layer; the probe counts it with rc_notes_count. It tested the file with `[ -f ]` and read it with grep, which
+# follow a symlink, so a cloned repo that linked .heimdall (or the file) to a file outside it got every note-shaped line of
+# that file copied into CHECKPOINT.md. The read now goes through the no-follow helper and the notes are SKIPPED when the
+# store is a link, a FIFO or a hard-linked file: the save still lands (rc 0: the notes are an optional input), ONE stderr
+# line says they were skipped, and the key records no store. L0 is the control: a clean repo's notes are still folded in.
+OUTSIDE="LEAKED-FROM-OUTSIDE-the-repo"
+outside_notes() { # <file>: note-shaped lines for each of the four fields `note` feeds
+  local c
+  : > "$1"
+  for c in in_progress gated_decisions open_warnings refuted_claims; do
+    printf '{"ts": 1, "utc": "x", "category": "%s", "text": "%s"}\n' "$c" "$OUTSIDE" >> "$1"
+  done
+}
+notes_skipped() { # <project> <phrase>: the save landed WITHOUT the notes, said so once (naming <phrase>), and the key records no store
+  local p="$1"
+  { [ "$H_RC" -eq 0 ] && [ -f "$p/.planning/CHECKPOINT.md" ] && [ -f "$p/.planning/RESUME-KEY.json" ] \
+      && ! grep -q "$OUTSIDE" "$p/.planning/CHECKPOINT.md" "$p/.planning/RESUME-KEY.json"; } \
+    && ok "rc 0: the save landed (fail open) and no line of the outside file is in CHECKPOINT.md" \
+    || bad "the outside file was read into the checkpoint, or the save was lost (rc=$H_RC): $(grep -c "$OUTSIDE" "$p/.planning/CHECKPOINT.md" 2>/dev/null) line(s) copied"
+  { [ "$(printf '%s\n' "$H_ERR" | grep -c "notes skipped")" -eq 1 ] && printf '%s\n' "$H_ERR" | grep -q -- "$2"; } \
+    && ok "one stderr line says the notes were skipped ($2)" \
+    || bad "stderr should say ONCE that the notes were skipped, naming $2 (got: $H_ERR)"
+  grep '"index"' "$p/.planning/RESUME-KEY.json" 2>/dev/null | grep -q '"present": false, "entries": 0' \
+    && ok "the key records no observation store (present false, 0 entries)" \
+    || bad "the key counts the outside file as the store: $(grep '"index"' "$p/.planning/RESUME-KEY.json" 2>/dev/null)"
+}
+
+echo "  L0. control — a clean repo's notes are folded into the checkpoint and counted in the key:"
+P="$(make_project)"
+run_note "$P"
+run_writer "$P"
+{ [ "$H_RC" -eq 0 ] && grep -q "note-under-test" "$P/.planning/CHECKPOINT.md" 2>/dev/null; } \
+  && ok "the recorded note is in CHECKPOINT.md (read through the no-follow helper), rc 0" \
+  || bad "a clean repo's note did not reach the checkpoint (rc=$H_RC): the skips below prove nothing"
+grep '"index"' "$P/.planning/RESUME-KEY.json" 2>/dev/null | grep -q '"present": true, "entries": 1' \
+  && ok "the key records the store: present, 1 entry" \
+  || bad "the key does not record the clean store: $(grep '"index"' "$P/.planning/RESUME-KEY.json" 2>/dev/null)"
+printf '%s\n' "$H_ERR" | grep -q "notes skipped" \
+  && bad "a plain store was reported as skipped: $H_ERR" \
+  || ok "no 'notes skipped' line for a plain store"
+rm -rf "$P"
+
+echo "  L1. resume-notes.ndjson is a symlink to a file of note-shaped lines:"
+P="$(make_project)"; T="$(mktemp -d)"
+mkdir -p "$P/.heimdall"; outside_notes "$T/target.ndjson"; ln -s "$T/target.ndjson" "$P/.heimdall/resume-notes.ndjson"
+BEFORE="$(cat "$T/target.ndjson")"
+run_writer "$P"
+notes_skipped "$P" "resume-notes.ndjson is a symbolic link"
+{ [ "$(cat "$T/target.ndjson")" = "$BEFORE" ] && [ -L "$P/.heimdall/resume-notes.ndjson" ] && [ "$(readlink "$P/.heimdall/resume-notes.ndjson")" = "$T/target.ndjson" ]; } \
+  && ok "the link and the file it points at are left alone" || bad "the link or its target was changed"
+rm -rf "$P" "$T"
+
+echo "  L2. .heimdall is a symlink to a directory holding a resume-notes.ndjson of note-shaped lines:"
+P="$(make_project)"; T="$(mktemp -d)"
+outside_notes "$T/resume-notes.ndjson"; ln -s "$T" "$P/.heimdall"
+BEFORE="$(cat "$T/resume-notes.ndjson")"
+run_writer "$P"
+notes_skipped "$P" "\.heimdall is a symbolic link"
+{ [ "$(cat "$T/resume-notes.ndjson")" = "$BEFORE" ] && [ -L "$P/.heimdall" ] && [ "$(readlink "$P/.heimdall")" = "$T" ]; } \
+  && ok "the .heimdall link and the notes file behind it are left alone" || bad "the .heimdall link or the file behind it was changed"
+rm -rf "$P" "$T"
+
+echo "  L3. resume-notes.ndjson is a HARD link to a file of note-shaped lines:"
+P="$(make_project)"; T="$(mktemp -d)"
+mkdir -p "$P/.heimdall"; outside_notes "$T/target.ndjson"; ln "$T/target.ndjson" "$P/.heimdall/resume-notes.ndjson"
+BEFORE="$(cat "$T/target.ndjson")"
+run_writer "$P"
+notes_skipped "$P" "hard link"
+[ "$(cat "$T/target.ndjson")" = "$BEFORE" ] \
+  && ok "the file the hard link shares an inode with is unchanged" || bad "the hard-linked file was changed"
+rm -rf "$P" "$T"
+
+echo "  L4. resume-notes.ndjson is a FIFO (not a regular file):"
+P="$(make_project)"
+mkdir -p "$P/.heimdall"; mkfifo "$P/.heimdall/resume-notes.ndjson"
+exec 3<>"$P/.heimdall/resume-notes.ndjson"   # the test holds the FIFO open, so a stray open cannot hang the writer
+run_writer "$P"
+exec 3<&-
+notes_skipped "$P" "not a regular file"
+[ -p "$P/.heimdall/resume-notes.ndjson" ] && ok "the FIFO is still a FIFO" || bad "the FIFO was replaced"
+rm -rf "$P"
+
+echo "  L5. HEIMDALL_HOME names the store and its resume-notes.ndjson is a symlink:"
+P="$(make_project)"; T="$(mktemp -d)"
+mkdir -p "$T/hmdhome"; outside_notes "$T/target.ndjson"; ln -s "$T/target.ndjson" "$T/hmdhome/resume-notes.ndjson"
+BEFORE="$(cat "$T/target.ndjson")"
+run_writer "$P" HEIMDALL_HOME="$T/hmdhome"
+notes_skipped "$P" "resume-notes.ndjson is a symbolic link"
+{ [ "$(cat "$T/target.ndjson")" = "$BEFORE" ] && [ -L "$T/hmdhome/resume-notes.ndjson" ]; } \
+  && ok "the explicit store's link and its target are left alone" || bad "the explicit store's link or its target was changed"
+rm -rf "$P" "$T"
+
+echo "  L6. the probe's count (rc_notes_count, shared through resume-contract.sh) does not follow a link either:"
+P="$(make_project)"; T="$(mktemp -d)"
+count_of() { env -u HEIMDALL_HOME bash -c '. "$1"; rc_notes_count "$2"' _ "$REPO/bin/lib/resume-contract.sh" "$1"; }
+run_note "$P"; run_note "$P"
+[ "$(count_of "$P")" = "2" ] \
+  && ok "control: a plain store with two notes counts 2" \
+  || bad "control broken: a plain store with two notes counts '$(count_of "$P")'"
+rm "$P/.heimdall/resume-notes.ndjson"; outside_notes "$T/target.ndjson"; ln -s "$T/target.ndjson" "$P/.heimdall/resume-notes.ndjson"
+[ "$(count_of "$P")" = "0" ] \
+  && ok "a symlinked store counts 0 (four note-shaped lines sit behind the link)" \
+  || bad "the count followed the link: '$(count_of "$P")'"
+rm -rf "$P" "$T"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
