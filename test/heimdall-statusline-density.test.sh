@@ -64,14 +64,16 @@ cols_for() { case "$1" in full) echo 120;; mid) echo 80;; narrow) echo 48;; tiny
 # cache + a fixed clock (HMD_NOW=7) + a fixed repo/model/limits + a fresh per-render
 # ledger-cache tmp make the emitted bytes stable.
 render_case() {
-  tier="$1"; color="$2"; cols="$(cols_for "$tier")"
+  tier="$1"; color="$2"; cols="${3:-$(cols_for "$tier")}"
   WS="$(mktemp -d)"; HOMED="$(mktemp -d)"; TMPD="$(mktemp -d)"
   mkdir -p "$WS/.heimdall"
   # The Row1 session code is the REPO's: keyed by the machine's session-code seed (a render only READS it -- a render
   # writes nothing) and by the realpath of the repo, workspace.project_dir (pinned in the stdin JSON below). The
   # throwaway HOME gets a FIXED seed and the JSON a FIXED project_dir, so the code -- and therefore every golden -- is
-  # the same on any machine and on every run, and the goldens keep covering the code's segment. No seed would mean no
-  # code on Row1 at all. This fixture used to get its determinism from a fixed session_id; the code is per-repo now
+  # the same on any machine and on every run. The code is SHOWN only while a relay client holds it registered (a marker
+  # under project_dir/.heimdall/app -- a path that does not exist here), so these goldens render Row1 with NO registration:
+  # no code, and the hint `pair: hmd app connect` only where Row1 has the room for it (it never displaces a segment). Section
+  # 6 proves the hint where it fits, test/app-pair-confirm.test.sh the code itself. No seed would mean no clause at all. This fixture used to get its determinism from a fixed session_id; the code is per-repo now
   # (no session id), so that determinism moved to the repo path. Left unpinned, project_dir falls back to current_dir
   # -- a fresh mktemp -d per render -- and the code, hence every full/mid golden, would change on every run.
   mkdir -p "$HOMED/.heimdall" && chmod 700 "$HOMED/.heimdall"
@@ -208,6 +210,17 @@ python3 -c "import sys;sys.exit(0 if float('$MED')<50.0 else 1)" \
   && ok "warm median render < 50ms (${MED}ms)" || bad "warm median render ${MED}ms exceeds 50ms budget"
 python3 -c "import sys;sys.exit(0 if float('$COLD')<500.0 else 1)" \
   && ok "cold-cache render < 500ms best-of-3 (${COLD}ms)" || bad "cold-cache render ${COLD}ms exceeds 500ms budget"
+
+echo "== 6) the pair hint (the code is not registered): shown where Row1 has room, never in place of a segment, every row == COLUMNS =="
+HINT_TXT="pair: hmd app connect"
+for c in 140 200; do
+  out="$(render_case full truecolor "$c")"; ws="$(widths <<<"$out")"
+  if grep -qF "· $HINT_TXT" <<<"$out" && [ "$ws" = "$c" ]; then ok "hint shown at $c cols, every row = $c"
+  else bad "hint at $c cols: missing, or widths [$ws] != [$c]"; fi
+done
+g="$GOLD/${SEED}_full_truecolor.txt"
+if ! grep -qF "$HINT_TXT" "$g" && grep -qF "Opus 4.8" "$g" && grep -qF ":statusline-v1" "$g"; then ok "120 cols (no room for it): no hint, and the model and repo:branch stay"
+else bad "120 cols: the hint was squeezed in, or it cost Row1 the model or the repo:branch"; fi
 
 echo
 echo "$pass passed, $fail failed"
