@@ -48,11 +48,14 @@
 #   - .planning/ is gitignored — we write to disk only, never `git add`.
 #   - Link-safe: this runs unattended (SessionEnd worker, PreCompact hook) in whatever repo the session is
 #     in, and a repository controls every name below its root. `write` REFUSES — skips the whole save, one
-#     stderr line, exit 0 (fail open: a hook is never hurt by it) — when `.planning`, CHECKPOINT.md,
-#     RESUME-KEY.json or settings.json is a symlink (a dangling one too) or not a plain directory / regular
-#     file. Every write goes through bin/lib/hmd_nofollow_write.py (a temp file beside the target, then a
-#     rename: no link followed, none replaced). The team record under .planning/ledger is written by
-#     checkpoint_share.py through the same helper: a link there skips only that record.
+#     stderr line, exit 4 — when `.planning`, CHECKPOINT.md, RESUME-KEY.json or settings.json is a symlink
+#     (a dangling one too) or not a plain directory / regular file; `note` REFUSES — appends nothing, one
+#     stderr line, exit 4 — when `.heimdall` or resume-notes.ndjson is. 4 is distinct on purpose: 0 reads as
+#     "saved" and 3 as INCOMPLETE. The hooks say "checkpoint skipped: unsafe path" for it and still fail
+#     open: a refusal never blocks a session. Every write goes through bin/lib/hmd_nofollow_write.py (a temp
+#     file beside the target, then a rename; a note is an O_NOFOLLOW append: no link followed, none
+#     replaced). The team record under .planning/ledger is written by checkpoint_share.py through the same
+#     helper: a link there skips only that record.
 #
 # USAGE
 #   heimdall-checkpoint write [project_dir]   # write/update .planning/CHECKPOINT.md
@@ -61,11 +64,13 @@
 #   heimdall-checkpoint help
 #
 # EXIT STATUS
-#   0  saved, complete, answer key published
-#   0  (also) refused on purpose — a path it writes is a link or not a plain entry; nothing was
-#      written, one line on stderr says which (fail open: the hooks must not be hurt)
+#   0  saved, complete, answer key published (`note`: recorded)
+#   1  usage error; `note`: the append failed for another reason (a full disk); `write`: CHECKPOINT.md
+#      could not be written after its paths were vetted (an I/O failure) — nothing was saved, stderr says why
 #   3  saved but INCOMPLETE — a contract field did not survive the write (loud)
-#   1  usage error
+#   4  REFUSED — a path it writes (`note`: appends to) is a link or not a plain entry, or could not be
+#      vetted (no python3); nothing was written, one line on stderr says which. Distinct from 0 and 3 so a
+#      hook cannot call it saved; the hooks fail open on it
 #
 # ENV SEAMS (tests only; neither carries data)
 #   HMD_CKPT_FAULT=<contract-id>  suppress one contract field at write time. This is
@@ -832,7 +837,7 @@ _write_key() { # <project_dir> <ts>
 # and a probe that grades three permanent blanks proves nothing at all.
 # ---------------------------------------------------------------------------
 cmd_note() { # <kind> <text...>
-  local kind="${1:-}" catid text store home
+  local kind="${1:-}" catid text store root rel err rc
   shift 2>/dev/null || true
   text="$*"
   if [ -z "$kind" ] || [ -z "$text" ]; then
@@ -843,18 +848,31 @@ cmd_note() { # <kind> <text...>
     echo "[heimdall-checkpoint] unknown note kind '$kind' — expected one of: in-progress, gated, refuted, warn" >&2
     return 1
   }
-  home="$(rc_home "$PWD")"
-  mkdir -p "$home" 2>/dev/null || {
-    echo "[heimdall-checkpoint] cannot create $home — note not recorded" >&2
-    return 1
-  }
+  # The store is <home>/resume-notes.ndjson, home = ${HEIMDALL_HOME:-<project>/.heimdall} (rc_home). A HEIMDALL_HOME is
+  # named by the environment: trusted, and made when missing, as before. The default .heimdall below the project belongs
+  # to the repository, so the append walks down from the project without following a link and REFUSES — nothing
+  # written, exit 4 — a .heimdall or resume-notes.ndjson that is a symlink (a dangling one too) or not a plain
+  # directory / regular file. `>>` would write through the link, create a dangling one's target and hang on a FIFO.
   store="$(rc_notes_path "$PWD")"
-  printf '{"ts": %s, "utc": "%s", "category": "%s", "text": "%s"}\n' \
+  if [ -n "${HEIMDALL_HOME:-}" ]; then
+    root="$(rc_home "$PWD")"; rel=""
+    mkdir -p "$root" 2>/dev/null || {
+      echo "[heimdall-checkpoint] cannot create $root — note not recorded" >&2
+      return 1
+    }
+  else
+    root="$PWD"; rel=".heimdall"
+  fi
+  err="$(printf '{"ts": %s, "utc": "%s", "category": "%s", "text": "%s"}\n' \
     "$(date +%s 2>/dev/null || echo 0)" "$(_timestamp)" "$catid" "$(rc_json_esc "$text")" \
-    >> "$store" || {
-    echo "[heimdall-checkpoint] cannot append to $store — note not recorded" >&2
+    | _nofollow append --root "$root" --rel "$rel" --name "${store##*/}" --mode 666 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    err="$(printf '%s' "${err#hmd_nofollow_write: }" | tr '\n' ' ')"
+    echo "[heimdall-checkpoint] note not recorded — ${err}" >&2
+    [ "$rc" -eq 4 ] && return 4
     return 1
-  }
+  fi
   echo "[heimdall-checkpoint] noted ($catid): $text"
 }
 
@@ -867,17 +885,19 @@ cmd_write() {
   # LINK SAFETY, before anything under .planning is read or written: a repository controls every name below
   # its root, and this runs unattended. A link (a dangling one too) or a non-plain entry at .planning or at a
   # file written below is REFUSED — the whole save is skipped (a key beside a checkpoint that was not written
-  # would grade the old one), one line on stderr, exit 0 so no hook is hurt. A missing path is plain.
+  # would grade the old one), one line on stderr, exit 4: not 0, which every caller reads as "saved", and not 3,
+  # which is INCOMPLETE. The hooks turn it into "checkpoint skipped: unsafe path" and still fail open. A missing
+  # path is plain.
   local refusal
   if ! refusal="$(_nofollow check "$project_dir" .planning/ .planning/CHECKPOINT.md .planning/RESUME-KEY.json .planning/settings.json 2>&1)"; then
     refusal="$(printf '%s' "${refusal#hmd_nofollow_write: }" | tr '\n' ' ')"
-    echo "[heimdall-checkpoint] write skipped — ${refusal}; nothing was saved" >&2
-    return 0
+    echo "[heimdall-checkpoint] write skipped — ${refusal}; nothing was written" >&2
+    return 4
   fi
 
   mkdir -p "$planning" 2>/dev/null || return 0
 
-  local ts block probe
+  local ts block probe wrc
   ts=$(_timestamp)
 
   # Measure once, in THIS shell — the printers below run in a subshell and the
@@ -911,7 +931,15 @@ cmd_write() {
     return 3
   fi
 
-  _write_checkpoint "$project_dir" "$block" || return 0
+  # A write that fails after the paths were vetted (an I/O error, or a link planted since the check) saved nothing, so it
+  # must not exit 0 either: 4 when the helper refused, 1 for any other failure. The reason is the helper's line above.
+  _write_checkpoint "$project_dir" "$block"
+  wrc=$?
+  if [ "$wrc" -ne 0 ]; then
+    echo "[heimdall-checkpoint] CHECKPOINT NOT WRITTEN — $(rc_ckpt_path "$project_dir") could not be replaced (rc=$wrc); the resume key was not published" >&2
+    [ "$wrc" -eq 4 ] && return 4
+    return 1
+  fi
 
   # The key is published only AFTER the checkpoint is proven whole. Order matters:
   # a key beside a damaged checkpoint would let a resume grade itself green.
@@ -954,15 +982,20 @@ Usage:
                                             The next `write` folds these into the
                                             matching contract field.
 
-Exit status of `write`:
+Exit status of `write` (`note`: 0 recorded, 1 failed, 4 refused):
   0  saved, all six resume fields verified present, key published
+  1  CHECKPOINT.md could not be written after its paths were vetted (an I/O error);
+     nothing was saved, stderr says why
   3  INCOMPLETE — a required field did not survive the write. The checkpoint is
      stamped, the key is revoked, and stderr names the field. Do not resume from it.
+  4  REFUSED — see below; nothing was written
 
-Link safety: `write` refuses — saves nothing, prints one line on stderr, exits 0 — when
-.planning, CHECKPOINT.md, RESUME-KEY.json or settings.json is a symlink (a dangling one too)
-or not a plain directory / regular file. A cloned repo can plant one and this runs unattended.
-Every write goes through bin/lib/hmd_nofollow_write.py: temp file beside the target, rename.
+Link safety: `write` refuses — saves nothing, prints one line on stderr, exits 4 (not 0: a
+hook would call that saved) — when .planning, CHECKPOINT.md, RESUME-KEY.json or settings.json
+is a symlink (a dangling one too) or not a plain directory / regular file; `note` refuses
+the same way for .heimdall and resume-notes.ndjson. A cloned repo can plant one and this
+runs unattended. Every write goes through bin/lib/hmd_nofollow_write.py: temp file beside
+the target, rename; a note is an O_NOFOLLOW append.
 
 Invoked automatically by the SessionEnd hook, and graded on the next restart by
 heimdall-resume-probe. The rich, human-authored handoff is /hmd:save

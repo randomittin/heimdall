@@ -358,18 +358,16 @@ def emit_issue(event, home=None):
 
 
 def _write_outbox(rec, home=None):
-    d = outbox_dir(home)
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, rec["ids"]["issue_id"] + ".json")
-    pmr_corpus._atomic_write_json(path, rec)
+    path = os.path.join(outbox_dir(home), rec["ids"]["issue_id"] + ".json")
+    pmr_corpus._atomic_write_json(path, rec, home)
     return path
 
 
 def _write_security_lane(rec, home=None):
-    d = security_signals_dir(home)
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, rec["ids"]["issue_id"] + ".json")
-    pmr_corpus._atomic_write_json(path, rec)
+    # The lane's root is the one security_signals_dir() hangs it from: the pinned home, else the repository -- whose
+    # .planning is the clone's to plant a link in, so the write walks down from the repo root without following one.
+    path = os.path.join(security_signals_dir(home), rec["ids"]["issue_id"] + ".json")
+    pmr_corpus._atomic_write_json(path, rec, home or _repo_root())
     return path
 
 
@@ -562,12 +560,11 @@ def purge(team_id=None, home=None):
         "requested_at": pmr_corpus._now_iso(),
         "status": "queued",
     }
-    os.makedirs(deletions_dir(home), exist_ok=True)
     req_path = os.path.join(
         deletions_dir(home),
         "%d-%s.json" % (int(pmr_corpus._now().timestamp()), tih),
     )
-    pmr_corpus._atomic_write_json(req_path, req)
+    pmr_corpus._atomic_write_json(req_path, req, home)
     removed = pmr_corpus._empty_dir(outbox_dir(home))
     return {"purged": True, "removed": removed, "team_id_hash": tih,
             "deletion_request": req_path}

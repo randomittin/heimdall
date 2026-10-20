@@ -50,6 +50,7 @@ if _HERE not in sys.path:
 # REUSE the general telemetry layer's secret-shape patterns — never re-derive the
 # secret vocabulary (bin/lib/telemetry.py:81 _SECRET_PATTERNS / :95 _ASSIGNED_OPAQUE).
 import telemetry as _tel  # noqa: E402 — sibling import after sys.path setup
+import hmd_nofollow_write as _nf  # noqa: E402 — the no-follow walk + atomic write every store write goes through
 
 # ── versioned consent (stamped on EVERY record — §3 rights layer) ─────────────
 # Bump when the T0 disclosure text or the pmr_v1 shape changes. The consent
@@ -195,14 +196,19 @@ def _read_json(path, default):
         return default
 
 
-def _atomic_write_json(path, obj):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp-%d" % os.getpid()
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, sort_keys=True, indent=2)
-        fh.write("\n")
-        fh.flush()
-    os.replace(tmp, path)
+def _atomic_write_json(path, obj, root=None):
+    """Write `obj` as `path`, atomically and WITHOUT following a link. `root` is the directory the store hangs from: the
+    corpus home the caller was told to use (None: corpus_home()). It is the caller's own word, so it is trusted and made
+    when missing, as before. Everything below it is not: the issue security lane lives in the repository, where any name
+    can be a symlink (a dangling one too) or a FIFO a clone planted. hmd_nofollow_write walks down from `root` one
+    component at a time and REFUSES (OSError: nothing written or created, the link left alone) instead of writing
+    through or over one -- including the temp file, which has an unguessable name and is created O_EXCL. It also makes
+    the directories the path needs, the same way, so a caller must not os.makedirs first (that follows a link). A `path`
+    that is not below `root` is refused. The file gets the umask's usual mode (0644), as the open() it replaces did."""
+    root = root or corpus_home()
+    os.makedirs(root, exist_ok=True)
+    data = (json.dumps(obj, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    _nf.write(root, os.path.relpath(os.path.dirname(path), root), os.path.basename(path), data, 0o666)
 
 
 def load_consent(home=None):
@@ -230,7 +236,7 @@ def load_consent(home=None):
 
 def save_consent(state, home=None):
     state["updated"] = _now_iso()
-    _atomic_write_json(consent_path(home), state)
+    _atomic_write_json(consent_path(home), state, home)
     return state
 
 
@@ -689,10 +695,8 @@ def emit_pmr(job, home=None):
 
 
 def _write_spool(rec, home=None):
-    d = spool_dir(home)
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, rec["ids"]["pmr_id"] + ".json")
-    _atomic_write_json(path, rec)
+    path = os.path.join(spool_dir(home), rec["ids"]["pmr_id"] + ".json")
+    _atomic_write_json(path, rec, home)
     return path
 
 
@@ -756,7 +760,7 @@ def _set_pending(rc_hash, pmr_id, home=None):
     if not isinstance(state, dict):
         state = {}
     state[rc_hash] = {"pmr_id": pmr_id, "ts": _now_iso()}
-    _atomic_write_json(pending_path(home), state)
+    _atomic_write_json(pending_path(home), state, home)
 
 
 def _get_pending(rc_hash, home=None):
@@ -767,7 +771,7 @@ def _clear_pending(rc_hash, home=None):
     state = _read_json(pending_path(home), {})
     if isinstance(state, dict) and rc_hash in state:
         state.pop(rc_hash, None)
-        _atomic_write_json(pending_path(home), state)
+        _atomic_write_json(pending_path(home), state, home)
 
 
 def _hunks_from_sha(repo, sha):
@@ -838,7 +842,7 @@ def observe_commit(repo=None, sha=None, home=None):
         if not isinstance(seeds, dict):
             seeds = {}
         seeds[pend["pmr_id"]] = seed
-        _atomic_write_json(seeds_path(home), seeds)
+        _atomic_write_json(seeds_path(home), seeds, home)
         _clear_pending(rc, home)
         return {"observed": True, "pmr_id": pend["pmr_id"],
                 "merged_sha_hash": seed["merged_sha_hash"]}
@@ -940,10 +944,8 @@ def scan_outcomes(repo=None, now=None, home=None):
 
 
 def _write_outcome(rec, home=None):
-    d = outcome_dir(home)
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, rec["pmr_id"] + ".outcome.json")
-    _atomic_write_json(path, rec)
+    path = os.path.join(outcome_dir(home), rec["pmr_id"] + ".outcome.json")
+    _atomic_write_json(path, rec, home)
     return path
 
 
@@ -1013,12 +1015,11 @@ def purge(team_id=None, repo=None, home=None):
         "requested_at": _now_iso(),
         "status": "queued",
     }
-    os.makedirs(deletions_dir(home), exist_ok=True)
     req_path = os.path.join(
         deletions_dir(home),
         "%d-%s.json" % (int(_now().timestamp()), tih),
     )
-    _atomic_write_json(req_path, req)
+    _atomic_write_json(req_path, req, home)
 
     removed = _empty_dir(spool_dir(home)) + _empty_dir(outcome_dir(home))
     for p in (pending_path(home), seeds_path(home)):
@@ -1329,13 +1330,11 @@ def spool_hunk(record, home=None):
     discipline as the T0 spool. A `pmr_id` / `hunk_id` (else a content hash) names the file.
     Returns the path. Stored as-is; the secret-scan belt runs at flush + the server re-scans at
     ingest, so a secret can never leave even if one is queued."""
-    d = hunk_spool_dir(home)
-    os.makedirs(d, exist_ok=True)
     name = str(record.get("pmr_id") or record.get("hunk_id")
                or hashlib.sha256(
                    json.dumps(record, sort_keys=True).encode("utf-8")).hexdigest()[:24])
-    path = os.path.join(d, name + ".json")
-    _atomic_write_json(path, record)
+    path = os.path.join(hunk_spool_dir(home), name + ".json")
+    _atomic_write_json(path, record, home)
     return path
 
 
