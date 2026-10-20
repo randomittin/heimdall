@@ -67,6 +67,9 @@ NPM_PKG_DIRS="packages/runheimdall packages/runhmd"
 NPM_EXPORT_ROOT=""
 # The commit a post-tag run grades and ships from: require_full_sweep_receipt <tag> sets it to the commit that tag names.
 RELEASE_COMMIT=""
+# What find_archived_receipt reports: the archived sweep receipt that vouches for the tag and what it graded, or why each file it tried does not. Assigned here, and afresh on every call, so that a stray
+# environment variable of the same name cannot stand in for a receipt.
+ARCHIVED_RECEIPT=""; ARCHIVED_HOW=""; ARCHIVED_NOTES=""
 # The author/committer identity allowlist is NOT duplicated here — R9 (b) below
 # delegates to bin/heimdall-check-identities, the single source of truth shared
 # with the native pre-push hook, so the release gate and pre-push gate can never
@@ -110,7 +113,9 @@ receipt the push gate accepts is not enough, and nothing is bumped without it.
 must have graded the tag's own `chore(release): vX.Y.Z` commit, or the commit it was bumped from (journal and
 ledger commits aside) while that commit only re-pins version files. Commits after the tag do not matter:
 --npm-only publishes the files of the tagged commit (never the working tree) and --release-only signs the
-tagged commit's install.sh. Anything else refuses, naming the tag's commit and why.
+tagged commit's install.sh. Anything else refuses, naming the tag's commit and why. When last-full-green.json
+has moved on to a later sweep, the receipt may be the archived one of its own sweep (receipts/full-green/
+<head_sha>.json, the newest 20 green full sweeps), held to the same checks.
 Stops at the first failure. Nothing is pushed if the local scan finds leaks.
 A run that CANNOT publish a release or publish to npm fails loudly in preflight — it
 never bumps, warns, and exits 0 (that silent skip is what stranded v2.2.3/v2.0.17/v2.0.13
@@ -174,6 +179,13 @@ write_version() {  # $1=new version — rewrite plugin.json's version field in p
 #   which only names WHICH tag a recovery run is about -- T's own manifest must say the same version, and the files that ship come from T.
 # A --release-only run that has to CREATE the tag (the ship died between the bump and the tag) has no T to grade: it tags HEAD, so it must pass the strict ordinary check at HEAD,
 # exactly as a full ship does. And a sweep recorded at a HEAD past the tag proves HEAD, not T, so it does not cover the tag: the refusal says so and names the commit to re-sweep.
+#
+# THE ARCHIVE (the anchor moves on). receipts/last-full-green.json is the chain anchor, and every later green sweep of main replaces it -- so a release that WAS swept green could no longer be published once main
+# had been swept again: the post-tag modes read only the anchor, and a sweep of later main is a receipt for a commit past the tag, which does not cover it (above). test/run-all.sh therefore also files an atomic
+# copy of every green FULL receipt as receipts/full-green/<head_sha>.json (the newest 20 are kept), and when the anchor cannot vouch for the tag the post-tag modes try those (find_archived_receipt): the file filed
+# for T, the one for T's parent, then every other. An archived receipt is held to exactly what the anchor is held to -- full_receipt_shape (green, clean, kind full and not aborted, THIS repo), receipt_covers_tag (the
+# same coverage rule, journal and ledger commits aside) and full_receipt_verified (verify-receipt when it has a cache block, the cold receipt of an x.y.0 release) -- and to one thing more: the file must be named for
+# the commit it graded, which is how test/run-all.sh writes it. The bare path (a NEW full ship) never reads the archive: it grades HEAD, which only the newest sweep can have graded.
 #
 # FAIL CLOSED. Anything that cannot be answered (a tag that does not resolve, a commit that is no ancestor, a file git cannot show, a mode, a status the bump never produces, an
 # export that is not T's own bytes) is a refusal that names its reason. None of the functions below tags, commits or pushes; the only thing they write is the export.
@@ -948,54 +960,122 @@ preflight_release_prereqs() {
   ok "release prereqs: gh present + authenticated, notes generator present"
 }
 
+# full_receipt_shape <receipt> <repo top> -- 0 when the file is, on its face, a green, clean FULL sweep of THIS repo: parseable, not an aborted run, exit_code 0, tree_clean, kind full, and `repo` the toplevel
+# of the repo being released. Anything else prints the refusal on one line and returns 1. What every receipt a release can rest on must be, the anchor and an archived one alike.
+full_receipt_shape() {
+  local fr="$1" canon="$2"
+  if [ ! -f "$fr" ] || ! jq -e . "$fr" >/dev/null 2>&1; then
+    printf 'a release requires a green FULL sweep receipt at HEAD, and there is none (%s). Run: bash test/run-all.sh  — an incremental --since-green receipt is not enough for a release.' "$fr"
+    return 1
+  fi
+  if ! jq -e '(.kind // "full") != "aborted"' "$fr" >/dev/null 2>&1; then
+    printf 'a release requires a green FULL sweep receipt at HEAD, but %s is from an ABORTED run (test/run-all.sh --fail-fast stopped it before every suite ran) and proves nothing. Run: bash test/run-all.sh, without --fail-fast' "$fr"
+    return 1
+  fi
+  if ! jq -e '.exit_code == 0 and .tree_clean == true and ((.kind // "full") == "full")' "$fr" >/dev/null 2>&1; then
+    printf 'a release requires a green FULL sweep receipt at HEAD, but %s is not a green, clean full sweep. Run: bash test/run-all.sh' "$fr"
+    return 1
+  fi
+  if [ "$(jq -r '.repo // empty' "$fr")" != "$canon" ]; then
+    printf 'a release requires a green FULL sweep receipt at HEAD, but %s was recorded for a different repo. Run: bash test/run-all.sh' "$fr"
+    return 1
+  fi
+}
+
+# full_receipt_verified <receipt> <version> -- 0 when a receipt that carries a suite-cache block (test/run-all.sh served some suites from its per-suite cache) verifies: bin/heimdall-suite-closure re-derives it at the
+# commit it graded (every closure hash, the salt, the age of every entry, the audit sample, a green entry per suite), and an x.y.0 release (a minor or a major version) needs a COLD receipt, every suite run in that
+# sweep. The flag in the receipt is never taken on its word. A receipt without a cache block is the legacy one (every suite ran) and passes. Otherwise prints the refusal on one line and returns 1.
+full_receipt_verified() {
+  local fr="$1" version="$2" vr_out
+  jq -e '(.cache | type) == "object"' "$fr" >/dev/null 2>&1 || return 0
+  if [ ! -x "$REPO_ROOT/bin/heimdall-suite-closure" ]; then
+    printf 'the sweep receipt %s carries a suite-cache block and bin/heimdall-suite-closure is not here to verify it -- a receipt nothing can verify authorises nothing. Run: bash test/run-all.sh --no-cache' "$fr"
+    return 1
+  fi
+  if ! vr_out="$("$REPO_ROOT/bin/heimdall-suite-closure" verify-receipt --repo "$REPO_ROOT" --receipt "$fr" 2>&1)"; then
+    printf 'the green FULL sweep receipt %s does not verify (bin/heimdall-suite-closure verify-receipt): %s. A release needs a receipt that verifies. Run: bash test/run-all.sh (the cache re-runs only what changed, plus the audit sample)' \
+      "$fr" "$(printf '%s' "$vr_out" | sed 's/^verify-receipt: //' | paste -sd';' - | sed 's/;/; /g')"
+    return 1
+  fi
+  case "$version" in
+    *.*.0)
+      if ! jq -e '.cache.cold == true' "$fr" >/dev/null 2>&1; then
+        printf 'a %s release (a minor or major version) needs a COLD sweep receipt -- every suite run in that sweep -- and %s was composed from the suite cache. Run: bash test/run-all.sh --cold' "$version" "$fr"
+        return 1
+      fi ;;
+  esac
+}
+
+# find_archived_receipt <home> <tag> <commit> <version> <repo top> -- the archived receipt (<home>/receipts/full-green/<head_sha>.json, one per green FULL sweep, the newest 20) that vouches for <commit>, the release
+# commit <tag> names, now that last-full-green.json no longer does. Returns 0 and sets ARCHIVED_RECEIPT (its path) and ARCHIVED_HOW (what it graded, as receipt_covers_tag words it); returns 1 and sets ARCHIVED_NOTES (what
+# is wrong with the files it tried, three at most, one line) when none does. The file for <commit> and the one for the commit it was bumped from are tried first, then every other: a receipt a few journal commits behind
+# the bump still covers it. Each one is held to what the anchor is held to (full_receipt_shape, receipt_covers_tag, full_receipt_verified) and to one thing more: the file must be named for the commit it graded, which is
+# how test/run-all.sh files it and how the archive says what a file vouches for, so a receipt copied under another name is a forgery. The engine, the one expensive question, is asked last, after the coverage rule.
+find_archived_receipt() {
+  local home="$1" tag="$2" rc="$3" version="$4" canon="$5" arch f p1 r_sha why how tried="" notes=""
+  ARCHIVED_RECEIPT=""; ARCHIVED_HOW=""; ARCHIVED_NOTES=""
+  arch="$home/receipts/full-green"
+  p1="$(git rev-parse -q --verify "${rc}^" 2>/dev/null)" || p1=""
+  for f in "$arch/$rc.json" "$arch/$p1.json" "$arch"/*.json; do
+    [ -f "$f" ] || continue
+    case "$tried" in *"|$f|"*) continue ;; esac
+    tried="$tried|$f|"
+    why="$(full_receipt_shape "$f" "$canon")" || { notes="$notes$why"$'\n'; continue; }
+    r_sha="$(jq -r '.head_sha // empty' "$f")"
+    [ "${f##*/}" = "$r_sha.json" ] \
+      || { notes="$notes$f is filed under a commit it did not grade (it graded ${r_sha:0:12}), so test/run-all.sh did not write it"$'\n'; continue; }
+    how="$(receipt_covers_tag "$r_sha" "$tag" "$rc")" || { notes="$notes${f##*/}: $how"$'\n'; continue; }
+    why="$(full_receipt_verified "$f" "$version")" || { notes="$notes$why"$'\n'; continue; }
+    ARCHIVED_RECEIPT="$f"; ARCHIVED_HOW="$how"
+    return 0
+  done
+  ARCHIVED_NOTES="$(printf '%s' "$notes" | awk 'NF && n < 3 { n++; printf "%s%s", (n > 1 ? "; " : ""), $0 }')"
+  return 1
+}
+
 # require_full_sweep_receipt [<tag>] — a release (a tag, a GitHub Release, an npm publish) ships what a FULL sweep proved, and only a FULL
 # sweep proves a commit: the incremental `test/run-all.sh --since-green` receipt the push gate accepts re-ran only the suites a diff could
 # reach, which is the right trade for a push and the wrong one for a version number. So release/ship.sh reads the chain anchor
 # (receipts/last-full-green.json, written by test/run-all.sh ONLY for a green, clean, full sweep) and demands that it is a green
 # FULL sweep of THIS repo. Runs in preflight, before anything is bumped, committed, tagged, pushed or published.
 #   Bare (a full ship): the receipt must cover HEAD, the commit about to be bumped -- commits that touch only hook-owned paths
-#   (bin/lib/hook-owned-path.sh) do not stale it, any other commit does.
+#   (bin/lib/hook-owned-path.sh) do not stale it, any other commit does. Only the anchor is read.
 #   With a <tag> (--release-only and --npm-only, which run AFTER the tag exists): the receipt must cover the commit that tag names, and HEAD is
-#   not looked at at all -- receipt_covers_tag holds the rule, and "The release commit and the sweep receipt" above the reasoning. On success
-#   RELEASE_COMMIT is that commit: the one these modes ship from.
+#   not looked at at all -- receipt_covers_tag holds the rule, and "The release commit and the sweep receipt" above the reasoning. The anchor is
+#   tried first; when it cannot vouch for the tag (a later sweep of main replaced it, or it is unusable) the archive of green full sweeps is
+#   (find_archived_receipt, "The archive" above), and the refusal says what was wrong with the receipts it tried. On success RELEASE_COMMIT is
+#   that commit: the one these modes ship from.
 require_full_sweep_receipt() {
-  local tag="${1:-}" version="${2:-}" home="${HEIMDALL_HOME:-$REPO_ROOT/.heimdall}" fr canon head r_sha other rc how vr_out
+  local tag="${1:-}" version="${2:-}" home="${HEIMDALL_HOME:-$REPO_ROOT/.heimdall}" fr canon head r_sha other rc how why
   fr="$home/receipts/last-full-green.json"
   command -v jq >/dev/null 2>&1 || die "jq not found — the sweep receipt cannot be read, so a release cannot be authorised. Install it (brew install jq)."
   head="$(git rev-parse HEAD 2>/dev/null)" || die "not a git checkout — cannot check the sweep receipt"
   canon="$(git rev-parse --show-toplevel)"
-  if [ ! -f "$fr" ] || ! jq -e . "$fr" >/dev/null 2>&1; then
-    die "a release requires a green FULL sweep receipt at HEAD, and there is none ($fr). Run: bash test/run-all.sh  — an incremental --since-green receipt is not enough for a release."
-  fi
-  jq -e '(.kind // "full") != "aborted"' "$fr" >/dev/null 2>&1 \
-    || die "a release requires a green FULL sweep receipt at HEAD, but $fr is from an ABORTED run (test/run-all.sh --fail-fast stopped it before every suite ran) and proves nothing. Run: bash test/run-all.sh, without --fail-fast"
-  jq -e '.exit_code == 0 and .tree_clean == true and ((.kind // "full") == "full")' "$fr" >/dev/null 2>&1 \
-    || die "a release requires a green FULL sweep receipt at HEAD, but $fr is not a green, clean full sweep. Run: bash test/run-all.sh"
-  [ "$(jq -r '.repo // empty' "$fr")" = "$canon" ] \
-    || die "a release requires a green FULL sweep receipt at HEAD, but $fr was recorded for a different repo. Run: bash test/run-all.sh"
-  # A receipt with a cache block (test/run-all.sh served some suites from its per-suite cache) counts only once bin/heimdall-suite-closure has re-derived it at the commit it graded: every closure
-  # hash, the salt, the age of every entry, the audit sample, a green entry per suite. An x.y.0 release (a minor or a major version) needs a COLD receipt: every suite ran in that sweep.
-  # The flag in the receipt is never taken on its word. A receipt without a cache block is the legacy one (every suite ran) and is judged as before.
-  if jq -e '(.cache | type) == "object"' "$fr" >/dev/null 2>&1; then
-    [ -x "$REPO_ROOT/bin/heimdall-suite-closure" ] \
-      || die "the sweep receipt $fr carries a suite-cache block and bin/heimdall-suite-closure is not here to verify it -- a receipt nothing can verify authorises nothing. Run: bash test/run-all.sh --no-cache"
-    vr_out="$("$REPO_ROOT/bin/heimdall-suite-closure" verify-receipt --repo "$REPO_ROOT" --receipt "$fr" 2>&1)" \
-      || die "the green FULL sweep receipt $fr does not verify (bin/heimdall-suite-closure verify-receipt): $(printf '%s' "$vr_out" | sed 's/^verify-receipt: //' | paste -sd';' - | sed 's/;/; /g'). A release needs a receipt that verifies. Run: bash test/run-all.sh (the cache re-runs only what changed, plus the audit sample)"
-    case "$version" in
-      *.*.0) jq -e '.cache.cold == true' "$fr" >/dev/null 2>&1 \
-               || die "a $version release (a minor or major version) needs a COLD sweep receipt -- every suite run in that sweep -- and $fr was composed from the suite cache. Run: bash test/run-all.sh --cold" ;;
-    esac
-  fi
-  r_sha="$(jq -r '.head_sha // empty' "$fr")"
   if [ -n "$tag" ]; then
-    rc="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}" 2>/dev/null)" \
-      || die "tag $tag does not exist (or names no commit): a post-tag run grades, and --npm-only publishes, the commit the tag names, and ${tag#v} was never tagged here. Finish the release first (release/ship.sh --release-only), then re-run."
-    how="$(receipt_covers_tag "$r_sha" "$tag" "$rc")" \
-      || die "the green FULL sweep receipt is STALE for tag $tag (${rc:0:12}): ${how}. A post-tag run grades the commit the tag names, not HEAD, so it needs a receipt that graded that commit or the one it was bumped from. Re-sweep it (check out ${rc:0:12}, run: bash test/run-all.sh) or cut a new release."
-    RELEASE_COMMIT="$rc"
-    ok "green FULL sweep receipt covers tag $tag (${rc:0:12}): it graded ${how}"
-    return 0
+    rc="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}" 2>/dev/null)" || rc=""
+    ARCHIVED_NOTES=""
+    if why="$(full_receipt_shape "$fr" "$canon")" && why="$(full_receipt_verified "$fr" "$version")"; then
+      [ -n "$rc" ] \
+        || die "tag $tag does not exist (or names no commit): a post-tag run grades, and --npm-only publishes, the commit the tag names, and ${tag#v} was never tagged here. Finish the release first (release/ship.sh --release-only), then re-run."
+      r_sha="$(jq -r '.head_sha // empty' "$fr")"
+      if how="$(receipt_covers_tag "$r_sha" "$tag" "$rc")"; then
+        RELEASE_COMMIT="$rc"
+        ok "green FULL sweep receipt covers tag $tag (${rc:0:12}): it graded ${how}"
+        return 0
+      fi
+      why="the green FULL sweep receipt is STALE for tag $tag (${rc:0:12}): ${how}. A post-tag run grades the commit the tag names, not HEAD, so it needs a receipt that graded that commit or the one it was bumped from. Re-sweep it (check out ${rc:0:12}, run: bash test/run-all.sh) or cut a new release."
+    fi
+    if [ -n "$rc" ] && find_archived_receipt "$home" "$tag" "$rc" "$version" "$canon"; then
+      RELEASE_COMMIT="$rc"
+      ok "green FULL sweep receipt covers tag $tag (${rc:0:12}): it graded ${ARCHIVED_HOW} -- the archived receipt full-green/${ARCHIVED_RECEIPT##*/}; last-full-green.json does not vouch for this tag"
+      return 0
+    fi
+    [ -z "$ARCHIVED_NOTES" ] || why="$why The archive of green full sweeps (full-green/) was tried too: $ARCHIVED_NOTES."
+    die "$why"
   fi
+  why="$(full_receipt_shape "$fr" "$canon")" || die "$why"
+  why="$(full_receipt_verified "$fr" "$version")" || die "$why"
+  r_sha="$(jq -r '.head_sha // empty' "$fr")"
   if [ "$r_sha" != "$head" ]; then
     # Commits since the graded one that touch only hook-owned paths never stale it. A question that cannot be answered (not an ancestor, no allowlist) counts as "changed".
     other="$(non_hook_changes "$r_sha" "$head")" || other="changed"
