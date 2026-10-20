@@ -34,6 +34,11 @@ and the back-off of the pair window's token (see "B / I" below):
 and the attended window's (see "C" below):
   C  `hmd app connect --confirm` renews its code on the same schedule as a plain connect (ahead of the relay's lapse, offered for
      HMD_PAIR_WINDOW_IDLE_H hours), and a phone turned down at the compare still has the window renewed at once
+and the statusline's code being one a phone can use (see "R" below):
+  R  the statusline shows the code only while a relay client holds it registered at the relay -- the marker the client keeps
+     (<repo>/.heimdall/app/registered-<code>.json: the code, the relay's expiry, its pid) exists, is unexpired and is this repo's code -- and
+     otherwise the hint `pair: hmd app connect`; the client writes it when the relay accepts the code, refreshes it at a renewal and takes
+     it down when the code is claimed, refused, lapses or the client ends (only a marker it wrote itself)
 """
 import argparse
 import concurrent.futures
@@ -168,23 +173,76 @@ def repo_code(seed, repo):
     return ref_code(seed, "repo", os.path.realpath(repo))
 
 
-def render(sl, sid, current_dir=None, project_dir=None, **env):
-    """The statusline for session `sid` in sandbox `sl`, escape codes stripped. `current_dir` and `project_dir` move the
-    payload's workspace (a session that `cd`ed into a subdirectory has another current_dir and the same project_dir); `env`
-    is added to the render's environment."""
+def render(sl, sid, current_dir=None, project_dir=None, columns=200, **env):
+    """The statusline for session `sid` in sandbox `sl`, escape codes stripped, `columns` wide. `current_dir` and `project_dir`
+    move the payload's workspace (a session that `cd`ed into a subdirectory has another current_dir and the same project_dir);
+    `env` is added to the render's environment."""
     blob = json.loads(sl.claude_blob)
     blob["session_id"] = sid
     if current_dir:
         blob["cwd"] = blob["workspace"]["current_dir"] = current_dir
     if project_dir:
         blob["workspace"]["project_dir"] = project_dir
-    _ms, _rc, out = sl.render(STATUSLINE, json.dumps(blob).encode(), COLUMNS="200", **env)
+    _ms, _rc, out = sl.render(STATUSLINE, json.dumps(blob).encode(), COLUMNS=str(columns), **env)
     return ANSI.sub("", out.decode("utf-8", "replace"))
 
 
 def row_code(text):
     m = re.search(r"Opus 4\.8 · ([A-HJ-NP-Z2-9]{5})", text)
     return m.group(1) if m else None
+
+
+HINT = "pair: hmd app connect"   # what the statusline says in place of a code that no relay client holds registered
+SANDBOX_NOW = 1752410000         # the clock every render in a statusline sandbox reads (statusline_sandbox.Sandbox.env's HMD_NOW)
+
+
+def first_row(text):
+    """Row1 of a render: the identity run, where the code (or the hint that stands in for it) is."""
+    return text.splitlines()[0] if text else ""
+
+
+def registered_name(code):
+    """The marker a relay client keeps for as long as the relay holds `code` for it."""
+    return "registered-%s.json" % code
+
+
+def plant_registered(ws, code, exp=None, pid=None, body_code=None, mode=0o600, text=None):
+    """The marker of a registered code, made by hand: {code, exp, pid} at <ws>/.heimdall/app/registered-<code>.json (what the real client
+    writes is proved against the real client, in case_registration_marker_follows_the_client). `body_code` puts another code in the file
+    than its name says, `text` replaces the whole body, `mode` is the file's (a checkout plants 0644). Returns the path."""
+    app_dir = os.path.join(ws, ".heimdall", "app")
+    os.makedirs(app_dir, exist_ok=True)
+    os.chmod(app_dir, 0o700)
+    path = os.path.join(app_dir, registered_name(code))
+    if text is None:
+        text = json.dumps({"code": body_code or code, "exp": exp, "pid": os.getpid() if pid is None else pid},
+                          sort_keys=True, separators=(",", ":"))
+    write_private(path, text, mode=mode)
+    return path
+
+
+def plant_paired(ws, code, label="Pixel 9a"):
+    """The marker of a phone that paired by this code, made by hand: what bin/heimdall-relay-client keeps for the statusline's note."""
+    path = os.path.join(ws, ".heimdall", "app", "paired-%s.json" % code)
+    write_private(path, json.dumps({"via": "code", "device_label": label, "gh_login": "octocat", "bound_at": SANDBOX_NOW,
+                                    "pid": os.getpid()}, sort_keys=True, separators=(",", ":")))
+    return path
+
+
+def read_marker(path):
+    """The marker's JSON, or None when it is missing or not JSON (a client replaces it atomically: it is whole or absent)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def dead_pid():
+    """The pid of a process that has ended: a client that was killed without cleaning up."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return child.pid
 
 
 def hook_commands():
@@ -315,21 +373,28 @@ def case_one_code():
             expected = repo_code(seed_of(heimdall_home), sl.ws)
             sub = os.path.join(sl.ws, "sub")
             os.makedirs(sub, exist_ok=True)
-            # connect, through the same seed, prints the code a person types
+            # connect, through the same seed, prints the code a person types -- and its client holds that code registered at the relay, which
+            # is the only time the statusline shows one (R below), so the statusline is read before the disconnect that closes it
             conn_env = s.env(HEIMDALL_HOME=heimdall_home)
             app = H.Proc([H.APP_PATH, "connect", "--repo", sl.ws, "--port", "0", "--relay", s.relay.url, "--bg"], conn_env, cwd=sl.ws)
             s.procs.append(app)
             app.close_stdin()
             app.wait_exit(90)
-            run([H.APP_PATH, "disconnect", "--repo", sl.ws], conn_env, timeout=120)
             printed = re.search(r"SESSION CODE: ([A-HJ-NP-Z2-9]{5})", app.text())
             printed = printed.group(1) if printed else None
             bare = [row_code(render(sl, SID1)), row_code(render(sl, SID2))]
+            run([H.APP_PATH, "disconnect", "--repo", sl.ws], conn_env, timeout=120)
             helper_bare = run([sys.executable, APP_CODE_PY, "--repo", sl.ws], env).stdout.strip()
             T.check(len(expected) == 5 and bare == [expected, expected] and helper_bare == expected and printed == expected,
-                    "1. with NO session record the statusline of two session ids in one repo, hmd_app_code.py --repo and the SESSION CODE "
-                    "`hmd app connect` prints are one value: the repo's own code",
+                    "1. with NO session record the statusline of two session ids in one repo (while connect's client holds the code), "
+                    "hmd_app_code.py --repo and the SESSION CODE `hmd app connect` prints are one value: the repo's own code",
                     "statusline %r helper %r connect %r expected %r" % (bare, helper_bare, printed, expected))
+            closed = render(sl, SID1)
+            T.check(row_code(closed) is None and expected not in closed and HINT in closed,
+                    "1. once `hmd app disconnect` has closed the code, the statusline no longer shows it: it says how to open one instead",
+                    first_row(closed))
+            # what follows asks what the statusline shows of the code, with the code registered: a marker made by hand (R proves the real one)
+            plant_registered(sl.ws, expected, SANDBOX_NOW + 600)
             # the records the SessionStart hook keeps, and the single session.json an older hook left: neither moves the code
             for sid in (SID1, SID2):
                 code_cli(env, "--record-session", "--repo", sl.ws, "--session-id", sid, "--pid", str(os.getpid()))
@@ -349,10 +414,11 @@ def case_one_code():
                     "subdirectory (project_dir unchanged) and a session id inherited by `hmd ui`: still that one code, in /api/state too",
                     "statusline %r sub %r helper %r cli %r state %r expected %r" % (recorded, sub_cwd, helper, cli, shown, expected))
             fresh_home = tempfile.mkdtemp(prefix="pair-confirm-nohome.")
-            blank = row_code(render(sl, SID1, HEIMDALL_HOME=fresh_home))
-            T.check(blank is None and not os.path.exists(os.path.join(fresh_home, "session-code.key")),
-                    "1. a render in a home with no seed shows no code and makes no seed (only a session start, `hmd ui` or `hmd app` does)",
-                    "code %r files %r" % (blank, os.listdir(fresh_home)))
+            no_seed = render(sl, SID1, HEIMDALL_HOME=fresh_home)
+            T.check(row_code(no_seed) is None and HINT not in no_seed and not os.path.exists(os.path.join(fresh_home, "session-code.key")),
+                    "1. a render in a home with no seed shows no code and no hint (there is no code to open) and makes no seed (only a session "
+                    "start, `hmd ui` or `hmd app` does)",
+                    "row1 %r files %r" % (first_row(no_seed), os.listdir(fresh_home)))
         finally:
             run([H.APP_PATH, "disconnect", "--repo", sl.ws], s.env(HEIMDALL_HOME=os.path.join(sl.home, ".heimdall")), timeout=120)
             sl.close()
@@ -383,11 +449,17 @@ def case_hooks():
         T.check(isinstance(sup, int) and alive(sup) and state.get("code") == repo_code(seed, s.repo),
                 "2. a supervisor is running for the repo and names its code", str(state))
         window_sid = s.relay.latest().id
+        marker = os.path.join(s.repo, ".heimdall", "app", registered_name(repo_code(seed, s.repo)))
+        T.check(wait_until(lambda: os.path.exists(marker), 15) and (read_marker(marker) or {}).get("exp") == s.relay.get(window_sid).exp,
+                "2. ...and while the window's client holds the code registered, the repo's marker says so (registered-<code>.json, the relay's expiry)",
+                str(read_marker(marker)))
         stopped = s.hook("pair-window-stop", SID1)
         T.check(stopped.returncode == 0 and s.session_record(SID1) is None,
                 "2. SessionEnd: the session's record is gone", "rc %r %s" % (stopped.returncode, stopped.stderr))
         T.check(isinstance(sup, int) and wait_until(lambda: not alive(sup), 30) and wait_until(lambda: window_sid in s.relay.revokes, 30),
                 "2. the last session ended: the supervisor is gone and its relay session was revoked", "alive %r revokes %r" % (alive(sup), s.relay.revokes))
+        T.check(wait_until(lambda: not os.path.exists(marker), 15),
+                "2. ...and the code is no longer registered, so the marker is gone", str(read_marker(marker)))
     # a window with no terminal outlives the client's own code window: the supervisor opens the next one
     knobs = {"HMD_RELAY_CODE_WINDOW_S": "3", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2", "HMD_RELAY_CODE_RENEW_MIN_S": "0.5",
              "HMD_PAIR_WINDOW_RESTART_S": "1"}
@@ -586,6 +658,160 @@ def case_stopped_client_keeps_its_marker():
                     "code %r %s wrote %r exit %r revokes %r" % (code, err, wrote, c.p.poll(), s.relay.revokes))
         finally:
             sl.close()
+
+
+# -- R -------------------------------------------------------------------------------------------------------------
+# The statusline shows the repo's code only while a relay client holds it registered at the relay: typed on the phone at any other time it is
+# answered "no open session for that code" (a repo that never ran `hmd app connect`, a window that is closed, a code that lapsed). The client keeps
+# <repo>/.heimdall/app/registered-<code>.json {code, exp, pid} for as long as the relay holds the code; otherwise the statusline says how to open one.
+def case_statusline_code_only_while_registered():
+    sl = SL.Sandbox(statusline_fixture())
+    try:
+        code_cli(sl.env(), "--session-id", "seed-probe")  # the first use makes the machine's seed
+        code = repo_code(seed_of(os.path.join(sl.home, ".heimdall")), sl.ws)
+        shown = lambda **kw: render(sl, SID1, **kw)
+        text = shown()
+        T.check(row_code(text) is None and code not in text and re.search(r"Opus 4\.8 · " + re.escape(HINT), text),
+                "R1. no marker: the statusline shows the hint, not the repo's code", first_row(text))
+        marker = plant_registered(sl.ws, code, SANDBOX_NOW + 300)
+        text = shown()
+        T.check(row_code(text) == code and HINT not in text,
+                "R2. a marker that is there, unexpired, names this repo's code and belongs to a live client: the code, and no hint", first_row(text))
+        refused = (("expired", dict(exp=SANDBOX_NOW - 1)),
+                   ("expiring this very second", dict(exp=SANDBOX_NOW)),
+                   ("for another code than its name says", dict(exp=SANDBOX_NOW + 300, body_code="ZZZZZ")),
+                   ("of a client that is gone", dict(exp=SANDBOX_NOW + 300, pid=dead_pid())),
+                   ("planted by a checkout (0644)", dict(exp=SANDBOX_NOW + 300, mode=0o644)),
+                   ("with an expiry that is no number", dict(text=json.dumps({"code": code, "exp": "soon", "pid": os.getpid()}))),
+                   ("that is not JSON", dict(text="registered")))
+        wrong = []
+        for label, kw in refused:
+            plant_registered(sl.ws, code, **kw)
+            text = shown()
+            if row_code(text) is not None or HINT not in text:
+                wrong.append(label)
+        T.check(not wrong, "R3. a marker that is expired, for another code, of a client that is gone, planted by a checkout or malformed "
+                "is no registration: the hint", "shown as registered: %s" % wrong)
+        os.unlink(marker)
+        plant_registered(sl.ws, "ZZZZZ", SANDBOX_NOW + 300)  # a valid marker, for another code: nothing under THIS repo's
+        other = shown()
+        elsewhere = os.path.join(sl.ws, "elsewhere.json")
+        write_private(elsewhere, json.dumps({"code": code, "exp": SANDBOX_NOW + 300, "pid": os.getpid()}))
+        os.symlink(elsewhere, marker)  # and a valid one that is reached through a link
+        linked = shown()
+        T.check(row_code(other) is None and HINT in other and row_code(linked) is None and HINT in linked,
+                "R3. a marker for another code, and one reached through a link, are no registration either", "%r | %r" % (first_row(other), first_row(linked)))
+        os.unlink(marker)
+        paired = plant_paired(sl.ws, code)
+        text = shown()
+        T.check("paired via code" in text and row_code(text) is None and code not in text and HINT not in text,
+                "R4. a phone paired and the code is closed: the statusline says the phone paired -- no code, no hint", first_row(text))
+        plant_registered(sl.ws, code, SANDBOX_NOW + 300)
+        text = shown()
+        T.check(re.search(r"Opus 4\.8 · %s · .*paired via code" % code, text) is not None,
+                "R4. ...and a code that is open again (hmd app add-device) is shown beside the note", first_row(text))
+        os.unlink(paired)
+        os.unlink(marker)
+        narrow, bare = shown(columns=60), shown(columns=60, HEIMDALL_HOME=tempfile.mkdtemp(prefix="pair-confirm-nohome."))
+        T.check(HINT not in narrow and "Opus 4.8" in narrow and first_row(narrow) == first_row(bare),
+                "R5. where the hint does not fit it is left out, and nothing else of Row1 moves for it (the model is not given up for it)",
+                "%r vs %r" % (first_row(narrow), first_row(bare)))
+    finally:
+        sl.close()
+
+
+def case_registration_marker_follows_the_client():
+    sl = SL.Sandbox(statusline_fixture())
+    with Scn() as s:
+        try:
+            ok, code, err = code_cli(sl.env(), "--repo", sl.ws)
+            marker = os.path.join(sl.ws, ".heimdall", "app", registered_name(code))
+            paired = os.path.join(sl.ws, ".heimdall", "app", "paired-%s.json" % code)
+            plant_registered(sl.ws, code, SANDBOX_NOW + 300, pid=dead_pid())  # what a client killed without cleaning up leaves behind
+            T.check(ok == 0 and HINT in render(sl, SID1), "R6. (setup) the marker of a client that is gone is no registration: the hint", err)
+            c = s.client(code, repo=sl.ws)
+            window = c.wait_event("code_window")
+            wait_until(lambda: (read_marker(marker) or {}).get("pid") == c.pid, 10)
+            rec = read_marker(marker)
+            text = render(sl, SID1)
+            T.check(window is not None and os.path.exists(marker) and mode_of(marker) == 0o600
+                    and rec == {"code": code, "exp": window["exp"], "pid": c.pid} and row_code(text) == code and HINT not in text,
+                    "R6. the client the relay accepted the code for keeps the marker (0600: the code, the relay's expiry, its pid) and the "
+                    "statusline shows the code", "marker %r row1 %r %s" % (rec, first_row(text), c.tail()))
+            sid = s.bind(device_label="Pixel 9a")
+            c.wait_event("device_bound", timeout=20)
+            gone = wait_until(lambda: not os.path.exists(marker) and os.path.exists(paired), 15)
+            text = render(sl, SID1)
+            T.check(gone and row_code(text) is None and code not in text and HINT not in text and "paired via code" in text,
+                    "R6. a phone pairs by the code: the relay released it, so the marker goes and the statusline shows the pairing -- no code, no hint",
+                    first_row(text))
+            s.relay.end_session(sid, "revoked")
+            wait_until(lambda: not os.path.exists(paired), 15)
+            text = render(sl, SID1)
+            T.check(not os.path.exists(marker) and row_code(text) is None and HINT in text,
+                    "R6. the phone's session ended: nothing holds the code, so the hint again", first_row(text))
+        finally:
+            sl.close()
+
+
+def case_registration_marker_renews_and_closes():
+    knobs = {"HMD_RELAY_CODE_WINDOW_S": "7", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2", "HMD_RELAY_CODE_RENEW_MIN_S": "0.5"}
+    with Scn(ttl=2) as s:
+        marker = os.path.join(s.repo, ".heimdall", "app", registered_name(H.CODE))
+        c = s.client(H.CODE, env=knobs)
+        c.wait_event("code_window")
+        wait_until(lambda: os.path.exists(marker), 10)
+        first = (read_marker(marker) or {}).get("exp")
+        wait_until(lambda: len(s.relay.registrations) >= 2, 12)
+        later = lambda: {s.relay.get(r["session_id"]).exp for r in list(s.relay.registrations)[1:]}
+        T.check(wait_until(lambda: (read_marker(marker) or {}).get("exp") in later(), 6) and (read_marker(marker) or {}).get("exp") != first,
+                "R7. a renewal registers the code again and the marker follows: its expiry is a later registration's, not the first's",
+                "first %r marker %r later %r" % (first, read_marker(marker), sorted(later())))
+        closed = c.wait_event("code_window_closed", timeout=20)
+        T.check(bool(closed) and c.rc is None and not os.path.exists(marker),
+                "R7. the window's whole lifetime passes (code_window_closed): the marker goes while the client runs on", c.tail())
+    with Scn() as s:
+        marker = os.path.join(s.repo, ".heimdall", "app", registered_name(H.CODE))
+        c = s.client(H.CODE)
+        c.wait_event("code_window")
+        wrote = wait_until(lambda: os.path.exists(marker), 10)
+        c.stop()
+        T.check(wrote and c.p.poll() is not None and not os.path.exists(marker),
+                "R7. a client that is stopped takes its marker down with it", c.tail())
+
+
+def case_registration_marker_is_this_clients_only():
+    with Scn() as s:
+        marker = os.path.join(s.repo, ".heimdall", "app", registered_name(H.CODE))
+        other = subprocess.Popen(["sleep", "60"])
+        try:
+            plant_registered(s.repo, H.CODE, int(time.time()) + 300, pid=other.pid)
+            s.relay.code_status = lambda _reg: (401, {"error": "github token rejected"})
+            c = s.client(H.CODE)
+            refused = c.wait_event("code_unavailable")
+            c.stop()
+            rec = read_marker(marker)
+            T.check(bool(refused) and rec is not None and rec.get("pid") == other.pid,
+                    "R8. a client the relay refused the code for takes down nobody else's marker: only one it wrote itself", "%r %s" % (rec, c.tail()))
+        finally:
+            other.kill()
+            other.wait()
+
+
+def case_registration_marker_dark_after_a_refused_claim():
+    knobs = {"HMD_RELAY_CODE_RENEW_MIN_S": "3", "HMD_RELAY_CODE_RENEW_EVENT_MIN_S": "3", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2"}
+    with Scn() as s:
+        marker = os.path.join(s.repo, ".heimdall", "app", registered_name(H.CODE))
+        c = s.client(H.CODE, env=knobs)
+        c.wait_event("code_window")
+        wait_until(lambda: os.path.exists(marker), 10)
+        s.bind(gh_login="mallory")  # a claim naming another GitHub identity: refused, its session revoked, the code renewed -- but not at once
+        rejected = c.wait_event("code_rejected", where=lambda e: e.get("reason") == "identity-mismatch", timeout=15)
+        dark = not os.path.exists(marker)
+        back = wait_until(lambda: os.path.exists(marker), 15)
+        T.check(bool(rejected) and dark and back and len(s.relay.registrations) >= 2,
+                "R9. a refused claim revokes the session: until the renewal registers the code again the marker is gone, and then it is back",
+                "dark %r back %r regs %d %s" % (dark, back, len(s.relay.registrations), c.tail()))
 
 
 # -- 8 -------------------------------------------------------------------------------------------------------------
@@ -1147,8 +1373,8 @@ def case_no_links_followed():
         s.bind()
         bound = c.wait_event("device_bound", timeout=20)
         err_ev = c.wait_event("error", where=lambda e: "paired marker not written" in e.get("detail", ""), timeout=15)
-        T.check(bool(bound) and bool(err_ev) and not [n for n in os.listdir(victim3) if n.startswith("paired-")],
-                "S1. the relay client's pairing marker is refused through a link (reported, the bind unaffected) and written nowhere",
+        T.check(bool(bound) and bool(err_ev) and not [n for n in os.listdir(victim3) if n.startswith(("paired-", "registered-"))],
+                "S1. the relay client's pairing and registration markers are refused through a link (reported, the bind unaffected) and written nowhere",
                 c.tail())
 
 
@@ -2420,7 +2646,9 @@ def report_children(names, run_one=case_in_child):
 
 def main():
     cases = (case_one_code, case_hooks, case_auto_pair, case_bg, case_identity_mismatch, case_no_sas_anywhere,
-             case_notice_and_statusline, case_stopped_client_keeps_its_marker, case_confirm, case_gh_signed_out_and_two_sessions, case_window_is_the_repos,
+             case_notice_and_statusline, case_stopped_client_keeps_its_marker, case_statusline_code_only_while_registered,
+             case_registration_marker_follows_the_client, case_registration_marker_renews_and_closes,
+             case_registration_marker_is_this_clients_only, case_registration_marker_dark_after_a_refused_claim, case_confirm, case_gh_signed_out_and_two_sessions, case_window_is_the_repos,
              case_renewal_schedule, case_stream_waits_for_renewal, case_renewal_floor_live, case_renewal_before_lapse_live,
              case_idle_stop, case_idle_stop_off, case_idle_stop_activity, case_idle_stop_spares_a_pairing,
              case_hook_hands_over_the_transcript, case_idle_stop_connect_reopens,

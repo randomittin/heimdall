@@ -310,6 +310,13 @@ Every phone is checked as the first was: the claim must name this laptop's GitHu
 name a phone claims is reduced by safe_label (letters, digits, space, - _ . ' ( ), 40 characters) before it reaches a notice, a record, an
 event or a log.
 
+REGISTRATION MARKER (--code). While the relay holds this client's code -- from the registration it accepted until the code is claimed, refused,
+freed for a renewal, lapses (its `exp`) or the client ends -- the client keeps <repo>/.heimdall/app/registered-<code>.json {code, exp, pid} (0600,
+through hmd_private_state: no link followed), written when the relay accepts the code, rewritten at every renewal and taken down at each of those
+ends (only a marker this process wrote). The statusline (sentinels/hmd-statusline.py) shows the code only while that marker is there, unexpired,
+this repo's code and a live client's; otherwise it shows the hint `pair: hmd app connect`, because a code nobody holds registered answers a phone
+"no open session for that code". A client that is killed outright leaves the marker, which its expiry and its dead pid then retire.
+
 SESSION RESUME (bin/lib/hmd_session_login.py owns every rule; operator decision, 2.4.8: a stopped laptop client must not unpair the phone).
 Once a phone is bound the client stores the login its relay session is attached with -- the bearer token, the hmd private key, the
 phone's public key, and two seq marks: hmd_seq, the high-water of the seq BLOCKS handed out (a frame's nonce is only sender tag || seq, so
@@ -1652,6 +1659,7 @@ class RelayClient:
     def _remove_pairing_traces(self):
         """What the pairing left that outlives a bind: the statusline's marker and the phone's record."""
         self._remove_paired_marker()
+        self._unmark_registered()  # an end the relay announced reaches here without a shutdown: no code of this client is registered any more
         self._forget_device()
 
     # -- HTTP: one-shot requests --------------------------------------------
@@ -1931,6 +1939,7 @@ class RelayClient:
             self._code_state = "closed"
             burned = self._key_revealed
         self._gh_secret = None
+        self._unmark_registered()
         emit({"event": event, "reason": reason})
         if burned:
             self.write_status()
@@ -1954,6 +1963,7 @@ class RelayClient:
                 return
             self._code_state = "bound"
         self._gh_secret = None
+        self._unmark_registered()
 
     def code_start(self):
         """Offer the session code, right after the first pair_init: read the token, commit to this session's
@@ -1982,6 +1992,7 @@ class RelayClient:
             self._last_renew_at = now
             self._window_login = login
             self._schedule_lapse(exp)
+        self._mark_registered(exp)  # before the event: whoever reads "code_window" (connect's SESSION CODE line) finds the marker there
         emit({"event": "code_window", "code": self._code, "gh_login": login, "exp": exp})
         threading.Thread(target=self._control_loop, name="code-control", daemon=True).start()
         threading.Thread(target=self._code_loop, name="code-window", daemon=True).start()
@@ -2055,6 +2066,7 @@ class RelayClient:
             if not still_open:
                 self._revoke_session(new_id, new_token)
                 return
+            self._unmark_registered()  # freed here, and not registered again until the relay takes the new one: the code is dark meanwhile
             self._revoke_session(self.session_id, self.token)
             freed = True
         login, exp, reason = self._register_code(new_id, new_token, commit_for(pub, nonce))
@@ -2085,6 +2097,7 @@ class RelayClient:
         if not installed:
             self._revoke_session(new_id, new_token)
             return
+        self._mark_registered(exp)  # the new registration's expiry replaces the old one's
         self._interrupt_stream()
         self._emit_pair_init(data, renewal)
         emit({"event": "code_window", "code": self._code, "gh_login": login, "exp": exp, "renewal": renewal})
@@ -2139,6 +2152,7 @@ class RelayClient:
             if pending["timer"] is not None:
                 pending["timer"].cancel()
             emit({"event": "code_rejected", "reason": "session-ended"})
+        self._unmark_registered()  # the relay ended the session the code was registered on
         self._renew_now.set()
         return True
 
@@ -2194,6 +2208,7 @@ class RelayClient:
                        "sid": self.session_id, "token": self.token, "timer": None,
                        "label": label, "login": login if valid_login(login) else "unknown"}
             self._pending = pending
+        self._unmark_registered()  # a claim released the code at the relay: nobody else can use it until a renewal registers it again
         if not self._post_key_reveal():
             self._resolve_approval(False, "reveal-failed", pending)
             return
@@ -2270,6 +2285,7 @@ class RelayClient:
     def _refuse_claim(self, reason):
         """A bind by code that must not pair, refused before a key was derived, revealed or sealed: say so, end the
         session the relay bound it to, and renew the window (a fresh session and key; the same code)."""
+        self._unmark_registered()  # the session is revoked below: the code is dark until the renewal registers it again
         emit({"event": "code_rejected", "reason": reason})
         self._revoke_session(self.session_id, self.token)
         self._renew_now.set()
@@ -2278,6 +2294,45 @@ class RelayClient:
 
     def _paired_marker_name(self):
         return "paired-%s.json" % self._code
+
+    # -- the registration marker (what the statusline reads to show the code only while a phone can use it) -----
+    # Class-level like _status_lock: one client per process. It serialises every write and removal of the marker, so the file always
+    # says what the last of them decided -- a renewal finishing just after a phone bound cannot leave a marker for a code that is closed.
+    _mark_lock = threading.Lock()
+
+    def _registered_marker_name(self):
+        return "registered-%s.json" % self._code
+
+    def _mark_registered(self, exp):
+        """The relay accepted this client's code and holds it until `exp` (epoch seconds): say so in
+        <repo>/.heimdall/app/registered-<code>.json {code, exp, pid}, the marker the statusline shows the code by -- a code the relay does not
+        hold answers a phone "no open session for that code". Written through hmd_private_state (no link followed, 0600). Not written when a
+        bind or an end already closed the window (state is read under the marker lock), and best effort like the paired marker: a fault is
+        reported as an `error` event and the statusline then shows its hint, never a code nobody holds."""
+        if not self._code:
+            return
+        with self._mark_lock:
+            with self._code_lock:
+                if self._code_state != "open":
+                    return
+            try:
+                if PRIVATE is None:
+                    raise OSError("bin/lib/hmd_private_state.py failed to import")
+                body = json.dumps({"code": self._code, "exp": exp, "pid": os.getpid()}, sort_keys=True, separators=(",", ":"))
+                PRIVATE.write(self.root, self._MARKER_REL, self._registered_marker_name(), body.encode("utf-8"))
+            except OSError as e:
+                emit({"event": "error", "detail": "registered marker not written: %s" % e})
+
+    def _unmark_registered(self):
+        """The relay no longer holds this client's code (it was claimed, refused, freed for a renewal, lapsed, or this client is ending): take
+        the marker down -- only a marker this very process wrote, another client's is left as it is. Call it after the state change, never
+        with the code lock held."""
+        if not self._code or PRIVATE is None:
+            return
+        with self._mark_lock:
+            rec = PRIVATE.read_json(self.root, self._MARKER_REL, self._registered_marker_name())
+            if rec is not None and rec.get("pid") == os.getpid():
+                PRIVATE.remove(self.root, self._MARKER_REL, self._registered_marker_name())
 
     def _is_returning_phone(self):
         """True when this phone's key already has a device record whose client is gone: it paired here before and that client ended without
@@ -3257,6 +3312,7 @@ class RelayClient:
         self._stopping = True
         self.stop_event.set()
         self._gh_secret = None  # a stopped client offers no code window, so it keeps no token
+        self._unmark_registered()  # ... and holds no registration worth showing, whatever becomes of its session below
         self._login_shutdown()  # before the (network-bound) revoke: a login process must not outlive us
         if self._login_kept and LOGIN_STORE is not None and LOGIN_STORE.status(self.root, self.session_id) == "resumable":
             # A phone is bound and its login is stored: stopping this client -- a TERM, Ctrl-C, a crash that got this far -- does NOT

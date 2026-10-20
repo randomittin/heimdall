@@ -546,6 +546,39 @@ def _session_code(repo):
     return code if isinstance(code, str) and code else None
 
 
+PAIR_HINT = "pair: hmd app connect"
+
+
+def _code_registered(cwd, code, now):
+    """True while a relay client of THIS repo holds `code` registered at the relay -- the only time a phone typing it is let in; at any
+    other time it answers "no open session for that code". The client keeps <cwd>/.heimdall/app/registered-<code>.json {code, exp, pid}
+    for as long as the registration lives (bin/heimdall-relay-client: _mark_registered), and this believes it only when the file names
+    THIS code, its `exp` (the relay's expiry, epoch seconds) is still ahead of `now` (the render's clock) and its `pid` is a live process.
+    Read through bin/lib/hmd_private_state.py (no link followed, and only a 0600 file this user wrote), so a repository cannot plant one.
+    Never raises, never forks: one stat when there is no marker, one vetted read when there is."""
+    if not code:
+        return False
+    name = "registered-%s.json" % code
+    if not os.path.lexists(os.path.join(cwd, ".heimdall", "app", name)):
+        return False
+    try:
+        spec = importlib.util.spec_from_file_location("hmd_private_state", _PRIVATE_STATE_LIB)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        rec = mod.read_json(cwd, ".heimdall/app", name)
+        if rec is None or rec.get("code") != code:
+            return False
+        exp, pid = rec.get("exp"), rec.get("pid")
+        if isinstance(exp, bool) or not isinstance(exp, int) or exp <= now:
+            return False
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    return True
+
+
 def _paired_note(cwd, code):
     """`📱 <device> paired via code` while a phone that paired with THIS repo's code is still connected, else
     None. The relay client that bound it keeps <cwd>/.heimdall/app/paired-<code>.json (bin/heimdall-relay-client:
@@ -2183,7 +2216,7 @@ def subagent_ghost(agents):
 
 # ── Row1 identity — WHOLE-SEGMENT drop (Spec v2 §2/§7: text drops per tier, NEVER
 # mid-token) ─────────────────────────────────────────────────────────────────────
-def row1_left(handle, model, repo_seg, cseg, avail, code=None, paired=None):
+def row1_left(handle, model, repo_seg, cseg, avail, code=None, paired=None, hint=None):
     """The Row1 identity left run — `⛭ HEIMDALL │ rj · Opus 4.8 │ heimdall:branch +2 ~1`
     — reduced to fit `avail` cells by dropping WHOLE segments, never slicing a token with
     an ellipsis (the `rj · Opus …` / `heimdall:statu…` mid-word clip from the 80c render).
@@ -2204,22 +2237,27 @@ def row1_left(handle, model, repo_seg, cseg, avail, code=None, paired=None):
     (already ASCII-safe — see hmd_termcaps.py's `_ASCII_MAP`) rather than a new bracket
     glyph, so the code degrades correctly on ascii-tier terminals too.
 
-    `paired` — `📱 <device> paired via code` (`_paired_note()`), appended after the code in the same
-    clause while a phone that typed THIS session's code is connected, so a pairing nobody expected is
-    visible where the operator looks. It rides the code's own `handle_on` bit (and needs a code), so a
-    run with no phone paired is BYTE-IDENTICAL to before this param existed.
+    `paired` — `📱 <device> paired via code` (`_paired_note()`), appended after the code (when there is
+    one: a phone that paired closed it, so the note often stands alone) in the same clause while a phone
+    that typed THIS repo's code is connected, so a pairing nobody expected is visible where the operator
+    looks. It rides the same `handle_on` bit, so a run with no phone paired is BYTE-IDENTICAL to before.
+
+    `hint` — `pair: hmd app connect`, said INSTEAD of a code when no relay client holds the code
+    registered (`_code_registered()`): a code a phone cannot use is not shown. It is an advisory, the
+    LAST thing to go: the segments are chosen exactly as if it did not exist, and it is appended to the
+    identity clause only when it still fits `avail` -- it never takes the place of the model, the repo
+    or the git counts, so a width that has no room for it renders Row1 as it was with no code at all.
 
     `avail` None → no width pressure, the full run is returned."""
     brand = f"{BLUE}{BOLD}⛭ HEIMDALL{X}"
 
-    def build(handle_on, model_on, repo_on, counts_on):
+    def build(handle_on, model_on, repo_on, counts_on, hinted=False):
         s = brand
         if handle_on:
             idt = f"{handle} · {model}" if model_on else str(handle)
-            if code:
-                idt += f" · {code}"
-                if paired:
-                    idt += f" · {paired}"
+            for part in (code, paired, hint if hinted else None):
+                if part:
+                    idt += f" · {part}"
             s += f"{SEP}{DIM}{idt}{X}"
         if repo_on:
             s += f"{SEP}{repo_seg}" + (cseg if counts_on else "")
@@ -2239,6 +2277,10 @@ def row1_left(handle, model, repo_seg, cseg, avail, code=None, paired=None):
     for h, m, r, c in combos:
         s = build(h, m, r, c)
         if avail is None or vis(s) <= avail:
+            if hint:  # an advisory: it takes only the room left over in the combo chosen without it
+                hinted = build(h, m, r, c, hinted=True)
+                if avail is None or vis(hinted) <= avail:
+                    return hinted
             return s
     return brand
 
@@ -2506,9 +2548,14 @@ def main():
     # which follows a `cd` into a subdirectory and would show another repo path's code there.
     project_dir = ws.get("project_dir")
     code_dir = project_dir if isinstance(project_dir, str) and project_dir.strip() else cwd
+    # The code is SHOWN only while a relay client holds it registered (_code_registered): typed on the phone at any other time it is
+    # answered "no open session for that code". Not registered, and no phone paired by it, the hint says how to open one instead.
     session_code = _session_code(code_dir)
+    offered = _code_registered(code_dir, session_code, t)
+    paired = _paired_note(code_dir, session_code)
     left1 = row1_left(_github_handle(cwd, handle), model, repo_seg, cseg, avail1,
-                       code=session_code, paired=_paired_note(code_dir, session_code))
+                      code=session_code if offered else None, paired=paired,
+                      hint=PAIR_HINT if session_code and not offered and not paired else None)
 
     # ── Row2 — the context gauge (CTX%·↓tokens on the fill, $cost on the track end) ──
     # narrow → bar-only (labels off). render_gauge splices the labels inside the bar's cell
