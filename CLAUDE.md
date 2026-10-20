@@ -236,7 +236,7 @@ what ate the day. The rules:
   fix made this release is triaged the same way; it does not restart the cycle unless it is HIGH.
 - **Background security-review findings** on hmd's own commits follow the same triage: HIGH → fix in
   this batch, otherwise backlog with one line. Never chain an agent per finding.
-- **One sweep, last.** Merge every fix of the round, then ONE full sweep on the frozen tree, then ship.
+- **One sweep, last.** Land every fix of the round, then ONE full sweep on the frozen tree, then ship.
   A red suite after it: fix, commit, `run-all.sh --failed` (never a second full sweep).
 - **Scope a fix agent to its finding.** No "while you're there" exploration, no listing of new
   candidate defects unless asked: a list becomes the next round.
