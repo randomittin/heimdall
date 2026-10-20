@@ -38,6 +38,7 @@ Faster test runs. A full sweep no longer re-runs what did not change, a red swee
 
 ### Fixed
 - The 21 shellcheck warnings waived in the previous release are fixed or carry a stated reason.
+- **A tag that was swept green can still be published after a later sweep** — `release/ship.sh --npm-only` and `--release-only` read only `receipts/last-full-green.json`, which every later green full sweep of main overwrites, so a release that had been swept green could no longer be published once main was swept again (`receipt is STALE for tag ...`; it hit the last release). `test/run-all.sh` now also files an atomic copy of each green full receipt as `receipts/full-green/<head_sha>.json` and keeps the newest 20. When the anchor does not cover the tag, the tag path tries those: each gets the checks the anchor gets (green, clean, kind `full` and not `aborted`, this repo, `verify-receipt` when it has a cache block, the cold-receipt rule of an x.y.0 release) and the same coverage rule (the tag's commit, or the commit it was bumped from give or take journal and ledger commits), and must be filed under the commit it graded. A full ship (no tag yet) is unchanged. Test: `test/ship-npm-only-after-bump.test.sh`.
 
 ## [2.4.8] - 2026-10-14 <!-- HEIMDALL:PIN:FROZEN -->
 

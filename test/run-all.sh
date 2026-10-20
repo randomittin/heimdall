@@ -143,7 +143,8 @@
 #
 # Incremental sweeps (--since-green). The ~500-suite sweep takes ~70 min, and it used to be re-run for every small merge
 # because any new commit staled the last green receipt. Receipts now carry a kind:
-#   full         every suite. A GREEN, clean one is also kept as receipts/last-full-green.json -- the chain anchor.
+#   full         every suite. A GREEN, clean one is also kept as receipts/last-full-green.json -- the chain anchor -- and, for good, as receipts/full-green/<head_sha>.json (the newest 20 are kept):
+#                the anchor moves to every later green sweep, but release/ship.sh --npm-only and --release-only grade the commit a TAG names, after the fact, and need the receipt that graded it.
 #   incremental  base = the anchor's HEAD; diff base..HEAD (hook-owned paths excluded; the tree must be clean). A suite is
 #                selected when it names a changed path or the basename of a changed bin/ script or module (the suite and the
 #                test/lib helpers it uses are searched; scripts that call a changed script widen the set; a name matches only as
@@ -1723,6 +1724,27 @@ fi
 
 BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0} + ${TMP_FINDINGS:-0} + n_refused + n_unsound))
 
+# archive_full_green -- keep an atomic copy of the green FULL receipt just written as receipts/full-green/<head_sha>.json, and prune that directory to the newest FULL_GREEN_KEEP.
+# WHY: last-full-green.json is the chain anchor and every later green sweep replaces it, but release/ship.sh --npm-only and --release-only grade the commit a TAG names, after the fact: a release that was
+# swept green could no longer be published once main had been swept again, because the one receipt on file graded a commit past the tag. ship.sh tries these copies next, under the checks the anchor gets.
+# The head sha becomes a file name, so only what git prints for a commit (40 or 64 hex digits) is accepted. Newest = latest modification time: each copy is moved into place when its sweep ends.
+# Prints the path on success, returns 1 on anything it cannot do; the caller says so. The archive is a record, never a reason to fail the sweep.
+FULL_GREEN_KEEP=20
+archive_full_green() {
+  local dir="$RECEIPT_DIR/full-green" tmp old
+  [[ "$RECEIPT_HEAD_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || return 1
+  mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$dir/.$RECEIPT_HEAD_SHA.$$"
+  if ! { cp "$RECEIPT_FILE" "$tmp" 2>/dev/null && mv "$tmp" "$dir/$RECEIPT_HEAD_SHA.json" 2>/dev/null; }; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  echo "full-green archive: $dir/$RECEIPT_HEAD_SHA.json (the newest $FULL_GREEN_KEEP are kept; release/ship.sh reads them when a later sweep has replaced the anchor)"
+  # shellcheck disable=SC2012  # the names are <hex>.json, so ls -t (newest first) cannot be misled, and find has no portable newest-first order
+  ls -t "$dir"/*.json 2>/dev/null | tail -n +"$((FULL_GREEN_KEEP + 1))" | while IFS= read -r old; do rm -f "$old" 2>/dev/null; done
+  return 0
+}
+
 # ── SWEEP RECEIPT ─────────────────────────────────────────────────────────────────────────
 # Turns "the sweep is green" into a checkable FACT instead of a claim. Three real
 # overclaims shipped this session from reporting LAST-KNOWN state as CURRENT state: work
@@ -1944,6 +1966,7 @@ if command -v jq >/dev/null 2>&1; then
           else
             echo "${YEL}run-all: could not write last-full-green.json -- incremental sweeps will have no base to chain to${OFF}" >&2
           fi
+          archive_full_green || echo "${YEL}run-all: could not archive this receipt under ${RECEIPT_DIR}/full-green -- release/ship.sh --npm-only and --release-only can then rest only on last-full-green.json, so a release of this commit has to be published before the next sweep replaces it${OFF}" >&2
         fi
       else
         echo "${YEL}run-all: could not move sweep receipt into place at ${RECEIPT_FILE}${OFF}" >&2

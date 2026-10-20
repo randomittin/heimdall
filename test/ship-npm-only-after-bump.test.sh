@@ -33,6 +33,13 @@
 # T's own bytes (an export-ignore or eol rule rewrote a file) is refused, and the export is removed on exit.
 # A --release-only run that must CREATE the tag has no T to grade: it needs the receipt to cover HEAD.
 #
+# THE ARCHIVE. last-full-green.json is the chain anchor, and every later green sweep of main replaces it: a tag that WAS swept green before it was released could no longer be published,
+# `--npm-only` died "receipt is STALE for tag ..." the day a sweep of later main landed. test/run-all.sh therefore also files an atomic copy of every green FULL receipt as
+# receipts/full-green/<head_sha>.json (the newest 20 are kept), and the post-tag modes try those when the anchor does not cover the tag: each archived receipt gets the checks the anchor
+# gets (green, clean, kind full and not aborted, this repo, verify-receipt when it has a cache block, the cold rule of an x.y.0 release) and the same coverage rule (receipt_covers_tag),
+# and must be filed under the commit it graded. A bare full ship never reads the archive. Section [10] proves the reader: an archived receipt rescues a tag; a red, other-repo, forged,
+# misfiled or older one does not. Section [11] proves the writer: the REAL test/run-all.sh files the copy, never for a red sweep, prunes to 20, and survives a directory it cannot write.
+#
 # HOW IT IS PROVEN. A throwaway plugin repo carries the REAL release/ship.sh, release/sync-release.sh,
 # bin/heimdall-render-version, bin/heimdall-check-identities and bin/lib/hook-owned-path.sh. The REAL full
 # ship runs in it (guards, bump, render, sync, commit, push to a local bare origin, fresh-clone R9, tag,
@@ -162,6 +169,20 @@ done
 SIGN_KEY="$WORK/fake-signing.key"; : > "$SIGN_KEY"   # a file for ship.sh's key check; the stub never reads it
 FAIL_PUBLISH=""                                      # set to 1 around a run_ship to make the npm stub's publish fail
 
+# The suite-closure engine, for the cases that need ship.sh to ASK it: a receipt with a cache block goes to `bin/heimdall-suite-closure verify-receipt`. This stand-in logs its arguments to
+# $HEIMDALL_HOME/closure-stub.log and answers with the verdict in $HEIMDALL_HOME/closure-verdict -- `ok`, or anything else for the refusal the real engine prints for a forged receipt. The engine has
+# its own suites (test/suite-closure.test.sh, test/suite-cache-e2e.test.sh); what is proven here is that ship.sh puts an ARCHIVED receipt through it, with that receipt's own path.
+ENGINE_STUB="$WORK/closure-stub"
+cat > "$ENGINE_STUB" <<'ENGINE'
+#!/usr/bin/env bash
+home="${HEIMDALL_HOME:?HEIMDALL_HOME unset}"
+printf '%s\n' "$*" >> "$home/closure-stub.log"
+[ "$(cat "$home/closure-verdict" 2>/dev/null)" = ok ] && exit 0
+echo "verify-receipt: suite a.test.sh: closure_sha does not match the closure at the graded commit (forged)" >&2
+exit 1
+ENGINE
+chmod +x "$ENGINE_STUB"
+
 # ── The throwaway plugin repo ─────────────────────────────────────────────────
 RAW="https://raw.githubusercontent.com/randomittin/heimdall"
 GH_REL="https://github.com/randomittin/heimdall/releases/download"
@@ -198,11 +219,25 @@ fx_readme() {  # $1=version — the README in its steady state at that version
     "$MARK_BEGIN" "$1" "$MARK_END" "$RAW" "$1" "$1" "$GH_REL" "$1"
 }
 
-write_receipt() {  # $1=repo  $2=graded sha  $3=HEIMDALL_HOME — a receipt shaped like the one test/run-all.sh writes
-  mkdir -p "$3/receipts" || return 1
+receipt_json() {  # $1=repo  $2=graded sha — a receipt shaped like the one test/run-all.sh writes
   jq -n --arg repo "$(git -C "$1" rev-parse --show-toplevel)" --arg head "$2" \
-    '{finished_at:"2026-10-13T00:00:00Z", repo:$repo, head_sha:$head, tree_clean:true, exit_code:0, kind:"full", suites_total:1, suites_passed:1, suites_failed:0}' \
-    > "$3/receipts/last-full-green.json"
+    '{finished_at:"2026-10-13T00:00:00Z", repo:$repo, head_sha:$head, tree_clean:true, exit_code:0, kind:"full", suites_total:1, suites_passed:1, suites_failed:0}'
+}
+
+write_receipt() {  # $1=repo  $2=graded sha  $3=HEIMDALL_HOME — the chain anchor, last-full-green.json
+  mkdir -p "$3/receipts" || return 1
+  receipt_json "$1" "$2" > "$3/receipts/last-full-green.json"
+}
+
+# write_archive <repo> <graded sha> <HEIMDALL_HOME> [<file name sha> [<jq filter>]] — the receipt of one green sweep as test/run-all.sh files it: receipts/full-green/<graded sha>.json.
+# A fourth argument files it under another commit's name, a fifth edits the receipt first (a red one, another repo's, a cache block).
+write_archive() {
+  local repo="$1" graded="$2" home="$3" name="${4:-$2}" edit="${5:-.}"
+  mkdir -p "$home/receipts/full-green" || return 1
+  if ! { receipt_json "$repo" "$graded" | jq "$edit" > "$home/receipts/full-green/$name.json" \
+         && jq -e . "$home/receipts/full-green/$name.json" >/dev/null 2>&1; }; then
+    echo "FATAL: could not write the archived receipt $home/receipts/full-green/$name.json (filter: $edit)" >&2; exit 2
+  fi
 }
 
 # make_fixture <dir> <journal-before-ship 0|1> [<bin/heimdall that dispatches attack 1|0>] — a plugin repo at the steady state of version 9.9.9, ready to ship.
@@ -291,13 +326,14 @@ files_of() {
 
 tag_commit() { git -C "$1" rev-parse "refs/tags/$NEW_TAG^{commit}"; }   # <repo> — the commit the release tag names
 
-# variant <name> — sets V to a private copy of the released BASE fixture, its receipt re-pointed at the copy's own path.
+# variant <name> [<fixture dir> <the commit its receipt graded>] — sets V to a private copy of the released BASE fixture (or of the other released fixture named), its receipt re-pointed at the copy's own path.
 # Its origin points nowhere: `git fetch origin` would otherwise re-fetch a tag a case deliberately deleted.
 variant() {
+  local from="${2:-$BASE}" graded="${3:-$BASE_RECEIPT_SHA}"
   V="$WORK/v-$1"
-  if ! { cp -R "$BASE" "$V" && cp -R "$BASE.home" "$V.home" \
+  if ! { cp -R "$from" "$V" && cp -R "$from.home" "$V.home" \
          && git -C "$V" remote set-url origin "$V.nowhere.git" \
-         && write_receipt "$V" "$BASE_RECEIPT_SHA" "$V.home"; }; then
+         && write_receipt "$V" "$graded" "$V.home"; }; then
     echo "FATAL: could not copy the base fixture to $V" >&2; exit 2
   fi
 }
@@ -318,6 +354,33 @@ amend_bump() {
   local d="$1"; shift
   if ! { git -C "$d" commit -q --amend "$@" >/dev/null 2>&1 && git -C "$d" tag -f "$NEW_TAG" >/dev/null 2>&1; }; then
     echo "FATAL: could not amend the bump commit in $d" >&2; exit 2
+  fi
+}
+
+# moved_on <repo> — the anchor moves on, as it does the next time main is swept: a commit lands after the release (it changes a published file too, so HEAD is not what the tag ships) and
+# last-full-green.json now names it. With no archive the tag is no longer covered -- see "receipt graded a commit past the tag" in [5].
+moved_on() {
+  printf 'echo later\n' > "$1/bin/later-fix.sh"
+  printf 'a later change\n' >> "$1/packages/runheimdall/README.md"
+  commit_all "$1" "fix: landed after the release"
+  write_receipt "$1" "$(git -C "$1" rev-parse HEAD)" "$1.home"
+}
+
+# install_engine <repo> -- put the engine stand-in in the fixture's bin/. It is untracked, so install it after the last commit of the case (commit_all would carry it into history).
+install_engine() {
+  if ! { cp "$ENGINE_STUB" "$1/bin/heimdall-suite-closure" && chmod +x "$1/bin/heimdall-suite-closure"; }; then
+    echo "FATAL: could not install the engine stand-in in $1" >&2; exit 2
+  fi
+}
+
+# x_y_0 <repo> -- retag the released bump as a minor release: its manifest and its title say 9.10.0 and the tag moves, so the cold-receipt rule of an x.y.0 release applies. Only plugin.json changes
+# (the other files keep the patch number; they still differ from the parent in version numbers alone, which is all the bump's shape rule reads).
+x_y_0() {
+  local d="$1"
+  if ! { jq '.version = "9.10.0"' "$d/.claude-plugin/plugin.json" > "$d/plugin.json.new" && mv "$d/plugin.json.new" "$d/.claude-plugin/plugin.json" \
+         && git -C "$d" commit -q -a --amend -m "chore(release): v9.10.0" \
+         && git -C "$d" tag -d "$NEW_TAG" >/dev/null && git -C "$d" tag v9.10.0; }; then
+    echo "FATAL: could not retag the bump in $d as 9.10.0" >&2; exit 2
   fi
 }
 
@@ -744,6 +807,210 @@ else
   else
     bad "the newest real bump commit (${REAL_BUMP:0:12}) fails the shape rule: ${WHY:-<no reason>} — extend RELEASE_BUMP_PATHS together with the bump"
   fi
+fi
+
+# ── [10] The archive, read: the anchor moves on, the tag's own sweep is still on file ────────
+echo "[10] archived receipts (receipts/full-green/<head_sha>.json), under the same checks as the anchor"
+
+# The defect, reproduced: the release was swept green, a sweep of later main replaced last-full-green.json, and --npm-only died "receipt is STALE for tag ...". With no archive that is still the answer,
+# so every acceptance below is the archive's doing. Archives of OTHER commits do not rescue the tag, and the refusal names them.
+variant archive-parent
+moved_on "$V"
+LATE="$(git -C "$V" rev-parse HEAD)"; T="$(tag_commit "$V")"
+if [ "$(files_of "$V" HEAD runheimdall)" != "$(files_of "$V" "$T" runheimdall)" ]; then
+  ok "anchor moved on: HEAD really differs from the tag in packages/ (the content check below is not vacuous)"
+else
+  bad "anchor moved on: the fixture did not make HEAD differ from the tag"
+fi
+expect_refused "the anchor moved on, no archive" "$V" --npm-only \
+  "receipt is STALE for tag $NEW_TAG (${T:0:12})" "the receipt graded ${LATE:0:12}, which is not an ancestor of ${BASE_RECEIPT_SHA:0:12}"
+if grep -Fq 'full-green' "$V.out"; then
+  bad "the anchor moved on, no archive: the refusal talks about an archive that does not exist"
+else
+  ok "the anchor moved on, no archive: the refusal does not mention an archive (there is none, so the text is the one it always was)"
+fi
+write_archive "$V" "$BASE_C0" "$V.home"
+write_archive "$V" "$LATE" "$V.home"
+expect_refused "archives of other commits only" "$V" --npm-only \
+  "receipt is STALE for tag $NEW_TAG (${T:0:12})" \
+  "${BASE_C0}.json: the receipt graded ${BASE_C0:0:12}, not the tagged commit or the commit it was bumped from (${BASE_RECEIPT_SHA:0:12})" \
+  "${LATE}.json: the receipt graded ${LATE:0:12}, which is not an ancestor of ${BASE_RECEIPT_SHA:0:12}"
+write_archive "$V" "$BASE_RECEIPT_SHA" "$V.home"
+expect_accepted "archive of the commit the tag was bumped from" "$V" --npm-only "npm reconciled to $NEW_VER" \
+  "green FULL sweep receipt covers tag $NEW_TAG (${T:0:12}): it graded the commit the tag was bumped from (${BASE_RECEIPT_SHA:0:12})"
+if grep -Fq "full-green/${BASE_RECEIPT_SHA}.json" "$V.out"; then
+  ok "archive of the commit the tag was bumped from: the run says which archived receipt it rested on"
+else
+  bad "archive of the commit the tag was bumped from: the run does not name the archived receipt"; tail_of "$V.out" 8
+fi
+published_equals "archive of the commit the tag was bumped from" "$V" "$T"
+published_from_a_throwaway_dir "archive of the commit the tag was bumped from" "$V"
+expect_accepted "archive of the commit the tag was bumped from" "$V" --release-only "Released $NEW_TAG" \
+  "green FULL sweep receipt covers tag $NEW_TAG (${T:0:12}): it graded the commit the tag was bumped from (${BASE_RECEIPT_SHA:0:12})"
+
+# A sweep recorded at the bump itself, and a sweep that journal commits separate from the commit the tag was bumped from (the shape of nearly every real release here: hooks journal while the sweep runs).
+variant archive-tagged
+moved_on "$V"; T="$(tag_commit "$V")"
+write_archive "$V" "$T" "$V.home"
+expect_accepted "archive of the tagged commit itself" "$V" --npm-only "npm reconciled to $NEW_VER" \
+  "green FULL sweep receipt covers tag $NEW_TAG (${T:0:12}): it graded the tagged commit itself"
+
+variant archive-journal-gap "$BASE2" "$BASE2_RECEIPT_SHA"
+moved_on "$V"; T="$(tag_commit "$V")"; P1="$(git -C "$V" rev-parse "${T}^")"
+write_archive "$V" "$BASE2_RECEIPT_SHA" "$V.home"
+expect_accepted "archive across a journal commit" "$V" --npm-only "npm reconciled to $NEW_VER" \
+  "green FULL sweep receipt covers tag $NEW_TAG (${T:0:12}): it graded ${BASE2_RECEIPT_SHA:0:12}, which only journal/ledger commits separate from the commit the tag was bumped from (${P1:0:12})"
+
+# A red archived receipt rescues nothing, whichever way it is red.
+variant archive-red
+moved_on "$V"; T="$(tag_commit "$V")"
+red_cases=(
+  'exit_code 1|.exit_code = 1|is not a green, clean full sweep'
+  'a dirty tree|.tree_clean = false|is not a green, clean full sweep'
+  'an incremental receipt|.kind = "incremental"|is not a green, clean full sweep'
+  'an aborted run|.kind = "aborted"|is from an ABORTED run'
+)
+for c in "${red_cases[@]}"; do
+  IFS='|' read -r label edit reason <<<"$c"
+  write_archive "$V" "$BASE_RECEIPT_SHA" "$V.home" "$BASE_RECEIPT_SHA" "$edit"
+  expect_refused "archived receipt, $label" "$V" --npm-only \
+    "receipt is STALE for tag $NEW_TAG (${T:0:12})" "receipts/full-green/${BASE_RECEIPT_SHA}.json" "$reason"
+done
+write_archive "$V" "$BASE_RECEIPT_SHA" "$V.home" "$BASE_RECEIPT_SHA" '.exit_code = 1'
+expect_refused "archived receipt, exit_code 1" "$V" --release-only \
+  "receipt is STALE for tag $NEW_TAG (${T:0:12})" "is not a green, clean full sweep"
+
+# Another repo's receipt rescues nothing.
+variant archive-other-repo
+moved_on "$V"; T="$(tag_commit "$V")"
+write_archive "$V" "$BASE_RECEIPT_SHA" "$V.home" "$BASE_RECEIPT_SHA" '.repo = "/somewhere/else/heimdall"'
+expect_refused "archived receipt recorded for another repo" "$V" --npm-only \
+  "receipt is STALE for tag $NEW_TAG (${T:0:12})" "receipts/full-green/${BASE_RECEIPT_SHA}.json was recorded for a different repo"
+
+# Forged receipts rescue nothing: one filed under the name of a commit it did not grade (it WOULD cover the tag if the name were ignored), and one whose cache block the engine cannot vouch for.
+variant archive-forged
+moved_on "$V"; T="$(tag_commit "$V")"; LATE="$(git -C "$V" rev-parse HEAD)"
+write_archive "$V" "$BASE_RECEIPT_SHA" "$V.home" "$LATE"
+expect_refused "archived receipt filed under another commit's name" "$V" --npm-only \
+  "receipt is STALE for tag $NEW_TAG (${T:0:12})" "${LATE}.json is filed under a commit it did not grade (it graded ${BASE_RECEIPT_SHA:0:12})"
+rm -f "$V.home/receipts/full-green/$LATE.json"
+write_archive "$V" "$BASE_RECEIPT_SHA" "$V.home" "$BASE_RECEIPT_SHA" '.cache = {mode:"closure", cold:false}'
+expect_refused "archived receipt with a cache block and no engine to verify it" "$V" --npm-only \
+  "receipt is STALE for tag $NEW_TAG (${T:0:12})" "carries a suite-cache block and bin/heimdall-suite-closure is not here to verify it"
+install_engine "$V"
+printf 'forged\n' > "$V.home/closure-verdict"; rm -f "$V.home/closure-stub.log"
+expect_refused "archived receipt the engine calls forged" "$V" --npm-only \
+  "receipt is STALE for tag $NEW_TAG (${T:0:12})" \
+  "receipts/full-green/${BASE_RECEIPT_SHA}.json does not verify (bin/heimdall-suite-closure verify-receipt): suite a.test.sh: closure_sha does not match"
+if grep -Fq -- "verify-receipt --repo" "$V.home/closure-stub.log" 2>/dev/null \
+   && grep -Fq -- "--receipt $V.home/receipts/full-green/${BASE_RECEIPT_SHA}.json" "$V.home/closure-stub.log" 2>/dev/null; then
+  ok "archived receipt the engine calls forged: the engine was asked about the archived receipt itself"
+else
+  bad "archived receipt the engine calls forged: the engine was not asked to verify the archived receipt"; cat "$V.home/closure-stub.log" >&2 2>/dev/null || true
+fi
+printf 'ok\n' > "$V.home/closure-verdict"
+expect_accepted "the same archived receipt, vouched for by the engine" "$V" --npm-only "npm reconciled to $NEW_VER" \
+  "green FULL sweep receipt covers tag $NEW_TAG (${T:0:12}): it graded the commit the tag was bumped from (${BASE_RECEIPT_SHA:0:12})"
+
+# The cold rule of an x.y.0 release: an archived receipt composed from the suite cache is not enough, a cold one is.
+variant archive-cold
+x_y_0 "$V"
+moved_on "$V"
+T="$(git -C "$V" rev-parse "refs/tags/v9.10.0^{commit}")"
+install_engine "$V"
+printf 'ok\n' > "$V.home/closure-verdict"
+write_archive "$V" "$BASE_RECEIPT_SHA" "$V.home" "$BASE_RECEIPT_SHA" '.cache = {mode:"closure", cold:false}'
+expect_refused "archived cache-composed receipt for an x.y.0 release" "$V" --npm-only \
+  "receipt is STALE for tag v9.10.0 (${T:0:12})" "needs a COLD sweep receipt" "receipts/full-green/${BASE_RECEIPT_SHA}.json was composed from the suite cache"
+write_archive "$V" "$BASE_RECEIPT_SHA" "$V.home" "$BASE_RECEIPT_SHA" '.cache = {mode:"closure", cold:true}'
+run_ship "$V" --npm-only
+if grep -Fq "green FULL sweep receipt covers tag v9.10.0 (${T:0:12}): it graded the commit the tag was bumped from (${BASE_RECEIPT_SHA:0:12})" "$V.out"; then
+  ok "archived cold receipt for an x.y.0 release: accepted"
+else
+  bad "archived cold receipt for an x.y.0 release: not accepted"; tail_of "$V.out" 8
+fi
+
+# ── [11] The archive, written: the REAL test/run-all.sh files it ──────────────────────────────
+echo "[11] test/run-all.sh files a copy of every green FULL receipt and keeps the newest 20"
+SW="$WORK/sweep"; ARCH="$SW/.heimdall/receipts/full-green"; ANCHOR="$SW/.heimdall/receipts/last-full-green.json"
+if ! { mkdir -p "$SW/test" "$SW/bin/lib" "$SW.home" "$SW.tmp" \
+       && cp "$REPO/test/run-all.sh" "$SW/test/run-all.sh" && cp "$REPO/bin/lib/hook-owned-path.sh" "$SW/bin/lib/hook-owned-path.sh"; }; then
+  echo "FATAL: could not build the sweep fixture" >&2; exit 2
+fi
+printf '%s\n' '#!/usr/bin/env bash' 'echo "1 passed, 0 failed"' > "$SW/test/alpha.test.sh"
+# shellcheck disable=SC2016 # fixture suite text: the single-quoted "${FAIL_SUITE:-}" is literal source for the fixture suite, never an expansion here
+printf '%s\n' '#!/usr/bin/env bash' '[ "${FAIL_SUITE:-}" = beta ] && { echo "  FAIL beta"; echo "0 passed, 1 failed"; exit 1; }' 'echo "1 passed, 0 failed"' > "$SW/test/beta.test.sh"
+printf '.heimdall/\n' > "$SW/.gitignore"
+if ! { git init -q "$SW" && git -C "$SW" config user.email "t@example.com" && git -C "$SW" config user.name "T" && git -C "$SW" config commit.gpgsign false \
+       && git -C "$SW" add -A && git -C "$SW" commit -q -m "fixture"; }; then
+  echo "FATAL: could not commit the sweep fixture" >&2; exit 2
+fi
+
+# sweep <repo> [<suite to turn red>] — the REAL test/run-all.sh in a fixture repo of its own (its own HOME and TMPDIR, no HEIMDALL_HOME: its receipts land in <repo>/.heimdall/receipts, which .gitignore hides).
+# Output in SW_OUT, exit code in SW_RC.
+sweep() {
+  SW_OUT="$( cd "$1" && env -u HEIMDALL_HOME HOME="$1.home" TMPDIR="$1.tmp" HMD_NO_CAFFEINATE=1 FAIL_SUITE="${2:-}" bash test/run-all.sh --min 1 --jobs 1 2>&1 )"; SW_RC=$?
+}
+next_commit() { printf '# %s\n' "$RANDOM$RANDOM" >> "$1/test/alpha.test.sh"; commit_all "$1" "change"; }   # <repo> — a new HEAD to sweep
+archived() { find "$ARCH" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '; }                         # how many receipts the archive holds
+
+sweep "$SW"; HEAD1="$(git -C "$SW" rev-parse HEAD)"
+if [ "$SW_RC" -eq 0 ] && [ -f "$ARCH/$HEAD1.json" ] && cmp -s "$ARCH/$HEAD1.json" "$ANCHOR" \
+   && [ "$(jq -r '[.head_sha, .kind, .exit_code, (.tree_clean | tostring)] | join(",")' "$ARCH/$HEAD1.json" 2>/dev/null)" = "$HEAD1,full,0,true" ]; then
+  ok "a green full sweep files its receipt as full-green/<head_sha>.json, byte for byte the anchor it just wrote"
+else
+  bad "a green full sweep did not file its receipt as full-green/<head_sha>.json (rc=$SW_RC)"; printf '%s\n' "$SW_OUT" | tail -n 12 | sed 's/^/      | /' >&2
+fi
+if [ "$(find "$ARCH" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && printf '%s' "$SW_OUT" | grep -Fq "full-green/$HEAD1.json"; then
+  ok "the copy is written atomically (no temp file is left in the archive) and the run names it"
+else
+  bad "the archive holds more than the one receipt, or the run does not name it"; find "$ARCH" >&2 2>/dev/null || true
+fi
+
+cp "$ANCHOR" "$SW.anchor1"
+next_commit "$SW"; sweep "$SW"; HEAD2="$(git -C "$SW" rev-parse HEAD)"
+if [ "$SW_RC" -eq 0 ] && [ "$(jq -r .head_sha "$ANCHOR")" = "$HEAD2" ] && [ -f "$ARCH/$HEAD2.json" ] && cmp -s "$ARCH/$HEAD1.json" "$SW.anchor1"; then
+  ok "the anchor moves on to the next green sweep and the first sweep's receipt stays on file, unchanged (the defect: it used to be gone)"
+else
+  bad "the first sweep's receipt did not survive the next sweep (rc=$SW_RC)"; printf '%s\n' "$SW_OUT" | tail -n 12 | sed 's/^/      | /' >&2
+fi
+
+next_commit "$SW"; sweep "$SW" beta; HEAD3="$(git -C "$SW" rev-parse HEAD)"
+if [ "$SW_RC" -ne 0 ] && [ ! -e "$ARCH/$HEAD3.json" ] && [ "$(jq -r .head_sha "$ANCHOR")" = "$HEAD2" ] && [ "$(archived)" = 2 ]; then
+  ok "a red sweep files nothing and leaves the anchor where it was"
+else
+  bad "a red sweep touched the archive or the anchor (rc=$SW_RC, archive holds $(archived))"; printf '%s\n' "$SW_OUT" | tail -n 12 | sed 's/^/      | /' >&2
+fi
+
+# 25 receipts of old sweeps (modification times in 2020, oldest first) + the two real ones + the next sweep's = 28; the newest 20 stay.
+mkdir -p "$ARCH" || { echo "FATAL: could not create $ARCH" >&2; exit 2; }
+i=1
+while [ "$i" -le 25 ]; do
+  f="$ARCH/$(printf '%040d' "$i").json"
+  if ! { printf '{}\n' > "$f" && touch -t "20200101$(printf '00%02d' "$i")" "$f"; }; then echo "FATAL: could not seed $f" >&2; exit 2; fi
+  i=$((i + 1))
+done
+next_commit "$SW"; sweep "$SW"; HEAD4="$(git -C "$SW" rev-parse HEAD)"
+pruned_right=1; i=1
+while [ "$i" -le 25 ]; do
+  f="$ARCH/$(printf '%040d' "$i").json"
+  if [ "$i" -le 8 ]; then [ ! -e "$f" ] || pruned_right=0; else [ -e "$f" ] || pruned_right=0; fi
+  i=$((i + 1))
+done
+if [ "$SW_RC" -eq 0 ] && [ "$(archived)" = 20 ] && [ "$pruned_right" = 1 ] \
+   && [ -f "$ARCH/$HEAD4.json" ] && [ -f "$ARCH/$HEAD2.json" ] && [ -f "$ARCH/$HEAD1.json" ]; then
+  ok "the archive keeps the newest 20: of 28 receipts the 8 oldest are gone, the sweep's own and the two earlier real ones stayed"
+else
+  bad "the archive was not pruned to the newest 20 (rc=$SW_RC, holds $(archived), oldest-8-gone=$pruned_right)"; printf '%s\n' "$SW_OUT" | tail -n 12 | sed 's/^/      | /' >&2
+fi
+
+# The archive is a record, not a verdict: where it cannot be written (a file stands where the directory should be) the sweep says so, stays green and still moves the anchor.
+rm -rf "$ARCH" && : > "$ARCH"
+next_commit "$SW"; sweep "$SW"; HEAD5="$(git -C "$SW" rev-parse HEAD)"
+if [ "$SW_RC" -eq 0 ] && [ "$(jq -r .head_sha "$ANCHOR")" = "$HEAD5" ] && printf '%s' "$SW_OUT" | grep -Fq 'could not archive'; then
+  ok "an archive that cannot be written is said so and never fails the sweep: the anchor still moves on"
+else
+  bad "an unwritable archive was silent, failed the sweep, or stopped the anchor (rc=$SW_RC)"; printf '%s\n' "$SW_OUT" | tail -n 12 | sed 's/^/      | /' >&2
 fi
 
 echo ""
