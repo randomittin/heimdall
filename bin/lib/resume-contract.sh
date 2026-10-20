@@ -138,16 +138,42 @@ rc_notes_path() { printf '%s/resume-notes.ndjson' "$(rc_home "$1")"; }   # <repo
 rc_log_path()   { printf '%s/probe.ndjson' "$(rc_home "$1")"; }          # <repo>
 rc_ckpt_path()  { printf '%s/.planning/CHECKPOINT.md' "$1"; }            # <repo>
 
-# How many observations the index layer currently holds. 0 when the store is absent.
+# Where this file lives, found ONCE when it is sourced (BASH_SOURCE names the file being sourced, whoever sources it), so
+# rc_notes_read finds bin/lib/hmd_nofollow_write.py beside it without the caller's help.
+_RC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+
+# The observation store's bytes on stdout, read WITHOUT following a link. The default store sits under <repo>/.heimdall,
+# a name a cloned repository controls, and `[ -f ]` plus grep follow a symlink to any file the user can read: a repo that
+# linked .heimdall or resume-notes.ndjson to a file outside it got every note-shaped line of that file copied into
+# CHECKPOINT.md. So the read goes through bin/lib/hmd_nofollow_write.py: each directory below the repo opened
+# O_NOFOLLOW, the file opened O_NOFOLLOW and checked ON THE DESCRIPTOR it reads (a regular file with one link), so the
+# check and the read cannot disagree. A HEIMDALL_HOME is named by the environment, so it is the root and only the file in
+# it is vetted — the same split `heimdall-checkpoint note` appends with.
+# Returns 0 when the store was read (it may hold no bytes), 4 REFUSED (a link or a non-plain entry; the reason on
+# stderr), another non-zero when there is nothing to read (not there; no python3 to vet it). A caller that cannot read
+# the store has NO notes: it skips them, and never falls back to opening the path itself.
+rc_notes_read() { # <repo>
+  local store py root rel
+  store="$(rc_notes_path "$1")"
+  [ -e "$store" ] || [ -L "$store" ] || return 1   # nothing there (the usual case): nothing to read, no python to start
+  py="$(command -v python3)" || return 127
+  if [ -n "${HEIMDALL_HOME:-}" ]; then root="$HEIMDALL_HOME"; rel=""; else root="$1"; rel=".heimdall"; fi
+  "$py" -I "$_RC_LIB_DIR/hmd_nofollow_write.py" read --root "$root" --rel "$rel" --name "${store##*/}"
+}
+
+# How many observations the index layer currently holds. 0 when the store is absent — or refused (rc_notes_read).
 # The writer records this at save time; the probe compares. A store that SHRANK
 # between save and resume means an observation was pruned — which is precisely the
 # "index observation missing" failure the probe has to be able to name.
 rc_notes_count() { # <repo>
-  local store n
-  store="$(rc_notes_path "$1")"
-  [ -f "$store" ] || { printf '0'; return 0; }
-  n="$(grep -c . "$store" 2>/dev/null)"
+  local n
+  n="$(rc_notes_read "$1" 2>/dev/null | grep -c .)"
   printf '%s' "${n:-0}"
+}
+
+# Whether the store is there and plain, i.e. whether rc_notes_read read it. The writer records it as the key's "present".
+rc_notes_present() { # <repo>
+  rc_notes_read "$1" >/dev/null 2>&1
 }
 
 # The hmd/context worklog branch, as the memory stack's third layer. Sets:

@@ -55,7 +55,10 @@
 #     open: a refusal never blocks a session. Every write goes through bin/lib/hmd_nofollow_write.py (a temp
 #     file beside the target, then a rename; a note is an O_NOFOLLOW append: no link followed, none
 #     replaced). The team record under .planning/ledger is written by checkpoint_share.py through the same
-#     helper: a link there skips only that record.
+#     helper: a link there skips only that record. The notes store is READ through the same helper too
+#     (rc_notes_read, lib/resume-contract.sh): `write` folds it into four fields and the key, and a link, a
+#     FIFO or a hard-linked file at .heimdall or resume-notes.ndjson is skipped, never followed — the save
+#     still lands (exit 0: the notes are an optional input) and one stderr line says they were skipped.
 #
 # USAGE
 #   heimdall-checkpoint write [project_dir]   # write/update .planning/CHECKPOINT.md
@@ -383,15 +386,27 @@ _scan_facts() {
 # disk, and telling those two apart is this entire feature.
 # ---------------------------------------------------------------------------
 
-# Read the recorded notes of one category, oldest-last, unescaped.
+# Read the recorded notes of one category, oldest-last, unescaped. The store is read through the no-follow helper
+# (rc_notes_read): `[ -f ]` and grep follow a symlink, so a repository that linked .heimdall or resume-notes.ndjson to a
+# file outside it would have that file's note-shaped lines copied into CHECKPOINT.md. A store that cannot be read plainly
+# (not there, a link, a FIFO, a hard-linked file) yields no notes.
 _notes_text() { # <project_dir> <contract-id> [max]
-  local store
-  store="$(rc_notes_path "$1")"
-  [ -f "$store" ] || return 0
-  grep -F "\"category\": \"$2\"" "$store" 2>/dev/null \
+  rc_notes_read "$1" 2>/dev/null \
+    | grep -F "\"category\": \"$2\"" \
     | tail -"${3:-6}" \
     | sed -n 's/.*"text": "\(.*\)"}$/\1/p' \
     | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g'
+}
+
+# Say ONCE that the notes were skipped. The readers above pass over a store the helper REFUSED (a link, a FIFO, a
+# hard-linked file) without a word, and "none recorded this session" would then read as the truth; the save goes on
+# without the notes — they are an optional input, so this never fails the save. One line on stderr, naming what was refused.
+_notes_notice() { # <project_dir>
+  local err rc
+  err="$(rc_notes_read "$1" 2>&1 >/dev/null)"; rc=$?
+  [ "$rc" -eq 4 ] || return 0
+  err="$(printf '%s' "${err#hmd_nofollow_write: }" | tr '\n' ' ')"
+  echo "[heimdall-checkpoint] notes skipped — ${err}; the save goes on without the recorded notes" >&2
 }
 
 _derive_in_progress() {
@@ -815,7 +830,7 @@ _write_key() { # <project_dir> <ts>
     printf '  "layers": {\n'
     printf '    "checkpoint": {"path": "%s", "present": true},\n' "$(rc_json_esc "$(rc_ckpt_path "$project_dir")")"
     printf '    "index": {"path": "%s", "present": %s, "entries": %s},\n' \
-      "$(rc_json_esc "$notes")" "$([ -f "$notes" ] && printf true || printf false)" "$ncount"
+      "$(rc_json_esc "$notes")" "$(rc_notes_present "$project_dir" && printf true || printf false)" "$ncount"
     printf '    "context-branch": {"ref": "refs/heads/hmd/context", "present": %s, "head": "%s", "worklog_ts": %s}\n' \
       "$([ "$RC_CB_PRESENT" = yes ] && printf true || printf false)" "$RC_CB_HEAD" "$RC_CB_TS"
     printf '  }\n'
@@ -905,6 +920,7 @@ cmd_write() {
   _scan_facts "$project_dir"
   _scan_worktrees "$project_dir"
   _scan_gate "$project_dir"
+  _notes_notice "$project_dir"
   _derive_contract "$project_dir"
 
   block=$(_build_block "$project_dir" "$ts") || return 0
@@ -995,7 +1011,9 @@ hook would call that saved) — when .planning, CHECKPOINT.md, RESUME-KEY.json o
 is a symlink (a dangling one too) or not a plain directory / regular file; `note` refuses
 the same way for .heimdall and resume-notes.ndjson. A cloned repo can plant one and this
 runs unattended. Every write goes through bin/lib/hmd_nofollow_write.py: temp file beside
-the target, rename; a note is an O_NOFOLLOW append.
+the target, rename; a note is an O_NOFOLLOW append. `write` also READS the notes store through
+it and, when that is a link, a FIFO or a hard-linked file, skips the notes (the save still
+lands, exit 0) and says so once on stderr.
 
 Invoked automatically by the SessionEnd hook, and graded on the next restart by
 heimdall-resume-probe. The rich, human-authored handoff is /hmd:save
