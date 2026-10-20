@@ -221,6 +221,28 @@ verdict to a state of the code that never existed.
   is the human-readable statement of a rule the enforcer already checks — if the two
   ever disagree, the enforcer is authoritative and this text is the bug.
 
+## Release convergence: one review, one sweep, then ship (2026-10-21)
+Operator directive, 2026-10-21: *fix the too-much-testing and reiterating loop; deliver well, not
+over-tested.* Measured on 2026-10-20/21: one 2.4.9 batch went fix → automated security finding on the
+fix → fix → finding on that fix → ... (five rounds in one evening), each round re-reached ~500 suites
+through a hub file, and a full review then opened a sixth round. The loop, not any single test, is
+what ate the day. The rules:
+
+- **One review round per release.** Review the release diff ONCE, after the batch is merged and before
+  the sweep. Fixes to its findings are proven by their own RED→GREEN test; they are NOT re-reviewed.
+  No second review of the fixes, no re-review of the whole diff.
+- **Only BLOCKER/HIGH block a release.** MEDIUM/LOW findings go to `.planning/BACKLOG.md` and ride the
+  next release, unless the fix is already written and tested. A finding that only exists because of a
+  fix made this release is triaged the same way; it does not restart the cycle unless it is HIGH.
+- **Background security-review findings** on hmd's own commits follow the same triage: HIGH → fix in
+  this batch, otherwise backlog with one line. Never chain an agent per finding.
+- **One sweep, last.** Merge every fix of the round, then ONE full sweep on the frozen tree, then ship.
+  A red suite after it: fix, commit, `run-all.sh --failed` (never a second full sweep).
+- **Scope a fix agent to its finding.** No "while you're there" exploration, no listing of new
+  candidate defects unless asked: a list becomes the next round.
+- **Done means delivered.** A release that is green, reviewed once and HIGH-free ships; the backlog is
+  where the rest of the perfection lives.
+
 ## Pre-commit vs pre-push: what stays at commit, what dedups at push
 Two things are easy to conflate and must not be: the ~1600s full sweep above (never
 auto-run, gated by the enforcer) and the small, real per-gate checks below (auto-run by
