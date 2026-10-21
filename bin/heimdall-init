@@ -486,7 +486,7 @@ GI="$REPO/.gitignore"
 if [ -s "$GI" ] && [ "$(tail -c 1 "$GI" | od -An -tx1 | tr -d '[:space:]')" != "0a" ]; then
   printf '\n' >> "$GI" 2>/dev/null || true
 fi
-for pat in ".heimdall/verdict.json" ".heimdall/receipts/" ".heimdall/audit.json"; do
+for pat in ".heimdall/verdict.json" ".heimdall/receipts/" ".heimdall/audit.json" ".planning/CONTINUE.md"; do
   if [ -f "$GI" ] && grep -qxF "$pat" "$GI" 2>/dev/null; then continue; fi
   printf '%s\n' "$pat" >> "$GI" 2>/dev/null || true
 done
