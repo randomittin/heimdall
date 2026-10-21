@@ -406,7 +406,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled presence-keeper-stop && exit 0; INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; if [ -x \"$HP\" ]; then SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); \"$HP\" keeper-stop --session \"$SID\" >/dev/null 2>&1 || true; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled presence-keeper-stop && exit 0; INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; if [ -x \"$HP\" ]; then SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); nohup perl -MPOSIX -e \"POSIX::setsid(); exec @ARGV or exit 127\" \"$HP\" keeper-stop --session \"$SID\" </dev/null >/dev/null 2>&1 & fi; exit 0",
+            "timeout": 5
           }
         ]
       },
@@ -423,7 +424,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled pair-window-stop && exit 0; INPUT=$(cat); APP=\"$HMDP/bin/heimdall-app\"; [ -x \"$APP\" ] || exit 0; SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); [ -n \"$SID\" ] || exit 0; \"$APP\" pair-window --stop --session \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1 || true; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled pair-window-stop && exit 0; INPUT=$(cat); APP=\"$HMDP/bin/heimdall-app\"; [ -x \"$APP\" ] || exit 0; SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); [ -n \"$SID\" ] || exit 0; nohup perl -MPOSIX -e \"POSIX::setsid(); exec @ARGV or exit 127\" \"$APP\" pair-window --stop --session \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" </dev/null >/dev/null 2>&1 & exit 0",
+            "timeout": 5
           }
         ]
       }
