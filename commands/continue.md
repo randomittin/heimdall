@@ -41,12 +41,14 @@ HMD_NOTE
 ## When it does not go cleanly
 
 - **Exit 3 / `WARNING - checkpoint not fully saved`** — the handoff was written but the checkpoint was not. Relay the warning, run `"${CLAUDE_PLUGIN_ROOT}/bin/heimdall-checkpoint" write`, and show the line only after that save succeeds or the user chooses to go on.
+- **Exit 3 / `WARNING - the handoff will NOT be re-injected`** — the handoff and the line are fine, but the compaction will not bring the handoff back: git tracks `.planning/CONTINUE.md`, or no provenance record could be kept under `HEIMDALL_HOME` (see Rules). Relay the warning with its reason and tell the user that after the compaction you have to be asked to read `.planning/CONTINUE.md` by hand. The fix is in the reason (`git rm --cached` it and add it to `.gitignore`; a `HEIMDALL_HOME` that is absolute and outside every git work tree); do not run it for them unasked.
 - **Exit 4** — a symlink or a non-plain file is in the way of `.planning/`; nothing was written and no line was printed. Say so; a plain `/compact` is then the user's call, with the loss that implies.
 - **Exit 2** — the note was refused (the message names the line). Fix it and run it again.
 
 ## Rules
 
 - The handoff is valid for 30 minutes (`HMD_CONTINUE_WINDOW_MIN`, `0` turns the re-injection off) and is injected once, on a compaction. If the user compacts later, or already compacted once, run this again.
+- It is injected by a hook of its own, `continue-inject` (`heimdall-hooks disable continue-inject` turns it off; disabling `resume-probe` does not touch it). It is believed only if git does NOT track `.planning/CONTINUE.md` and the record this command kept under `$HEIMDALL_HOME/continue/` (default `~/.heimdall`: an absolute path, outside every git work tree) names the same id and time. A `CONTINUE.md` that arrived with a clone, or that was committed, is ignored on purpose; keep the file out of git (add `.planning/CONTINUE.md` to `.gitignore` when the repo does not ignore `.planning/`).
 - Only a compaction re-injects it. `/clear`, a fresh start and `--resume` do not, and leave it waiting.
 - The `/compact` line only steers the summary; the re-injected handoff is what keeps the state exact. Keep both honest: never write a next step you have not checked against the repo.
 - Do not run the full sweep for this; a pivot is not a landing.

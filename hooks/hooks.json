@@ -328,6 +328,16 @@
             "asyncRewake": true
           }
         ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled continue-inject && exit 0; HOOK=\"$HMDP/bin/heimdall-continue\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" inject --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null; fi; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SubagentStop": [

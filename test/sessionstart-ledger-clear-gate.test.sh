@@ -437,12 +437,23 @@ fi
 #                                           asyncRewake watcher for an idle session
 # Both are registered in hooks/hooks.metadata.json, switchable with
 # `heimdall-hooks disable <id>`, covered by test/heimdall-inbox-wake.test.sh.
+#
+# 15 -> 16 on 2026-10-21, one entry, known and advisory:
+#   SessionStart[15] continue-inject      -- bin/heimdall-continue inject, matcher
+#                                           "compact": re-injects the /hmd:continue
+#                                           handoff once after a compaction. It used to
+#                                           ride heimdall-resume-probe, so
+#                                           `heimdall-hooks disable resume-probe` killed
+#                                           it. Registered in hooks/hooks.metadata.json,
+#                                           switchable with `heimdall-hooks disable
+#                                           continue-inject`, covered by
+#                                           test/hmd-continue.test.sh.
 # ══════════════════════════════════════════════════════════════════════════
 SS_COUNT="$(jq '.hooks.SessionStart | length' "$HOOKS_JSON")"
-if [ "$SS_COUNT" -eq 15 ]; then
-  ok "G9 all 15 SessionStart entries still present"
+if [ "$SS_COUNT" -eq 16 ]; then
+  ok "G9 all 16 SessionStart entries still present"
 else
-  bad "G9 expected 15 SessionStart entries, found $SS_COUNT"
+  bad "G9 expected 16 SessionStart entries, found $SS_COUNT"
 fi
 
 # The caveman `rules` entry specifically: it is the ONLY thing that puts hmd's

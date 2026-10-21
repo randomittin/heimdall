@@ -13,12 +13,13 @@ Usage:
         however much state it is given: decisions are dropped first, then agents, then gated items; the next step is kept whole.
   heimdall-continue focus
         the note on stdin; prints the `/compact <focus>` line and nothing else (no checkpoint, nothing written).
-  heimdall-continue inject [--repo DIR] [--source S] [--prefix TEXT]
-        the SessionStart side, run by bin/heimdall-resume-probe. When a handoff is waiting -- written by `write` no more than
-        HMD_CONTINUE_WINDOW_MIN minutes ago (default 30, 0 turns this off), not yet consumed -- and the restart is a compaction (--source compact, or
-        the "source" of the hook payload on stdin), it prints ONE line of hookSpecificOutput JSON whose additionalContext is --prefix (the probe's
-        verdict, which the probe's own output would have carried) plus the whole handoff, then marks the handoff consumed. Anything else prints
-        nothing and leaves the handoff where it is.
+  heimdall-continue inject [--repo DIR] [--source S]
+        the SessionStart(compact) side, run by the `continue-inject` hook of hooks/hooks.json: a SessionStart entry of its own with matcher "compact",
+        so switching bin/heimdall-resume-probe off (`heimdall-hooks disable resume-probe`) leaves it working and `heimdall-hooks disable continue-inject`
+        turns it off. When a handoff is waiting -- written by `write` no more than HMD_CONTINUE_WINDOW_MIN minutes ago (default 30, 0 turns this off),
+        not yet consumed, and PROVEN (below) -- and the restart is a compaction (--source compact, or the "source" of the hook payload on stdin), it
+        prints ONE line of hookSpecificOutput JSON whose additionalContext is the whole handoff behind a one-line header, then marks the handoff
+        consumed. Anything else prints nothing and leaves the handoff where it is.
 
 THE NOTE (stdin, one `key: value` per line; a quoted heredoc passes any text without shell quoting):
     goal: <the current task, one line>                                   once
@@ -31,20 +32,36 @@ THE NOTE (stdin, one `key: value` per line; a quoted heredoc passes any text wit
 
 THE HANDOFF. .planning/CONTINUE.md, first line `<!-- hmd-continue:v1 id=<8 hex> written_ts=<epoch> consumed_ts=<epoch or empty> -->`, then the
 note and the contract block. The state lives in that first line: `inject` rewrites it with consumed_ts when it injects, so the same handoff is
-never injected twice and a new `write` is a new handoff. A file without that line is not a handoff. A date in the future is never fresh (a
-repository can ship a file; it cannot ship a date inside the window). The injected text is cut at 9000 chars: the harness caps hook context at
-10000 and replaces the rest with a preview.
+never injected twice and a new `write` is a new handoff. A file without that line is not a handoff. A date in the future is never fresh (the date is
+the cheapest check, not the one that keeps a repository from supplying a handoff: see PROVENANCE). The injected text is cut at 9000 chars: the harness
+caps hook context at 10000 and replaces the rest with a preview.
 
 LINKS. Every read and write below the repository goes through bin/lib/hmd_nofollow_write.py (each component opened O_NOFOLLOW relative to the one
 before). A link on the way down (.planning, CONTINUE.md) or an entry that is not a regular file is REFUSED: `write` exits 4 and writes nothing,
 `inject` reads and rewrites nothing.
 
-EXIT  0 done | 1 failed (an I/O error) | 2 usage or a bad note | 3 `write` made the handoff but the checkpoint was not saved (said on stderr; the
-      line is still printed) | 4 REFUSED (a link or an entry that is not plain)
+PROVENANCE. A repository controls every name below its root, so a clone can ship a .planning/CONTINUE.md with a fresh-looking marker line, and whatever
+it says would enter the session as context the model acts on. `inject` therefore believes a handoff only when BOTH hold:
+  1. git does not track the file: `git ls-files --error-unmatch` (5 s, run with no GIT_* variable in its environment: a session's environment is the
+     repository's to set, and GIT_INDEX_FILE or GIT_DIR would make git answer about another index). A tracked file, a git that fails, times out or is
+     not there, and any answer but "unknown to git" are refusals.
+  2. its id and written_ts match the record `write` kept for this repository in the operator's home: $HEIMDALL_HOME/continue/<sha256(realpath repo)[:16]>.json,
+     {"v":1,"repo":<realpath>,"id":<id>,"written_ts":<epoch>}, 0600 in a 0700 directory, written and read through bin/lib/hmd_private_state.py (no link
+     followed; a file of this user's with no group or other permission bits, or it is not believed). HEIMDALL_HOME is resolved as the relay-approval and
+     pair-optin stores resolve it (bin/lib/hmd_relay_approval.py, one definition): an absolute path, else ~/.heimdall -- a relative one would mean the
+     repository -- and a store inside the repository or inside ANY git work tree is neither read nor made, because a record planted there would vouch for itself.
+Anything else injects nothing, says why on stderr and leaves the file alone. `write` checks the same two things when it is done and says so -- stderr,
+exit 3, the line still printed -- when the handoff will NOT come back. The record binds the handoff's identity and time, not its body: it keeps a clone
+from supplying a handoff, not a process that can already write your working tree.
+
+EXIT  0 done | 1 failed (an I/O error) | 2 usage or a bad note | 3 `write` made the handoff but something is incomplete (said on stderr; the line is still
+      printed): the checkpoint was not saved, or the handoff will not be re-injected (no record could be kept, or git tracks it, or git cannot say) |
+      4 REFUSED (a link or an entry that is not plain)
 
 Python 3.7+, standard library only.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -55,13 +72,18 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import hmd_nofollow_write as nf  # noqa: E402  (the no-follow walk every read and write goes through)
+import hmd_nofollow_write as nf  # noqa: E402  (the no-follow walk every read and write below the repository goes through)
+import hmd_relay_approval as approval  # noqa: E402  (where HEIMDALL_HOME is, what is inside a git work tree, and the vetted reader of a record in the operator's home: one definition, shared with the relay-approval and pair-optin stores)
+
+private = approval.PRIVATE  # hmd_private_state: the no-follow, 0600-in-0700 writer the record goes through
 
 OK, FAILED, USAGE, PARTIAL, REFUSED = 0, 1, 2, 3, nf.REFUSED
 REL, NAME, CKPT_NAME = ".planning", "CONTINUE.md", "CHECKPOINT.md"
+HOME_REL = "continue"  # <HEIMDALL_HOME>/continue/<sha256(realpath repo)[:16]>.json: the record `write` keeps of the handoff it made for that repository
+RECORD_VERSION = 1
+GIT_BUDGET_S = 5  # how long `git ls-files` may take before the handoff is refused
 LINE_CAP = 1500  # chars of the pasted line, "/compact " included
 INJECT_CAP = 9000  # chars of additionalContext (the harness caps hook context at 10000)
-PREFIX_CAP = 1000  # chars of the probe verdict that rides along
 DEFAULT_WINDOW_MIN = 30
 SKEW_S = 120  # a clock this far ahead still reads as now; further is a planted date
 MAX_FILE = 1 << 20
@@ -78,7 +100,6 @@ FIELD_CAP = 600
 TAIL = "The full handoff is re-injected from .planning/CONTINUE.md after compaction."
 MARK_RE = re.compile(r"<!-- hmd-continue:v1 id=([0-9a-f]{8}) written_ts=([0-9]{1,12}) consumed_ts=([0-9]{0,12}) -->")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
-BLOCK_CONTROL_RE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]+")  # the same, but a newline stays (the probe verdict is several lines)
 
 
 class Fail(Exception):
@@ -234,10 +255,10 @@ def sibling(name):
     return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
 
 
-def run(argv, cwd, timeout):
-    """(exit status, stdout, stderr); 142 when it ran past `timeout`, 127 when it could not start."""
+def run(argv, cwd, timeout, env=None):
+    """(exit status, stdout, stderr); 142 when it ran past `timeout`, 127 when it could not start. `env`, when given, is the whole environment."""
     try:
-        done = subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        done = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     except subprocess.TimeoutExpired:
         return 142, "", "ran past %d s" % timeout
     except OSError as exc:
@@ -315,6 +336,83 @@ def window_minutes():
     return DEFAULT_WINDOW_MIN
 
 
+# ── provenance: who made this handoff (see PROVENANCE above) ───────────────────
+def record_name(root):
+    return "%s.json" % hashlib.sha256(os.fsencode(root)).hexdigest()[:16]
+
+
+def keep_record(root, hid, written):
+    """Keep what `inject` will ask for: this handoff's id and time, for this repository, in the operator's home. None when it is kept, else the reason it is not --
+    nothing is created, in the repository or in any git work tree, when the home cannot be believed."""
+    base = approval.home()
+    if base is None:
+        return "there is no absolute HEIMDALL_HOME or HOME to keep a record under"
+    try:
+        probe = approval._deepest_dir(os.path.join(base, HOME_REL))  # the directory the record is in, or will be made in, judged before anything is created
+        try:
+            inside = approval.in_a_repo(probe, root)
+        finally:
+            os.close(probe)
+        if inside:
+            return "%s is inside a git work tree or this repository, where a repository could plant a record" % base
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        body = json.dumps({"v": RECORD_VERSION, "repo": root, "id": hid, "written_ts": written}, sort_keys=True, separators=(",", ":"))
+        private.write(base, HOME_REL, record_name(root), body.encode("utf-8"))
+    except (OSError, ValueError) as exc:
+        return "cannot write a record under %s/%s: %s" % (base, HOME_REL, exc)
+    return None
+
+
+def look_up(root):
+    """(record, "") -- the record `write` kept for `root`, a dict -- or (None, why there is none that is believed). Nothing is made. The directory that is OPENED is judged
+    (inside the repository or any git work tree: not read) and the record is read through that descriptor, so the check and the read cannot disagree."""
+    base = approval.home()
+    if base is None:
+        return None, "there is no absolute HEIMDALL_HOME or HOME to look under"
+    try:
+        store = private.open_dir(base, HOME_REL, False)
+    except OSError:
+        return None, "no believable record for this repository: there is no store at %s/%s" % (base, HOME_REL)
+    try:
+        if approval.in_a_repo(store, root):
+            return None, "%s is inside a git work tree or this repository, where a repository could plant a record" % base
+        rec = approval._record(store, record_name(root))
+    finally:
+        os.close(store)
+    if rec is None:
+        return None, "no believable record for this repository in %s/%s (missing, loose permissions, a link, not ours, or not JSON)" % (base, HOME_REL)
+    return rec, ""
+
+
+def git_env():
+    """The environment of the git that is asked about the handoff: no GIT_* variable, and English messages (the answer is read from one)."""
+    env = dict((key, value) for key, value in os.environ.items() if not key.startswith("GIT_"))
+    env["LC_ALL"] = "C"
+    return env
+
+
+def tracked_reason(root):
+    """None when git says the handoff is not tracked, else why it is not believed: git tracks it (a repository can ship a tracked file), or git could not say -- not a
+    repository, a failure, a timeout, any answer but the one for "unknown to git"."""
+    rc, _, err = run(["git", "ls-files", "--error-unmatch", "--", "%s/%s" % (REL, NAME)], root, GIT_BUDGET_S, git_env())
+    if rc == 0:
+        return "git tracks %s/%s (a repository can ship a tracked file; keep the handoff out of git: .gitignore it and `git rm --cached` it)" % (REL, NAME)
+    if rc == 1 and "did not match any file(s) known to git" in err:
+        return None
+    return "git could not say whether %s/%s is tracked (exit %d: %s)" % (REL, NAME, rc, last_line(err) or "no message")
+
+
+def unproven(root, hid, written):
+    """None when this handoff is believed -- the record in the operator's home names this id and time for this repository, and git does not track the file -- else the
+    reason it is not."""
+    rec, why = look_up(root)
+    if rec is None:
+        return why
+    if rec.get("v") != RECORD_VERSION or rec.get("repo") != root or rec.get("id") != hid or rec.get("written_ts") != written:
+        return "its id and time do not match the record /hmd:continue kept for this repository"
+    return tracked_reason(root)
+
+
 def cmd_focus(args):
     say(focus_line(parse_note(read_note_text())))
     return OK
@@ -335,6 +433,7 @@ def cmd_write(args):
     hid = os.urandom(4).hex()
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
     put_file(root, marker(hid, now, "") + "\n" + render_note(note, fields, facts, problems, stamp, window))
+    holds = [why for why in (keep_record(root, hid, now), tracked_reason(root)) if why]  # what `inject` will ask: both are checked, so both are reported
     say("[heimdall-continue] handoff written: %s/%s/%s (id %s)" % (root, REL, NAME, hid))
     if problems:
         warn("[heimdall-continue] WARNING - checkpoint not fully saved: %s. The handoff has the note but no resume-contract snapshot; run heimdall-checkpoint write too."
@@ -343,12 +442,15 @@ def cmd_write(args):
         say("[heimdall-continue] checkpoint saved, all %d resume fields are in the handoff" % len(LABELS))
     if window == 0:
         warn("[heimdall-continue] HMD_CONTINUE_WINDOW_MIN=0: the handoff will NOT be re-injected after compaction")
+    elif holds:
+        warn("[heimdall-continue] WARNING - the handoff will NOT be re-injected after compaction: %s. The /compact line below still steers the summary; after the compaction have %s/%s read."
+             % ("; ".join(holds), REL, NAME))
     else:
         say("[heimdall-continue] it is re-injected once, after the first compaction within %d min" % window)
     line = focus_line(note)
     say("[heimdall-continue] paste this as your next message (%d of %d chars; only you can run /compact):" % (len(line), LINE_CAP))
     say(line)
-    return PARTIAL if problems else OK
+    return PARTIAL if problems or (holds and window) else OK
 
 
 # ── the SessionStart side ─────────────────────────────────────────────────────
@@ -415,11 +517,12 @@ def cmd_inject(args):
         return OK
     if (args.source or payload_source()) != "compact":
         return OK
-    parts = []
-    if args.prefix:
-        parts.append(BLOCK_CONTROL_RE.sub(" ", scrub(args.prefix))[:PREFIX_CAP].strip())
-    parts.append("[heimdall] /hmd:continue handoff (written %s ago), re-injected once because this session was just compacted:" % ago(max(0, now - written)))
-    parts.append(scrub(body).strip("\n"))
+    why = unproven(root, hid, written)
+    if why is not None:
+        warn("[heimdall-continue] %s/%s not injected: %s" % (REL, NAME, why))
+        return OK
+    parts = ["[heimdall] /hmd:continue handoff (written %s ago), re-injected once because this session was just compacted:" % ago(max(0, now - written)),
+             scrub(body).strip("\n")]
     context = "\n\n".join(parts)
     if len(context) > INJECT_CAP:
         cut = "\n[cut at %d chars: the whole handoff is in %s/%s]" % (INJECT_CAP, REL, NAME)
@@ -435,10 +538,9 @@ def main(argv=None):
     wr = sub.add_parser("write", help="the note on stdin: checkpoint, write .planning/CONTINUE.md, print ONE /compact line")
     wr.add_argument("--repo", default="", help="the project dir (default: $CLAUDE_PROJECT_DIR, else the cwd)")
     sub.add_parser("focus", help="the note on stdin: print the /compact line only")
-    inj = sub.add_parser("inject", help="the SessionStart side: print the hook JSON for a fresh, unconsumed handoff on a compaction restart")
+    inj = sub.add_parser("inject", help="the SessionStart(compact) side: print the hook JSON for a fresh, unconsumed handoff that /hmd:continue wrote here and git does not track")
     inj.add_argument("--repo", default="", help="the project dir (default: $CLAUDE_PROJECT_DIR, else the cwd)")
     inj.add_argument("--source", default="", help="the SessionStart source; default: the \"source\" of the hook payload on stdin")
-    inj.add_argument("--prefix", default="", help="text that leads the injected context (the probe's verdict)")
     args = parser.parse_args(argv)
     try:
         return {"write": cmd_write, "focus": cmd_focus, "inject": cmd_inject}[args.action](args)

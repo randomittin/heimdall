@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# heimdall-continue -- /compact and /continue in one move: write the handoff, print the ONE `/compact <focus>` line to paste, and (through
-# bin/heimdall-resume-probe) re-inject the handoff once after the compaction.
+# heimdall-continue -- /compact and /continue in one move: write the handoff, print the ONE `/compact <focus>` line to paste, and (through the
+# `continue-inject` SessionStart(compact) hook of hooks/hooks.json) re-inject the handoff once after the compaction.
 #
 # This file is only the launcher. The behaviour, the usage and the contract (`heimdall-continue --help` prints the usage) are in
 # bin/lib/hmd_continue.py; every read and write under the repository goes through bin/lib/hmd_nofollow_write.py. Python runs isolated (-I -S), like the

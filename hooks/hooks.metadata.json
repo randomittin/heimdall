@@ -372,6 +372,16 @@
       "remote_toggle": false
     },
     {
+      "event": "SessionStart",
+      "index": 15,
+      "id": "continue-inject",
+      "description": "Re-injects the /hmd:continue handoff once after a compaction: a SessionStart hook of its own (matcher compact, so it fires only when the restart is a compaction) running heimdall-continue inject, which prints ONE line of hookSpecificOutput.additionalContext JSON holding the whole handoff (.planning/CONTINUE.md) when it was written within HMD_CONTINUE_WINDOW_MIN minutes (default 30, 0 = off), is not yet consumed (marked so the moment it is injected), git does NOT track it, and its id and written_ts match the record /hmd:continue kept for this repository under $HEIMDALL_HOME/continue/ (an absolute path, in no git work tree, 0600 in a 0700 directory, no link followed). A tracked, unrecorded, stale, future-dated, marker-less, consumed or symlinked handoff, and any restart that is not a compaction, injects nothing: a cloned repository can ship a CONTINUE.md but not a record in your home. Independent of resume-probe: disabling that hook leaves this one working, disabling this one (heimdall-hooks disable continue-inject) stops the injection and nothing else, and the probe no longer injects, so a handoff is never injected twice. Fail-open (stderr discarded, always exit 0), timeout 10s.",
+      "matcher": "compact",
+      "fingerprint": "00516e6986903221415757c98220cf6b73fdb14f60191af9d475cb2bff71949f",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "SubagentStop",
       "index": 0,
       "id": "subagent-metric",
