@@ -79,6 +79,7 @@ Agents parked BEFORE this rule applied send no fresh notification. Sweep with `b
 - `/hmd:status` — Show current project state
 - `/hmd:maintain` — Toggle maintainer mode
 - `/hmd:reflect` — Force conflict reflection pass
+- `/hmd:continue` — Save, then print the one `/compact <focus>` line to paste; the handoff (goal, next step, in-flight agents, decisions, gated items) comes back once after the compaction. Nothing can run `/compact` for the user
 
 ## Reference Documentation
 

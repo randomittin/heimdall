@@ -23,7 +23,7 @@ README.md, first sentence: **"Heimdall makes your coding agent's work pass a tes
 | Executables in `bin/` | `find bin -maxdepth 1 -type f -perm +111 \| wc -l` → 219 (221 files; `ls bin \| wc -l` → 223 incl. `lib/`, `protocol/`; a checkout that has run Python also holds an untracked `__pycache__/`) |
 | Python libraries in `bin/lib/` | `ls bin/lib/*.py \| wc -l` → 136 (of which `ls bin/lib/cp_*.py \| wc -l` → 47 control-plane) |
 | Hooks in the registry | `bin/heimdall-hooks list --json \| jq length` → 36 |
-| Agents / commands / skills | `ls agents/*.md \| wc -l` → 16 · `ls commands/*.md \| wc -l` → 19 · `ls skills/*/SKILL.md \| wc -l` → 5 |
+| Agents / commands / skills | `ls agents/*.md \| wc -l` → 16 · `ls commands/*.md \| wc -l` → 20 · `ls skills/*/SKILL.md \| wc -l` → 5 |
 | Test suites | `ls test/*.test.sh \| wc -l` → 468 |
 | Oracles registered | `jq -r '.oracles \| keys[]' evals/oracles/registry.json \| wc -l` → 10 |
 | Corpus cases | `jq '.cases \| length' evals/corpus/INDEX.json` → 13 |
@@ -133,7 +133,7 @@ Groups per event: UserPromptSubmit 4 · PreToolUse 7 · PostToolUse 4 · Session
 | PostToolUse | `context-sync` | no | Write\|Edit | Throttled background `heimdall-context-sync` to the `hmd/context` orphan branch |
 | PostToolUse | `journal-commit` | no | Bash | Journal entry when a Bash call landed a commit |
 | SessionStart | `session-bootstrap` | no | * | Autoupdate check, statusline register, selfheal, tracker builds, state init, stack detect, team/presence beat, reap advice, checkpoint notice |
-| SessionStart | `resume-probe` | no | * | `heimdall-resume-probe` when CHECKPOINT.md exists |
+| SessionStart | `resume-probe` | no | * | `heimdall-resume-probe` when CHECKPOINT.md exists; on a compaction restart (`source: compact`) it prints a fresh `/hmd:continue` handoff, once, as one line of `additionalContext` JSON in place of its verdict line |
 | SessionStart | `maintain-resume-hint` | no | * | maintainer loop resume hint |
 | SessionStart | `quota-resume-hint` | no | * | quota-exhaustion resume hint |
 | SessionStart | `dream-notice` | no | * | surfaces a failing nightly /dream |
@@ -222,9 +222,9 @@ Spawn discipline (CLAUDE.md "Parallelism"): batch independent calls; one agent p
 | `stacks` | Stack-specific knowledge packs (`ls skills/stacks/` → fastapi, nextjs, react-native, spring-boot) loaded onto a role agent |
 | `system-health` | Disk/memory cleanup advisor; catches hmd's own runaway presence keeper; hands off to mac-deep-clean |
 
-**Commands** (`commands/*.md`, 19 — `docs/INDEX.md` was corrected from 15 to 19 on 2026-09-19):
+**Commands** (`commands/*.md`, 20 — `docs/INDEX.md` was corrected from 15 to 19 on 2026-09-19, and `continue` made it 20):
 
-`autocommit` · `autonomy` (1 Guided / 2 Checkpoint / 3 Full Auto) · `bench` · `debloat` · `demo` · `designmatch` · `dream` · `fallback` · `feedback` · `invite` · `level` (deprecated alias of autonomy) · `maintain-check` · `maintain` · `reflect` · `report-bug` · `save` · `status` · `switch-ai` · `team`.
+`autocommit` · `autonomy` (1 Guided / 2 Checkpoint / 3 Full Auto) · `bench` · `continue` (save, then print the one `/compact <focus>` line to paste; the handoff is re-injected once after the compaction) · `debloat` · `demo` · `designmatch` · `dream` · `fallback` · `feedback` · `invite` · `level` (deprecated alias of autonomy) · `maintain-check` · `maintain` · `reflect` · `report-bug` · `save` · `status` · `switch-ai` · `team`.
 
 ```bash
 for f in commands/*.md; do printf '%s\t' "$(basename $f .md)"; grep -m1 '^description:' "$f" | cut -c14-120; done
@@ -377,6 +377,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-repo-checks` | a repo's OWN declared checks (`.heimdall/repo-checks.json`), run and recorded as a receipt bound to commit, tree and committed declaration (`run`, `status [--pushes IDS]`: every commit the push sends must be the receipt's); what the push gate passes a non-sweep repo on. A launcher: the CLI is `bin/lib/hmd_repo_checks.py`, the receipt's one definition (fields, types, formats; build and verify) is `bin/lib/hmd_repo_receipt.py`. `bin/lib/hmd_push_target.py` is the resolver that names the repo(s) a push goes to (asked of git), reads their class from the commits (sweep / repo-checks / unmanaged, strictest of HEAD, upstream, origin, refspecs) and fails closed on any construct it does not model exactly |
 | `heimdall-checkpoint` | mechanical, LLM-free auto-save of forward session state |
 | `heimdall-precompact-checkpoint` | PreCompact entry point driving `heimdall-checkpoint` |
+| `heimdall-continue` | `/hmd:continue`'s tool (launcher for `bin/lib/hmd_continue.py`): `write` takes a checkpoint, writes `.planning/CONTINUE.md` and prints ONE `/compact <focus>` line (under 1500 chars, next step kept whole); `inject` is what `heimdall-resume-probe` calls on `source: compact` to re-inject a handoff written within `HMD_CONTINUE_WINDOW_MIN` (30) minutes, once; `focus` prints the line only. Every read and write goes through `bin/lib/hmd_nofollow_write.py` |
 | `heimdall-autocommit` | shared mechanics for the two automatic checkpoint commits |
 | `heimdall-wip-commit` | mechanical mid-task checkpoint commits |
 | `heimdall-resume-brief` / `heimdall-resume-probe` | resume state for an orchestrator; the falsifier for the memory stack |

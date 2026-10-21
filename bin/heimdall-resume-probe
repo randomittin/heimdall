@@ -41,6 +41,18 @@
 # not red for its absence (context-sync is opt-out by design). A gate that cries wolf
 # on ordinary work gets switched off, and then it protects nobody.
 #
+# THE /hmd:continue HANDOFF RIDES THIS HOOK
+# -----------------------------------------
+# hooks/hooks.json runs this probe on EVERY SessionStart (no matcher), so it already fires when
+# the session restarts because of a compaction (source "compact"), and it is the one script there
+# that can re-inject context for it. When bin/heimdall-continue left a fresh handoff in
+# .planning/CONTINUE.md and the restart is a compaction, `run` prints ONE line of
+# hookSpecificOutput JSON instead of its verdict line: the hook keeps only `head -8` of what the
+# probe prints, so the handoff only fits as a single JSON line, and the verdict travels inside its
+# additionalContext. Which handoff is fresh, whether the restart is a compaction (the "source" of the
+# payload on stdin, read only when a handoff is waiting) and marking it consumed are all
+# bin/lib/hmd_continue.py's; with no handoff the probe pays one `[ -e ]` and prints what it always did.
+#
 # Usage:
 #   heimdall-resume-probe run [--repo DIR] [--json] [--verbose]
 #   heimdall-resume-probe log [--repo DIR] [--limit N]
@@ -311,10 +323,20 @@ _render_json() { # <repo> <streak>
   printf '}\n'
 }
 
+# A fresh /hmd:continue handoff, as the one line of hook JSON that carries it (the verdict rides in its
+# additionalContext), when the restart is a compaction; nothing otherwise. Fails open: no handoff file,
+# no python3 or any error is "nothing", and the caller prints the verdict as before.
+_continue_handoff() { # <repo> <streak>
+  local py
+  [ -e "$1/.planning/CONTINUE.md" ] || [ -L "$1/.planning/CONTINUE.md" ] || return 1
+  py="$(command -v python3)" || return 1
+  "$py" -I -S "$_PROBE_BIN/lib/hmd_continue.py" inject --repo "$1" --prefix "$(_render_human "$1" "$2")" 2>/dev/null
+}
+
 # ── verbs ───────────────────────────────────────────────────────────────────────
 
 cmd_run() {
-  local repo="$PWD" json=0 verbose=0 raw
+  local repo="$PWD" json=0 verbose=0 raw handoff
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo) raw="${2:-}"; shift 2 || shift $# ;;
@@ -342,6 +364,8 @@ cmd_run() {
 
   if [ "$json" = "1" ]; then
     _render_json "$repo" "$streak"
+  elif handoff="$(_continue_handoff "$repo" "$streak")" && [ -n "$handoff" ]; then
+    printf '%s\n' "$handoff"
   else
     _render_human "$repo" "$streak"
     if [ "$verbose" = "1" ] && [ "$VERDICT" = "GREEN" ]; then
