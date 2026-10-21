@@ -223,7 +223,7 @@ verdict to a state of the code that never existed.
 
 ## Release convergence: one review, one sweep, then ship (2026-10-21)
 Operator directive, 2026-10-21: *fix the too-much-testing and reiterating loop; deliver well, not
-over-tested.* Measured on 2026-10-20/21: one 2.4.9 batch went fix → automated security finding on the
+over-tested.* Measured on 2026-10-20/21: one release batch went fix → automated security finding on the
 fix → fix → finding on that fix → ... (five rounds in one evening), each round re-reached ~500 suites
 through a hub file, and a full review then opened a sixth round. The loop, not any single test, is
 what ate the day. The rules:

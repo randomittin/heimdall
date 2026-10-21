@@ -156,7 +156,8 @@ packages/runhmd/package.json|release/sync-release.sh|"$ROOT/packages/runhmd/pack
 PUBLISHED_TYPES=( -type f '('
   -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.toml'
   -o -name '*.html' -o -name '*.js' -o -name '*.sh' -o -name '*.yml' -o -name '*.yaml'
-  -o -name 'VERSION' -o -name '_redirects' ')' -print )
+  -o -name 'VERSION' -o -name '_redirects' ')'
+  ! -name 'package-lock.json' -print )   # a lockfile pins THIRD-PARTY versions (e.g. "msw": "^2.4.9"), never ours
 
 find_files() {
   local mode="$1" root="$2"

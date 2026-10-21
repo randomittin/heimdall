@@ -7,7 +7,7 @@
 # Two copies of a definition is how a gate starts failing what the warning never mentioned (and the reverse), so there is one. Both callers evaluate the jq text below with jq itself (the tool
 # prepends it to its transcript program, the hook runs it over the spawn payload), so the matching engine is shared too, not only the words.
 #
-# WHY (CLAUDE.md "Release convergence", operator directive 2026-10-21). Measured on 2.4.9: six chained rounds in one evening, each round spawning a fix agent for a MEDIUM/LOW finding that only
+# WHY (CLAUDE.md "Release convergence", operator directive 2026-10-21). Measured on the 2026-10-20/21 release batch: six chained rounds in one evening, each round spawning a fix agent for a MEDIUM/LOW finding that only
 # existed because of the previous fix. Only BLOCKER/HIGH findings get a fix agent; MEDIUM/LOW go to the backlog.
 #
 # THE DEFINITION. A spawn is a finding-fix spawn when its description and its prompt, read together and without regard to case, BOTH
