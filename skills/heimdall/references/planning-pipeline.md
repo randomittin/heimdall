@@ -148,6 +148,7 @@ After the planner creates a plan with acceptance criteria (Phase 3), synthesize 
 - **Clear:** `/goal clear` when switching tasks or user wants manual control.
 - **Restore:** On session resume (`--resume`), restore goal from `heimdall-state goal-get`.
 - **Checkpoint:** `/hmd:save` persists active goal condition for cross-session restore.
+- **Compact:** `/hmd:continue` saves, then prints the one `/compact <focus>` line (goal included) for the user to paste; the SessionStart(compact) hook re-injects the handoff once, so an active goal survives the compaction. Only the user can type `/compact`.
 
 ## 6c. Two-Tier Verification
 
