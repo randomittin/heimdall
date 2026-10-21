@@ -13,8 +13,13 @@
 #      each mode runs two sweeps: A sees no commit (the control: it anchors and archives, and says nothing about HEAD); B has a suite commit mid-run (it names the commit it STARTED on, records
 #      head_moved_to, prints one line, and leaves the anchor and the archive byte for byte as A left them)
 #   T  a sweep that started on a dirty tree (an untracked file a suite removes mid-run) is not tree_clean and is not anchored
-#   M  mutation proof: break one line of the real code at a time, each proof above must go red
-# Cost: about 10 s -- every scenario runs side by side, each in a repo of its own.
+#   H  commits that touch ONLY paths the repo's own hooks write (a ledger checkpoint and a journal entry, two commits) land mid-run: no move. The receipt is anchored and archived under the
+#      commit the sweep started on, records no head_moved_to, and the run says so in one line -- with the suite cache on (the default sweep) and with --no-cache. A hook auto-committed a ledger
+#      file in the middle of the 2.4.9 sweep and the whole receipt was refused for it
+#   R  every other commit is still a move, refused as in B: a hook's file and a code change in ONE commit; a file under a hook's directory that has none of the hooks' shapes (dropper.sh);
+#      a hook's commit followed by a code change; and the start commit (itself a hook's) rewritten, which is no step forward from it
+#   M  mutation proof: break one line of the real code at a time (and one line of the shared allowlist), each proof above must go red
+# Cost: about 15 s -- every scenario runs side by side, each in a repo of its own.
 # EXIT: 0 = every proof holds and every mutant is killed; 1 = any FAIL.
 # shellcheck disable=SC2016  # the fixture suites are written LITERALLY: their $VARs must reach the file unexpanded
 set -uo pipefail
@@ -43,7 +48,10 @@ trap cleanup EXIT
 unset HEIMDALL_HOME HMD_COLD HMD_SUITE_CACHE_MAX_DAYS HMD_SUITE_CACHE_AUDIT_PCT GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR 2>/dev/null || true
 
 # ── fixtures ───────────────────────────────────────────────────────────────────────────────────────────────────────────
-mksuite() { # dir name -- RED_SUITES: always red. COMMIT_SUITE: commits a new file into the fixture repo while the sweep runs. RM_SUITE: removes scratch.txt while the sweep runs
+mksuite() { # dir name -- RED_SUITES: always red. COMMIT_SUITE: commits a new file into the fixture repo while the sweep runs. RM_SUITE: removes scratch.txt while the sweep runs.
+  # MOVE_SUITE + MOVE_KIND: makes the commits of that kind while the sweep runs -- hook: a ledger checkpoint and a journal entry, one commit each, both of the shapes the hooks write;
+  # mixed: a ledger checkpoint and a code file in ONE commit; decoy: a file under a hook's directory that is none of the hooks' shapes; both: a hook's commit, then a code commit;
+  # amend: rewrites the commit HEAD is on
   printf '%s\n' '#!/usr/bin/env bash' \
     'n="$(basename "$0" .test.sh)"; top="$(cd "$(dirname "$0")/.." && pwd)"' \
     'case " ${RED_SUITES:-} " in *" $n "*) echo "  FAIL assertion in $n"; echo "$n: 0 passed, 1 failed"; exit 1 ;; esac' \
@@ -51,23 +59,37 @@ mksuite() { # dir name -- RED_SUITES: always red. COMMIT_SUITE: commits a new fi
     '  f="late-$RANDOM$RANDOM.txt"; echo "landed while the sweep was running" > "$top/$f"' \
     '  git -C "$top" add "$f" && git -C "$top" -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -qm "a commit made while the sweep runs" || { echo "  FAIL the fixture suite could not commit"; echo "$n: 0 passed, 1 failed"; exit 1; }' \
     'fi' \
+    'if [ "${MOVE_SUITE:-}" = "$n" ]; then' \
+    '  g() { git -C "$top" -c core.hooksPath=/dev/null -c commit.gpgsign=false "$@"; }' \
+    '  put() { mkdir -p "$(dirname "$top/$1")" && echo "$RANDOM$RANDOM" > "$top/$1" && g add "$1"; }' \
+    '  case "$MOVE_KIND" in' \
+    '    hook)  put .planning/ledger/checkpoints/haid_fix.json && g commit -qm "hook: checkpoint" && put .planning/journal/2026-10-21-haid_fix.md && g commit -qm "hook: journal" ;;' \
+    '    mixed) put .planning/ledger/checkpoints/haid_fix.json && put late.txt && g commit -qm "a checkpoint and a code change in one commit" ;;' \
+    '    decoy) put .planning/ledger/checkpoints/dropper.sh && g commit -qm "a file that only sits where the hooks write" ;;' \
+    '    both)  put .planning/ledger/checkpoints/haid_fix.json && g commit -qm "hook: checkpoint" && put late.txt && g commit -qm "a code change after it" ;;' \
+    '    amend) g commit -q --amend -m "the commit the sweep started on, rewritten" ;;' \
+    '    *)     false ;;' \
+    '  esac || { echo "  FAIL the fixture suite could not make its commits"; echo "$n: 0 passed, 1 failed"; exit 1; }' \
+    'fi' \
     '[ "${RM_SUITE:-}" = "$n" ] && rm -f "$top/scratch.txt"' \
     'echo "$n: 1 passed, 0 failed"' > "$1/test/$2.test.sh"
 }
-mkfix() { # dir run-all-copy-to-grade -- a git repo holding that run-all.sh, the real closure engine and cache library, and the three fixture suites
-  local d="$1" ra="$2" s
+mkfix() { # dir run-all-copy-to-grade [hook-owned-path.sh copy] -- a git repo holding that run-all.sh, the real closure engine and cache library, and the three fixture suites
+  local d="$1" ra="$2" lib="${3:-$ROOT/bin/lib/hook-owned-path.sh}" s
   mkdir -p "$d/test" "$d/bin/lib" "$d.home" "$d.tmp"
   git -C "$d" init -q; git -C "$d" config user.email t@example.com; git -C "$d" config user.name T
   printf '.heimdall/\n' > "$d/.gitignore"
   cp "$ra" "$d/test/run-all.sh"
-  cp "$ROOT/bin/lib/hook-owned-path.sh" "$ROOT/bin/lib/sweep-chain.sh" "$ROOT/bin/lib/suite_closure.py" "$ROOT/bin/lib/suite-cache.sh" "$d/bin/lib/"
+  cp "$ROOT/bin/lib/sweep-chain.sh" "$ROOT/bin/lib/suite_closure.py" "$ROOT/bin/lib/suite-cache.sh" "$d/bin/lib/"
+  cp "$lib" "$d/bin/lib/hook-owned-path.sh"
   cp "$ROOT/bin/heimdall-suite-closure" "$d/bin/heimdall-suite-closure"
   for s in s1 s2 s3; do mksuite "$d" "$s"; done
   git -C "$d" add -A; git -C "$d" -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -qm fixture
 }
-runit() { # dir [run-all args] -> OUT, RC. The caller's RED_SUITES / COMMIT_SUITE / RM_SUITE travel with the call; its own HOME keeps the gate marker out of everyone else's way
+runit() { # dir [run-all args] -> OUT, RC. The caller's RED_SUITES / COMMIT_SUITE / RM_SUITE / MOVE_* travel with the call; its own HOME keeps the gate marker out of everyone else's way, and a
+  # fake account home (nothing in it) keeps the real-home guard off the machine's real ~/.heimdall
   local d="$1"; shift
-  OUT="$( cd "$d" && env HOME="$d.home" TMPDIR="$d.tmp" HMD_NO_CAFFEINATE=1 bash test/run-all.sh --min 1 --jobs 1 "$@" 2>&1 )"; RC=$?
+  OUT="$( cd "$d" && env HOME="$d.home" TMPDIR="$d.tmp" HMD_TEST_ACCOUNT_HOME="$d.acct" HMD_NO_CAFFEINATE=1 bash test/run-all.sh --min 1 --jobs 1 "$@" 2>&1 )"; RC=$?
 }
 LASTJ() { printf '%s/.heimdall/receipts/last-sweep.json' "$1"; }
 ANCHOR() { printf '%s/.heimdall/receipts/last-full-green.json' "$1"; }
@@ -125,16 +147,61 @@ check_t() { # name -- the proofs for the dirty-start scenario
   eq "T3 the tree looks clean at the end, yet the receipt says tree_clean=false: part of the run graded a dirty tree" "$(jq -r '.tree_clean' "$r/t.last" 2>/dev/null)" "false"
   eq "T4 so it is not the anchor" "$([ -e "$r/t.anchor" ] && echo anchored || echo none)" "none"
 }
+move() { # name mode kind [run-all-copy [hook-owned-path.sh copy]] -- ONE sweep in a repo of its own; the suite s2 makes the commits of KIND (see mksuite) while it runs. mode: default | nocache
+  local mode="$2" kind="$3" ra="${4:-$RUN_ALL}" lib="${5:-}" d="$WORK/$1" r="$RES/$1" args=""
+  mkdir -p "$r"; mkfix "$d" "$ra" "$lib"
+  if [ "$kind" = amend ]; then   # the commit the sweep starts on is itself a hook's, so nothing but the rewrite tells the rewritten commit from one of the hooks'
+    mkdir -p "$d/.planning/ledger/checkpoints"; echo '{}' > "$d/.planning/ledger/checkpoints/haid_start.json"
+    git -C "$d" add -A; git -C "$d" -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -qm "hook: the commit the sweep starts on"
+  fi
+  [ "$mode" = nocache ] && args="--no-cache"
+  git -C "$d" rev-parse HEAD > "$r/start"
+  MOVE_SUITE=s2 MOVE_KIND="$kind" runit "$d" $args; keep "$d" "$r/m"
+  git -C "$d" rev-list --count "$(cat "$r/start")..HEAD" > "$r/n" 2>/dev/null
+}
+check_hook() { # name label -- commits that touch only the hooks' own paths landed mid-run: no move, so the receipt is anchored and archived under the commit the sweep started on
+  local r="$RES/$1" l="$2" start end out
+  start="$(cat "$r/start" 2>/dev/null)"; end="$(cat "$r/m.end" 2>/dev/null)"; out="$(cat "$r/m.out" 2>/dev/null)"
+  eq "$l-0 premise: two commits really landed while the sweep ran" "$([ -n "$start" ] && [ "$start" != "$end" ] && cat "$r/n" 2>/dev/null)" "2"
+  eq "$l-1 the sweep is green" "$(cat "$r/m.rc" 2>/dev/null)" "0"
+  eq "$l-2 its receipt names the commit it started on, records no move, and is tree_clean" "$(jq -r --arg s "$start" '[.head_sha == $s, (has("head_moved_to") | not), .tree_clean] | join(",")' "$r/m.last" 2>/dev/null)" "true,true,true"
+  eq "$l-3 it is the anchor" "$(jq -r '.head_sha' "$r/m.anchor" 2>/dev/null)" "$start"
+  eq "$l-4 and it is archived under that commit" "$(cat "$r/m.arch" 2>/dev/null)" "$start.json"
+  has "$l-5 the run says, naming both commits and how many, that HEAD only advanced by the hooks' own commits" "$out" "run-all: HEAD advanced during the sweep (${start:0:12} -> ${end:0:12}, 2 commit(s)): every one touches only the hooks' own journal and ledger records"
+  has "$l-6 and that the receipt stays release-grade" "$out" "stays release-grade"
+  eq "$l-7 in ONE line" "$(grep -c 'HEAD advanced during the sweep' "$r/m.out" 2>/dev/null)" "1"
+  lacks "$l-8 and never calls it a move" "$out" "HEAD moved"
+}
+check_refused() { # name label -- commits that are not only the hooks' landed mid-run: a move, as in B -- the receipt names the start commit, records where HEAD went, and is neither anchored nor archived
+  local r="$RES/$1" l="$2" start end out
+  start="$(cat "$r/start" 2>/dev/null)"; end="$(cat "$r/m.end" 2>/dev/null)"; out="$(cat "$r/m.out" 2>/dev/null)"
+  eq "$l-0 premise: HEAD really moved while the sweep ran" "$([ -n "$start" ] && [ "$start" != "$end" ] && echo moved || echo same)" "moved"
+  eq "$l-1 the sweep is still green: HEAD moving does not change what the suites said" "$(cat "$r/m.rc" 2>/dev/null)" "0"
+  eq "$l-2 its receipt names the commit it STARTED on" "$(jq -r '.head_sha' "$r/m.last" 2>/dev/null)" "$start"
+  eq "$l-3 and records where HEAD went" "$(jq -r '.head_moved_to // "none"' "$r/m.last" 2>/dev/null)" "$end"
+  eq "$l-4 it is not the anchor" "$([ -e "$r/m.anchor" ] && echo anchored || echo none)" "none"
+  eq "$l-5 and it is not archived" "$(cat "$r/m.arch" 2>/dev/null)" ""
+  has "$l-6 the run says HEAD moved during the sweep" "$out" "HEAD moved during the sweep (${start:0:12} -> ${end:0:12})"
+  has "$l-7 and that the receipt is not release-grade" "$out" "not release-grade"
+  lacks "$l-8 and never takes it for the hooks' own advance" "$out" "HEAD advanced"
+}
 
 # ── mutation proof, launched with the scenarios so everything runs side by side ───────────────────────────────────────
 MUT="$WORK/mut"; mkdir -p "$MUT"
-mutant() { # name sed-expr chain|dirty -- in the background: break one line of a COPY of run-all.sh, grade it with the same proofs, record killed (a proof goes red) or survived
-  local name="$1" expr="$2" kind="$3" fails
+mutant() { # name sed-expr kind [lib] -- in the background: break one line of a COPY of run-all.sh (with `lib`: of the shared allowlist bin/lib/hook-owned-path.sh), grade it with the proofs of KIND -- chain, dirty,
+  # hook (H, the suite cache on) or refused:<kind> (an R scenario) -- and record killed (a proof goes red) or survived
+  local name="$1" expr="$2" kind="$3" lib="${4:-}" src="$RUN_ALL" ra="" lc="" fails
+  [ -z "$lib" ] || src="$ROOT/bin/lib/hook-owned-path.sh"
   (
-    sed "$expr" "$RUN_ALL" > "$MUT/$name.sh"
-    if cmp -s "$RUN_ALL" "$MUT/$name.sh"; then echo noapply > "$MUT/$name.res"; exit 0; fi
-    if [ "$kind" = dirty ]; then dirty_start "m-$name" "$MUT/$name.sh"; fails="$( ( check_t "m-$name" ) 2>&1 | grep -c $'\033\\[31mFAIL' )"
-    else chain "m-$name" nocache "$MUT/$name.sh"; fails="$( ( check "m-$name" M ) 2>&1 | grep -c $'\033\\[31mFAIL' )"; fi
+    sed "$expr" "$src" > "$MUT/$name.sh"
+    if cmp -s "$src" "$MUT/$name.sh"; then echo noapply > "$MUT/$name.res"; exit 0; fi
+    if [ -n "$lib" ]; then ra="$RUN_ALL"; lc="$MUT/$name.sh"; else ra="$MUT/$name.sh"; fi
+    case "$kind" in
+      dirty)     dirty_start "m-$name" "$ra"; fails="$( ( check_t "m-$name" ) 2>&1 | grep -c $'\033\\[31mFAIL' )" ;;
+      hook)      move "m-$name" default hook "$ra" "$lc"; fails="$( ( check_hook "m-$name" M ) 2>&1 | grep -c $'\033\\[31mFAIL' )" ;;
+      refused:*) move "m-$name" nocache "${kind#refused:}" "$ra" "$lc"; fails="$( ( check_refused "m-$name" M ) 2>&1 | grep -c $'\033\\[31mFAIL' )" ;;
+      *)         chain "m-$name" nocache "$ra"; fails="$( ( check "m-$name" M ) 2>&1 | grep -c $'\033\\[31mFAIL' )" ;;
+    esac
     if [ "$fails" = 0 ]; then echo survived > "$MUT/$name.res"; else echo killed > "$MUT/$name.res"; fi
   ) &
 }
@@ -148,12 +215,23 @@ chain c cold &
 chain n nocache &
 chain f failed &
 dirty_start t &
+move hook   default hook  &
+move hook-n nocache hook  &
+move mixed  nocache mixed &
+move decoy  nocache decoy &
+move both   nocache both  &
+move amend  nocache amend &
 mutant anchor     's/^        if \[ "\$HEAD_MOVED" = true \]; then$/        if false; then/' chain
 mutant start      's/^  RECEIPT_HEAD_SHA="\$SWEEP_HEAD_START"$/  RECEIPT_HEAD_SHA="$RECEIPT_HEAD_NOW"/' chain
-mutant detect     's/ || HEAD_MOVED=true$/ || HEAD_MOVED=false/' chain
+mutant detect     's/; then HEAD_MOVED=true$/; then HEAD_MOVED=false/' chain
 mutant moved-to   's/{head_moved_to:\$head_end}/{head_moved_to:\$head_sha}/' chain
 mutant line       's/run-all: HEAD moved during the sweep (/run-all: head went elsewhere (/' chain
 mutant start-tree 's/ && \[ -z "\$(_receipt_dirty_lines < "\$WORK\/status-before.txt")" \]//' dirty
+mutant waved      's/^  case \$? in 1) return 1 ;; \*) return 0 ;; esac$/  case $? in 1) return 1 ;; *) return 1 ;; esac/' refused:mixed
+mutant every      's/^  case \$? in 1) return 1 ;; \*) return 0 ;; esac$/  case $? in 1) return 0 ;; *) return 0 ;; esac/' hook
+mutant ancestry   '/merge-base --is-ancestor "\$from" "\$to"/d' refused:amend
+mutant epilogue   's#_sweep_head_moved "\$CACHE_HEAD" "\$(git -C "\$REPO" rev-parse HEAD 2>/dev/null)"#[ "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" != "$CACHE_HEAD" ]#' hook
+mutant allowlist  's#haid_\[^/]+\\\.json#[^/]+#' refused:decoy lib
 wait
 
 echo "-- D. a default sweep: the suite cache is on ------------------------------------------------------------------"
@@ -166,6 +244,15 @@ echo "-- F. --failed: the amend of a red run -----------------------------------
 check f F
 echo "-- T. a sweep that started on a dirty tree is not tree_clean, whatever the tree looks like at the end -------------"
 check_t t
+
+echo "-- H. commits that touch only the hooks' own paths land mid-run: no move, anchored and archived under the start commit --"
+check_hook hook   HD
+check_hook hook-n HN
+echo "-- R. every other commit is still a move -----------------------------------------------------------------------"
+check_refused mixed RM
+check_refused decoy RD
+check_refused both  RB
+check_refused amend RA
 
 echo "-- M. mutation proof: break one line of the real run-all.sh at a time; the proof for it must go red -----------------"
 KILLED=0; TOTAL=0
@@ -184,6 +271,11 @@ verdict detect     "a HEAD that moved is never noticed"
 verdict moved-to   "the receipt no longer records where HEAD went"
 verdict line       "the run no longer says that HEAD moved"
 verdict start-tree "a sweep that started on a dirty tree is tree_clean again once the dirt is gone"
+verdict waved      "a commit that touches code passes for a hook's (anything the allowlist does not name is waved through)"
+verdict every      "a hook's own commits count as a move again"
+verdict ancestry   "a HEAD that is no step forward from the start (history rewritten) passes for hook commits"
+verdict epilogue   "the suite cache drops what the sweep stored when only hook commits landed: the receipt is not full-equivalent, so it is not anchored"
+verdict allowlist  "the shared allowlist (bin/lib/hook-owned-path.sh) is widened from a hook's file shape to a whole directory, and run-all.sh follows it"
 
 echo
 printf 'falsifiability: %d/%d\n' "$KILLED" "$TOTAL"

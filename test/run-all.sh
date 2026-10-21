@@ -63,6 +63,14 @@
 #      started with env -i drops TMPDIR and writes to the real one). It exists because free space dropped 1.6 GB while agents
 #      ran suites that never removed their mktemp dirs, and nothing said so. Without test/lib/run-all-guards.sh next
 #      to this script (a fixture copy) suites share TMPDIR as before. Proof: test/run-all-guards.test.sh sections 5-8.
+#  10. THE ACCOUNT'S OWN HOME IS NOT WRITTEN. bin/lib/hmd_pair_optin.py records the per-repo "pair by code" choice in the account's own heimdall home -- <pw_dir>/.heimdall, pw_dir from the
+#      account database, never $HOME -- besides the home the environment names, unless HMD_TEST_CANONICAL_HOME names a believed stand-in: a directory outside any work tree that holds a 0600
+#      marker file (.hmd-test-canonical-home). About twenty suites run connect/disconnect with HOME and HEIMDALL_HOME sandboxed and no seam of their own, and one sweep wrote ten records into
+#      the operator's real ~/.heimdall (2.4.9). So (a) every suite is launched with its OWN stand-in: a fresh 0700 directory under its TMPDIR (beside the run's scratch files when it has none),
+#      the marker made as the module requires, exported as HMD_TEST_CANONICAL_HOME and removed after the suite -- a suite that sets its own seam keeps its own; and (b) the sweep snapshots
+#      <pw_dir>/.heimdall/app/pair-optin and .../relay-approved (path, inode, size, mtime) before the first suite and after the last: an entry that is new, changed or gone makes the run RED
+#      (REAL HOME WRITTEN), naming the entries and the suites that were running when each was written. The runner never writes, removes or restores anything in that home.
+#      HMD_TEST_ACCOUNT_HOME=DIR names the directory the guard takes for pw_dir (the tests of the guard point it at a fake one). Proof: test/run-all-real-home.test.sh.
 #
 # Usage:
 #   test/run-all.sh                     # all non-live suites, parallel, with red re-runs
@@ -96,6 +104,7 @@
 #                                       # this one are separate knobs and whichever is stricter refuses. The same floors stop a RUNNING
 #                                       # sweep: they are asked again before every suite, and once one is crossed nothing more is started
 #                                       # (see "Disk floor between suites" below the exit codes)
+#   HMD_TEST_ACCOUNT_HOME=DIR test/run-all.sh  # the directory the real-home guard takes for the account's home (default: pw_dir from the account database, never $HOME); for the guard's own tests (guarantee 10)
 #
 # Exit 0 = every suite that ran passed. Nonzero = at least one FAIL / TIMEOUT / DISCREPANCY,
 # or discovery fell below the floor. Exit 2 = bad arguments, or --since-green on a dirty tree;
@@ -147,6 +156,9 @@
 #                the anchor moves to every later green sweep, but release/ship.sh --npm-only and --release-only grade the commit a TAG names, after the fact, and need the receipt that graded it.
 #                head_sha is the commit the sweep STARTED on, and tree_clean also needs the tree to have been clean when it started. A sweep during which HEAD moved (a commit landed mid-run) still
 #                writes its receipt, naming that start commit, with head_moved_to = where HEAD was at the end; it prints one line saying so and is neither anchored nor archived, in any mode.
+#                Commits that touch only paths this repo's own hooks write (bin/lib/hook-owned-path.sh: journal entries, ledger records -- a hook auto-commits them mid-run, no suite reads them, and
+#                release/ship.sh and the push gate read them the same way) are no move: the receipt stays release-grade and the run says so in one line. A commit that touches anything else, a merge
+#                that brings one in, or history that was rewritten is a move.
 #                Proof: test/run-all-head-moved.test.sh.
 #   incremental  base = the anchor's HEAD; diff base..HEAD (hook-owned paths excluded; the tree must be clean). A suite is
 #                selected when it names a changed path or the basename of a changed bin/ script or module (the suite and the
@@ -576,6 +588,22 @@ fi
 # would hand a green to a commit nothing graded -- then anchor it (last-full-green.json) and archive it (full-green/) for release/ship.sh to trust. The tree the sweep starts on is the snapshot
 # REPO INTEGRITY takes before the first suite (status-before.txt). Proof: test/run-all-head-moved.test.sh.
 SWEEP_HEAD_START="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "")"
+# _sweep_head_moved FROM TO -- 0 when HEAD going from FROM to TO is a move the sweep has to own up to, 1 when it is not: the same commit, or only commits that touch nothing but the paths this repo's
+# OWN hooks write (bin/lib/hook-owned-path.sh, sourced above -- the rule release/ship.sh and the push gate apply to the same kind of commit: journal entries, ledger records). A hook auto-commits those on
+# its own clock, in the middle of a sweep (2.4.9: a ledger checkpoint, and the whole receipt was refused for it), and no suite reads them, so the tree the suites ran against is the one the receipt names.
+# It is judged commit by commit, never by the net diff of FROM..TO: a commit that touches a file and a later one that puts it back leave no net diff, and the suites in between ran against another
+# tree. A merge is shown against each of its parents (-m), so what it brings in counts. Anything that cannot be told is a move: a HEAD that cannot be read, a TO that does not descend from FROM (history
+# rewritten, another branch checked out), git failing, a path the allowlist does not name.
+_sweep_head_moved() {
+  local from="$1" to="$2" paths
+  [ "$from" != "$to" ] || return 1
+  [ -n "$from" ] && [ -n "$to" ] || return 0
+  git -C "$REPO" merge-base --is-ancestor "$from" "$to" 2>/dev/null || return 0
+  paths="$(git -C "$REPO" log -m --no-renames --name-only --format= "$from..$to" 2>/dev/null)" || return 0
+  [ -n "$paths" ] || return 1
+  printf '%s\n' "$paths" | grep -Ev "^${HMD_HOOK_OWNED_PATH_RE}\$" >/dev/null
+  case $? in 1) return 1 ;; *) return 0 ;; esac
+}
 
 # ── INCREMENTAL SELECTION (--since-green) ─────────────────────────────────────────────────
 # Narrows ALL to the suites a diff since the last green FULL sweep can affect, or leaves it whole and says why (an escalation is
@@ -805,8 +833,9 @@ _cache_note_result() {
 # _cache_epilogue -- after CLASSIFY RESULTS: drop what a moved tree cannot vouch for, purge on CLOSURE UNSOUND, build the receipt's cache block from the entries on disk, add the CACHED table rows
 _cache_epilogue() {
   local name cold=false
-  if [ "$n_treeviol" -gt 0 ] || [ "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" != "$CACHE_HEAD" ]; then
-    # the tree (or HEAD) moved under the run: what it stored may describe something else, so none of it is kept
+  if [ "$n_treeviol" -gt 0 ] || _sweep_head_moved "$CACHE_HEAD" "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"; then
+    # the tree (or HEAD) moved under the run: what it stored may describe something else, so none of it is kept. Commits that touch only the hooks' own journal and ledger records are no move
+    # (_sweep_head_moved): without that, one auto-commit mid-sweep drops every green this run stored and the receipt is not full-equivalent
     while IFS= read -r name; do [ -z "$name" ] || suite_cache_invalidate "$CACHE_DIR" "$name" 2>/dev/null || true; done < "$CACHE_TMP/stored.txt"
     : > "$CACHE_TMP/stored.txt"
   fi
@@ -1036,6 +1065,37 @@ _status_snapshot() { git -C "$REPO" status --porcelain=v1 --no-renames 2>/dev/nu
 _status_snapshot > "$WORK/status-before.txt"
 git -C "$REPO" stash list > "$WORK/stash-before.txt" 2>/dev/null
 
+# ── THE ACCOUNT'S OWN HOME, BEFORE SIDE (guarantee #10 above) ───────────────────────────────
+# ACCOUNT_HOME is what bin/lib/hmd_pair_optin.py calls the account's own home: pw_dir from the account database for this uid (perl's getpwuid: the module asks the same database), never $HOME,
+# which a session's environment sets. HMD_TEST_ACCOUNT_HOME names another directory for the tests of this guard; anything that is not an absolute path means there is no home to watch.
+# The guard watches the two stores a suite could leave a record in: <ACCOUNT_HOME>/.heimdall/app/pair-optin and .../relay-approved. _account_home_snapshot prints one sorted line per entry --
+# path, inode, size, mtime to the microsecond for a file, "(dir)" for a directory -- so an entry that appears, goes, or is written again (the store replaces a file on every write: a new inode)
+# shows as a different line. It only reads: nothing in that home is ever written, removed or restored by this runner.
+ACCOUNT_HOME="${HMD_TEST_ACCOUNT_HOME:-}"
+[ -n "$ACCOUNT_HOME" ] || ACCOUNT_HOME="$(perl -e 'my @p = getpwuid($<); print $p[7] if @p && defined $p[7]' 2>/dev/null)"
+case "$ACCOUNT_HOME" in /*) ;; *) ACCOUNT_HOME="" ;; esac
+_account_home_snapshot() {
+  [ -n "$ACCOUNT_HOME" ] || return 0
+  perl -MFile::Find -MFcntl=:mode -MTime::HiRes=lstat -e '
+    for my $top (@ARGV) {
+      my @t = lstat($top) or next;
+      find({ no_chdir => 1, wanted => sub {
+        my @s = lstat($_) or return;
+        print S_ISDIR($s[2]) ? "$File::Find::name\t(dir)\n" : join("\t", $File::Find::name, $s[1], $s[7], $s[9]) . "\n";
+      } }, $top);
+    }
+  ' -- "$ACCOUNT_HOME/.heimdall/app/pair-optin" "$ACCOUNT_HOME/.heimdall/app/relay-approved" 2>/dev/null | LC_ALL=C sort
+}
+_account_home_snapshot > "$WORK/real-home-before.txt"
+n_realhome=0
+# _standin_home DIR -- make DIR the stand-in for the account's own home and print its absolute path: a fresh 0700 directory holding the marker file bin/lib/hmd_pair_optin.py wants before it
+# believes one (.hmd-test-canonical-home: a regular file of this user's with no group or other permission bits; the directory must also be in no git work tree, which a TMPDIR is not).
+# Made the way test/heimdall-app.test.sh makes its own. Prints nothing and leaves nothing when it cannot be made: the suite then runs without one, and the guard judges what it did.
+_standin_home() {
+  rm -rf "$1" 2>/dev/null
+  mkdir -m 700 "$1" 2>/dev/null && ( umask 077 && printf '%s\n' 'a stand-in for the account own home, made by test/run-all.sh for one suite' > "$1/.hmd-test-canonical-home" ) 2>/dev/null && ( cd "$1" && pwd ) || { rm -rf "$1" 2>/dev/null; return 1; }
+}
+
 # _hook_owned_path — the single `grep -Ev` pattern (status-code prefix + path) matching a
 # `git status --porcelain` line that this repo's OWN hooks produce, never a suite. Shared
 # verbatim by BOTH the tracked-diff below (REPO INTEGRITY, AFTER SIDE) and
@@ -1102,19 +1162,26 @@ _hook_owned_path() {
 
 # ── EXECUTE (bounded parallelism; bash 3.2 has no `wait -n`, so poll with kill -0) ─────────
 run_one() {
-  local idx="$1" suite="$2" t0 t1 rc budget stmp=""
+  local idx="$1" suite="$2" t0 t1 rc budget stmp="" shome="" seam
   budget="$(suite_timeout "$suite")"
   t0=$(date +%s)
   # PER-SUITE TMPDIR: a fresh dir under the run's temp root (hmd_test_tmp_begin), so what the suite makes through mktemp / $TMPDIR is
   # measurable and removable. Without the lib (TMP_ROOT empty) the suite runs exactly as before.
   [ -n "${TMP_ROOT:-}" ] && mkdir -p "$TMP_ROOT/s$idx" 2>/dev/null && stmp="$TMP_ROOT/s$idx"
+  # THE STAND-IN FOR THE ACCOUNT'S OWN HOME (guarantee #10): a fresh one per suite, under the suite's TMPDIR (beside the run's scratch files when it has none), handed over as HMD_TEST_CANONICAL_HOME
+  # so a connect/disconnect that sandboxed HOME and HEIMDALL_HOME still records its own-home copy there, never in the real one. A suite that sets its own keeps its own (it sets it after this).
+  # When none can be made the caller's value, if any, goes through unchanged.
+  shome="$(_standin_home "${stmp:-$WORK}/canonical-home.$idx")" || shome=""
+  seam="${shome:-${HMD_TEST_CANONICAL_HOME:-}}"
   if [ -n "$stmp" ]; then
-    RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" TMPDIR="$stmp" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1 9>&-
+    RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" HMD_TEST_CANONICAL_HOME="$seam" TMPDIR="$stmp" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1 9>&-
   else
-    RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1 9>&-
+    RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" HMD_TEST_CANONICAL_HOME="$seam" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1 9>&-
   fi
   rc=$?
   t1=$(date +%s)
+  # the stand-in goes with its suite, BEFORE the settle below: it is the runner's, never a leftover of the suite's
+  [ -z "$shome" ] || rm -rf "$shome" 2>/dev/null
   # SETTLE: measure, record and remove the suite's own TMPDIR. After timeout_run, never before: it has already killed the suite's whole
   # process group, so nothing is still writing into the directory being measured. t1 is taken above, so this is not billed to the suite.
   [ -z "$stmp" ] || hmd_test_suite_tmp_settle "$stmp" "$WORK/$idx.tmpleak"
@@ -1491,6 +1558,36 @@ if [ "$NEW_STASH_N" -gt 0 ]; then
   head -n "$NEW_STASH_N" "$WORK/stash-after.txt" | sed 's/^/    /' >> "$WORK/tree-report.txt"
 fi
 
+# ── THE ACCOUNT'S OWN HOME, AFTER SIDE (guarantee #10) ──────────────────────────────────────
+# The snapshot taken before suite #0 against the one taken now, after the very last suite (solo re-runs included): an entry that is new, changed or gone is a finding -- one line each, with the
+# suites whose [t0,t1] window covers the entry's mtime named as candidates (_attribute, the tree guard's own, honestly a hint: windows overlap under --jobs). Nothing is removed or restored: the
+# entries stay as they were left, for whoever has to look.
+_account_home_snapshot > "$WORK/real-home-after.txt"
+n_account_entries=$(wc -l < "$WORK/real-home-after.txt" | tr -d ' ')
+: > "$WORK/real-home-changes.txt"; : > "$WORK/real-home-report.txt"
+if [ -n "$ACCOUNT_HOME" ]; then
+  awk -F'\t' -v before="$WORK/real-home-before.txt" '
+    BEGIN { while ((getline l < before) > 0) { split(l, f, "\t"); b[f[1]] = l } close(before) }
+    { a[$1] = $0 }
+    END {
+      for (p in a) { if (!(p in b)) print "new\t" p; else if (a[p] != b[p]) print "changed\t" p }
+      for (p in b) if (!(p in a)) print "removed\t" p
+    }' "$WORK/real-home-after.txt" | LC_ALL=C sort > "$WORK/real-home-changes.txt"
+  n_realhome=$(wc -l < "$WORK/real-home-changes.txt" | tr -d ' ')
+  while IFS="$TAB" read -r rh_kind rh_path; do
+    [ -n "$rh_path" ] || continue
+    rh_mtime="$(awk -F'\t' -v p="$rh_path" '$1 == p { split($4, m, "."); print m[1]; exit }' "$WORK/real-home-after.txt")"
+    rh_cands=""; [ -z "$rh_mtime" ] || rh_cands="$(_attribute "$rh_mtime")"
+    if [ -z "$rh_mtime" ]; then
+      printf '    %-8s %s\n' "$rh_kind" "$rh_path" >> "$WORK/real-home-report.txt"
+    elif [ -n "$(printf '%s' "$rh_cands" | tr -d '[:space:]')" ]; then
+      printf '    %-8s %s   (mtime %s -- running then: %s)\n' "$rh_kind" "$rh_path" "$rh_mtime" "$rh_cands" >> "$WORK/real-home-report.txt"
+    else
+      printf '    %-8s %s   (mtime %s -- no recorded suite window covers it)\n' "$rh_kind" "$rh_path" "$rh_mtime" >> "$WORK/real-home-report.txt"
+    fi
+  done < "$WORK/real-home-changes.txt"
+fi
+
 # ── CLASSIFY RESULTS ──────────────────────────────────────────────────────────────────────
 n_pass=0; n_fail=0; n_timeout=0; n_unparsed=0; n_discrep=0; n_refused=0; n_notrun=0
 tot_p=0; tot_f=0
@@ -1686,6 +1783,11 @@ if [ "$n_treeviol" -gt 0 ]; then
   echo "  this is a REAL CORRUPTION SIGNAL, not advisory — a suite wrote where only a human or git should."
   echo ""
 fi
+if [ "$n_realhome" -gt 0 ]; then
+  echo "${RED}${BLD}REAL HOME WRITTEN (${n_realhome})${OFF} — the account's own heimdall home (${ACCOUNT_HOME}/.heimdall: app/pair-optin and app/relay-approved) was NOT the same after the run as before it. Every suite is handed a stand-in for it (HMD_TEST_CANONICAL_HOME), so a write here went around that (a child started with env -i, a suite that unset it, a HOME it did not sandbox) or came from something beside the sweep. Nothing was removed or restored:"
+  cat "$WORK/real-home-report.txt"
+  echo ""
+fi
 # TMP LEAK (fails the run) / TMP LEFTOVERS and TMP OUTSIDE TMPDIR (loud warnings): the text comes from hmd_test_tmp_guard.
 if [ -s "$WORK/tmp-section.txt" ]; then cat "$WORK/tmp-section.txt"; echo ""; fi
 
@@ -1717,6 +1819,13 @@ if [ "$n_treeviol" -eq 0 ]; then
 else
   echo "${RED}tree-integrity: VIOLATED (${n_treeviol} finding(s) -- see TREE INTEGRITY VIOLATION above)${OFF}"
 fi
+if [ -z "$ACCOUNT_HOME" ]; then
+  echo "real-home: not checked (no absolute account home: the account database names none, or HMD_TEST_ACCOUNT_HOME is not an absolute path)"
+elif [ "$n_realhome" -eq 0 ]; then
+  echo "real-home: untouched (${ACCOUNT_HOME}/.heimdall/app/{pair-optin,relay-approved}: ${n_account_entries} entr$([ "$n_account_entries" = 1 ] && echo y || echo ies), none new, changed or gone)"
+else
+  echo "${RED}real-home: WRITTEN (${n_realhome} change(s) under ${ACCOUNT_HOME}/.heimdall/app -- see REAL HOME WRITTEN above)${OFF}"
+fi
 if [ "$DISK_HIT" -eq 1 ]; then
   echo "${RED}disk floor: TRIPPED before ${DISK_HIT_BEFORE} (${DISK_HIT_PHASE}) -- ${n_refused} suite(s) REFUSED, ${DISK_RETRIES_SKIPPED} re-run(s) skipped (see DISK FLOOR above)${OFF}"
 fi
@@ -1732,7 +1841,7 @@ if [ -n "$EVIDENCE" ]; then
   done
 fi
 
-BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0} + ${TMP_FINDINGS:-0} + n_refused + n_unsound))
+BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0} + ${TMP_FINDINGS:-0} + n_refused + n_unsound + n_realhome))
 
 # archive_full_green -- keep an atomic copy of the green FULL receipt just written as receipts/full-green/<head_sha>.json, and prune that directory to the newest FULL_GREEN_KEEP.
 # WHY: last-full-green.json is the chain anchor and every later green sweep replaces it, but release/ship.sh --npm-only and --release-only grade the commit a TAG names, after the fact: a release that was
@@ -1778,7 +1887,12 @@ if command -v jq >/dev/null 2>&1; then
   # went (head_moved_to), and is neither anchored nor archived below.
   RECEIPT_HEAD_NOW="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "")"
   RECEIPT_HEAD_SHA="$SWEEP_HEAD_START"
-  HEAD_MOVED=false; [ "$RECEIPT_HEAD_NOW" = "$SWEEP_HEAD_START" ] || HEAD_MOVED=true
+  # A HEAD that is somewhere else is a move (head_moved_to, not release-grade) unless every commit in between touched only the hooks' own paths (_sweep_head_moved): then the tree the suites ran
+  # against is the one the receipt names, the receipt stays as it is, and the run says so below (HEAD_HOOK_ONLY).
+  HEAD_MOVED=false; HEAD_HOOK_ONLY=false
+  if _sweep_head_moved "$SWEEP_HEAD_START" "$RECEIPT_HEAD_NOW"; then HEAD_MOVED=true
+  elif [ "$RECEIPT_HEAD_NOW" != "$SWEEP_HEAD_START" ]; then HEAD_HOOK_ONLY=true
+  fi
   # Canonical (symlink-resolved) toplevel, NOT a bare `cd && pwd` value: the reader
   # (bin/heimdall-state, bin/heimdall-delivery-audit) compares against its own
   # `git rev-parse --show-toplevel`, which resolves symlinks. Under macOS $TMPDIR
@@ -1976,6 +2090,11 @@ if command -v jq >/dev/null 2>&1; then
        + {suite_durations:$durs}' > "$RECEIPT_TMP" 2>/dev/null; then
       if mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null; then
         echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})"
+        # Commits landed during the sweep and every one touched only the hooks' own journal and ledger records (_sweep_head_moved): not a move, and said so in one line -- never silently, as the push gate
+        # does not read such a receipt silently either.
+        if [ "$HEAD_HOOK_ONLY" = true ]; then
+          echo "${DIM}run-all: HEAD advanced during the sweep (${RECEIPT_HEAD_SHA:0:12} -> ${RECEIPT_HEAD_NOW:0:12}, $(git -C "$REPO" rev-list --count "${RECEIPT_HEAD_SHA}..${RECEIPT_HEAD_NOW}" 2>/dev/null || echo '?') commit(s)): every one touches only the hooks' own journal and ledger records, which no suite reads -- not a move of the tree, so the receipt names ${RECEIPT_HEAD_SHA:0:12}, the commit the sweep started on, and stays release-grade${OFF}"
+        fi
         # HEAD moved under the run (see SWEEP_HEAD_START): the receipt above names the commit the sweep STARTED on and stays a plain record. What makes a receipt release-grade is the anchor and the archive, and a
         # sweep that did not see one tree from its first suite to its last gets neither, green or not -- in every mode (suite cache, --cold, --failed, --no-cache): the cache path's own FULL_EQ only noticed it
         # through the entries its epilogue drops, and the receipt still named the new HEAD.
@@ -2029,6 +2148,7 @@ if [ "$BAD" -gt 0 ]; then
   else
     echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s) not green."
   fi
+  [ "$n_realhome" -gt 0 ] && echo "  real home: ${n_realhome} change(s) in the account's own heimdall home -- see REAL HOME WRITTEN above; nothing was removed or restored, and a suite must not reach it (the sweep hands each one a stand-in: HMD_TEST_CANONICAL_HOME)"
   [ "$n_refused" -gt 0 ] && echo "  disk floor: ${n_refused} suite(s) were never started (REFUSED) -- see DISK FLOOR above; free space, then run the sweep again"
   [ "$n_notrun" -gt 0 ] && echo "  --fail-fast: ${n_notrun} suite(s) were never started (NOTRUN) -- this was not a sweep, and its receipt is refused as one; fix the red, then run without --fail-fast"
   [ "$n_unsound" -gt 0 ] && echo "  CLOSURE UNSOUND: ${n_unsound} audited suite(s) failed with an unchanged closure -- see above; the suite cache was purged, so the next sweep is cold"
