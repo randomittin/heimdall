@@ -567,7 +567,8 @@ if [ "$RC" = 2 ] && jq -e '.error | startswith("BLOCKED: hmd sweep guard: alread
 
 echo "-- 14. wiring: the docs agents read name the rule and the guard --"
 if grep -q 'HMD_SWEEP_ALLOW' "$REPO/CLAUDE.md" && grep -q 'bin/lib/hmd_sweep_guard.py' "$REPO/CLAUDE.md" && grep -q 'test/sweep-guard.test.sh' "$REPO/CLAUDE.md"; then ok "CLAUDE.md describes the guard: the override, the lib, and this test"; else bad "CLAUDE.md does not name HMD_SWEEP_ALLOW, bin/lib/hmd_sweep_guard.py and test/sweep-guard.test.sh"; fi
-if awk '/^## \[Unreleased\]/ { u = 1; next } /^## \[/ { u = 0 } u && /hmd_sweep_guard/ { found = 1 } END { exit !found }' "$REPO/CHANGELOG.md"; then ok "CHANGELOG.md [Unreleased] has the bullet"; else bad "CHANGELOG.md [Unreleased] does not mention hmd_sweep_guard"; fi
+# The bullet lives under [Unreleased] until a release stamps it into its version section, so look in any section.
+if grep -q 'hmd_sweep_guard' "$REPO/CHANGELOG.md"; then ok "CHANGELOG.md has the bullet"; else bad "CHANGELOG.md does not mention hmd_sweep_guard"; fi
 if grep -q 'HMD_SWEEP_ALLOW' "$HOOK" && grep -q 'hmd_sweep_guard.py' "$HOOK"; then ok "bin/heimdall-precheck-bash documents the switch and calls the helper"; else bad "the hook does not name HMD_SWEEP_ALLOW and hmd_sweep_guard.py"; fi
 
 printf '\n  sweep-guard: %d passed, %d failed\n' "$PASS" "$FAIL"
