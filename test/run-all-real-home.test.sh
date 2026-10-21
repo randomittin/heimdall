@@ -12,7 +12,8 @@
 # the fake home, never the real one.
 #   S  the stand-in: a suite is handed a 0700 directory holding the 0600 marker, which the REAL module believes (it records the off there, besides HEIMDALL_HOME, and NOT in the account's home);
 #      two suites get two directories and the second sees none of the first's records; a suite that names its own keeps its own; nothing of it is left once the suite is done
-#   L  in the real layout (the guard library next to run-all.sh) the stand-in is under the suite's own TMPDIR, and is not counted as a leftover even under HMD_TEST_STRICT_TMP=1
+#   L  in the real layout (the guard library next to run-all.sh) the stand-in is under the suite's own TMPDIR, and is not counted as a leftover even under HMD_TEST_STRICT_TMP=1; the fixture
+#      sweep's own TMPDIR is short enough (the runner's 60-byte socket headroom target) to be accepted inside a sweep, where this suite's TMPDIR is already deep
 #   G  the guard: five suites reach the fake account home -- a new record, a changed one, a removed one, a new relay approval, and a file outside the two stores. The run is RED (exit 1, the receipt
 #      says exit_code 1, nothing is anchored) and names the first four, each with the suites that were running; the fifth is out of scope. Nothing is removed or restored. A control sweep that
 #      touches nothing is green and says "untouched"; a sweep with no usable account home says it did not check
@@ -43,13 +44,19 @@ PY="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null)"
 case "$PY" in /*) [ -x "$PY" ] || PY="" ;; *) PY="" ;; esac
 [ -n "$PY" ] || { echo "FATAL: python3 gave no absolute interpreter path" >&2; exit 2; }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/hmd-real-home.XXXXXX")"
+# WORK holds every fixture repo and, beside each, the TMPDIR its fixture sweep runs under ($d.tmp), so it has to be SHORT. test/run-all.sh refuses to start (exit 6) when its per-suite temp dir,
+# $TMPDIR/hr.XXXX/s<N>, leaves a unix socket path no room, and the L scenario (the guard library next to run-all.sh) is the one that has that preflight. Inside a sweep THIS suite's own TMPDIR is
+# already such a dir (~70 bytes on macOS), and a WORK under it put the L sweep's per-suite dir at 108 bytes: refused, L-1..L-4 red -- in a sweep only, never in a plain run, where TMPDIR is short
+# (the defect test/run-all-guards.test.sh had, fixed in 55a73a60). So WORK is a private dir directly under /tmp, made from a template and removed by the trap below, whatever TMPDIR this suite
+# runs under (under TMPDIR only when /tmp cannot be written); check_room judges it, so a plain run catches a regression too. No socket goes into the shared /tmp: the fixtures bind none.
+WORK="$(mktemp -d /tmp/rh.XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/rh.XXXXXX")"
 [ -n "$WORK" ] || { echo "FATAL: mktemp failed" >&2; exit 2; }
 FACTS_ROOT="$WORK/facts"; MUT="$WORK/mut"; PROBE="$WORK/probe.py"; mkdir -p "$FACTS_ROOT" "$MUT"
 cleanup() { local p; for p in $(jobs -p); do kill "$p" 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
-# HMD_TEST_CANONICAL_HOME too: inside a sweep THIS suite was handed a stand-in, and a fixture sweep that does not hand one over would then pass the outer one on
-unset HEIMDALL_HOME HMD_TEST_CANONICAL_HOME HMD_TEST_ACCOUNT_HOME HMD_TEST_STRICT_TMP HMD_TEST_TMP_WATCH HMD_COLD HMD_SUITE_CACHE_MAX_DAYS HMD_SUITE_CACHE_AUDIT_PCT GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR 2>/dev/null || true
+# HMD_TEST_CANONICAL_HOME too: inside a sweep THIS suite was handed a stand-in, and a fixture sweep that does not hand one over would then pass the outer one on.
+# HMD_TEST_SOCK_HEADROOM: check_room reads the runner's default socket target (60), so a caller's own value must not move it.
+unset HEIMDALL_HOME HMD_TEST_CANONICAL_HOME HMD_TEST_ACCOUNT_HOME HMD_TEST_STRICT_TMP HMD_TEST_TMP_WATCH HMD_TEST_SOCK_HEADROOM HMD_COLD HMD_SUITE_CACHE_MAX_DAYS HMD_SUITE_CACHE_AUDIT_PCT GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR 2>/dev/null || true
 export PY LIBDIR PROBE PYTHONDONTWRITEBYTECODE=1
 
 # What a fixture suite learns about its stand-in, printed as key=value lines (the proofs below judge them). The account database is replaced the way the module's own tests do it, so the
@@ -214,6 +221,10 @@ check_lib() { # name label
   has "$l-4 the temp accounting calls every suite's TMPDIR clean: the stand-in is the runner's, never a suite's leftover" "$(cat "$f/out" 2>/dev/null)" "tmp dirs:   clean"
   lacks "$l-5 and reports no TMP LEAK" "$(cat "$f/out" 2>/dev/null)" "TMP LEAK"
 }
+check_room() { # name label -- L, beside check_lib (not part of it: the mutants are graded on check_lib alone, and a mutant must die of its own break). See WORK above.
+  local f="$FACTS_ROOT/$1"
+  eq "$2-6 the fixture sweep's TMPDIR is short: its receipt says the runner's 60-byte socket headroom target is met, so a deep TMPDIR here cannot get it refused (exit 6) inside a sweep" "$(jq -r 'if .tmp_sock.target == 60 and .tmp_sock.headroom >= .tmp_sock.target then "met" else "short: \(.tmp_sock)" end' "$f/last.json" 2>&1)" "met"
+}
 finding() { printf '%s\n' "$1" | grep -F -- "$3" | grep -Eq "^ +$2 "; } # output kind path -- a report line of that kind naming that path
 check_leak() { # name label
   local f="$FACTS_ROOT/$1" l="$2" a="$WORK/$1.acct" out p="$WORK/$1.acct/.heimdall/app"
@@ -282,6 +293,7 @@ echo "-- S. every suite gets a stand-in the real module believes ---------------
 check_seam seam S
 echo "-- L. in the real layout it is under the suite's own TMPDIR, and never a leftover ------------------------------------"
 check_lib lib L
+check_room lib L
 echo "-- G. the guard: a write to the account's own home turns the run red, and names what changed -------------------------"
 check_leak leak G
 echo "-- G. the controls ---------------------------------------------------------------------------------------------------"

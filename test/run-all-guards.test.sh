@@ -124,7 +124,9 @@ OUT="$(HMD_UI_PROCS_SCRIPT_ROOT="$FAKE" HMD_UI_PROCS_TMP_ROOTS="$TMPR" hmd_test_
 if [ -z "$OUT" ]; then ok "a clean sweep prints nothing at all (output byte-identical to before the guard)"; else bad "clean sweep printed: $OUT"; fi
 
 echo "-- 4. wiring in run-all.sh --"
-for needle in '--wait-quiet)' 'hmd_test_wait_quiet' 'hmd_test_orphan_guard' 'RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" timeout_run' 'ORPHAN_SURVIVORS'; do
+# Both launch lines of run_one, whole: each hands the suite RUN_ALL_LEAK_FILE (timeout_run appends what the suite left in its process group to it, so the sweep can name the suite) beside the
+# stand-in home the sweep also gives every suite (HMD_TEST_CANONICAL_HOME, 1007f975); the first line is the one that also sets the suite's own TMPDIR.
+for needle in '--wait-quiet)' 'hmd_test_wait_quiet' 'hmd_test_orphan_guard' 'RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" HMD_TEST_CANONICAL_HOME="$seam" TMPDIR="$stmp" timeout_run "$budget" bash "$suite"' 'RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" HMD_TEST_CANONICAL_HOME="$seam" timeout_run "$budget" bash "$suite"' 'ORPHAN_SURVIVORS'; do
   if grep -qF -- "$needle" "$RUNALL"; then ok "run-all.sh carries: $needle"; else bad "run-all.sh is missing: $needle"; fi
 done
 if bash -n "$RUNALL" 2>/dev/null; then ok "run-all.sh still parses"; else bad "run-all.sh no longer parses"; fi
