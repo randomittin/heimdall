@@ -75,6 +75,14 @@ WAIT = 9.0  # about 4.5 lifetimes of a 2 s registration
 LABEL = "Pixel 9a"
 
 
+def scn(**kw):
+    """C.Scn as an operator's own machine has it: the sandbox's HEIMDALL_HOME is the stand-in for the account's own ~/.heimdall (HMD_TEST_CANONICAL_HOME, set up the way
+    pair_code_harness.Sandbox(own_home=True) does), so a repo with no record of the choice reads "default" -- on. bin/lib/hmd_pair_optin.py reads any other home with no record as
+    off, and U1 / U2 are about exactly the repo 2.4.7 left: a stored login and no record of the choice, in the operator's own home. Resuming a paired phone never asked the
+    choice (bin/heimdall-app, _pw_start), so what the stand-in changes is what the record-less repo reads, not whether the phone comes back."""
+    return C.Scn(own_home=True, **kw)
+
+
 def hook_command(ident):
     """The command of the hook hooks.metadata.json calls `ident`, as hooks.json carries it."""
     with open(C.HOOKS_JSON, encoding="utf-8") as f:
@@ -222,7 +230,7 @@ def drop_pairing_record(s):
 
 def case_session_end_restart_idle():
     """S1 - S4."""
-    with C.Scn() as s:
+    with scn() as s:
         clock = C.Clock(s.sb.root)
         knobs = dict(KNOBS, HMD_PAIR_WINDOW_NOW_FILE=clock.path)  # the supervisor's clock moves by rewriting a file; no HMD_PAIR_WINDOW_IDLE_H is set
         a = Claude(s, C.SID1, **knobs)
@@ -310,7 +318,7 @@ def case_session_end_restart_idle():
 
 def case_default_never_idles():
     """S3b."""
-    with C.Scn() as s:
+    with scn() as s:
         clock = C.Clock(s.sb.root)
         a = Claude(s, C.SID1, **dict(KNOBS, HMD_PAIR_WINDOW_NOW_FILE=clock.path))  # no HMD_PAIR_WINDOW_IDLE_H: the default
         try:
@@ -332,7 +340,7 @@ def case_default_never_idles():
 
 def case_laptop_restart_gh_signed_out():
     """S5."""
-    with C.Scn() as s:
+    with scn() as s:
         a = Claude(s, C.SID1, **KNOBS)
         c = None
         try:
@@ -385,7 +393,7 @@ def case_laptop_restart_gh_signed_out():
 
 def case_disconnect_ends_it():
     """S6."""
-    with C.Scn() as s:
+    with scn() as s:
         a = Claude(s, C.SID1, **KNOBS)
         try:
             p = pair_phone(s, a)
@@ -406,7 +414,7 @@ def case_disconnect_ends_it():
 
 def case_phone_revoke_ends_it():
     """S7."""
-    with C.Scn() as s:
+    with scn() as s:
         a = Claude(s, C.SID1, **KNOBS)
         try:
             p = pair_phone(s, a)
@@ -446,7 +454,7 @@ def case_no_other_hook_stops_it():
 
 def case_upgrade_resumes_without_a_record():
     """U1, U2: a repo paired under 2.4.7 has a stored login and no record of the choice -- its phone must still be resumed, asking gh and the relay nothing."""
-    with C.Scn() as s:
+    with scn() as s:
         gh_log = logging_gh(s)
         a = Claude(s, C.SID1, **DEFAULT)
         c = None
@@ -507,7 +515,7 @@ def case_upgrade_resumes_without_a_record():
 
 def case_record_keeps_the_code_and_connect_reoffers_it():
     """R1, R2: the repo's pairing record pins its code through a restart, and the connect that offers the code again offers that one."""
-    with C.Scn() as s:
+    with scn() as s:
         gh_log = logging_gh(s)
         a = Claude(s, C.SID1, **DEFAULT)
         c = None
@@ -559,7 +567,7 @@ def case_record_keeps_the_code_and_connect_reoffers_it():
 def case_connected_unpaired_one_token_send():
     """O1 - O3: a repo recorded as on (C.Scn's explicit yes, as `hmd app connect` leaves it) with no phone paired registers the code once, and the
     token goes out with that registration and no other."""
-    with C.Scn(ttl=2) as s:
+    with scn(ttl=2) as s:
         gh_log = logging_gh(s)
         clock = C.Clock(s.sb.root)
         knobs = dict(DEFAULT, HMD_PAIR_WINDOW_NOW_FILE=clock.path, **SCALED)
@@ -596,7 +604,7 @@ def case_connected_unpaired_one_token_send():
 
 def case_switched_off_unpaired_does_nothing():
     """X1: this repo was switched off (`hmd app disconnect`) and no phone is paired: a session start must cost nothing -- no gh call, no relay request."""
-    with C.Scn() as s:
+    with scn() as s:
         record(s, "off")  # C.Scn records every repo as on; this one was switched off, as `hmd app disconnect` leaves it
         gh_log = logging_gh(s)
         a = Claude(s, C.SID1, **DEFAULT)

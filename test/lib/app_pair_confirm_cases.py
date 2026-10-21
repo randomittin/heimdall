@@ -263,10 +263,11 @@ def hook_commands():
 
 
 class Scn:
-    """A sandbox (HOME, repo, TMPDIR, HEIMDALL_HOME), a fake `gh`, a loopback relay and a phone."""
+    """A sandbox (HOME, repo, TMPDIR, HEIMDALL_HOME), a fake `gh`, a loopback relay and a phone. `own_home=True`: HEIMDALL_HOME is the account's own home, as far as the
+    pair-by-code choice is concerned (pair_code_harness.Sandbox)."""
 
-    def __init__(self, gh="ok", ttl=60, gh_login="octocat"):
-        self.sb = H.Sandbox()
+    def __init__(self, gh="ok", ttl=60, gh_login="octocat", own_home=False):
+        self.sb = H.Sandbox(own_home=own_home)
         write_gh(self.sb.bin, gh)
         self.relay = FakeCodeRelay(ttl_s=ttl, gh_login=gh_login, expect_token=H.TOKEN).start()
         self.phone = H.Phone(E2E)
