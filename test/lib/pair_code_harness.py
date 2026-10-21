@@ -188,7 +188,10 @@ class Phone:
 
 # -- sandbox and processes -----------------------------------------------------------------------------
 class Sandbox:
-    def __init__(self):
+    def __init__(self, own_home=False):
+        """`own_home=True` makes the sandbox's HEIMDALL_HOME itself the stand-in for the account's own ~/.heimdall (below), as it is on a real machine, where HEIMDALL_HOME is unset or
+        is that directory: bin/lib/hmd_pair_optin.py gives the default (on) to the account's own home alone, so a repo with no record of the choice reads "default" there. With the
+        stand-in a directory beside it, as it is without the flag, such a repo reads "off" -- what any home that is not the account's own gives it."""
         self.root = tempfile.mkdtemp(prefix="app-pair-code.")
         self.home = os.path.join(self.root, "home")
         self.tmp = os.path.join(self.root, "tmp")
@@ -200,7 +203,7 @@ class Sandbox:
                        shell=True, cwd=self.repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # bin/lib/hmd_pair_optin.py reads the account's real home and `hmd app disconnect` / `connect` write it too: this directory stands in for it as the one that is WRITTEN,
         # so a test never writes the real ~/.heimdall. It is honoured only for a directory carrying the marker file below, which no repository can make outside its own tree.
-        self.canonical = os.path.join(self.root, "canonical")
+        self.canonical = os.path.join(self.home, ".heimdall") if own_home else os.path.join(self.root, "canonical")
         os.makedirs(self.canonical, mode=0o700)
         marker = os.path.join(self.canonical, ".hmd-test-canonical-home")
         with open(marker, "w", encoding="utf-8") as f:

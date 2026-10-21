@@ -64,6 +64,10 @@ export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 # HOME `security` has no default keychain, so every bind waited on a Keychain write that cannot succeed and said device_bound seconds late.
 export HMD_SESSION_LOGIN_STORE=file
 mkdir -p "$HOME/.claude"
+# bin/lib/hmd_pair_optin.py reads the account's real home and `hmd app connect` / `disconnect` write it too: this directory stands in for it as the one that is WRITTEN
+# (honoured only because of the marker file in it, which no repository can make outside its own tree), so a run never writes the real ~/.heimdall (as test/heimdall-app.test.sh)
+export HMD_TEST_CANONICAL_HOME="$TMPROOT/canonical"
+mkdir -m 700 "$HMD_TEST_CANONICAL_HOME" && (umask 077 && printf 'a test stand-in for an account own home\n' >"$HMD_TEST_CANONICAL_HOME/.hmd-test-canonical-home")
 
 # ── python3 pin ──────────────────────────────────────────────────────────
 # test/run-all.sh has already pinned the real interpreter for the suites it runs, in which case this call

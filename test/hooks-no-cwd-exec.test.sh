@@ -69,9 +69,17 @@ else
 fi
 
 # -- 2. static: no command derives a root (or anything executable) from the cwd --
-STATIC="$(grep -nE 'show-toplevel|pwd\)|\$PWD|`pwd`|[ "]\./bin/' "$CMDDIR"/*.cmd | cut -c1-170 | head -3)"
+# ONE read of the cwd is let through, by its exact text: `M="$1 (repo: $PWD)"`, in L() of the SessionEnd worker. When the repo's own .heimdall/logs path is refused (a link, a FIFO),
+# the notice goes to $HOME/.heimdall/logs/session-end.log, and that line has to say WHICH repo it is about (test/checkpoint-autosave.test.sh G6-G9 pin that it names it). That $PWD
+# is TEXT: it lands in an echo appended to a log file and is never executed, sourced, compiled or used as the path of anything -- the rule in the header is about code, and cases
+# 4-7 run this very command from a hostile clone to prove no planted script of it is reached. Only the assignment is exempt: any other $PWD, `pwd`, show-toplevel or ./bin/, in this
+# command or any other, still trips the net.
+NOTE_REPO='M="$1 (repo: $PWD)"'
+STATIC="$(for f in "$CMDDIR"/*.cmd; do
+  perl -pe 'BEGIN { $note = shift } s/\Q$note\E//g' "$NOTE_REPO" "$f" | grep -nE 'show-toplevel|pwd\)|\$PWD|`pwd`|[ "]\./bin/' | sed "s|^|${f##*/}:|"
+done | cut -c1-170 | head -3)"
 if [ -z "$STATIC" ]; then
-  ok "2. no hook command derives a path from the session's git toplevel or cwd"
+  ok "2. no hook command derives a path from the session's git toplevel or cwd (bar the repo's name as text in a log notice)"
 else
   bad "2. a hook command derives a path from the session's repo/cwd" "$STATIC"
 fi

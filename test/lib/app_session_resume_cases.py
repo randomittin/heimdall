@@ -241,10 +241,20 @@ class Sandbox:
         for d in (self.repo, self.home, self.bin):
             os.makedirs(d)
         subprocess.run(["git", "init", "-q", self.repo], check=True, capture_output=True)
+        # bin/lib/hmd_pair_optin.py reads the account's real home and `hmd app disconnect` / `connect` write it too: this directory stands in for it as the one that is WRITTEN, so a
+        # run never writes the real ~/.heimdall (test/lib/pair_code_harness.py Sandbox does the same). It is honoured only for a directory carrying the marker file below, which no
+        # repository can make outside its own tree, and that is in no git work tree.
+        self.canonical = os.path.join(self.tmp, "canonical")
+        os.makedirs(self.canonical, mode=0o700)
+        marker = os.path.join(self.canonical, ".hmd-test-canonical-home")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("a test's stand-in for an account's own home\n")
+        os.chmod(marker, 0o600)
 
     def env(self, **extra):
         env = dict(os.environ, HOME=self.home, HEIMDALL_HOME=self.hh, HMD_SESSION_LOGIN_STORE="file", HMD_PUSH="0",
-                   HMD_RELAY_STREAM_TRANSPORT="ndjson", PYTHONDONTWRITEBYTECODE="1", HMD_RELAY_BACKOFF_BASE_MS="200")
+                   HMD_RELAY_STREAM_TRANSPORT="ndjson", PYTHONDONTWRITEBYTECODE="1", HMD_RELAY_BACKOFF_BASE_MS="200",
+                   HMD_TEST_CANONICAL_HOME=self.canonical)
         env.pop("HMD_SESSION_RESUME_H", None)
         env.update(extra)
         return env
