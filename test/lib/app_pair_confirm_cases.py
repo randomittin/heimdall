@@ -121,6 +121,18 @@ def alive(pid):
     return True
 
 
+def stop_worker_running(sid):
+    """True while a `heimdall-app pair-window --stop --session SID` runs, found by its own argument line (a session id belongs to one case): the SessionEnd
+    hook hands that command to a detached worker (nohup + setsid) and returns at once, so it outlives the hook that started it."""
+    out = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=30).stdout
+    return any("pair-window --stop --session %s " % sid in line for line in out.splitlines())
+
+
+def wait_stop_worker(sid, timeout=60):
+    """Wait for the SessionEnd hook's detached `pair-window --stop` to finish: the session's record is gone and the window is closing only after it."""
+    wait_until(lambda: not stop_worker_running(sid), timeout)
+
+
 def write_private(path, text, mode=0o600):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
@@ -354,7 +366,10 @@ class Scn:
             self.opt_in()
         env = self.env(CLAUDE_PLUGIN_ROOT=REPO, CLAUDE_PROJECT_DIR=self.repo, **extra)
         stdin = json.dumps(dict({"session_id": sid, "source": "startup"}, **(payload or {})))
-        return run(["sh", "-c", hook_commands()[ident]], env, stdin=stdin, timeout=60, cwd=self.repo)
+        done = run(["sh", "-c", hook_commands()[ident]], env, stdin=stdin, timeout=60, cwd=self.repo)
+        if ident == "pair-window-stop":
+            wait_stop_worker(sid)
+        return done
 
     def window_state(self):
         """The repo's window state file (a repo has one window, whatever its sessions), or None."""

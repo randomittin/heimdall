@@ -455,9 +455,9 @@
       "event": "SessionEnd",
       "index": 0,
       "id": "presence-keeper-stop",
-      "description": "Stops this session's presence keeper (disabling it with presence-keeper-start enabled leaks a keeper process).",
+      "description": "Stops this session's presence keeper (disabling it with presence-keeper-start enabled leaks a keeper process). Reads the session id off stdin, then hands heimdall-presence keeper-stop to a detached worker (nohup + setsid, survives the hook's exit) and returns at once: Claude Code cancels a SessionEnd hook that outlives its budget (1.5s, or this hook's timeout of 5s). The keeper is gone a moment after the session ends, not before the hook returns.",
       "matcher": "",
-      "fingerprint": "1b26c0cc3e3b2c78ba518cd5b1248f880c1ab323b814e5587f6e51b8428fec64",
+      "fingerprint": "ba42f6495052ecdfe9e3616e782559f1d82f2a58bdabaedfe3c027483cae2fed",
       "locked": false,
       "remote_toggle": false
     },
@@ -475,9 +475,9 @@
       "event": "SessionEnd",
       "index": 2,
       "id": "pair-window-stop",
-      "description": "Forgets this session (removes its record under <repo>/.heimdall/app/sessions/) and, when no phone is paired, closes the repo's pair-by-code window (hmd app pair-window --stop), which revokes its unclaimed relay session -- unless another live session of the repo, or a running hmd app connect client, still needs the window, in which case it stays and ends with the last of them. It NEVER stops or revokes a paired phone: with a phone paired the window, its supervisor and the phone's client are left running and a line saying so goes to $HEIMDALL_HOME/logs/app.log; only hmd app disconnect, the phone's revoke or a login the relay refuses ends a pairing. Disabling it with pair-window-start enabled leaves a window to end when no session of the repo has a live Claude process (its supervisor looks every few seconds).",
+      "description": "Forgets this session (removes its record under <repo>/.heimdall/app/sessions/) and, when no phone is paired, closes the repo's pair-by-code window (hmd app pair-window --stop), which revokes its unclaimed relay session -- unless another live session of the repo, or a running hmd app connect client, still needs the window, in which case it stays and ends with the last of them. It NEVER stops or revokes a paired phone: with a phone paired the window, its supervisor and the phone's client are left running and a line saying so goes to $HEIMDALL_HOME/logs/app.log; only hmd app disconnect, the phone's revoke or a login the relay refuses ends a pairing. Disabling it with pair-window-start enabled leaves a window to end when no session of the repo has a live Claude process (its supervisor looks every few seconds). Reads the session id off stdin, then runs hmd app pair-window --stop in a detached worker (nohup + setsid, survives the hook's exit) and returns at once: with a live window the stop took 1.6 to 1.9s, past Claude Code's SessionEnd budget (1.5s, or this hook's timeout of 5s), so quitting printed 'Hook cancelled'. The record goes and the window closes a moment after the session ends, not before the hook returns; the worker stops only this session's repo window.",
       "matcher": "",
-      "fingerprint": "3038001d43d4f85c0a255848f228bd13f14adbb5f66d9fd67dcf68d5bcbf31fe",
+      "fingerprint": "1ae3cd46306d243e05c081102a2466ec94ef033e25882ff6e7f6f4727f0449a3",
       "locked": false,
       "remote_toggle": false
     },
