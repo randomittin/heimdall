@@ -1,6 +1,6 @@
 {
   "name": "runheimdall",
-  "version": "2.4.9",
+  "version": "2.4.10",
   "description": "Thin npx wrapper for the Heimdall installer — fetches the pinned-tag install.sh, verifies its sha256, and runs it. Byte-identical to runheimdall.dev/install. Nothing ships unproven.",
   "bin": {
     "runheimdall": "bin/runheimdall.js"
@@ -41,8 +41,8 @@
   "license": "MIT",
   "author": "Heimdall",
   "heimdall": {
-    "tag": "v2.4.9",
-    "installScriptUrl": "https://raw.githubusercontent.com/randomittin/heimdall/v2.4.9/install.sh",
-    "sha256": "98ecc11bd6af7412692a2826d6c35be174a737b748010fce7d98a6b95ecf4934"
+    "tag": "v2.4.10",
+    "installScriptUrl": "https://raw.githubusercontent.com/randomittin/heimdall/v2.4.10/install.sh",
+    "sha256": "81617bcbc21d990955948b3cd7f24c9bd4935a32271fd387c2e3fc416e7d2b3e"
   }
 }
