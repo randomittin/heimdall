@@ -1,0 +1,109 @@
+{
+  "project": "heimdall",
+  "identity_source": "IDENTITY.md (read identity from there, never memory)",
+  "phase": "unknown",
+  "parallelism": {
+    "max_agents": 10,
+    "min_agents_for_parallel": 2,
+    "notes": "R1: parallel agents get DISJOINT output sub-paths or sequence. R3: spawned coders commit in-worktree, orchestrator merges branch. R2: confirm merge lands before removing branch/worktree. NEVER remove a .claude/worktrees/agent-* that is a memory home. R7: cap spawned-task size (~3 items/2 domains), agents commit mid-task; several truncated ~120-160k tokens this session — inspect worktree from git, don't trust truncated reports. R13: Agent spawns UNNAMED by default; name: => mailbox-resident, never completes. R13: Agent spawns UNNAMED by default; name: => mailbox-resident, never completes. TRUNCATION: agents cut off ~106-165k tokens losing their commit step — inspect the worktree from git and land by copy, never treat truncation as failure. STALE BASE: 6 agents started behind main today; instruct ff-to-main first. WORKTREE MISROUTE: agents can be isolated into an unrelated repo and unable to write — tell them to stage to /tmp, never evade the guard."
+  },
+  "model_routing": {
+    "fable5": [
+      "ESCALATION ONLY: a task looping on bad output (same step failed repeatedly after sonnet then opus)",
+      "bench/eval re-spikes"
+    ],
+    "sonnet": [
+      "mechanical impl",
+      "refactor",
+      "docs",
+      "stack packs",
+      "tests"
+    ],
+    "haiku": [
+      "sentinels",
+      "doc-sync",
+      "format",
+      "lint"
+    ],
+    "default_code": "sonnet",
+    "default_effort": "high",
+    "notes": "Operational spawns resolve the LATEST Claude per tier via bin/heimdall-model-resolve (bare alias opus|sonnet|haiku -> Claude Code picks current-gen); pin only for bench/eval reproducibility via HEIMDALL_MODEL_<TIER>=<full-id>. default_code is a TIER (sonnet), not a pinned id. 2026-08-11 user directive: main CC agent stays on the user's default (NOT hardcoded opus); default coding tier is sonnet; fable5 is escalation-only for bad-output loops. opus retained ONLY for reviewer/verifier/security-auditor (adjudication + security judgment). Fable 5 NOT ZDR (30d) - client repos need repo-policy allow_non_zdr_models. Re-spike on Fable 5 before any public delta claim.",
+    "main_agent": "unpinned — agents/heimdall.md declares `tier: inherit`, a first-class declaration meaning it runs the operator's own Claude Code default. hmd never overrides the model the human chose.",
+    "escalation": "sonnet -> opus on first failed verification; fable5 ONLY when a task is looping on bad output (repeated failed attempts at the same step), never as a default",
+    "context_window": "1M context is the default wherever the tier supports it. bin/heimdall-model-resolve emits sonnet[1m] (1M is opt-in on sonnet, and the suffix still floats to current-gen); opus and fable are left bare because 1M is already their default maximum; haiku has NO 1m variant (200K) and is exempt. Rationale: a compaction is a lossy rewrite of the context the agent is reasoning over, and compacting repeatedly through one task is how an agent forgets its own acceptance criteria. HEIMDALL_NO_1M=1 opts out for cost-capped or pre-1M bench runs. Above 200K input a long-context premium applies over the base rates in bin/lib/tier-table.json, so a base-rate total for a long session is a floor."
+  },
+  "commands": {
+    "alarm_corpus": "bin/corpus run",
+    "alarm_falsify_exchange": "bin/falsify exchange-lob --assert-score 1.0",
+    "alarm_falsify_emulator": "bin/falsify emulator-gb --assert-score 1.0",
+    "alarm_runtest_exchange": "bash evals/oracles/exchange-lob/run.test.sh",
+    "alarm_runtest_emulator": "bash evals/oracles/emulator-gb/run.test.sh",
+    "c2_live_arm": "bash evals/oracles/exchange-lob/gate.sh --differential --seeds 20",
+    "demo": "bin/heimdall-demo",
+    "bench": "bin/heimdall-bench --dry",
+    "debloat_report": "bin/heimdall-debloat --report-only",
+    "validate_bash": "bash -n",
+    "validate_json": "jq .",
+    "isolation_oracle": "bin/falsify rr-multitenant-isolation --assert-score 1.0",
+    "ship": "release/ship.sh",
+    "ship_check": "release/ship.sh --check",
+    "rebuild_deploy": "bash deploy/cloud-run/go-live.sh (REBUILDS image; deploy-public-rr only redeploys revision). Re-assert enroll caps on public after.",
+    "live_verify": "curl $PUB/readyz (200), $PUB/config (200), POST $PUB/corpus unsigned (401), beat->roster-team own-watchman visible; PUB=https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app",
+    "test": "bash test/run-all.sh (single runner; globs test/*.test.sh, per-suite timeout, --include-live for deploy/prod suites)",
+    "sl_fullbleed": "bash test/heimdall-statusline-fullbleed.test.sh (+ --prove-red for falsifiability)",
+    "sl_density": "bash test/heimdall-statusline-density.test.sh (--regen to re-cut goldens)",
+    "sl_suites": "gauge/eyestrip/sigil-render/sigil-heroes/sigil-team-mini/statusline-width/statusline-cols-detect",
+    "sl_render": "echo '<stdin json>' | COLUMNS=120 bash hooks/statusline.sh   (team via HEIMDALL_HOME=<dir with ledger/status.json>)",
+    "gc": "bin/heimdall-gc run  (on main ec88498; reap orphan procs+temp+MERGED worktrees; keeps live keepers)",
+    "lint": "",
+    "build": "",
+    "test_one": "bash test/<name>.test.sh",
+    "live_verify_tool": "bin/heimdall-live-verify (read-only; writes evals/live-isolation/LATEST.{md,json})"
+  },
+  "git_identity": {
+    "name": "RJ",
+    "email": "rj@runheimdall.dev"
+  },
+  "governance": "hierarchical",
+  "autonomy_level": 3,
+  "no_interrupt_except": [
+    "stranger-test",
+    "S-7 re-spike headline pick",
+    "L0 copy handoff",
+    "L1 assets+reviewers"
+  ],
+  "hard_constraints": [
+    "agent never pushes/publishes; RJ holds all credentials + does force-pushes",
+    "public numbers trace to heimdall bench or commit sha; fable-5-pinned only",
+    "verifier-surface changes re-trigger alarm suite; golden edits re-trigger BLIND-VERIFICATION; unverified goldens don't gate",
+    "launches never batched; next at zero-or-answered queue",
+    "no new orchestration features (gates/corpus/router/bench/reach only)",
+    "security incident stays in .planning/ NEVER public",
+    "conventions R1-R13 in force (.planning/conventions.md)",
+    "gates must fail closed: an unreachable verifier is NON_VERIFIED, never OPEN; an empty scan fails loudly, never passes",
+    "hooks run under /bin/sh where echo expands escapes — always printf %s into jq/grep (test/gate-echo-parser-guard.test.sh enforces)"
+  ],
+  "namespace_note": "spawn agents as hmd:<role> — resolved + working this session (all 5 fix agents spawned hmd:coder/hmd:architect successfully). Source declares heimdall.",
+  "avoid_dirs": [
+    ".claude/worktrees",
+    "node_modules",
+    "dist",
+    "/tmp/spike-*",
+    "/tmp/mut-*",
+    "/tmp/heimdall-*"
+  ],
+  "goal": null,
+  "auto_checkpoint_at": "2026-10-21T06:43:41Z",
+  "ai_backend": {
+    "selected": "claude-code",
+    "selected_at": "2026-08-18T07:28:54Z",
+    "source": "user"
+  },
+  "user_preferences": [
+    "release order: one merge, one sweep, ship.sh, npm same day; site pushed in same step",
+    "no new version until operator reviews docs/GTM-2.4.x.md",
+    "deliver, do not over-test: one review/release, MEDIUM/LOW to backlog",
+    "agent never publishes npm; operator runs --npm-only",
+    "clarity questions objective, closed options"
+  ]
+}
