@@ -675,6 +675,8 @@ gp_rules_apply() {
 # -- brief-adoption gate -------------------------------------------------------
 # Every pass-through below goes through allow(), which is where a general-purpose spawn gets its rules block (section above): the original tool_input, only the prompt changed, in an allow +
 # updatedInput document. Before the payload has parsed (empty stdin, no jq) TOOL_INPUT is unset and there is nothing to rewrite, so it is a plain exit 0.
+# Never trust an inherited TOOL_INPUT/SATYPE: allow() must only rewrite what this payload parsed.
+unset TOOL_INPUT SATYPE
 allow() {
   local rewritten=""
   [ -z "${TOOL_INPUT:-}" ] || rewritten="$(gp_rules_apply "$TOOL_INPUT")"
