@@ -39,7 +39,7 @@
 #   stderr  every advisory: gate verdicts, "UNAVAILABLE" notices, the native-hook
 #           delegation line, falsify/corpus output, and a copy of every deny verdict.
 #   exit 2  DENY — a gate failed (secret in staged diff, quality gate rc 2, push
-#           secret gate, self-scan, non-falsifiable oracle, corpus regression, CI waste guard, sweep guard).
+#           secret gate, self-scan, non-falsifiable oracle, corpus regression, CI waste guard, sweep guard, wait guard).
 #   exit 0  everything else, including "gate never evaluated" (the quality-gate
 #           verdict UNAVAILABLE branch warns and allows, as before).
 #
@@ -62,6 +62,8 @@
 #                       Unset, empty, 0, true or any other value leaves it ON. Only that guard: every other gate still runs.
 #   HMD_SWEEP_ALLOW     exactly 1 turns the sweep guard off (a FULL test/run-all.sh is no longer denied after a red sweep, at a HEAD already proven green, or beside a running sweep): none of it runs. Read from THIS hook's
 #                       environment, so an inline `HMD_SWEEP_ALLOW=1 bash test/run-all.sh` reaches the sweep, not the hook that has already said no. Unset, empty, 0, true or any other value leaves it ON.
+#   HMD_WAIT_ALLOW      exactly 1 turns the wait guard off (a loop that sleeps, a while/until loop that polls pgrep or kill -0, a sleep of 60 s or more, an interpreter alarm + sleep and tail -f / tail -F are no longer denied): none of it runs. Read from THIS hook's
+#                       environment, so an inline `HMD_WAIT_ALLOW=1 sleep 300` reaches the command, not the hook that has already said no. Unset, empty, 0, true or any other value leaves it ON. A call with run_in_background: true is never held.
 #
 # Deliberately NO `set -e`, `set -u` or `pipefail`: the inline string ran under
 # Claude Code's plain `sh -c`/`bash -c` defaults, and its logic depends on them —
@@ -70,17 +72,19 @@
 #
 # -h, --help   print this header (the hook never passes arguments).
 case "${1:-}" in
-  -h|--help) sed -n '2,71p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,73p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-# SINCE THE EXTRACTION — seven deliberate deltas from the historical inline chain
+# SINCE THE EXTRACTION — eight deliberate deltas from the historical inline chain
 # (2026-10-11, "precheck never blocks silently in another repo"; then "never execute the session's
 # repo"; 2026-10-13, "each repo's own checks, not heimdall's"; 2.4.8, "a disk-space floor";
 # 2026-10-19, "never pay CI minutes to re-roll a flaky result"; 2026-10-21, "never start a full
-# sweep the records already answer").
+# sweep the records already answer"; 2026-11-10, "never wait in the foreground for a job the agent
+# started itself").
 # test/heimdall-precheck-bash.test.sh cases 17, 21 and 24-29 pin the first three,
 # test/heimdall-push-gate-per-repo.test.sh the fourth, test/disk-floor.test.sh the fifth,
-# test/ci-waste-guard.test.sh the sixth, test/sweep-guard.test.sh the seventh;
+# test/ci-waste-guard.test.sh the sixth, test/sweep-guard.test.sh the seventh,
+# test/wait-guard.test.sh the eighth;
 # every other branch is still byte-identical to the inline string.
 #
 #   1. deny(): a deny states its verdict on stderr TOO. Claude Code surfaces ONLY stderr for an
@@ -169,6 +173,13 @@ esac
 #      pays nothing else. OPERATOR OVERRIDE: HMD_SWEEP_ALLOW=1, read from THIS hook's environment (an inline prefix reaches the sweep, not this hook). A COST guard, not a security gate, so it FAILS OPEN like the CI waste guard: a missing or garbled receipt, a git failure,
 #      a command it cannot read or a timeout is one stderr line and an allow, and only a form it READ denies. A plugin root without the helper prints nothing and allows (a plumbing gap, as for the disk floor's lib). The hook never runs what the session's repo
 #      ships: the salt comes from the plugin's own closure engine. Best effort, not a boundary. Proof: test/sweep-guard.test.sh.
+#   8. WAIT GUARD (2026-11-10; operator: general-purpose and hmd:coder agents go stale after 1-2 h, docs/analysis/2026-11-10-stale-general-purpose-agents.md). They are not hung, they sit inside their own shell: foreground poll loops (until grep -q DONE f; do sleep 30; done, perl -e 'alarm 595; sleep 595') waiting for a
+#      job the agent itself put in the background were 167.8 h of general-purpose and 113.6 h of hmd:coder Bash time. The hook now DENIES a loop (until, while, for, select) whose body or condition runs sleep, a while/until loop whose condition polls pgrep or kill -0, a standalone sleep of 60 s or more, an interpreter one-liner that sleeps with an
+#      alarm or for 60 s or more, and tail -f / tail -F. The deny says: wait loops block the agent and stale it; run the job with run_in_background and wait for its completion notification (or the Monitor tool); bound a long command with the Bash timeout. A call whose payload has tool_input.run_in_background true is never held (the harness
+#      tells the agent when a background job ends). bin/lib/hmd_wait_guard.py is the one definition (its docstring has the rule): it reads the command the way a shell does by reusing the kill guard's lexer, so text that only MENTIONS a form (echo, grep, a commit message or its heredoc) is not a form. It sits AFTER the CI waste guard, the disk floor
+#      and the sweep guard, and its pre-filter is one builtin `case` on the raw command (sleep, alarm, or tail followed by a flag with an f in it): every other command pays nothing else, and the jq read of run_in_background and python start only for a command that passes it. OPERATOR OVERRIDE: HMD_WAIT_ALLOW=1, read from THIS hook's environment (an
+#      inline prefix reaches the command, not this hook). A COST guard, not a security gate, so it FAILS OPEN like the CI waste guard: a helper that is missing (silent: a fixture root, a partial copy), crashes or times out, or a command it cannot read, is one stderr line and an allow, and only a form it READ denies. Best effort, not a boundary: a wait
+#      inside a script file, or a loop in another interpreter's own code, is not read. Proof: test/wait-guard.test.sh.
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
 
 INPUT=$(cat)
@@ -262,6 +273,31 @@ case ${HMD_SWEEP_ALLOW:-} in
             4) printf 'heimdall sweep guard: %s -- no sweep check for this command, allowing\n' "$GP_SW_WHY" >&2 ;;
             *) printf 'heimdall sweep guard: the guard itself failed (exit %s) -- no sweep check for this command, allowing\n' "$GP_SW_RC" >&2 ;;
           esac
+        fi ;;
+    esac ;;
+esac
+# WAIT GUARD (delta 8 in the header above), AFTER the CI waste guard, the disk floor and the sweep guard. The outer `case` is the operator's switch (exactly 1 = off), the inner one the pre-filter: one builtin `case` on the raw command is all an ordinary command pays (no tr, no fork), and the statements here are builtins whose xtrace lines
+# test/heimdall-precheck-bash.test.sh's equiv() already drops (`+ case`, `GP_*`). A command that passes the pre-filter (sleep, alarm, or tail followed by a flag with an f in it: -f, -F, --follow) first reads run_in_background from the payload: true (a boolean, or the string true) is a call the harness runs in the background and tells the agent
+# about when it ends, so nothing is checked and python never starts. The helper's exit status is the verdict: 3 denies; 4 (could not read) and anything else (a crash, python3 absent) is ONE stderr line and an allow -- a cost guard fails OPEN, like the CI waste guard. A plugin root with no helper (a fixture root, a partial copy) is silent and allows.
+case ${HMD_WAIT_ALLOW:-} in
+  1) ;;
+  *)
+    case $CMD in
+      *sleep*|*alarm*|*tail*-*[fF]*)
+        if [ -r "$PLUGIN/bin/lib/hmd_wait_guard.py" ]; then
+          GP_WT_BG=$(jq -r '.tool_input.run_in_background // empty' <<<"$INPUT" 2>/dev/null)
+          if [ "$GP_WT_BG" != true ]; then
+            GP_WT_WHY=$(python3 -I -S "$PLUGIN/bin/lib/hmd_wait_guard.py" <<<"$CMD" 2>/dev/null)
+            GP_WT_RC=$?
+            case $GP_WT_RC in
+              0) ;;
+              3)
+                GP_WT_ESC=$(printf '%s' "$GP_WT_WHY" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+                deny "$(printf '{"error": "BLOCKED: hmd wait guard: %s. Wait loops block the agent and stale it: it sits inside its own shell, each poll is cut at the Bash timeout and re-issued, and its context grows with every poll result (2026-11-10, 2102 subagent transcripts: foreground poll loops were 167.8 h of general-purpose and 113.6 h of hmd:coder Bash time; docs/analysis/2026-11-10-stale-general-purpose-agents.md). Run the job with run_in_background (run_in_background: true on the Bash call) and wait for its completion notification, or use the Monitor tool to watch for the event you are waiting for; bound a long command with the Bash timeout parameter instead of polling it. If a foreground wait is wanted on purpose, the OPERATOR sets HMD_WAIT_ALLOW=1 in the environment Claude Code runs in: an inline HMD_WAIT_ALLOW=1 in front of the command is seen by that command only, not by this hook, which reads its own environment and has already said no. This guard is best-effort cost control, not a security boundary."}' "$GP_WT_ESC")" ;;
+              4) printf 'heimdall wait guard: %s -- no wait check for this command, allowing\n' "$GP_WT_WHY" >&2 ;;
+              *) printf 'heimdall wait guard: the guard itself failed (exit %s) -- no wait check for this command, allowing\n' "$GP_WT_RC" >&2 ;;
+            esac
+          fi
         fi ;;
     esac ;;
 esac
