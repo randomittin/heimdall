@@ -431,6 +431,32 @@ secret scan) now denies, through `bin/lib/hmd_ci_guard.py`:
   `agents/fixer.md`): fix the flake (a test must not depend on the wall-clock speed of a shared runner:
   count steps, not seconds, or mark it local-only) or report it. Proof: `test/ci-waste-guard.test.sh`.
 
+## Wait guard: never wait in the foreground for your own job (2026-11-10)
+General-purpose and hmd:coder agents "went stale after 1-2 h". They were not hung: they sat inside their own shell.
+Across all 2102 subagent transcripts (`docs/analysis/2026-11-10-stale-general-purpose-agents.md`) foreground poll loops
+(`until grep -q DONE f; do sleep 30; done`, `perl -e 'alarm 595; sleep 595'`, `while pgrep -f job; do sleep 5; done`)
+took 167.8 h of general-purpose and 113.6 h of hmd:coder Bash time: a loop waiting for a job the agent itself put in the
+background, cut at the 10-minute Bash cap and re-issued, its context growing with every poll until the turn cap or a stall.
+The Bash hook (`bin/heimdall-precheck-bash`, after the CI waste guard, the disk floor and the sweep guard) now denies,
+through `bin/lib/hmd_wait_guard.py`:
+
+- **A loop that sleeps.** `until`/`while`/`for` whose condition or body runs `sleep` (any duration), also behind
+  `env`/`timeout`/`nohup`, in a substitution, `sh -c` or `eval`. **A process poll:** a `while`/`until` whose condition is
+  `pgrep` or `kill -0`, with a sleep or without.
+- **A long sleep.** A standalone `sleep` of 60 s or more (`1m`, `infinity`), or an interpreter one-liner that sleeps with
+  an alarm or for 60 s or more (`perl -e 'alarm 595; sleep 595'`). **`tail -f` / `tail -F`** (and `--follow`).
+- **Allowed.** Any call with `run_in_background: true` (read from the payload's `tool_input`), text that only MENTIONS a
+  form (echo, grep, a commit message or its heredoc), `sleep` under 60 s outside a loop, loops without `sleep`, `tail`
+  without a follow flag.
+- **What to do instead.** Run the job with `run_in_background` and wait for its completion notification (or the Monitor
+  tool); bound a long command with the Bash `timeout`. Never poll your own job.
+- **Operator override: `HMD_WAIT_ALLOW=1`**, set in the environment Claude Code runs in. The hook reads ITS OWN
+  environment, so an inline prefix reaches the command, not the hook that has already said no; only exactly `1` lifts it.
+- **Fails OPEN, on purpose.** A cost guard, not a security gate (the CI waste guard's convention): a helper that is
+  missing, crashes or times out (`HMD_WAIT_GUARD_TIMEOUT_S`, default 5), or a command it cannot read, is one line on
+  stderr and an allow. Best effort, said plainly: a wait inside a script file or a python loop is not read, and a loop
+  sent to the background with `&` is held like any other (use `run_in_background`). Proof: `test/wait-guard.test.sh`.
+
 ## Model routing (2026-08-11 directive)
 - **Main Claude Code agent: never pinned.** It runs on the user's own default. hmd
   does not hardcode opus — or anything else — for the main agent.
