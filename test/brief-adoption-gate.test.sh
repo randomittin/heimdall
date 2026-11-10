@@ -34,6 +34,10 @@ HOOKS="$ROOT/hooks/hooks.json"
 # the floor (it was at 7.1% when the fence was added). That fence is proved under a fake df in test/disk-floor.test.sh; here it is pinned off, like the context gate is in
 # test/agent-name-gate.test.sh, so the brief-adoption assertions below do not depend on the disk they happen to run on.
 export HMD_MIN_FREE_PCT=0
+# The general-purpose rules section (2026-11-10) appends a rules block to a general-purpose spawn's prompt through the same updatedInput, which would turn this suite's "stdout stays empty" cases (small
+# prompt, === DELTA BRIEF prefix, HEIMDALL_ALLOW_LONG_BRIEF=1) into rewrites. It is another section with its own proof, test/gp-agent-rules.test.sh (which also covers how it composes with this gate),
+# so it is pinned off here, like the disk floor above.
+export HMD_GP_RULES_OFF=1
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 
