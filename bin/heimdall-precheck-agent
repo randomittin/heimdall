@@ -634,8 +634,55 @@ if [ "${HMD_FIX_CHAIN_ALLOW:-}" != "1" ] && [ -n "$INPUT" ]; then
 fi
 # -- end fix-chain advisory ------------------------------------------------------
 
+# -- general-purpose agent rules (2026-11-10) -----------------------------------
+# A `general-purpose` subagent gets none of hmd's agent rules (agents/*.md carry them, and only for hmd:*). docs/analysis/2026-11-10-stale-general-purpose-agents.md measured what that
+# costs on 695 general-purpose transcripts: the agent waits in its own FOREGROUND shell for a job it started itself (until/while/for + sleep, tail -f, pgrep loops: 167.8 h of Bash time
+# over 266 agents) and runs long commands with no bound (20050 of 24256 Bash calls set no timeout), so it sits blocked, burns turns re-polling, its context grows with every poll, and it goes
+# stale after an hour or two. This section is the fix at the source: a short rules block is APPENDED to the prompt of a spawn whose subagent_type is general-purpose, or absent/empty (the
+# Agent tool takes that as general-purpose). hmd:* and every other type are untouched, fork included.
+#
+# HOW. The channel is the brief-adoption gate's below: hookSpecificOutput.updatedInput with permissionDecision allow, built from the payload's OWN tool_input, so only `.prompt` changes and
+# every other field (model, description, name, isolation, run_in_background, ...) is carried over as it was. It composes with the brief gate instead of competing with it: the block is added
+# AFTER that gate has decided, never before, because ~100 words of rules would push a 250-word prompt over HEIMDALL_BRIEF_WORD_THRESHOLD and get it replaced by a brief nobody asked for;
+# and when the gate does substitute a brief, the block rides on the substituted prompt, in the same updatedInput. The rewrite takes the payload on stdin, never as an argument, so a very
+# large prompt cannot fail it on the argument-size limit.
+#
+# IDEMPOTENT. The block opens with the marker line `[hmd agent rules]`; a prompt that already carries it is left alone, so a re-spawn of a rewritten prompt never doubles it.
+#
+# OPT-OUT. HMD_GP_RULES_OFF=1, in the environment Claude Code runs in (this hook reads its own environment, not the spawn's); only exactly 1 turns it off.
+#
+# FAILS OPEN on everything: no jq, an unparsable payload, no prompt or a prompt that is not a string, a jq call that fails on the rewrite. The spawn then goes through with the input the
+# harness sent, exactly as before this section existed. Nothing here can deny a spawn, and nothing here exits: allow() below is the one place that emits the rewrite.
+GP_RULES_MARKER='[hmd agent rules]'
+GP_RULES_BLOCK="$GP_RULES_MARKER
+1. Never poll in the foreground: no until/while/for + sleep loops, tail -f, or pgrep waits. They block you, burn turns and bloat your context.
+2. Start long jobs with run_in_background and wait for the completion notification (or use Monitor). Never sit in a Bash call waiting on a job.
+3. Set an explicit timeout on every Bash call that can run long.
+4. Commit early and often in your worktree, unless told not to.
+5. Run only the tests you touched, once, after all edits.
+6. Report concisely: what changed, commit sha, test result line."
+
+# gp_rules_apply <tool_input_json>: prints the tool_input with the rules block appended to .prompt, or NOTHING when no rewrite applies (opted out, not a general-purpose spawn, no string
+# prompt, block already there, or jq failed). Always returns 0.
+gp_rules_apply() {
+  [ "${HMD_GP_RULES_OFF:-}" != "1" ] || return 0
+  case "${SATYPE:-}" in general-purpose|'') ;; *) return 0 ;; esac
+  printf '%s' "$1" | jq -c --arg m "$GP_RULES_MARKER" --arg b "$GP_RULES_BLOCK" \
+    'if (.prompt | type) == "string" and (.prompt | length) > 0 and ((.prompt | contains($m)) | not) then .prompt += ("\n\n" + $b) else empty end' 2>/dev/null || true
+}
+# -- end general-purpose agent rules ---------------------------------------------
+
 # -- brief-adoption gate -------------------------------------------------------
-allow() { exit 0; }
+# Every pass-through below goes through allow(), which is where a general-purpose spawn gets its rules block (section above): the original tool_input, only the prompt changed, in an allow +
+# updatedInput document. Before the payload has parsed (empty stdin, no jq) TOOL_INPUT is unset and there is nothing to rewrite, so it is a plain exit 0.
+allow() {
+  local rewritten=""
+  [ -z "${TOOL_INPUT:-}" ] || rewritten="$(gp_rules_apply "$TOOL_INPUT")"
+  if [ -n "$rewritten" ]; then
+    printf '%s' "$rewritten" | jq -c '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: .}}' 2>/dev/null
+  fi
+  exit 0
+}
 
 [ -n "$INPUT" ] || allow
 command -v jq >/dev/null 2>&1 || allow
@@ -674,6 +721,9 @@ case "$BRIEF_RC" in
   0)
     NEW_TOOL_INPUT="$(printf '%s' "$TOOL_INPUT" | jq -c --arg p "$BRIEF_OUT" '.prompt = $p' 2>/dev/null)" || allow
     [ -n "$NEW_TOOL_INPUT" ] || allow
+    # A general-purpose spawn also gets the rules block, on the substituted prompt, in this same updatedInput (nothing printed by gp_rules_apply = no rules apply = send the brief as is).
+    GP_WITH_RULES="$(gp_rules_apply "$NEW_TOOL_INPUT")"
+    [ -z "$GP_WITH_RULES" ] || NEW_TOOL_INPUT="$GP_WITH_RULES"
     printf 'BIFROST - Heimdall brief-adoption notice: spawn prompt was %s words (over %s) with no heimdall-brief header - auto-built one via heimdall-brief (task %s) and substituted it into the spawn. The spawned agent should read its own === DELTA BRIEF header for the task id and report back via heimdall-task-result done --task %s --status pass|fail|partial --from <role> --what <text>. Set HEIMDALL_ALLOW_LONG_BRIEF=1 to opt a spawn out.\n' "$WC" "$THRESH" "$TASK" "$TASK" >&2
     jq -cn --argjson ti "$NEW_TOOL_INPUT" \
       '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: $ti}}'
