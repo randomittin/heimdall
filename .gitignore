@@ -234,3 +234,4 @@ service-account*.json
 # (translation keys, fixture data, *.key template files) and this repo has none
 # tracked today -- a rule that starts silently hiding new files is worse than
 # the gap it closes. secret-scan still covers the content of any such file.
+.planning/CONTINUE.md
