@@ -33,6 +33,10 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 LAUNCHER="$REPO/bin/heimdall"
+# The consent gate discover_skills asks before every clone (T5.1; it needs its settings tool, bin/lib/skills_config.py, beside it).
+# The harnesses below source it next to the function they cut out, and pin HMD_SKILLS_CONSENT=auto, the legacy behaviour that clones:
+# this suite is about the prompt being data, not about when a NEW install is asked first (test/skills-consent-discover.test.sh).
+CONSENT_LIB="$REPO/bin/lib/skills_consent.sh"
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
@@ -40,6 +44,9 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf
 
 command -v python3 >/dev/null 2>&1 || { echo "FATAL: python3 not found"; exit 2; }
 [ -f "$LAUNCHER" ] || { echo "FATAL: $LAUNCHER is missing"; exit 2; }
+for f in "$CONSENT_LIB" "$REPO/bin/lib/skills_config.py"; do
+  [ -f "$f" ] || { echo "FATAL: $f is missing"; exit 2; }
+done
 
 WORK="$(mktemp -d)" || exit 1
 trap 'rm -rf "$WORK"' EXIT
@@ -132,8 +139,9 @@ TWINFN
 run_fn() {
   local fn="$1"; shift
   ( cd "$CWD" && env -u ANTHROPIC_API_KEY LC_ALL=C HOME="$HOMEDIR" PLUGIN_DIR="$PLUGIN" WORK_DIR="$CWD" FN="$fn" SRC="${SRC:-$LAUNCHER}" \
-      INSTALL_LOG="$INSTALL_LOG" PROMPT_FILE="$PROMPT_FILE" bash -c '
+      HMD_SKILLS_CONSENT=auto CONSENT_LIB="$CONSENT_LIB" INSTALL_LOG="$INSTALL_LOG" PROMPT_FILE="$PROMPT_FILE" bash -c '
         set -euo pipefail
+        . "$CONSENT_LIB"
         hmd_skill_install() { printf "%s|%s|%s|%s\n" "$1" "$2" "$3" "$4" >> "$INSTALL_LOG"; mkdir -p "$3"; }
         eval "$(sed -n "/^${FN}()/,/^}/p" "$SRC")"
         if [ -n "$PROMPT_FILE" ]; then set -- "$(cat "$PROMPT_FILE")"; fi
@@ -159,8 +167,10 @@ run_launcher() {
 
 # run_corpus SRC PLUGIN_ROOT PROMPTS : every prompt line through discover_skills from SRC; everything it prints, in one stream.
 run_corpus() {
-  ( cd "$CWD" && env -u ANTHROPIC_API_KEY LC_ALL=C HOME="$HOMEDIR" PLUGIN_DIR="$2" SRC="$1" PROMPTS="$3" bash -c '
+  ( cd "$CWD" && env -u ANTHROPIC_API_KEY LC_ALL=C HOME="$HOMEDIR" PLUGIN_DIR="$2" SRC="$1" PROMPTS="$3" \
+      HMD_SKILLS_CONSENT=auto CONSENT_LIB="$CONSENT_LIB" bash -c '
         set -euo pipefail
+        . "$CONSENT_LIB"
         hmd_skill_install() { printf "stub %s|%s|%s|%s\n" "$1" "$2" "$3" "$4"; mkdir -p "$3"; }
         eval "$(sed -n "/^discover_skills()/,/^}/p" "$SRC")"
         while IFS= read -r p; do
