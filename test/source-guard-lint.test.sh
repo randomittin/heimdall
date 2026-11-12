@@ -220,8 +220,11 @@ assert_site GUARDED bin/heimdall 55
 # pipefail` / `set -u`), so §0's hazard never applies here regardless of shape; two of
 # these three sites are ALSO pre-guarded by an early `[ -f ] || return 1`/`return 0`.
 assert_site NOT-AFF bin/heimdall-modules 1898
-assert_site NOT-AFF bin/heimdall-autoupdate 837
-assert_site NOT-AFF bin/heimdall-autoupdate 884
+# heimdall-autoupdate moves often (module work), so its two sites are found by content, not pinned numbers.
+AU_LIB_LINE=$(grep -n '^    \. "\$lib" 2>/dev/null || exit 0$' "$ROOT/bin/heimdall-autoupdate" | head -1 | cut -d: -f1)
+AU_VER_LINE=$(grep -n '^  \. "\$verlib" || {' "$ROOT/bin/heimdall-autoupdate" | head -1 | cut -d: -f1)
+assert_site NOT-AFF bin/heimdall-autoupdate "${AU_LIB_LINE:-0}"
+assert_site NOT-AFF bin/heimdall-autoupdate "${AU_VER_LINE:-0}"
 assert_site NOT-AFF bin/lib/hmd-route-claude 52
 assert_site NOT-AFF bin/lib/hmd-route-claude 81
 assert_site NOT-AFF bin/lib/hmd-route-claude 101
