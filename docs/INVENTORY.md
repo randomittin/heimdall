@@ -95,7 +95,7 @@ Also in `evals/oracles/`: `BLIND-VERIFICATION.md`, `REPORT-CONTRACT.md`, `change
 jq '{finished_at,head_sha,suites_total,suites_passed,suites_failed,assertions_passed,assertions_failed,duration_s,tree_clean}' .heimdall/receipts/last-sweep.json
 ```
 
-Last receipt at writing: **412/412 suites, 10,127 assertions passed, 0 failed**, 1037 s, `tree_clean: true`, at `b43c4f4b`. Suites added since bring the on-disk count to 468. CLAUDE.md rule: the full sweep runs **once**, immediately before the landing commit; `bin/heimdall-conformance` fails `gate-runs-once` / `gates-at-end` on the transcript otherwise. Commit `b43c4f4b` made the receipt immune to hmd's own post-commit publishing dirtying the tree (`test/sweep-receipt-gate.test.sh`).
+Last receipt at writing: **412/412 suites, 10,127 assertions passed, 0 failed**, 1037 s, `tree_clean: true`, at `b43c4f4b`. Suites added since bring the on-disk count to 468. CLAUDE.md rule: the full sweep is recommended to the developer at merge time (the Bash hook says why, the command and the cost) and runs **once**, on the frozen tree; `bin/heimdall-conformance` fails `gate-runs-once` / `gates-at-end` on the transcript otherwise. Commit `b43c4f4b` made the receipt immune to hmd's own post-commit publishing dirtying the tree (`test/sweep-receipt-gate.test.sh`).
 
 ### 2.7 The judgment invariant
 
@@ -489,7 +489,7 @@ Shell: `hmd-gate-endpoint.sh` (judgment invariant), `hmd-adjudication-set.sh`, `
 ```bash
 ls test/*.test.sh | wc -l                               # 468 suites
 bash test/<one>.test.sh                                 # the normal loop — run constantly
-bash test/run-all.sh                                    # the full sweep — ONCE, before the landing commit
+bash test/run-all.sh                                    # the full sweep — ONCE, recommended at merge time
 jq .assertions_passed .heimdall/receipts/last-sweep.json
 bash test/version-pin-conformance.test.sh --self-test   # corrupt-and-confirm proof of the version gate
 bash test/truth-pass-claims.test.sh --self-test         # five mutants incl. the sibling-site sweep

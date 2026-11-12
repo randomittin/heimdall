@@ -231,7 +231,7 @@ equiv() {
   # `export` of that pair (two lines inside the substitution) are dropped
   # (bash traces the export's arguments as assignments of their own, `++ GIT_DIR=...` and `++ GIT_WORK_TREE=...`; and the fallback test's operand is `-` for a row
   # that is not the fallback, where it used to be empty)
-  local mtr='^(\+ (SQ=|GP_|SLINT=|PG_|IFS=|read -r PG_|cd |case |grep -qE .*push|.\[. .* = fallback .\].)|\+\+ (tr -d |jq -r .\.cwd|python3 -I -S .*hmd_push_target\.py|printf .sweep|case |(export )?GIT_(DIR|WORK_TREE)=))'
+  local mtr='^(\+ (SQ=|GP_|SLINT=|PG_|IFS=|read -r PG_|cd |case |grep -qE .*push|.\[. .* = fallback .\].|.\[. -r [^ ]*hmd_sweep_advice\.py .\].)|\+\+ (tr -d|jq -r .\.cwd|python3 -I -S .*hmd_push_target\.py|printf .sweep|case |(export )?GIT_(DIR|WORK_TREE)=))'
   grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | grep -vE "$mtr" | awk '/^\+ .\[. [0-9]+ = 2 .\].$/ && !guard_test++ { next } { print }' | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
   LC_ALL=C sort "$TMPROOT/$tag.trace-inline.err" | grep -vE "$mtr" > "$TMPROOT/$tag.trace-inline.sorted"
   # denies are exempt from the trace comparison: the stderr mirror is a statement the string never had

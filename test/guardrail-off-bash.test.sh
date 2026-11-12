@@ -17,6 +17,7 @@ HOOK="$REPO/bin/heimdall-precheck-bash"
 MANIFEST="$REPO/guardrails.manifest.json"
 LIBS=(hmd_guardrail_enabled.sh hmd_ci_guard.py hmd_kill_guard.py hmd_push_target.py hmd_repo_receipt.py hmd_disk_floor.sh hmd_sweep_guard.py hmd_wait_guard.py hook-owned-path.sh)
 SWITCHED=(ci-waste-guard disk-floor sweep-guard wait-guard)
+ADVISED=(sweep-advice)  # a recommended guard that gives advice and never denies: the hook asks the switch for it too, but it has no canonical bad command for the loops below (test/sweep-advice.test.sh drives it)
 PASS=0
 FAIL=0
 N=0
@@ -153,10 +154,10 @@ N=$((N + 1)); run_hook "$PLUGIN" 'git commit -m x' FAKE_SCAN_RC=1
 if [ "$RC" = 2 ] && jq -e '.error | startswith("BLOCKED: secret detected")' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. every id listed: the commit secret scan (core, no switch) still denies"; else bad "$N. every id listed: the commit secret scan did not deny" "rc=$RC $(head -c 200 "$TMPROOT/out")"; fi
 CODE="$(grep -v '^[[:space:]]*#' "$HOOK")"  # the hook without its comment lines: what runs, not what is described
 ASKED="$(grep -o 'gp_guard_on [a-z-]*' <<<"$CODE" | sed '/gp_guard_on $/d; s/^gp_guard_on //' | LC_ALL=C sort -u | tr '\n' ' ')"
-WANT="$(printf '%s\n' "${SWITCHED[@]}" | LC_ALL=C sort | tr '\n' ' ')"
+WANT="$(printf '%s\n' "${SWITCHED[@]}" "${ADVISED[@]}" | LC_ALL=C sort | tr '\n' ' ')"
 if [ "$ASKED" = "$WANT" ]; then ok "the hook asks the switch for exactly: $ASKED"; else bad "the hook asks the switch for [$ASKED], want [$WANT]"; fi
 NOT_REC=""
-for id in "${SWITCHED[@]}"; do
+for id in "${SWITCHED[@]}" "${ADVISED[@]}"; do
   [ "$(jq -r --arg id "$id" '[.guardrails[] | select(.id == $id)] | if length == 1 then .[0].tier else "missing" end' "$MANIFEST")" = recommended ] || NOT_REC="$NOT_REC $id"
 done
 if [ -z "$NOT_REC" ]; then ok "each of the four is ONE recommended row of guardrails.manifest.json (a mistyped id would be a switch that never works)"; else bad "not one recommended manifest row:$NOT_REC"; fi
