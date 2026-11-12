@@ -261,7 +261,7 @@ bin/heimdall-fallback status --json | jq 'del(.checks)'   # secret-free; on this
 
 **OmniRoute module** (`modules/omniroute/manifest.json`): third-party local LLM gateway, `default_included: false`, bound to `127.0.0.1:20128`, installed pinned by `bin/heimdall-omniroute-install` (clone, checkout exact pin, apply `patches/omniroute/*.patch`, `npm ci`, verified build). Opt-in only.
 
-**Headroom module** (`modules/headroom/manifest.json`): local context-compression proxy + storage codec, `default_included: true`, `consent_waived: true` (disclosed, not asked). Nothing installs it for you; `hmd modules add headroom` runs `uv tool install` against PyPI with no digest verification (receipt records `verified: false`). Only `hmd wrap claude` / `hmd route claude` actually carry generation traffic through it. `bin/lib/module_preflight.sh` names the fix for every failed precondition. `bin/heimdall-modules` is the lifecycle (`add|remove|status|list`); `modules/_classes/` holds the four permission-class contracts (rule-pack, storage-codec, tool-adapter, traffic-proxy); `test/modules-lifecycle.test.sh` gates it.
+**Headroom module** (`modules/headroom/manifest.json`): local context-compression proxy + storage codec, `default_included: false` (off by default: a fresh install never acquires it, and `hmd headroom on|off|status`, see the `heimdall-headroom` row in section 10, switches it on demand), `consent_waived: true` (disclosed, not asked). An install that already has it keeps it until `hmd headroom off`. `hmd headroom on` runs `hmd modules add headroom` when the module is absent, which runs `uv tool install` against PyPI with no digest verification (receipt records `verified: false`). Only `hmd wrap claude` / `hmd route claude` actually carry generation traffic through it, and only while it is on. `bin/lib/module_preflight.sh` names the fix for every failed precondition. `bin/heimdall-modules` is the lifecycle (`add|remove|status|list`); `modules/_classes/` holds the four permission-class contracts (rule-pack, storage-codec, tool-adapter, traffic-proxy); `test/modules-lifecycle.test.sh` gates it.
 
 ---
 
@@ -317,6 +317,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-ai-select` | detect/default/persist which offline coding-AI CLI backend hmd prefers |
 | `heimdall-wrap` | `hmd wrap <tool>` / `unwrap`: Layer-0 hooks + AGENTS.md fence + presence, byte-for-byte reversible |
 | `heimdall-route` | run a coding tool through the Headroom chain and change nothing else |
+| `heimdall-headroom` | `hmd headroom on`, `off`, `status`: switch the Headroom proxy on demand; off by default |
 | `heimdall-init` | install the universal git core (Layer 0) in any repo |
 | `heimdall-hooks-link` | make a linked worktree's relative `core.hooksPath` resolve |
 | `session-fork` | spawn parallel Claude sessions for independent sub-tasks |

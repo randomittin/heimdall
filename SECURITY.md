@@ -86,23 +86,33 @@ above.
 
 ## The Headroom proxy — a local process that can read your prompts
 
-hmd's default module set includes **Headroom**
+hmd has a module for **Headroom**
 ([`modules/headroom/manifest.json`](modules/headroom/manifest.json), Apache-2.0):
-a local context-compression proxy. Point traffic at it and a process on your
-machine sits between your coding tool and the model provider, reads the prompts
-and context on their way out, and rewrites them to be smaller. That is what it is
-for. It is documented here because someone auditing hmd's security posture should
-not have to discover it by reading a manifest.
+a local context-compression proxy that is **off by default** and used only on
+demand. Point traffic at it and a process on your machine sits between your coding
+tool and the model provider, reads the prompts and context on their way out, and
+rewrites them to be smaller. That is what it is for. It is documented here because
+someone auditing hmd's security posture should not have to discover it by reading a
+manifest.
 
-**Installing it is not wiring it.** `hmd modules add headroom` installs the
-package and applies neither wire the manifest declares. `bin/heimdall-wrap`
-contains no reference to the module and the memory-codec seam reports
-`backend=plain`, so on a stock install hmd sends nothing through this proxy and
-your traffic goes exactly where it went before. Both facts are *measured* at add
-time rather than asserted here: `[6/7] wire` prints each declared wire as
-`RECORDED, not routed` beside the measurement behind it, and `hmd modules status
-headroom` reads back the same record. What follows describes what this module can
-reach **if you route traffic through it** — which is the state worth threat-
+**A new install does not have it.** A fresh install never installs it, never loads a
+launchd job for it and never points `ANTHROPIC_BASE_URL` at it; it exists on your
+machine only after you run `hmd headroom on`. An install that already had the module
+keeps it exactly as it is until you run `hmd headroom off`.
+
+**Installing it is not routing traffic to it.** `hmd headroom on` installs the
+package (through `hmd modules add headroom`) and starts nothing: the proxy starts,
+lazily, on the first launch you route through `hmd route claude` or
+`hmd wrap claude` (or a shell function of your own that calls one), and a launch
+that goes another way, bare `hmd` for one, sends nothing through it, so your
+traffic goes exactly where it went before. Both wires the manifest declares are
+*measured* at add time rather than asserted here: `[6/7] wire` prints the wrap
+chain as `ROUTED` (`bin/heimdall-wrap` references the module, so the chain it
+offers can reach it, which is an offer and not traffic) and the memory-codec seam
+as `RECORDED, not routed` (it reports `backend=plain`), and
+`hmd modules status headroom` reads back the same record. What follows describes
+what this module can reach **once you have turned it on and routed traffic
+through it** — which is the state worth threat-
 modelling, and the reason the scrubs below exist at all.
 
 ### What it is
@@ -116,18 +126,27 @@ modelling, and the reason the scrubs below exist at all.
   of truth for that pin. The forwarding behaviour is Headroom's own code, at that
   pin, under Apache-2.0 — readable at
   <https://github.com/headroomlabs-ai/headroom>.
-- **Shipped by default, installed by you.** `default_included: true` is a
-  *distribution* fact, not a claim that it helps and not an unattended install.
-  `install.sh` has no module code path, and `bin/heimdall-autoupdate` will not
-  acquire a consent-required class unattended — doing so would mean passing `--yes`
-  on your behalf, which is a forged signature rather than an install path. It names
-  the module and prints the command instead.
+- **Off by default, enabled by you.** `default_included: false` is a
+  *distribution* fact, not a claim that it helps: the installer and the updater never
+  acquire it, and no module is in the default set today. `install.sh` has no module
+  code path, and `bin/heimdall-autoupdate` acquires only a module whose manifest says
+  `default_included: true`. A module that requires consent and does not waive it is
+  never acquired unattended even then — that would mean passing `--yes` on your
+  behalf, which is a forged signature rather than an install path — so the updater
+  names it and prints the command instead. You turn Headroom on with
+  `hmd headroom on` and off with `hmd headroom off` (below).
+- **One fixed upstream.** The chain is client → Headroom → `api.anthropic.com`. It
+  pins the proxy's upstream to that provider and refuses a proxy whose own `/health`
+  reports any other, so "no new destination" is checked from the running process
+  rather than asserted here. OmniRoute is never chained behind it: when the OmniRoute
+  fallback gate says ROUTE, `hmd route` sends that launch to OmniRoute and Headroom
+  compression is off for it.
 
 ### What it can and cannot reach
 
 | Traffic | Through the proxy? | What enforces that |
 |---|---|---|
-| Model **generation** traffic from your coding tool | **Only if you route it there** — that is the module's purpose, and hmd does not do it for you | Nothing in hmd points generation at the proxy: the `wrap-chain` wire is declared and not applied, which `[6/7] wire` and `hmd modules status headroom` both report as `RECORDED, not routed`. Falsifier: [`test/wire-kind-dispatch.test.sh`](test/wire-kind-dispatch.test.sh), which measures the wire against the repo and refuses any declared wire kind the code has no handler for |
+| Model **generation** traffic from your coding tool | **Only on a launch you route there, with the module on** — that is the module's purpose, and a fresh install routes nothing | Nothing points generation at the proxy until you run `hmd headroom on` and launch through `hmd route claude` or `hmd wrap claude`, and only `claude` reads the `ANTHROPIC_BASE_URL` those set. The `wrap-chain` wire is measured at add time, not asserted: `[6/7] wire` and `hmd modules status headroom` report it `ROUTED` because `bin/heimdall-wrap` references the module, which is an offer of the hop and not traffic. Falsifier: [`test/wire-kind-dispatch.test.sh`](test/wire-kind-dispatch.test.sh), which measures the wire against the repo and refuses any declared wire kind the code has no handler for |
 | Any call that produces a **verdict** (gate, oracle, verifier, panel) | **No** | `hmd_gate_exec` in [`bin/lib/hmd-gate-endpoint.sh`](bin/lib/hmd-gate-endpoint.sh) unsets `ANTHROPIC_BASE_URL`, the HTTP/HTTPS/ALL/NO_PROXY pairs and the whole `HEADROOM_*` namespace, then pins the endpoint to the real provider. Falsifier: [`test/gate-judgment-uncompressed.test.sh`](test/gate-judgment-uncompressed.test.sh) |
 | **Control-plane, enrollment, team and presence** traffic | **No** | `hmd_signed_exec` in the same file. [`test/cp-signed-no-rewriting-proxy.test.sh`](test/cp-signed-no-rewriting-proxy.test.sh) is a runtime differential with a positive control, and it **fails closed**: an unreachable control plane reports `NON_VERIFIED` and fails the invariant rather than passing quietly |
 
@@ -144,7 +163,9 @@ pose.
 ### Consent is waived. Disclosure is not.
 
 Headroom carries `consent_waived: true` on its own manifest, so `hmd modules add
-headroom` discloses and proceeds rather than stopping to ask. This is a deliberate
+headroom` discloses and proceeds rather than stopping to ask. The waiver stays now
+that Headroom is off by default: your own `hmd headroom on` is the request, so the
+add path does not ask the same question a second time. This is a deliberate
 decision by the maintainer, and its blast radius is exactly one module:
 [`modules/_classes/traffic-proxy.json`](modules/_classes/traffic-proxy.json) still
 reads `consent_required: true`, so every other traffic-proxy module hmd ever ships
@@ -158,8 +179,10 @@ after the fact rather than indistinguishable from a yes you typed.
 
 ### The remote-install caveat
 
-**`hmd modules add headroom` performs a remote code install and verifies no
-digest.** Stated plainly, because it is the sharpest thing on this page:
+**Turning Headroom on performs a remote code install and verifies no digest.**
+`hmd headroom on` runs `hmd modules add headroom` when the module is absent, and that
+is where the install happens. Stated plainly, because it is the sharpest thing on
+this page:
 
 - The fetch is `uv tool install --python 3.13 "headroom-ai[all]==<pin>"`, resolved
   from PyPI at install time and executed as you.
@@ -176,32 +199,37 @@ digest.** Stated plainly, because it is the sharpest thing on this page:
   install size and time are materially larger than hmd's own. This is the one place
   hmd stops being near-stdlib.
 
-A failed Headroom install does not fail `hmd install`: the module reports ABSENT
-with the blocker named and rolls back, and hmd keeps working without it.
+A failed Headroom install breaks nothing: the module reports ABSENT with the blocker
+named and rolls back, and hmd keeps working without it.
 
 ### How to decline it, or remove it
 
-Two surfaces read opt-out signals, and they do **not** overlap — each verb honours
-the signals of the surface it belongs to:
+`hmd headroom off` is the first-class way to turn Headroom off, and a new install
+does not have it at all unless you run `hmd headroom on`. Underneath, two surfaces
+read opt-out signals, and they do **not** overlap — each verb honours the signals of
+the surface it belongs to:
 
 | Signal | Read by | Effect |
 |---|---|---|
+| `hmd headroom off` | `bin/heimdall-headroom` | the first-class way to turn it off: records the module opt-out, so `hmd route` and `hmd wrap` decline and launch direct (or to the OmniRoute fallback when its gate says ROUTE); unloads and removes a launchd supervisor job if one was installed; removes an `ANTHROPIC_BASE_URL` entry in your Claude `settings.json` `env` when it equals the proxy URL; stops the idle proxy when no session is routed through it. It **refuses** (exit 3, nothing changed) inside a session that is currently routed through the proxy unless `--next-session` is given. Everything it changes is backed up first under `~/.heimdall/headroom/off-backup/<UTC-stamp>/` (override: `--backup-dir DIR` or `HMD_HEADROOM_BACKUP_DIR`), with a `CHANGES.txt` giving the undo for each change |
+| `hmd headroom off --next-session` | `bin/heimdall-headroom` | for a session that is running through the proxy: changes configuration only, leaves the running proxy alone, needs no tty, is idempotent and exits 0 when Headroom is already off; a launchd job it disables is re-enabled by `hmd headroom on` |
 | `hmd modules optout headroom` | `bin/heimdall-modules` | persisted as this tool's own record; nothing re-installs it, and `repair`, `defer` and `pending` refuse to act |
 | `HMD_MODULE_OPTOUT=headroom` | `bin/heimdall-modules` | the same, for a single invocation |
 | `HEIMDALL_NO_MODULES=1` | `bin/heimdall-autoupdate` | no module is acquired automatically, at all |
 | `~/.heimdall/modules-optout` | `bin/heimdall-autoupdate` | one module name per line, read on the updater's acquisition path. Nothing in this repo *writes* this file — an operator writes it by hand |
 
 `install.sh` reads none of these, because it acquires no modules in the first
-place: there is no installer flag to suppress and none is offered. Every signal
-above governs acquisition that would happen **on your behalf**, so
+place: there is no installer flag to suppress and none is offered. Every module and
+updater signal above governs acquisition that would happen **on your behalf**, so
 `HEIMDALL_NO_MODULES=1` does not block an explicit `hmd modules add` — an operator
 typing the command themselves is not what an opt-out for unattended installs is
 trying to stop.
 
-**Removal is total.** `hmd modules remove headroom` unwinds through the same
-`remove_module()` path a failed install rolls back through, which is what makes the
-result byte-identical rather than merely tidy. `uv tool uninstall headroom-ai`
-removes the tool itself.
+**Off is not removal; removal is total.** `hmd headroom off` switches Headroom off
+and leaves the installed module in place. To delete the install entirely,
+`hmd modules remove headroom` unwinds through the same `remove_module()` path a
+failed install rolls back through, which is what makes the result byte-identical
+rather than merely tidy, and `uv tool uninstall headroom-ai` removes the tool itself.
 
 ## Auto-commit — hmd can commit your working tree without being asked
 

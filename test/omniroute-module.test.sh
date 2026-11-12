@@ -197,7 +197,8 @@ if [ "$HAVE_MANIFEST" -eq 1 ]; then
   cp "$MREG/omniroute/manifest.json" "$MANIFEST_BASELINE"
 fi
 # headroom rides along in the same temp registry for the O3 contrast — it is
-# real, shipped, default_included:true, consent_waived:true.
+# real, shipped, consent_waived:true, and opt-in (default_included:false). O3 drives it
+# through `add`, which reads the waiver and never default_included.
 mkdir -p "$MREG/headroom"
 cp "$REAL_REG/headroom/manifest.json" "$MREG/headroom/manifest.json"
 

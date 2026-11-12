@@ -2530,6 +2530,22 @@ case "${1:-}" in
     fi
     exec "$ROUTE_BIN" "$@"
     ;;
+  headroom)
+    # `hmd headroom status|on|off [--next-session] [--backup-dir DIR]`: Headroom, the local compression proxy, is OFF by
+    # default and used only on demand (operator directive 2026-11-12). Pass-through to bin/heimdall-headroom, which reuses
+    # the module tool (add, optout, optin), the launchd supervisor and the chain's own probes instead of repeating them.
+    # Without this arm `hmd headroom off` fell through to the task-prompt path and started a Claude run with "headroom
+    # off" as the task. All args forward verbatim, so a routed run and a direct bin run are byte-identical, exit codes
+    # included (3 = refused: this session is routed through the proxy).
+    shift
+    HEADROOM_BIN="$PLUGIN_DIR/bin/heimdall-headroom"
+    if [ ! -x "$HEADROOM_BIN" ]; then
+      echo "  Error: heimdall-headroom not found at $HEADROOM_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$HEADROOM_BIN" "$@"
+    ;;
   modules)
     shift
     MODULES_BIN="$PLUGIN_DIR/bin/heimdall-modules"
