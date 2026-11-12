@@ -59,6 +59,14 @@
 #     (rc_notes_read, lib/resume-contract.sh): `write` folds it into four fields and the key, and a link, a
 #     FIFO or a hard-linked file at .heimdall or resume-notes.ndjson is skipped, never followed — the save
 #     still lands (exit 0: the notes are an optional input) and one stderr line says they were skipped.
+#   - Sweep-safe: while test/run-all.sh holds THIS checkout's sweep lock (bin/lib/hmd_sweep_live.sh) `write` writes NOTHING — not
+#     CHECKPOINT.md, settings.json, the key or the shared ledger record — says so in one stderr line and exits 5. A sweep fails the
+#     whole run when a tracked file changed under it, and CHECKPOINT.md and settings.json are tracked here (2026-11-12: another
+#     session's SessionEnd write did exactly that, an hour into a sweep). The save is SKIPPED, not parked in a side file to apply
+#     later: the block is derived afresh from git, the worktrees and the notes store on every run, and the notes live in the
+#     untracked .heimdall/ (`note` keeps recording), so the first `write` after the sweep saves what a deferred one would have.
+#     Checked twice — before anything is measured, and again right before the first tracked write, because measuring takes
+#     seconds and a sweep can start in them. Fails open: a lock it cannot read as a live sweep of this checkout is no sweep.
 #
 # USAGE
 #   heimdall-checkpoint write [project_dir]   # write/update .planning/CHECKPOINT.md
@@ -74,6 +82,8 @@
 #   4  REFUSED — a path it writes (`note`: appends to) is a link or not a plain entry, or could not be
 #      vetted (no python3); nothing was written, one line on stderr says which. Distinct from 0 and 3 so a
 #      hook cannot call it saved; the hooks fail open on it
+#   5  DEFERRED — `write` only: a sweep of this checkout is running (see Sweep-safe); nothing was written, one line on
+#      stderr names the sweep's pid. Distinct from 0, 3 and 4 for the same reason; the hooks fail open on it
 #
 # ENV SEAMS (tests only; neither carries data)
 #   HMD_CKPT_FAULT=<contract-id>  suppress one contract field at write time. This is
@@ -115,6 +125,8 @@ else
   echo "[heimdall-checkpoint] FATAL: bin/lib/resume-contract.sh is missing — cannot verify a save is complete, so this one is refused." >&2
   exit 3
 fi
+# Optional, unlike the contract: without it hmd_sweep_live is undefined, _defer_for_sweep below answers "no sweep" and `write` does what it did before.
+[ -r "$_CKPT_BIN/lib/hmd_sweep_live.sh" ] && . "$_CKPT_BIN/lib/hmd_sweep_live.sh"
 
 _timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown"; }
 
@@ -891,11 +903,24 @@ cmd_note() { # <kind> <text...>
   echo "[heimdall-checkpoint] noted ($catid): $text"
 }
 
+# While test/run-all.sh holds this checkout's sweep lock, `write` writes NOTHING (the Sweep-safe paragraph of the CONTRACT above says why, and why it skips
+# rather than parks). hmd_sweep_live (bin/lib/hmd_sweep_live.sh) answers; exit 5 is the caller's half, this line the human's: it names the pid, and the
+# PreCompact hook and /hmd:continue repeat it.
+_defer_for_sweep() { # <project_dir> -> 0, after saying so on stderr, when a live sweep of this checkout forbids a write; 1 otherwise
+  local pid
+  pid="$(hmd_sweep_live "$1" 2>/dev/null)" || return 1
+  echo "[heimdall-checkpoint] write DEFERRED — a sweep (test/run-all.sh, pid ${pid}) is grading this working tree and a change to a tracked file now (CHECKPOINT.md, settings.json) would turn it red; nothing was written. The first write after the sweep ends saves it (the block is derived afresh each time; notes keep recording)" >&2
+  return 0
+}
+
 cmd_write() {
   local project_dir="${1:-$PWD}"
   # Resolve; a bad path is non-fatal (we simply do nothing).
   project_dir=$(cd "$project_dir" 2>/dev/null && pwd) || return 0
   local planning="$project_dir/.planning"
+
+  # A sweep grading this checkout must not see a tracked file change under it. Asked before anything is measured, so a deferred save costs nothing...
+  _defer_for_sweep "$project_dir" && return 5
 
   # LINK SAFETY, before anything under .planning is read or written: a repository controls every name below
   # its root, and this runs unattended. A link (a dangling one too) or a non-plain entry at .planning or at a
@@ -924,6 +949,9 @@ cmd_write() {
   _derive_contract "$project_dir"
 
   block=$(_build_block "$project_dir" "$ts") || return 0
+
+  # ...and again before the first tracked write (CHECKPOINT.md, in either branch below): measuring took seconds, and a sweep can start in them.
+  _defer_for_sweep "$project_dir" && return 5
 
   # Verify the BYTES, before they are anywhere a resume could read them.
   probe=$(mktemp) || return 0
@@ -1005,6 +1033,9 @@ Exit status of `write` (`note`: 0 recorded, 1 failed, 4 refused):
   3  INCOMPLETE — a required field did not survive the write. The checkpoint is
      stamped, the key is revoked, and stderr names the field. Do not resume from it.
   4  REFUSED — see below; nothing was written
+  5  DEFERRED — a sweep (test/run-all.sh) of this checkout is running and would fail
+     the run over a changed tracked file; nothing was written, stderr names the
+     sweep's pid. Run `write` again once the sweep ends (notes keep recording).
 
 Link safety: `write` refuses — saves nothing, prints one line on stderr, exits 4 (not 0: a
 hook would call that saved) — when .planning, CHECKPOINT.md, RESUME-KEY.json or settings.json
