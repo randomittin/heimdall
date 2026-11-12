@@ -75,11 +75,34 @@ cmd_restore_file() {
   restore_path "$owner"
 }
 
+# registry_on — is skills.registry on? Asked as the launcher asks, `python3 -I bin/lib/skills_config.py get registry` (the environment, else the
+# operator's $HEIMDALL_HOME/skills-config.json, else off; never a file of the repository). Anything but a clean "on" is off: the legacy code.
+registry_on() {
+  [ "$(python3 -I "$PLUGIN_DIR/bin/lib/skills_config.py" get registry 2>/dev/null)" = on ]
+}
+
+# registry_status DIR — print the status block the skills registry resolver gives. Non-zero, with nothing printed on stdout, when the flag is off or
+# the resolver could not answer (any non-zero exit: an invalid manifest is exit 3, a crash): the caller then runs the legacy code, which stays
+# authoritative in M1. The answer is captured before it is printed, so a failed run never leaves half of one on stdout.
+registry_status() {
+  local project_dir="$1" block
+  registry_on || return 1
+  if block="$(python3 -I "$PLUGIN_DIR/bin/lib/skills_resolver.py" status --manifest "$PLUGIN_DIR/skills.manifest.json" \
+      --project "$project_dir" --settings "$SETTINGS")"; then
+    printf '%s\n' "$block"
+    return 0
+  fi
+  echo "skill-manager: the skills registry resolver could not answer; using the legacy status" >&2
+  return 1
+}
+
 cmd_status() {
   local project_dir="${1:-.}"
 
   [ -f "$CONFIG" ] || { echo "No config: $CONFIG"; return 1; }
   command -v python3 &>/dev/null || { echo "python3 required"; return 1; }
+
+  registry_status "$project_dir" && return 0
 
   python3 <<PYEOF
 import json, glob, os

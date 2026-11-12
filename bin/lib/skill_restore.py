@@ -33,6 +33,17 @@ CONCURRENCY. Every read-modify-write of settings.json runs under one advisory lo
 If the lock cannot be had within LOCK_WAIT_SECONDS the work proceeds unlocked: pausing skills is
 housekeeping and must never hang a launch.
 
+THE REGISTRY FLAG. What the project needs (the one decision `activate` takes) is answered by
+needed_plugins() below while skills.registry is off, which is the default. With it on, `activate`
+asks the registry resolver instead (bin/lib/skills_resolver.py activate-set, answering from
+skills.manifest.json; docs/superpowers/plans/2026-11-12-3x-m1-skill-registry.md, T3.2). The flag is
+read the way the launcher reads it, `python3 -I bin/lib/skills_config.py get registry`, so there is
+one definition of it and a repository cannot set it. Off, the resolver is never started. On, any
+answer but a clean exit 0 -- an invalid manifest is exit 3, a crash, a timeout -- is said on stderr and
+the legacy rules answer: the legacy config stays authoritative in M1, so it is still read first, and
+a broken registry must never leave a launch without its skills. Nothing else changes: the restore
+file, the recovery of dead launches and the locking are the same whichever answers.
+
 Settings are written in place (as they always were), which keeps a symlinked settings.json
 symlinked. The restore file is written to a temp file and renamed, so a crash never leaves half of
 one. stdlib only.
@@ -42,6 +53,7 @@ import glob
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -53,6 +65,10 @@ except ImportError:  # no flock on this platform: run unlocked rather than fail
 
 SWEEP_MAX = 64
 LOCK_WAIT_SECONDS = 10
+REGISTRY_TIMEOUT_SECONDS = 10  # one bound for reading the flag and for the resolver's answer: neither may hang a launch
+LIB_DIR = os.path.dirname(os.path.abspath(__file__))
+MANIFEST = os.path.join(os.path.dirname(os.path.dirname(LIB_DIR)), "skills.manifest.json")
+PYTHON = sys.executable or "python3"
 OWNER_FILE = re.compile(r"^[0-9]+\.json$")
 USAGE = (
     "usage:\n"
@@ -211,10 +227,44 @@ def needed_plugins(config, project_dir):
     return needed
 
 
+def registry_on():
+    """Is skills.registry on? Asked as the launcher asks: `python3 -I bin/lib/skills_config.py get registry` (the environment, else the operator's
+    $HEIMDALL_HOME/skills-config.json, else off; never a file of the repository). Anything but a clean `on` -- a failing read, a missing script, a
+    timeout -- is off: the legacy rules."""
+    try:
+        done = subprocess.run([PYTHON, "-I", os.path.join(LIB_DIR, "skills_config.py"), "get", "registry"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=REGISTRY_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.decode("utf-8", "replace").strip() == "on"
+
+
+def registry_needed(project_dir):
+    """The plugins the registry resolver says PROJECT_DIR needs (a set), or None when the legacy rules must answer: the flag is off, or the resolver
+    could not answer (a non-zero exit, a timeout, no interpreter to run it). Its own reason is on stderr already. The resolver only reads."""
+    if not registry_on():
+        return None
+    command = [PYTHON, "-I", os.path.join(LIB_DIR, "skills_resolver.py"), "activate-set", "--manifest", MANIFEST, "--project", project_dir]
+    try:
+        done = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, timeout=REGISTRY_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        warn("the skills registry resolver gave no answer in %d s; using the legacy rules" % REGISTRY_TIMEOUT_SECONDS)
+        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn("the skills registry resolver could not run (%s: %s); using the legacy rules" % (type(exc).__name__, exc))
+        return None
+    if done.returncode != 0:
+        warn("the skills registry resolver exited %d; using the legacy rules" % done.returncode)
+        return None
+    return {ref for ref in done.stdout.decode("utf-8", "replace").split("\n") if ref}
+
+
 def activate(config_path, settings_path, project_dir, restore_file, state_dir):
     """Pause what the project does not need. Returns the summary line, or None if nothing was done."""
     config = read_json(config_path)
-    needed = needed_plugins(config, project_dir)
+    needed = registry_needed(project_dir)
+    if needed is None:
+        needed = needed_plugins(config, project_dir)
     try:
         os.makedirs(state_dir, mode=0o700, exist_ok=True)
         os.makedirs(os.path.dirname(restore_file) or ".", exist_ok=True)
