@@ -1,0 +1,503 @@
+{
+  "schema": 1,
+  "marketplaces": {
+    "claude-plugins-official": {"source": "anthropics/claude-plugins-official", "pin": null},
+    "heimdall-marketplace": {"source": "randomittin/heimdall-marketplace", "pin": null}
+  },
+  "entries": [
+    {
+      "id": "caveman",
+      "kind": "plugin",
+      "ref": "caveman@caveman",
+      "marketplace": "caveman",
+      "install": false,
+      "tier": "detected",
+      "why": "Retired: token compression is in-house since 2026-08-30. Activation-only, kept unpaused for users who still have the plugin; hmd never installs it",
+      "activate": {"permanent": true, "detect": []},
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "permanent"}
+      ]
+    },
+    {
+      "id": "superpowers",
+      "kind": "plugin",
+      "ref": "superpowers@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "recommended",
+      "why": "Core workflow skills (brainstorming, debugging, planning); hmd sets it up at first run and keeps it active in every project",
+      "activate": {"permanent": true, "detect": []},
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "permanent"},
+        {"mechanism": "bin/heimdall:first_run_setup", "path": "install superpowers"}
+      ]
+    },
+    {
+      "id": "frontend-design",
+      "kind": "plugin",
+      "ref": "frontend-design@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "recommended",
+      "why": "UI and frontend work gets design guidance",
+      "activate": {"permanent": false, "detect": ["frontend"]},
+      "triggers": {
+        "prompt_ere": "react|vue|angular|css|responsive|ui|frontend|component",
+        "files": [
+          {"path": "package.json", "contains_any": ["react", "vue", "angular", "svelte"]}
+        ],
+        "order": 1
+      },
+      "legacy": [
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "prompt rule 1"},
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "file rule 1"},
+        {"mechanism": "plugin-autoinstall.md", "path": "auto-install map row 1"},
+        {"mechanism": "plugin-autoinstall.md", "path": "mid-task signal row 1"},
+        {"mechanism": "plugin-autoinstall.md", "path": "mid-task signal row 2"},
+        {"mechanism": "heimdall-skills.json", "path": "detection.frontend"}
+      ]
+    },
+    {
+      "id": "devops-toolkit",
+      "kind": "plugin",
+      "ref": "devops-toolkit@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "recommended",
+      "why": "Docker, Kubernetes and CI/CD work gets devops tooling",
+      "triggers": {
+        "prompt_ere": "docker|k8s|kubernetes|deploy|ci.?cd|pipeline",
+        "files": [
+          {"path": "Dockerfile"},
+          {"path": "docker-compose.yml"}
+        ],
+        "order": 2
+      },
+      "legacy": [
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "prompt rule 2"},
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "file rule 2"},
+        {"mechanism": "plugin-autoinstall.md", "path": "auto-install map row 6"},
+        {"mechanism": "plugin-autoinstall.md", "path": "mid-task signal row 3"}
+      ]
+    },
+    {
+      "id": "database-toolkit",
+      "kind": "plugin",
+      "ref": "database-toolkit@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "recommended",
+      "why": "SQL, schema and ORM work gets database tooling",
+      "triggers": {
+        "prompt_ere": "sql|database|schema|migration|prisma|typeorm",
+        "files": [
+          {"path": "prisma/schema.prisma"},
+          {"path": "ormconfig.json"}
+        ],
+        "order": 3
+      },
+      "legacy": [
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "prompt rule 3"},
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "file rule 3"},
+        {"mechanism": "plugin-autoinstall.md", "path": "auto-install map row 5"},
+        {"mechanism": "plugin-autoinstall.md", "path": "mid-task signal row 4"}
+      ]
+    },
+    {
+      "id": "seo",
+      "kind": "plugin",
+      "ref": "seo@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "recommended",
+      "why": "SEO, meta tag and sitemap work gets SEO tooling",
+      "triggers": {"prompt_ere": "seo|meta.?tag|sitemap|robots.?txt", "order": 4},
+      "legacy": [
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "prompt rule 4"},
+        {"mechanism": "plugin-autoinstall.md", "path": "auto-install map row 2"},
+        {"mechanism": "plugin-autoinstall.md", "path": "mid-task signal row 7"}
+      ]
+    },
+    {
+      "id": "security-scanner",
+      "kind": "plugin",
+      "ref": "security-scanner@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "recommended",
+      "why": "Auth, JWT and security work gets security scanning",
+      "triggers": {"prompt_ere": "auth|jwt|oauth|security|owasp|vulnerability", "order": 5},
+      "legacy": [
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "prompt rule 5"},
+        {"mechanism": "plugin-autoinstall.md", "path": "auto-install map row 7"},
+        {"mechanism": "plugin-autoinstall.md", "path": "mid-task signal row 6"}
+      ]
+    },
+    {
+      "id": "api-design",
+      "kind": "plugin",
+      "ref": "api-design@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "recommended",
+      "why": "API, OpenAPI and GraphQL work gets API design guidance",
+      "triggers": {"prompt_ere": "api|openapi|swagger|rest|graphql", "order": 6},
+      "legacy": [
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "prompt rule 6"},
+        {"mechanism": "plugin-autoinstall.md", "path": "auto-install map row 4"},
+        {"mechanism": "plugin-autoinstall.md", "path": "mid-task signal row 5"}
+      ]
+    },
+    {
+      "id": "slack",
+      "kind": "plugin",
+      "ref": "slack@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "recommended",
+      "why": "Slack, notification and webhook work gets Slack integration; kept active in projects with Slack config files",
+      "activate": {"permanent": false, "detect": ["slack"]},
+      "triggers": {"prompt_ere": "slack|notification|webhook", "order": 7},
+      "legacy": [
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "prompt rule 7"},
+        {"mechanism": "plugin-autoinstall.md", "path": "auto-install map row 8"},
+        {"mechanism": "plugin-autoinstall.md", "path": "mid-task signal row 9"},
+        {"mechanism": "heimdall-skills.json", "path": "detection.slack"}
+      ]
+    },
+    {
+      "id": "mcp-server-dev",
+      "kind": "plugin",
+      "ref": "mcp-server-dev@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "recommended",
+      "why": "MCP and tool-server work gets MCP server development help",
+      "triggers": {"prompt_ere": "mcp|tool.?server|model.?context", "order": 8},
+      "legacy": [
+        {"mechanism": "bin/heimdall:preinstall_plugins", "path": "prompt rule 8"},
+        {"mechanism": "plugin-autoinstall.md", "path": "auto-install map row 3"},
+        {"mechanism": "plugin-autoinstall.md", "path": "mid-task signal row 8"}
+      ]
+    },
+    {
+      "id": "design-for-ai",
+      "kind": "plugin",
+      "ref": "design-for-ai@rtd",
+      "marketplace": "rtd",
+      "install": false,
+      "tier": "detected",
+      "why": "Activation-only: kept unpaused when the project has frontend files; hmd never installs it (its marketplace is not on the allow-list)",
+      "activate": {"permanent": false, "detect": ["frontend"]},
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "detection.frontend"}
+      ]
+    },
+    {
+      "id": "playwright",
+      "kind": "plugin",
+      "ref": "playwright@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "detected",
+      "why": "Kept active when the project has Playwright or Cypress config or .spec.ts files",
+      "activate": {"permanent": false, "detect": ["playwright"]},
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "detection.playwright"}
+      ]
+    },
+    {
+      "id": "pr-review-toolkit",
+      "kind": "plugin",
+      "ref": "pr-review-toolkit@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "detected",
+      "why": "Kept active when the project has a PR template, GitHub workflows or CODEOWNERS",
+      "activate": {"permanent": false, "detect": ["pr-workflow"]},
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "detection.pr-workflow"}
+      ]
+    },
+    {
+      "id": "code-review",
+      "kind": "plugin",
+      "ref": "code-review@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "detected",
+      "why": "Kept active in projects with source files (ts, js, py, go, rs, java, rb, sh)",
+      "activate": {"permanent": false, "detect": ["code-review"]},
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "detection.code-review"}
+      ]
+    },
+    {
+      "id": "security-guidance",
+      "kind": "plugin",
+      "ref": "security-guidance@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "detected",
+      "why": "Kept active in projects with source files (ts, js, py, go, rs, java)",
+      "activate": {"permanent": false, "detect": ["security"]},
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "detection.security"}
+      ]
+    },
+    {
+      "id": "claude-md-management",
+      "kind": "plugin",
+      "ref": "claude-md-management@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "detected",
+      "why": "Kept active when the project has CLAUDE.md, AGENTS.md or GEMINI.md",
+      "activate": {"permanent": false, "detect": ["docs"]},
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "detection.docs"}
+      ]
+    },
+    {
+      "id": "skill-creator",
+      "kind": "plugin",
+      "ref": "skill-creator@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "on_demand",
+      "why": "On demand: not activated by any project file, kept for an explicit request",
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "on_demand"}
+      ]
+    },
+    {
+      "id": "claude-code-setup",
+      "kind": "plugin",
+      "ref": "claude-code-setup@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "on_demand",
+      "why": "On demand: not activated by any project file, kept for an explicit request",
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "on_demand"}
+      ]
+    },
+    {
+      "id": "ralph-loop",
+      "kind": "plugin",
+      "ref": "ralph-loop@claude-plugins-official",
+      "marketplace": "claude-plugins-official",
+      "install": true,
+      "tier": "on_demand",
+      "why": "On demand: not activated by any project file, kept for an explicit request",
+      "legacy": [
+        {"mechanism": "heimdall-skills.json", "path": "on_demand"}
+      ]
+    },
+    {
+      "id": "ui-ux-pro-max",
+      "kind": "github-skill",
+      "repo": "nextlevelbuilder/ui-ux-pro-max-skill",
+      "install": true,
+      "tier": "detected",
+      "why": "Offered when a prompt matches its design keywords (UI, UX, responsive, dashboard)",
+      "keywords": ["ui", "ux", "design", "frontend", "react", "tailwind", "landing page", "mobile ui", "responsive", "component", "css", "html", "dashboard"],
+      "category": "design",
+      "description": "Professional UI/UX design skill for React, Tailwind, and responsive frontends",
+      "legacy": [
+        {"mechanism": "skills-registry.json", "path": "skills[0]"}
+      ]
+    },
+    {
+      "id": "oh-my-mermaid",
+      "kind": "github-skill",
+      "repo": "oh-my-mermaid/oh-my-mermaid",
+      "install": true,
+      "tier": "detected",
+      "why": "Offered when a prompt matches its documentation keywords (diagram, mermaid, flowchart)",
+      "keywords": ["diagram", "mermaid", "architecture", "flowchart", "sequence diagram", "visualization", "codebase map"],
+      "category": "documentation",
+      "description": "Generate Mermaid diagrams for architecture, flowcharts, and codebase maps",
+      "legacy": [
+        {"mechanism": "skills-registry.json", "path": "skills[1]"}
+      ]
+    },
+    {
+      "id": "token-optimizer",
+      "kind": "github-skill",
+      "repo": "alexgreensh/token-optimizer",
+      "install": true,
+      "tier": "detected",
+      "why": "Offered when a prompt matches its optimization keywords (token, compaction, context window)",
+      "keywords": ["token", "optimize", "context", "compaction", "context window"],
+      "category": "optimization",
+      "description": "Optimize token usage and context window compaction",
+      "legacy": [
+        {"mechanism": "skills-registry.json", "path": "skills[2]"}
+      ]
+    },
+    {
+      "id": "context-mode",
+      "kind": "github-skill",
+      "repo": "mksglu/context-mode",
+      "install": true,
+      "tier": "detected",
+      "why": "Offered when a prompt matches its optimization keywords (context, sandbox, tool output)",
+      "keywords": ["context", "sandbox", "tool output", "context window", "optimization"],
+      "category": "optimization",
+      "description": "Sandbox tool output and optimize context window usage",
+      "legacy": [
+        {"mechanism": "skills-registry.json", "path": "skills[3]"}
+      ]
+    },
+    {
+      "id": "godogen",
+      "kind": "github-skill",
+      "repo": "htdt/godogen",
+      "install": true,
+      "tier": "detected",
+      "why": "Offered when a prompt matches its gamedev keywords (godot, game, 2d, 3d)",
+      "keywords": ["godot", "game", "gamedev", "2d", "3d", "game design", "unity"],
+      "category": "gamedev",
+      "description": "Godot game development skill for 2D and 3D projects",
+      "legacy": [
+        {"mechanism": "skills-registry.json", "path": "skills[4]"}
+      ]
+    },
+    {
+      "id": "claude-obsidian",
+      "kind": "github-skill",
+      "repo": "AgriciDaniel/claude-obsidian",
+      "install": true,
+      "tier": "detected",
+      "why": "Offered when a prompt matches its knowledge keywords (obsidian, wiki, notes)",
+      "keywords": ["obsidian", "wiki", "knowledge", "notes", "documentation", "research"],
+      "category": "knowledge",
+      "description": "Obsidian wiki and knowledge management integration",
+      "legacy": [
+        {"mechanism": "skills-registry.json", "path": "skills[5]"}
+      ]
+    },
+    {
+      "id": "claude-ads",
+      "kind": "github-skill",
+      "repo": "AgriciDaniel/claude-ads",
+      "install": true,
+      "tier": "detected",
+      "why": "Offered when a prompt matches its marketing keywords (ads, ppc, campaign)",
+      "keywords": ["ads", "advertising", "google ads", "meta ads", "facebook ads", "marketing", "ppc", "campaign"],
+      "category": "marketing",
+      "description": "Google Ads and Meta Ads campaign management skill",
+      "legacy": [
+        {"mechanism": "skills-registry.json", "path": "skills[6]"}
+      ]
+    },
+    {
+      "id": "claude-seo",
+      "kind": "github-skill",
+      "repo": "AgriciDaniel/claude-seo",
+      "install": true,
+      "tier": "detected",
+      "why": "Offered when a prompt matches its marketing keywords (seo, sitemap, serp)",
+      "keywords": ["seo", "search engine", "meta tags", "sitemap", "robots", "ranking", "serp"],
+      "category": "marketing",
+      "description": "SEO optimization for meta tags, sitemaps, and search ranking",
+      "legacy": [
+        {"mechanism": "skills-registry.json", "path": "skills[7]"}
+      ]
+    },
+    {
+      "id": "get-shit-done",
+      "kind": "github-skill",
+      "repo": "gsd-build/get-shit-done",
+      "install": true,
+      "tier": "detected",
+      "why": "Offered when a prompt matches its productivity keywords (spec, planning, spec-driven)",
+      "keywords": ["spec", "planning", "architecture", "spec-driven", "meta-prompting"],
+      "category": "productivity",
+      "description": "Spec-driven planning, architecture, and meta-prompting for productivity",
+      "legacy": [
+        {"mechanism": "skills-registry.json", "path": "skills[8]"}
+      ]
+    },
+    {
+      "id": "heimdall",
+      "kind": "bundled",
+      "ref": "skills/heimdall",
+      "install": false,
+      "tier": "bundled",
+      "why": "The orchestrator skill (task decomposition, agents, quality gates); ships in-tree with hmd and is never installed",
+      "legacy": [
+        {"mechanism": "skills/", "path": "skills/heimdall/SKILL.md"}
+      ]
+    },
+    {
+      "id": "designmatch",
+      "kind": "bundled",
+      "ref": "skills/designmatch",
+      "install": false,
+      "tier": "bundled",
+      "why": "Visual QA loop for matching React Native screens to a Claude Design canonical; ships in-tree, never installed",
+      "legacy": [
+        {"mechanism": "skills/", "path": "skills/designmatch/SKILL.md"}
+      ]
+    },
+    {
+      "id": "stacks",
+      "kind": "bundled",
+      "ref": "skills/stacks",
+      "install": false,
+      "tier": "bundled",
+      "why": "Stack knowledge packs (fastapi, nextjs, react-native, spring-boot) for role agents; ships in-tree, never installed",
+      "legacy": [
+        {"mechanism": "skills/", "path": "skills/stacks/SKILL.md"}
+      ]
+    },
+    {
+      "id": "self-improve",
+      "kind": "bundled",
+      "ref": "skills/self-improve",
+      "install": false,
+      "tier": "bundled",
+      "why": "Maintainer self-improvement loop over routing evidence; ships in-tree, never installed",
+      "legacy": [
+        {"mechanism": "skills/", "path": "skills/self-improve/SKILL.md"}
+      ]
+    },
+    {
+      "id": "system-health",
+      "kind": "bundled",
+      "ref": "skills/system-health",
+      "install": false,
+      "tier": "bundled",
+      "why": "Suggests a disk or memory cleanup when the machine is slow or full; ships in-tree, never installed",
+      "legacy": [
+        {"mechanism": "skills/", "path": "skills/system-health/SKILL.md"}
+      ]
+    },
+    {
+      "id": "mac-deep-clean",
+      "kind": "bundled",
+      "ref": "skills/mac-deep-clean",
+      "install": false,
+      "tier": "bundled",
+      "why": "Deep clean of a macOS dev machine (disk, caches, memory); ships in-tree, never installed",
+      "legacy": [
+        {"mechanism": "skills/", "path": "skills/mac-deep-clean/SKILL.md"}
+      ]
+    }
+  ],
+  "detection_rules": {
+    "frontend": {
+      "files": ["*.tsx", "*.jsx", "*.vue", "*.svelte", "*.css", "*.scss", "*.less", "tailwind.config.*", "postcss.config.*", "vite.config.*"],
+      "entries": ["frontend-design", "design-for-ai"]
+    },
+    "playwright": {"files": ["playwright.config.*", "cypress.config.*", "*.spec.ts"], "entries": ["playwright"]},
+    "pr-workflow": {"files": [".github/pull_request_template*", ".github/workflows/*", ".github/CODEOWNERS"], "entries": ["pr-review-toolkit"]},
+    "code-review": {"files": ["*.ts", "*.js", "*.py", "*.go", "*.rs", "*.java", "*.rb", "*.sh", "*.tsx", "*.jsx"], "entries": ["code-review"]},
+    "security": {"files": ["*.ts", "*.js", "*.py", "*.go", "*.rs", "*.java"], "entries": ["security-guidance"]},
+    "slack": {"files": [".slack*", "slack.json", "slack-*.json"], "entries": ["slack"]},
+    "docs": {"files": ["CLAUDE.md", "AGENTS.md", "GEMINI.md"], "entries": ["claude-md-management"]}
+  },
+  "keyword_skills": ["ui-ux-pro-max", "oh-my-mermaid", "token-optimizer", "context-mode", "godogen", "claude-obsidian", "claude-ads", "claude-seo", "get-shit-done"]
+}
