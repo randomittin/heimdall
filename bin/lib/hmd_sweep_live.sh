@@ -11,10 +11,12 @@
 # first and stays off the tree while the answer is yes. Skipping loses nothing for the checkpoint, which is derived afresh from git and the (untracked) notes store on every run.
 #
 # WHAT IT READS. The runner takes an flock on receipts/sweep.lock and writes pid=, repo= (git's toplevel) and started= into it; it blanks the file when it exits (test/run-all.sh, "ONE SWEEP AT A TIME").
-# The file is found where the runner puts it, ${HEIMDALL_HOME:-<toplevel>/.heimdall}/receipts/sweep.lock, and read the way the sweep guard reads it (bin/lib/hmd_sweep_guard.py, running()): the pid is the
+# The runner puts the file in ITS home, ${HEIMDALL_HOME:-<toplevel>/.heimdall}/receipts/sweep.lock, which is not necessarily the writer's: install.sh exports HEIMDALL_HOME="$PLUGIN_DIR/.heimdall" (a throwaway home) to
+# the headless claude it boots for its validation gate, and that session's SessionEnd hook runs a writer in the checkout the installer was started from (2026-11-12, test/install-stranger.test.sh: three sweeps red).
+# So both places are asked, the writer's own HEIMDALL_HOME (when set) and the checkout's own <toplevel>/.heimdall, and a lock is read the way the sweep guard reads it (bin/lib/hmd_sweep_guard.py, running()): the pid is the
 # first pid= line of digits, it must be above 1 (kill -0 0 signals the whole process group, and kill -0 1 is init: both answer alive) and it must answer kill -0. A process of another user, which kill -0
-# refuses with EPERM, still counts: ps -p finds it. The lock must also name THIS checkout in repo=: HEIMDALL_HOME is often shared by every repo of the machine, and the sweep's own suites run the writers
-# in throwaway repos under that same environment, which a sweep of another checkout must never defer.
+# refuses with EPERM, still counts: ps -p finds it. The lock must also name THIS checkout in repo=, in either place: HEIMDALL_HOME is often shared by every repo of the machine, and the sweep's own suites run the writers
+# in throwaway repos under that same environment, which a sweep of another checkout must never defer. A lock that is not this checkout's live sweep ends the look at THAT place only: the other place is still asked.
 #
 # FAILS OPEN. A cost guard, not a security gate (the sweep guard's and the CI waste guard's convention): no git, no lock, a link, a FIFO or a directory where the lock should be, no usable pid, no repo=, a
 # pid that is gone: each is "no sweep", i.e. the caller does what it did before. The lock is read only when it is a plain file (head on a FIFO a cloned repo planted would block) and never through a link.
@@ -23,14 +25,19 @@
 # Every name here starts hmd_sweep_live, so sourcing it into a hook cannot collide with the hook's own. Bash 3.2 compatible (macOS /bin/bash) and nounset-safe.
 
 hmd_sweep_live() { # <dir> -> the sweep's pid on stdout and exit 0; exit 1 when there is none
-  local top lock text pid repo
+  local top home lock text pid repo
   top="$(git -C "${1:-.}" rev-parse --show-toplevel 2>/dev/null)" || return 1
-  lock="${HEIMDALL_HOME:-$top/.heimdall}/receipts/sweep.lock"
-  { [ -f "$lock" ] && [ ! -L "$lock" ]; } || return 1
-  text="$(head -c 4096 "$lock" 2>/dev/null)" || return 1
-  pid="$(printf '%s\n' "$text" | sed -n 's/^pid=\([0-9]\{1,9\}\)[[:space:]]*$/\1/p' | head -n 1)"
-  repo="$(printf '%s\n' "$text" | sed -n 's/^repo=//p' | head -n 1)"
-  { [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$repo" = "$top" ]; } || return 1
-  kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1 || return 1
-  printf '%s' "$pid"
+  for home in "${HEIMDALL_HOME:-}" "$top/.heimdall"; do
+    [ -n "$home" ] || continue
+    lock="$home/receipts/sweep.lock"
+    { [ -f "$lock" ] && [ ! -L "$lock" ]; } || continue
+    text="$(head -c 4096 "$lock" 2>/dev/null)" || continue
+    pid="$(printf '%s\n' "$text" | sed -n 's/^pid=\([0-9]\{1,9\}\)[[:space:]]*$/\1/p' | head -n 1)"
+    repo="$(printf '%s\n' "$text" | sed -n 's/^repo=//p' | head -n 1)"
+    { [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$repo" = "$top" ]; } || continue
+    kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1 || continue
+    printf '%s' "$pid"
+    return 0
+  done
+  return 1
 }

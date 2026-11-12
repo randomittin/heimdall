@@ -134,6 +134,18 @@ TMPH="$(mktemp -d)"
 PROBE_TREE=""
 trap 'reap_private_root; rm -rf "$TMPH" "$FAKE_DIR" ${PROBE_TREE:+"$PROBE_TREE"}; hmd_private_tmp_rm' EXIT
 
+# THE STRANGER NEVER STARTS IN THE CHECKOUT UNDER TEST (2026-11-12: three sweeps red on TREE INTEGRITY VIOLATION). test/run-all.sh does not cd, so a suite starts in the checkout, and install.sh's validation gate boots a REAL
+# headless Claude Code (bin/heimdall-doctor-install --cc-verify) in whatever directory the installer was started from. That session's SessionEnd hook (hooks/hooks.json) ran the stranger's own bin/heimdall-checkpoint write
+# against it -- with HEIMDALL_HOME="$PLUGIN_DIR/.heimdall", which install.sh exports, so the writer never looked for the sweep's lock in the checkout -- and the checkout's TRACKED .planning/CHECKPOINT.md and
+# .planning/settings.json were rewritten mid-sweep (two haid_unknown ledger records published too). Every stranger child below inherits this cwd: a scratch directory of its own, inside the private root and outside every
+# HOME the suite makes. Nothing after this reads a relative path (REPO, SELF_DIR and the sourced lib are absolute). (0b) asks a real child where it starts.
+STRANGER_CWD="$(mktemp -d)" && cd "$STRANGER_CWD" || { echo "FATAL: cannot make the stranger's working directory"; exit 2; }
+STRANGER_PWD="$(in_stranger "$TMPH" /bin/pwd -P)"
+ROOT_PHYS="$(cd "$HMD_PRIVATE_TMP" && pwd -P)"
+case "$STRANGER_PWD" in
+  "$ROOT_PHYS"/*) ok "(0b) a stranger child starts in the suite's private scratch dir, not in the checkout under test" ;;
+  *) bad "(0b) a stranger child starts in '$STRANGER_PWD', outside the private root '$ROOT_PHYS': install.sh's headless claude would fire its hooks in that directory (the checkout's tracked .planning files get rewritten mid-sweep)" ;;
+esac
 echo "stranger-install harness  repo=$REPO  ref=${REF:0:12}  HOME=$TMPH"
 echo "--------------------------------------------------------------------"
 
