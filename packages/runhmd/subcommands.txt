@@ -53,6 +53,8 @@ app
 dash
 settings-guard
 hooks
+skills
+guardrails
 caveman-audit
 cost-forensics
 branch-context
