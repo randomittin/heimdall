@@ -1,11 +1,11 @@
 <!-- heimdall-auto-checkpoint:begin -->
-## Auto-checkpoint — 2026-11-11T06:09:07Z
+## Auto-checkpoint — 2026-11-11T18:38:23Z
 
 > Written automatically at session end (mechanical, no LLM). Run `/hmd:save`
 > for a richer human/LLM-authored handoff — it enriches this same file.
 
 - **Branch:** main
-- **HEAD:** 9ce24d8f
+- **HEAD:** 63a1a82a
 - **Phase:** unknown
 - **Active goal:** none
 - **Uncommitted files:** 4
@@ -15,17 +15,17 @@
 > `.planning/RESUME-KEY.json`, written at save time — while the knowledge is
 > still present. A field that does not survive this write FAILS the save.
 
-- **In progress:** phase=unknown · goal=none · compaction (auto) at 2026-10-08T15:46:42Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-10-13T10:19:12Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-10-13T12:16:58Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-10-14T16:50:08Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-10-20T01:35:33Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-11-10T12:36:23Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail went · in flight: 4 uncommitted file(s) — .gitignore.planning/CHECKPOINT.md.planning/ledger/checkpoints/haid_rj.rishabhs-macbook-air-46d5.json.planning/settings.json
-- **Gated decisions:** push gate FAILING — nothing may be pushed until it clearsOperator-only (item 15): push local commits to origin; runhmd.dev DNS; GitHub App registration; npm publish runhmd only after hmd attack is released; hmd receipt keygen + commit release/runhmd-receipt.pub; relay deploy (canary URL assumes hmd-relay-canary.therishabh16.workers.dev, else set RELAY_URL).
+- **In progress:** phase=unknown · goal=none · in flight: 4 uncommitted file(s) — .planning/CHECKPOINT.md.planning/settings.json.planning/ledger/checkpoints/haid_unknown.rishabhs-macbook-air-6af2.json.planning/ledger/checkpoints/haid_unknown.rishabhs-macbook-air-9cb3.json
+- **Gated decisions:** push gate FAILING — nothing may be pushed until it clears
 - **Held branches:** perf-app-pair (4 commit(s) not on main)perf-attach (1 commit(s) not on main)perf-mutants (4 commit(s) not on main)perf-shell-heavy (1 commit(s) not on main)perf-view (1 commit(s) not on main)readme-launch (2 commit(s) not on main)worktree-agent-a01812998a16c79bf (2 commit(s) not on main)worktree-agent-a0b3b29e1ead39351 (5 commit(s) not on main)worktree-agent-a3236595ab3b3adbd (1 commit(s) not on main)worktree-agent-a4ddcfc5c10a426d1 (4 commit(s) not on main)worktree-agent-a540397c1f134aa66 (1 commit(s) not on main)worktree-agent-a58aa859c281c70a8 (13 commit(s) not on main)worktree-agent-a5e40bbcd8616400e (6 commit(s) not on main)worktree-agent-a748f2d5d2d8b8d87 (1 commit(s) not on main)worktree-agent-a757edcc7298ab070 (3 commit(s) not on main)worktree-agent-ab644b92c05a00b17 (1 commit(s) not on main)
-- **Unpushed:** 13 commit(s) unpushed on main (HEAD 9ce24d8f, upstream origin/main)
-- **Open warnings:** hmdapp app-side needed: refusal ack must parse detail=='non-increasing-seq' + numeric last; phone register_push loop = 99% of 5,200 acks/day; restart hmd app connect for push-test + WebSocket hmd leg; launch-brief handbacks not yet written to hmdapp/docs.⚠ push gate is RED⚠ 1 worktree(s) flagged dirty or unmerged
-- **Refuted claims:** module-consent-waiver's 7 failures were real defects → they were starvation artifacts from my own stray load generators; solo run is 65/0the OmniRoute gateway is wedged at the HTTP layer → it is a webpack DEV server recompiling per request; it answered / with 307 after 141.78sthe 6 sweep reds on f166096a were code regressions → 5 were timing budgets under external load 18-45 (A/B: main faster than fd256c80), 1 was a 30-day reachability exemption that expired on 2026-09-21
+- **Unpushed:** 15 commit(s) unpushed on main (HEAD 63a1a82a, upstream origin/main)
+- **Open warnings:** ⚠ push gate is RED⚠ 1 worktree(s) flagged dirty or unmerged
+- **Refuted claims:** none recorded this session — record one with: heimdall-checkpoint note refuted "<claim> → what was actually true"
 
-### Worktree ledger — nothing-lost proof (3 of 3 worktree(s) scanned)
+### Worktree ledger — nothing-lost proof (1 of 1 worktree(s) scanned)
 > Base ref: `main`. Clean = zero uncommitted files AND HEAD merged into base.
 
-- 2/3 clean, 1 flagged — rescue these before restarting:
+- 0/1 clean, 1 flagged — rescue these before restarting:
 - DIRTY `/Users/rj/Downloads/heimdall` — 4 uncommitted file(s)
 
 ### This session's edited files (edit-tracker — git log cannot attribute these)
@@ -37,11 +37,13 @@
 > RED — do not push until this clears. Detail:
 ```
 LINT WAIVED: 2.4.8: 21 shellcheck warnings (15 SC2034 unused vars, SC2163 intentional export of kv string, SC2010, SC2120, SC2154, SC1090), 0 errors, 19 in test files; fixing them stales the green full receipt 3a0f2c0b; fixes ride the 2.4.9 batch (waived 2026-10-19T20:50:33Z) -- the lint evidence is NOT passing (findings: 24 lint finding(s) in the last run)
-GATE FAILED: sweep receipt is STALE — receipt HEAD bba5fd2910c724817c3fa4d069c3e53983afaf06 != current HEAD 9ce24d8f14cce919e2706a688236509584f4be1e (commits landed since the sweep ran, including non-hook-owned paths: .claude-plugin/plugin.json,.planning/CHECKPOINT.md,.planning/STATE.md). Run: bash test/run-all.sh --since-green
+GATE FAILED: no sweep receipt at /var/folders/t3/17x0hkw12n3g0qy3sjkggbsr0000gn/T/hr.0wxM/s14/install-stranger.Ta7QF2/tmp.m1xOdOBm/.heimdall/.heimdall/receipts/last-sweep.json — a full sweep has never recorded a result in this checkout. Run: bash test/run-all.sh
 Quality gates not met. Push blocked.
 ```
 
 ### Recent commits
+- 63a1a82a journal: [COMMUNICATION] chore(planning): auto-checkpoint + gitignore CONTINUE.md
+- b821e441 chore(planning): auto-checkpoint + gitignore CONTINUE.md
 - 9ce24d8f Merge branch 'worktree-agent-a49220508c99b79b2'
 - f6edda76 Merge branch 'worktree-agent-a93c5652879b7a43a'
 - d6f469ba journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] docs(analysis): stale long-running agents — root cause is foreground poll loops
@@ -50,15 +52,13 @@ Quality gates not met. Push blocked.
 - d32dc12d fix(hooks): ignore inherited TOOL_INPUT/SATYPE in precheck-agent rewrite
 - e09d418e journal: [COMMUNICATION] journal: [COMMUNICATION] docs(analysis): stale long-running agents — root cause is foreground poll loops
 - aff76a52 feat(hooks): give general-purpose spawns hmd agent rules (stale-agent fix)
-- bad17277 journal: [COMMUNICATION] docs(analysis): stale long-running agents — root cause is foreground poll loops
-- 935d3911 docs(analysis): stale long-running agents — root cause is foreground poll loops
 
 ### Uncommitted changes (git status --porcelain)
 ```
- M .gitignore
  M .planning/CHECKPOINT.md
- M .planning/ledger/checkpoints/haid_rj.rishabhs-macbook-air-46d5.json
  M .planning/settings.json
+?? .planning/ledger/checkpoints/haid_unknown.rishabhs-macbook-air-6af2.json
+?? .planning/ledger/checkpoints/haid_unknown.rishabhs-macbook-air-9cb3.json
 ```
 
 ### Resume
