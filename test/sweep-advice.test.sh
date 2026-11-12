@@ -130,12 +130,16 @@ mkrepo "$UN" && printf 'one\n' >"$UN/a.txt" && commit "$UN" "U1"; U1="$(git -C "
 git -C "$UN" branch trunk "$U1" && git -C "$UN" update-ref refs/remotes/origin/trunk "$U1" && git -C "$UN" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/trunk
 NOGIT="$TMPROOT/nogit"; mkdir -p "$NOGIT"
 
-receipt() {  # receipt <home dir> <head_sha> <exit_code> <kind> <tree_clean> [extra json object]: a sweep receipt for the SW fixture, with the numbers the cost line reads
-  local home="$1" extra="${6:-}"
+receipt_at() {  # receipt_at <file> <head_sha> <exit_code> <kind> <tree_clean> [extra json object]: a sweep receipt for the SW fixture, with the numbers the cost line reads, written to <file>
+  local file="$1" extra="${6:-}"
   [ -n "$extra" ] || extra='{}'
-  mkdir -p "$home/receipts"
+  mkdir -p "$(dirname "$file")"
   jq -n --arg repo "$SWTOP" --arg sha "$2" --argjson rc "$3" --arg kind "$4" --argjson clean "$5" --argjson extra "$extra" \
-    '{finished_at: "2026-11-12T13:20:31Z", repo: $repo, head_sha: $sha, tree_clean: $clean, exit_code: $rc, kind: $kind, suites_total: 568, suites_passed: 568, duration_s: 2873} + $extra' >"$home/receipts/last-sweep.json"
+    '{finished_at: "2026-11-12T13:20:31Z", repo: $repo, head_sha: $sha, tree_clean: $clean, exit_code: $rc, kind: $kind, suites_total: 568, suites_passed: 568, duration_s: 2873} + $extra' >"$file"
+}
+receipt() {  # receipt <home dir> <head_sha> <exit_code> <kind> <tree_clean> [extra json object]: last-sweep.json of that home, as receipt_at writes it
+  local home="$1"; shift
+  receipt_at "$home/receipts/last-sweep.json" "$@"
 }
 sleep 300 &
 SLEEPER=$!
@@ -471,6 +475,47 @@ receipt "$SWH" "$C1" 0 full true
 printf '{"finished_at": "2026-10-01T00:00:00Z", "repo": "%s", "head_sha": "%s", "tree_clean": true, "exit_code": 0, "kind": "full", "suites_total": 535, "duration_s": 492}\n' "$SWTOP" "$C3" >"$SWH/receipts/last-full-green.json"
 proves "the last-sweep receipt is red or partial but last-full-green.json (the chain anchor) covers HEAD" "${C3:0:12}" 'git push origin main'
 rm -f "$SWH/receipts/last-full-green.json"
+
+echo "-- 4b. the Why and the Cost measure from the NEWEST green full run on file: last-sweep.json, last-full-green.json (the anchor) or an archived receipts/full-green/<sha>.json --"
+# run-all.sh moves the anchor, and archives a receipt, ONLY for a green full sweep that is also full-equivalent. A green sweep in which one suite passed only on its solo re-run has no cache
+# record for it (full_equivalent=false) and lives in last-sweep.json alone: the anchor lags behind it by design. The advice used to skip that run and measure from an anchor weeks old
+# (202 commits since, 8m12s) when the run that had just finished was a handful of commits back and took 47m53s.
+RDIR="$SWH/receipts"
+OLD_GREEN='{"finished_at": "2026-10-21T07:21:09Z", "suites_total": 535, "duration_s": 492, "cache": {"mode": "closure", "cold": false, "suites_fresh": 85, "suites_cached": 450}, "full_equivalent": true}'
+FLAKY_GREEN='{"cache": {"mode": "closure", "cold": true, "suites_fresh": 568, "suites_cached": 0}, "full_equivalent": false, "flaky_under_load": [{"suite": "a.test.sh", "parallel_exit": 1, "solo_exit": 0}]}'
+receipt_at "$RDIR/last-full-green.json" "$C1" 0 full true "$OLD_GREEN"
+receipt "$SWH" "$C2" 0 full true "$FLAKY_GREEN"
+hv 'git push origin main'
+WHY="$(msg | grep '^Why: ')"; COST="$(msg | grep '^Cost: ')"
+N=$((N + 1))
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'bash test/run-all.sh' && printf '%s' "$WHY" | grep -qF "since the last green full sweep (${C2:0:12}, 2026-11-12T13:20:31Z), which is not full-equivalent" && ! printf '%s' "$WHY" | grep -qF "${C1:0:12}"; then ok "$N. a NEWER green run in last-sweep.json (not full-equivalent: a suite passed only on its solo re-run) beats the older anchor as the baseline, and the Why says it is no proof"; else bad "$N. the Why does not measure from the newer green run" "$WHY"; fi
+N=$((N + 1))
+if printf '%s' "$COST" | grep -qF '568 suites (568 fresh, 0 cached), 47m53s of machine time last run' && ! printf '%s' "$COST" | grep -qE '535 suites|8m12s'; then ok "$N. the suite count and the wall clock of the Cost come from that same receipt (47m53s, not the anchor's 8m12s)"; else bad "$N. the Cost is not from the baseline receipt" "$COST"; fi
+receipt "$SWH" "$C2" 1 full true '{"suites_total": 111, "duration_s": 11}'
+hv 'git push origin main'
+WHY="$(msg | grep '^Why: ')"; COST="$(msg | grep '^Cost: ')"
+N=$((N + 1))
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'was red' && printf '%s' "$WHY" | grep -qF "since the last green full sweep (${C1:0:12}, 2026-10-21T07:21:09Z)" && printf '%s' "$COST" | grep -qF '535 suites (85 fresh, 450 cached), 8m12s of machine time last run' && ! printf '%s' "$COST" | grep -qF '111 suites'; then ok "$N. a RED last-sweep.json is no baseline: the Why and the Cost come from the older green anchor, and the red is still said"; else bad "$N. a red last-sweep.json was used as the baseline" "$WHY | $COST"; fi
+receipt "$SWH" "$C1" 0 full true '{"finished_at": "2026-10-01T00:00:00Z", "suites_total": 100, "duration_s": 59}'
+receipt_at "$RDIR/last-full-green.json" "$C1" 0 full true '{"suites_total": 535, "duration_s": 492}'
+hv 'git push origin main'
+WHY="$(msg | grep '^Why: ')"; COST="$(msg | grep '^Cost: ')"
+N=$((N + 1))
+if [ "$HRC" = 3 ] && printf '%s' "$WHY" | grep -qF "since the last green full sweep (${C1:0:12}, 2026-11-12T13:20:31Z)" && printf '%s' "$COST" | grep -qF '535 suites' && ! printf '%s' "$COST" | grep -qF '100 suites'; then ok "$N. two green sweeps of one commit: the NEWER by finished_at is the baseline, whichever file holds it"; else bad "$N. the older of two equal sweeps was the baseline" "$WHY | $COST"; fi
+rm -f "$RDIR/last-sweep.json"
+receipt_at "$RDIR/last-full-green.json" "$C1" 0 full true "$OLD_GREEN"
+receipt_at "$RDIR/full-green/$C3.json" "$C3" 0 full true '{"finished_at": "2026-10-25T09:00:00Z", "suites_total": 540}'
+proves "an ARCHIVED receipt (receipts/full-green/<sha>.json) proves the commit the anchor, at an older one, does not" "540 suites" 'git push origin main'
+printf 'not json at all\n' >"$RDIR/full-green/$C2.json"                                   # named like a commit, but no receipt
+printf '{}\n' >"$RDIR/full-green/notes.json"                                              # not named for a commit
+mkdir "$RDIR/full-green/$C1.json"                                                         # a directory, not a regular file
+receipt_at "$RDIR/full-green/$CS.json" "$C3" 0 full true '{"repo": "/somewhere/else", "finished_at": "2026-11-01T00:00:00Z", "suites_total": 999}'   # recorded for another checkout
+proves "junk in the archive (not JSON, not a commit name, a directory, another checkout's receipt) is skipped: no error, and none of it is used" "540 suites" 'git push origin main'
+rm -rf "$RDIR/full-green"
+receipt_at "$RDIR/last-full-green.json" "$C3" 0 full true "$OLD_GREEN"
+receipt "$SWH" "$C3" 0 full true "$FLAKY_GREEN"
+proves "a newer green run that is not full-equivalent never stands in for the proof: HEAD is proven by the anchor at the same commit, and the message names THAT sweep" "535 suites" 'git push origin main'
+rm -f "$RDIR/last-full-green.json"
 
 echo "-- 5. the cost: suites, wall clock, and tokens as LABELLED ESTIMATES with their arithmetic --"
 receipt "$SWH" "$C1" 0 full true
