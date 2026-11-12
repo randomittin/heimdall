@@ -96,6 +96,12 @@ for s in reg.get('skills', []):
 PYEOF
 }
 
+# install_skill NAME [OWNER/REPO] -- clone a skill into ~/.claude/skills, once somebody has said yes. A NEW install asks bin/lib/skills_consent.sh
+# first (3.x M1, T5.2 of docs/superpowers/plans/2026-11-12-3x-m1-skill-registry.md, "Consent model"): with a terminal and consent=ask the person gets
+# the Install now / Not now / Never ask again menu; with no terminal (this is what an agent calls mid-session) nothing is cloned, the skill becomes a
+# `suggested` row in the skills lock and the exit status is 3, so the agent relays the question to the person. A yes is HMD_SKILLS_YES=1, consent auto
+# (chosen, or an install that predates the model), an allowlisted name or "Install now". A name the registry does not know and a skill that is already
+# installed never reach the gate. Exit: 0 installed or already there | 1 unknown skill or the clone failed | 3 consent required | 4 declined.
 install_skill() {
   local name="$1" repo="${2:-}"
 
@@ -130,6 +136,34 @@ for s in reg.get("skills", []):
     return 0
   fi
 
+  # A NEW install is asked before anything is created or cloned. The why the lock row records (the rule that fired and the repo that was asked for,
+  # never prompt text) and the project it belongs to (the one this command runs in: the lock tool's own default, and where the gate writes its rows,
+  # so a `suggested` row becomes the `installed` row of the same lock) are read by the gate and by hmd_skill_install below, and live only as long
+  # as this function.
+  local consent_lib="$PLUGIN_DIR/bin/lib/skills_consent.sh" consent_rc=0
+  local HMD_INSTALL_WHY_RULE=explicit HMD_INSTALL_WHY_EVIDENCE="$repo" WORK_DIR="${WORK_DIR:-$PWD}"
+  if [ -f "$consent_lib" ]; then
+    # shellcheck disable=SC1090
+    if ! . "$consent_lib" || ! type hmd_skills_consent >/dev/null 2>&1; then
+      echo "ERROR: cannot load the consent gate $consent_lib; not installing $name"
+      return 3
+    fi
+    # `|| consent_rc=$?`, the form the gate's header gives for a caller under set -e: its 10 (defer) and 11 (declined) are answers, not failures.
+    hmd_skills_consent "$name" discover-skills || consent_rc=$?
+    case "$consent_rc" in
+      0) ;;
+      11)
+        echo "declined: $name was declined earlier and is not installed (hmd skills suggest --reset asks again)"
+        return 4 ;;
+      *)
+        echo "consent required: $name ($repo) was not installed. Ask the user; if they agree, rerun the same discover-skills install command with HMD_SKILLS_YES=1."
+        return 3 ;;
+    esac
+  else
+    # A tree without the gate predates the consent model, and installs as it always did: said, never silent.
+    echo "discover-skills: $consent_lib is missing; installing $name without a consent check" >&2
+  fi
+
   mkdir -p "$SKILLS_DIR"
   echo "INSTALLING: $name from $repo..."
   if hmd_skill_install "$name" "$repo" "$skill_path" discover-skills; then
@@ -148,8 +182,9 @@ for s in reg.get("skills", []):
         echo "description: $desc"
         echo "---"
         echo ""
-        # Include CLAUDE.md content (skip the "# CLAUDE.md" header line if present)
-        sed '1{/^# CLAUDE\.md$/d}' "$skill_path/CLAUDE.md"
+        # Include CLAUDE.md content (skip the "# CLAUDE.md" header line if present). awk, not sed '1{/re/d}': BSD sed (macOS) rejects that
+        # script ("extra characters at the end of d command"), which aborted the install under set -e.
+        awk 'NR == 1 && /^# CLAUDE\.md$/ { next } { print }' "$skill_path/CLAUDE.md"
       } > "$skill_path/SKILL.md"
       echo "OK: Generated SKILL.md for Claude Code discovery"
     fi
