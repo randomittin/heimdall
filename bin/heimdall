@@ -4976,6 +4976,38 @@ apply_heimdall_theme
 ensure_project_claude_md
 print_banner
 check_for_update
+
+# ── Recommended-skills nudge (3.x M1, T7.1: docs/superpowers/plans/2026-11-12-3x-m1-skill-registry.md) ──
+#
+# ONE line after the banner -- `N recommended skills not installed - hmd skills suggest` -- when ALL of these hold: a person is at the terminal
+# (the consent gate's own rule, _hmd_sc_interactive: a terminal on stdin and stdout, or the HMD_SKILLS_ASSUME seam), consent is not `auto` (a
+# grandfathered install keeps today's behaviour and is never nagged), `hmd skills suggest` counts N > 0, and the stamp
+# $HEIMDALL_HOME/skills-nudge-stamp is not today's date. The stamp is written when the line is shown, so a launch with nothing to show leaves
+# no stamp behind and a project that has something to suggest still gets its line that day. N is skills_cli_install.py suggest's own count: it
+# reads local files, makes no `claude` call, and runs bounded (3 s). Cost: off a terminal, or once today's line was shown, no process at all;
+# consent `auto`, one python start; otherwise two. It never blocks or aborts a launch: a missing tool, a failed or hung count and a consent
+# mode it cannot read are all silence. Defined where it is called -- the one place this change edits -- and cut out of this file by
+# test/skills-session-nudge.test.sh to run it in isolation.
+hmd_skills_nudge() {
+  local stamp="$HEIMDALL_HOME_DIR/skills-nudge-stamp" today mode n
+  type _hmd_sc_interactive >/dev/null 2>&1 || return 0
+  _hmd_sc_interactive || return 0
+  today="$(date +%Y-%m-%d)"
+  [ "$(cat "$stamp" 2>/dev/null || true)" != "$today" ] || return 0
+  mode="$(python3 -I "$PLUGIN_DIR/bin/lib/skills_config.py" get consent 2>/dev/null)" || return 0
+  case "$mode" in ask|allowlist) ;; *) return 0 ;; esac
+  n="$(python3 -I - "$PLUGIN_DIR/bin/lib/skills_cli_install.py" 2>/dev/null <<'PYEOF'
+import re, subprocess, sys
+done = subprocess.run(["python3", "-I", sys.argv[1], "suggest"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3, check=True)
+found = re.match(r"(\d+) skill", done.stdout)
+print(int(found.group(1)) if found else 0)
+PYEOF
+)" || return 0
+  case "$n" in ''|*[!0-9]*|0) return 0 ;; esac
+  printf '  \033[38;2;0;212;255m▸\033[0m %s recommended skill%s not installed - hmd skills suggest\n\n' "$n" "$([ "$n" = 1 ] || echo s)"
+  { _heimdall_home_ensure && printf '%s\n' "$today" >"$stamp"; } 2>/dev/null || true
+}
+hmd_skills_nudge
 load_checkpoint_context
 
 # ── F1 resolution order, phases 2–4: RESUME → PERSONA-CHECK → ONBOARD-IF-COLD ──
