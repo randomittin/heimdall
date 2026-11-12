@@ -536,7 +536,7 @@ When spawning an agent, provide:
    - Docs agents: `claude-md-management:claude-md-improver`
 3. **Context**: a delta brief, built by `bin/heimdall-brief build --task <id> --spec <text> [--symbols a,b] [--files p,q] [--capsules x,y]` and pasted in — symbol spans + their callers + touched-file outlines + capsule closure, never the plan text. Exit 1 (INCOMPLETE) or 3 (NON_VERIFIED) means **do not spawn**. See `skills/heimdall/references/agent-templates.md`
 4. **Constraints**: what NOT to do (prevent overlap with other wave agents)
-5. **Acceptance criteria**: the specific checks this agent must pass before reporting done — test criteria scoped to its OWN test file(s), run ONCE after its changes are written; never a neighbouring or full suite (§6c)
+5. **Acceptance criteria**: the specific checks this agent must pass before reporting done — test criteria scoped to its OWN test file(s), run ONCE after its changes are written; never a neighbouring or full suite; in a client repo, the user journeys its change must be proven on, as use-case scenarios (§6c)
 6. **State updates**: commands to run on completion (`heimdall-state set ...`)
 
 ### 4d. Closing Idle Agents — automatic, no human input
@@ -643,6 +643,7 @@ When multiple skills give contradictory instructions:
 
 Operator directive 2026-10-08: avoid over-testing the same stuff; save testing for the end. The measured case and the full rule are in `CLAUDE.md` "When the full gate runs".
 
+- **Client (managed) repos run a different regime** (operator directive 2026-11-12: testing was "always extra and never testing actual usecases"): the release/tag gate is `lint` + the repo's USE-CASE suite — one scenario per real user journey the product promises ("book a cab", "order coffee", "search email"), end to end through the real code, fakes only at external boundaries — declared as the checks `lint` + `use-cases` in `.heimdall/repo-checks.json` and run with `bin/heimdall-repo-checks run`. No full unit-suite sweep, no offline-eval sweep as a gate, no "regression" run of unrelated suites, and never a full-sweep `test/run-all.sh` created in a client repo to satisfy an hmd gate. Put the rule in every spawn prompt for such a repo and require each agent's report to name the user journeys its change was proven on. The sweep bullets below are heimdall's own repo. Rules: `skills/heimdall/references/use-case-tests.md`
 - Tests are written alongside implementation (or before, if TDD pattern is active)
 - After any code change, mark state as dirty: `heimdall-state mark-dirty`
 - Spawned agents run ONLY the test file(s) they add or edit, ONCE, after all their changes are written; a failure plausibly caused by machine load gets ONE solo re-run. That is not their default — put it in every spawn prompt (§4c item 5)

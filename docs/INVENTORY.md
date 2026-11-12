@@ -216,7 +216,7 @@ Spawn discipline (CLAUDE.md "Parallelism"): batch independent calls; one agent p
 
 | Skill | Description (frontmatter, abridged) |
 |---|---|
-| `heimdall` | The orchestrator superskill: analyzes prompts, assigns skills, decomposes into sub-projects, spawns parallel agents, enforces gates, tracks token budget; maintainer mode. References: `skills/heimdall/references/` (agent-templates, communication-templates, definition-of-done, git-workflow, identity-and-ledger, image-triage, journal, maintainer-guide, planning-pipeline, plugin-autoinstall, quality-gates, stack-packs, statusline-ledger) |
+| `heimdall` | The orchestrator superskill: analyzes prompts, assigns skills, decomposes into sub-projects, spawns parallel agents, enforces gates, tracks token budget; maintainer mode. References: `skills/heimdall/references/` (agent-templates, communication-templates, definition-of-done, git-workflow, identity-and-ledger, image-triage, journal, maintainer-guide, planning-pipeline, plugin-autoinstall, quality-gates, stack-packs, statusline-ledger, use-case-tests) |
 | `designmatch` | Match a React Native screen to a Claude Design HTML canonical at ≥95% visual parity; Playwright canonical renderer, pixelmatch + SSIM diff harness |
 | `mac-deep-clean` | macOS deep clean, invoked as `hmd:mac-deep-clean`: tiered, read-only-first, confirm-gated disk reclaim (caches, dead repos, worktrees, SDK/simulator bloat, System Data) + memory-leak diagnosis; the executor `system-health` and `heimdall-cleanup --deep` hand off to (they detect a plugin-shipped or user-installed copy) |
 | `self-improve` | karpathy/autoresearch ported to hmd's routing/planning: evidence → hypothesis → bounded experiment → keep only if it beats baseline |

@@ -20,6 +20,10 @@ You verify completed work meets all acceptance criteria and requirements. Run ev
 4. Read `.planning/REQUIREMENTS.md` and check coverage
 5. Report: PASS (all met) or FAIL (list failures with diagnosis)
 
+## Client (managed) repos — verify on user journeys
+
+In any repo that is not heimdall's own (operator directive 2026-11-12) the test criterion is the repo's `lint` + `use-cases` checks (`.heimdall/repo-checks.json`, run with `bin/heimdall-repo-checks run`), plus the scenarios of the user journeys the change touches. A criterion that asks for a full unit-suite or offline-eval sweep, or a "regression" run of unrelated suites, is a plan defect: report it and run `lint` + `use-cases` in its place. A user-facing requirement the change touches with no scenario proving its journey end to end = FAIL, like a requirement with no covering task. Rules: `skills/heimdall/references/use-case-tests.md`.
+
 ## P0 Oracle Gate — Falsifiability is required BEFORE a PASS
 
 A P0 oracle gate is **not trusted green until it has been proven able to go red.** Before scoring ANY task PASS on its wired oracle, you MUST confirm the gate is falsifiable:
@@ -53,6 +57,12 @@ Write to `.planning/VERIFY-{phase}.md`:
 |-------------|-----------|--------|
 | User can log in | Task: Login API | PASS |
 | Rate limiting | NOT COVERED | FAIL |
+
+#### User Journeys Proven (client repos)
+
+| Journey | Scenario | Result |
+|---------|----------|--------|
+| book a cab | test_book_a_cab | PASS |
 
 #### Failures Requiring Fix
 

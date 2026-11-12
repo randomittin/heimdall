@@ -4,7 +4,7 @@ Every piece of work Heimdall produces passes through mandatory quality gates bef
 
 ## Gate 1: Tests Pass
 
-**Requirement**: All tests in the project's test suite must pass.
+**Requirement**: All tests in the project's test suite must pass (heimdall's own repo; a managed client repo gates on lint + its use-case suite instead — see "Managed (client) repos" below).
 
 **Checked by**: test-runner agent or `heimdall-state check-quality-gates`
 
@@ -16,6 +16,8 @@ Every piece of work Heimdall produces passes through mandatory quality gates bef
 3. ONCE, on the final frozen tree, immediately before the landing commit / push / demo / checkpoint, and only when no fix can still land: test runner executes the full test suite
 4. If all pass: `heimdall-state mark-clean`
 5. If any fail: tests_passing remains false, push is blocked
+
+**Managed (client) repos** (operator directive 2026-11-12): the gate is `lint` + a USE-CASE suite, not the full-suite sweep above — one scenario per real user journey the product promises ("book a cab", "order coffee", "search email"), end to end through the real code, fakes only at external boundaries (payments, network, LLM, third-party APIs). Declare the two checks, `lint` and `use-cases`, in `.heimdall/repo-checks.json` (the repo-checks class under "Which gate runs") and run them with `bin/heimdall-repo-checks run`. Never create a full-sweep `test/run-all.sh` in a client repo to satisfy an hmd gate: it grades the repo as the sweep class. During work, run only the tests of the files you touched, once; no full unit-suite or offline-eval sweep, no "regression" run of unrelated suites. Derivation, scenario shape, fakes, naming and the `repo-checks.json` example: `use-case-tests.md`.
 
 ## Gate 2: Lint Clean
 
@@ -86,7 +88,7 @@ subshells, wrappers, `sh -c`; git itself names the git directory) and gives each
 | Class | Marker | Gate |
 |---|---|---|
 | sweep | a commit has `test/run-all.sh` naming `last-sweep.json` (heimdall's own sweep regime; tracked code, never the receipt) | `heimdall-state check-quality-gates`, run inside that repo: unchanged, fail closed |
-| repo-checks | a commit has `.heimdall/repo-checks.json`, the repo's own checks | passes ONLY on a green, current, clean-tree receipt of them bound to the commit, its tree and the declaration's committed bytes (`bin/heimdall-repo-checks run` writes it, `status` verifies it; one definition of the receipt in `bin/lib/hmd_repo_receipt.py`) **and only for the commit the push sends**: every refspec source git resolves (a bare push sends HEAD) must be the receipt's `head_sha`, and `--all`, `--mirror`, `--tags`, a wildcard or push configuration that picks the refs block; stale, red, dirty, missing, mismatched, malformed or invalid blocks and names the runner command |
+| repo-checks | a commit has `.heimdall/repo-checks.json`, the repo's own checks (a client repo declares `lint` + `use-cases`: `use-case-tests.md`) | passes ONLY on a green, current, clean-tree receipt of them bound to the commit, its tree and the declaration's committed bytes (`bin/heimdall-repo-checks run` writes it, `status` verifies it; one definition of the receipt in `bin/lib/hmd_repo_receipt.py`) **and only for the commit the push sends**: every refspec source git resolves (a bare push sends HEAD) must be the receipt's `head_sha`, and `--all`, `--mirror`, `--tags`, a wildcard or push configuration that picks the refs block; stale, red, dirty, missing, mismatched, malformed or invalid blocks and names the runner command |
 | unmanaged | no inspected commit has either marker, git resolved the repo, and the command was understood exactly | one `WARNING` line on stderr; the push proceeds |
 
 The class is read from the **commits** (HEAD, its upstream, `origin/HEAD`, `origin/<branch>`, whatever the push
