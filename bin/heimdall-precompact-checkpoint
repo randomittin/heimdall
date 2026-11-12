@@ -40,8 +40,11 @@
 #   by the API, blocking it surfaces that error and fails the request. A checkpoint
 #   is bookkeeping; the operator's session is the thing that must survive. So:
 #     * exit 0 on every path — malformed JSON, empty stdin, no jq, no git, missing
-#       heimdall-checkpoint, unwritable .planning, a writer that reports INCOMPLETE or
-#       refuses an unsafe path (a symlinked .planning: exit 4, said as "checkpoint skipped").
+#       heimdall-checkpoint, unwritable .planning, a writer that reports INCOMPLETE,
+#       refuses an unsafe path (a symlinked .planning: exit 4, said as "checkpoint skipped")
+#       or defers for a running sweep (exit 5, said as "checkpoint deferred": test/run-all.sh
+#       fails the whole run over a tracked file that changed under it, and CHECKPOINT.md is
+#       tracked; the compaction note is still recorded, so the next write folds it in).
 #     * bounded runtime — every child runs under perl's alarm+exec (macOS ships no
 #       timeout(1)); a hung git, a hung jq, a hung writer is killed, not waited on.
 #       HMD_PRECOMPACT_BUDGET (seconds, default 8) caps the writer; the note gets a
@@ -189,6 +192,7 @@ main() {
     0)   say "compaction ($trigger) — checkpoint saved to $project_dir/.planning/CHECKPOINT.md before context rewrite" ;;
     3)   say "compaction ($trigger) — checkpoint written but INCOMPLETE (a resume field did not survive; see .planning/CHECKPOINT.md); compaction proceeds — run /hmd:save after" ;;
     4)   say "compaction ($trigger) — checkpoint skipped: unsafe path (a symlink or non-plain entry under $project_dir/.planning, or no python3 to vet it); nothing was written; compaction proceeds" ;;
+    5)   say "compaction ($trigger) — checkpoint deferred: a sweep (test/run-all.sh) is grading $project_dir and a tracked-file write would turn it red; nothing was written, the compaction note is kept for the next write; compaction proceeds — run heimdall-checkpoint write once the sweep ends" ;;
     142) say "compaction ($trigger) — checkpoint writer exceeded ${BUDGET}s and was stopped; compaction proceeds — run /hmd:save after" ;;
     *)   say "compaction ($trigger) — checkpoint writer exited $rc; compaction proceeds — run /hmd:save after" ;;
   esac
