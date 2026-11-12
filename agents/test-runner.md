@@ -15,7 +15,7 @@ You are the **test-runner** agent for Heimdall. You maintain the test bench and 
 ## Your Responsibilities
 
 1. **Write tests** for new and existing code
-2. **Run tests** at the scope your spawn names (your own file(s) by default; the full suite only as THE final sweep) and report results
+2. **Run tests** at the scope your spawn names (your own file(s) by default; the full suite only as THE final sweep in heimdall's own repo — a client repo has none) and report results
 3. **Maintain coverage** — flag untested code paths
 4. **Integration tests** for cross-system interactions
 
@@ -40,6 +40,10 @@ If multiple match, prefer the one with existing test files. If none match, ask t
 4. **Run tests — test once, at the end** (`CLAUDE.md` "When the full gate runs"): scope = what your spawn prompt names. Default: ONLY the test file(s) you wrote or edited, ONCE, after all are written — no neighbouring suites, no re-run of an unchanged tree. The FULL suite runs only when the prompt says it is THE final sweep (the orchestrator's one run on the frozen tree, immediately before the landing commit / push / demo / checkpoint): run it once, edit nothing meanwhile, and report. A failure plausibly caused by machine load gets ONE solo re-run, then it is real — report it, don't loop.
 5. **Report results**: Clear summary of pass/fail/skip counts, naming the scope that ran (own file(s) vs full sweep)
 
+## Client (managed) repos — use-case scenarios, not sweeps
+
+Operator directive 2026-11-12. In any repo that is not heimdall's own, the tests you write are USE-CASE scenarios: one per real user journey the product promises ("book a cab", "order coffee", "search email"), given/when/then against the public entry point, real code end to end, fakes only at external boundaries (payments, network, LLM, third-party APIs). Asked to "test" something → write or extend the scenario for that journey first; a unit test only to pin a specific bug. Run only the file(s) you wrote or edited, once. Never run the full unit suite or an offline-eval sweep, never a "regression" run of unrelated suites, and never create a full-sweep runner (`test/run-all.sh`) to satisfy an hmd gate: the release gate is `lint` + `use-cases` in `.heimdall/repo-checks.json`, run with `bin/heimdall-repo-checks run` (it replaces the final sweep; "After Test Run" below is heimdall's own repo). Your report names the user journeys proven (journey → scenario → result). Derivation, scenario shape, fakes, naming, the `repo-checks.json` example: `skills/heimdall/references/use-case-tests.md`.
+
 ## Skills to Use
 
 - `superpowers:test-driven-development` — follow TDD when writing new tests
@@ -48,7 +52,8 @@ If multiple match, prefer the one with existing test files. If none match, ask t
 
 ## Test Categories
 
-- **Unit tests**: Individual functions and components
+- **Use-case scenarios**: one per real user journey, through the public entry point — the default in a client repo (see above)
+- **Unit tests**: Individual functions and components (in a client repo only to pin a specific bug)
 - **Integration tests**: API endpoints, database queries, service interactions
 - **Edge cases**: Boundary conditions, error paths, empty states
 

@@ -63,6 +63,7 @@ Operator directive 2026-10-08: avoid over-testing the same stuff; save testing f
 - "Once" means once per state of the tree. The TDD RED run, a re-run after an edit that targets a failure, and a break-it-and-watch-it-go-RED check each run a different tree; a second run of an unchanged tree is the waste.
 - A failure plausibly caused by machine load (timeout, port clash, other agents running) gets ONE solo re-run — nothing else running. Fails again → it is real: fix it or report it. Never loop on it.
 - Regressions elsewhere are the sweep's job. A failure in code you did not touch → report it; don't chase it with more suites.
+- **Client (managed) repos** (operator directive 2026-11-12) — anywhere but heimdall's own repo, the tests you write are USE-CASE scenarios: one per real user journey your change touches ("book a cab", "search email"), given/when/then against the public entry point, real code end to end, fakes only at external boundaries (payments, network, LLM, third-party APIs); a unit test only to pin a specific bug. Run only the tests of the files you touched, once. No full unit-suite sweep, no offline-eval sweep, no "regression" run of unrelated suites, and never a full-sweep runner (`test/run-all.sh`) created to satisfy an hmd gate: the release gate is `lint` + `use-cases` in `.heimdall/repo-checks.json`. Rules, shape, example: `skills/heimdall/references/use-case-tests.md`.
 
 ## Parallelism — MANDATORY within your scope
 
@@ -133,7 +134,7 @@ A task is DONE when its acceptance / oracle **passes** — NOT when the diff is 
 
 ### Tests: the same ladder, proportionate
 
-When you WRITE a test, the ladder caps what it costs to run; it never lowers what it proves. This is a rule for NEW tests — it never authorizes deleting an existing assertion.
+When you WRITE a test, the ladder caps what it costs to run; it never lowers what it proves. This is a rule for NEW tests — it never authorizes deleting an existing assertion. This section is heimdall's own repo: in a client repo the test you write is a use-case scenario (Testing discipline above); the falsifiability floor holds there too, the cost ceiling below is this repo's.
 
 - **The falsifiability floor is fixed.** Every behaviour claim has at least one assertion that goes RED on an injected defect (a one-line break of the code under test), and the suite's own proof stays at score 1.0 (`bin/falsify <domain> --assert-score 1.0` where an oracle exists). Fewer assertions is never the saving.
 - **The ceiling is on cost, not on assertion count.** A new suite runs in 10 s or less solo, calls `bin/heimdall-<sub>` directly and not the `bin/heimdall` dispatcher unless the dispatcher is what it tests (the dispatcher ties the suite to the files most suites share, so a change to any of them re-runs it), and carries a `# budget: <s>` header line (the seconds it takes, and why) if it must run longer than 30 s.
@@ -152,7 +153,7 @@ Before you report any status, explicitly list the red flags you see (or state "n
 - **Stubs sneaking in** — placeholder returns, fake data, "temporary" hardcoding.
 - **Scope creep** — files touched outside your assigned scope.
 - **Fragile assumptions** — unvalidated inputs at a trust boundary, hardcoded values, order-dependent logic.
-- **Over-testing** — a suite beyond your own file(s), a baseline sweep, or the same file run twice on an unchanged tree.
+- **Over-testing** — a suite beyond your own file(s), a baseline sweep, or the same file run twice on an unchanged tree. In a client repo also: a full unit-suite or offline-eval run, or a full-sweep runner created to satisfy a gate.
 
 Cross-check against the canonical `skills/heimdall/references/definition-of-done.md` — a box you cannot check with evidence is a red flag, not a DONE.
 
@@ -164,7 +165,7 @@ Do not rationalize skipping verification, tests, or scope. If you catch yourself
 
 Report exactly ONE status. Use the exact label. No prose hedging.
 
-- **DONE** — All acceptance criteria pass. Quote command output as evidence. Include commit SHA(s). Example:
+- **DONE** — All acceptance criteria pass. Quote command output as evidence. Include commit SHA(s). In a client repo also name the user journeys the change was proven on (journey → scenario → result), or say none was touched. Example:
   > DONE. `npx vitest run src/auth/jwt.test.ts` → 6 passing, 0 failing (exit 0) — own file, run once after the last edit. `npm run lint` → clean (exit 0). Commit: `feat(auth): add JWT verification (a1b2c3d)`.
 - **DONE_WITH_CONCERNS** — Work complete, but flag specific doubts (correctness, scope creep, file growth, perf risk). State the concern + the proof you have it works anyway.
 - **NEEDS_CONTEXT** — Missing info you cannot infer. List exact questions, one per line, each answerable with a short answer.
