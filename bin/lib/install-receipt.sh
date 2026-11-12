@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install-receipt.sh — the auto-install receipt (M0, interim install transparency).
-# SOURCED by install.sh, bin/heimdall and bin/discover-skills; defines functions, runs nothing.
+# SOURCED by install.sh, bin/heimdall and bin/discover-skills; defines functions (and notes its own directory), runs nothing.
 #
 # WHY: the auto-install paths ran `claude plugins install … || true`, fell back to an unlisted
 # third-party marketplace, and recorded nothing — an install could land code on the machine, or
@@ -13,6 +13,13 @@
 # anything that did not install, {detail, note}. A failure prints `install failed, continuing without
 # <name>` on stderr and records the same sentence in `note`: the run goes on without the plugin
 # (fail-open, as before) but never silently. A refusal (below) is a failure of the same shape.
+#
+# LOCK (3.x M1, T4.3): a SUCCESSFUL plugin or skill install is also recorded in the skills lock, bin/lib/skills_lock.py
+# (_hmd_ir_lock below): the receipt stays the per-run attempt log, the lock is the durable "what and why" (INV-S6: every
+# `ok` plugin or skill receipt line has a lock row). The receipt line is written first and its format never changes; a lock
+# that cannot be written is one stderr line and never the install's status. The caller says WHY through the optional
+# HMD_INSTALL_WHY_RULE / HMD_INSTALL_WHY_EVIDENCE, and HOW it was agreed to through HMD_SKILLS_CONSENT_BASIS (set by
+# bin/lib/skills_consent.sh).
 #
 # SOURCES: only the marketplaces named in hmd_marketplace_source() are ever registered. There is no
 # fallback to any other marketplace; an unlisted name is refused without invoking `claude`. This is
@@ -29,6 +36,12 @@
 #
 # Bash 3.2-safe (macOS /bin/bash): no associative arrays, no ${var,,}. Safe under `set -euo pipefail`:
 # every function returns the underlying command's status and never aborts its caller on its own.
+
+# This file's own directory, absolute and fixed when the file is sourced (a later `cd` cannot move it), from builtins only:
+# the lock tool lives beside it.
+_HMD_IR_LIB_DIR="${BASH_SOURCE[0]:-$0}"
+case "$_HMD_IR_LIB_DIR" in */*) _HMD_IR_LIB_DIR="${_HMD_IR_LIB_DIR%/*}" ;; *) _HMD_IR_LIB_DIR=. ;; esac
+case "$_HMD_IR_LIB_DIR" in /*) ;; *) _HMD_IR_LIB_DIR="$PWD/$_HMD_IR_LIB_DIR" ;; esac
 
 # Path of this run's receipt. The run id is reduced to [A-Za-z0-9._-] (summary-card does the same).
 hmd_install_receipt_file() {
@@ -87,6 +100,43 @@ _hmd_ir_warn() {  # NAME SOURCE DETAIL
   printf '  ⚠ hmd: install failed, continuing without %s (source %s): %s\n' "$1" "$2" "${3:-no detail}" >&2
 }
 
+# _hmd_ir_lock KIND ID REF VERSION SOURCE PIN VIA [COMMIT] — record a SUCCESSFUL install in the skills lock (see LOCK above).
+# KIND is the lock's (plugin | github-skill), ID the manifest id, COMMIT the git commit of a skill (the row's content_hash).
+#   scope    first-run* and install.sh install for the machine, so they are machine rows ($HEIMDALL_HOME/skills.lock); every
+#            other via is "this project needed it": the project's .planning/skills.lock, the project being the launcher's
+#            $WORK_DIR (the rule of skills_consent.sh's scope, plus: no project known -> the machine lock; the working
+#            directory is never guessed at and never written to).
+#   why      HMD_INSTALL_WHY_RULE / HMD_INSTALL_WHY_EVIDENCE when set: the trigger and the matched token or path, never
+#            prompt text (the tool cuts the evidence to 64). A row the consent gate wrote as `suggested` keeps what it said.
+#   consent  HMD_SKILLS_CONSENT_BASIS when it names a basis; n/a is "no decision" and is never written over one.
+# Returns 0 always: the lock is bookkeeping, so nothing here may change the install's status. A lock that cannot be read,
+# locked or written (the tool exits non-zero and says why on its last line) is ONE stderr line; the receipt line is already
+# written. A tree without the tool records nothing.
+_hmd_ir_lock() {
+  local kind="$1" id="$2" ref="$3" version="$4" src="$5" pin="$6" via="$7" commit="${8:-}"
+  local tool="$_HMD_IR_LIB_DIR/skills_lock.py" scope=machine out="" rc=0
+  local -a args
+  [ -f "$tool" ] || return 0
+  if [ -n "${WORK_DIR:-}" ]; then
+    case "$via" in first-run*|install.sh) ;; *) scope=project ;; esac
+  fi
+  case "$commit" in *[!0-9a-f]*) commit="" ;; esac
+  if [ "${#commit}" -lt 7 ] || [ "${#commit}" -gt 64 ]; then commit=""; fi
+  args=(record "--scope=$scope" "--id=$id" --state=installed "--kind=$kind" "--ref=$ref" "--version=$version" "--source=$src" "--pin=$pin" "--via=$via")
+  if [ "$scope" = project ]; then args+=("--project-dir=$WORK_DIR"); fi
+  if [ -n "$commit" ]; then args+=("--content-hash=$commit"); fi
+  if [ -n "${HMD_INSTALL_WHY_RULE:-}" ]; then args+=("--rule=$HMD_INSTALL_WHY_RULE"); fi
+  if [ -n "${HMD_INSTALL_WHY_EVIDENCE:-}" ]; then args+=("--evidence=$HMD_INSTALL_WHY_EVIDENCE"); fi
+  case "${HMD_SKILLS_CONSENT_BASIS:-}" in
+    auto-legacy|prompt|allowlist|yes-flag|explicit) args+=("--consent=$HMD_SKILLS_CONSENT_BASIS") ;;
+  esac
+  out="$(python3 -I "$tool" "${args[@]}" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '  ⚠ hmd: could not record %s in the skills lock (%s): %s\n' "$(_hmd_ir_clean "$id" 64)" "$scope" "$(_hmd_ir_clean "$(_hmd_ir_detail "$out" "$rc" "skills_lock.py record")" 200)" >&2
+  fi
+  return 0
+}
+
 # hmd_installed_version ID — the version the CLI resolved for an installed plugin id, else "unknown".
 # Reads the pretty-printed `claude plugins list --json` (id line, then its version line) with awk, so
 # it needs neither jq nor python; any other shape just yields "unknown".
@@ -107,6 +157,7 @@ hmd_plugin_install() {
     version="$(hmd_installed_version "$id")"
     if [ "$version" = "unknown" ] && [ -n "$hint" ]; then version="$hint"; fi
     hmd_install_receipt plugin "$id" "$version" "$src" "$pin" ok "$via" || true
+    _hmd_ir_lock plugin "${id%@*}" "$id" "$version" "$src" "$pin" "$via" || true
     return 0
   fi
   detail="$(_hmd_ir_detail "$out" "$rc" "claude plugins install")"
@@ -168,6 +219,7 @@ hmd_skill_install() {
   if [ "$rc" -eq 0 ]; then
     sha="$(git -C "$dest" rev-parse --short=12 HEAD 2>/dev/null || true)"
     hmd_install_receipt skill "$name" "${sha:-unknown}" "github.com/$repo" none ok "$via" || true
+    _hmd_ir_lock github-skill "$name" "$repo" "${sha:-unknown}" "github.com/$repo" none "$via" "$sha" || true
     return 0
   fi
   detail="$(_hmd_ir_detail "$out" "$rc" "git clone")"
