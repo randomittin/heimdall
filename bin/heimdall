@@ -3662,6 +3662,41 @@ if [[ "${1:-}" == "--team" ]]; then
     exit 1
   fi
 
+  # THE LAUNCH LINES CARRY NO DATA. tmux send-keys TYPES into the pane's shell, and a shell reads typed text twice:
+  # first its line editor (readline, ZLE), which acts on every control character -- ^U kills the line typed so far, so
+  # a task holding ^U and a balanced quote turned the rest of the line into commands -- then its parser, which ran any
+  # `;` or `$( )` of a task typed in while claude was not (or no longer) the foreground process. A task that was a tmux
+  # key name (Enter, C-c, Escape ...) was also sent as that KEY. So the two directories are typed single-quoted, after
+  # a check that no control character is in them, and the task, which can hold anything, is NEVER typed: it goes into
+  # a 0600 temp file that the lead's own shell reads (and deletes) with a command substitution, after `--` so a task
+  # that looks like an option is the prompt, not a flag. Proof: test/discover-skills-bin-injection.test.sh.
+  case "$WORK_DIR$PLUGIN_DIR" in
+    *[[:cntrl:]]*)
+      echo "  Error: the working directory or the heimdall directory has a control character in its name; not starting a team." >&2
+      exit 1 ;;
+  esac
+
+  # shell_quote STRING -- STRING as ONE single-quoted word (' becomes '\''): inside the quotes nothing is special to sh,
+  # bash, zsh or fish, so the shell that reads it back gets STRING byte for byte.
+  shell_quote() {
+    local s="$1" q="'" r="'\\''"
+    # shellcheck disable=SC2295  # $q is one single quote: it has no glob character to match as a pattern
+    printf "'%s'" "${s//$q/$r}"
+  }
+  # team_launch_line [TASK_FILE] -- the line a pane types: cd to the working directory and start claude there. The
+  # lead's line also reads its task from TASK_FILE ($( ): bash, zsh, dash, fish >= 3.4).
+  team_launch_line() {
+    printf 'cd %s && claude --agent heimdall %s --plugin-dir %s' \
+      "$(shell_quote "$WORK_DIR")" "$PERMISSION_FLAG" "$(shell_quote "$PLUGIN_DIR")"
+    if [ -n "${1:-}" ]; then
+      # shellcheck disable=SC2016  # the $( ) is typed into the pane's shell, not expanded here
+      printf ' -- "$(cat %s; rm -f %s)"' "$(shell_quote "$1")" "$(shell_quote "$1")"
+    fi
+  }
+  # team_type TARGET LINE -- type LINE into the pane TARGET and press Enter. -l sends the characters as they are, never
+  # as tmux key names.
+  team_type() { tmux send-keys -t "$1" -l -- "$2" && tmux send-keys -t "$1" Enter; }
+
   SESSION="heimdall-team-$$"
   echo "  Spawning $TEAM_SIZE workers in tmux session: $SESSION"
 
@@ -3671,19 +3706,19 @@ if [[ "${1:-}" == "--team" ]]; then
   # --model flag here, same reasoning as select_model() below.
   tmux new-session -d -s "$SESSION" -n "lead"
   # Lead worker gets the task
-  tmux send-keys -t "$SESSION:lead" "cd $WORK_DIR && claude --agent heimdall $PERMISSION_FLAG --plugin-dir $PLUGIN_DIR" Enter
+  TEAM_TASK_FILE=""
+  if [[ "$TASK" == *[![:space:]]* ]]; then
+    TEAM_TASK_FILE="$(mktemp /tmp/heimdall-team-XXXXXX)"
+    printf '%s' "$TASK" > "$TEAM_TASK_FILE"
+  fi
+  team_type "$SESSION:lead" "$(team_launch_line "$TEAM_TASK_FILE")"
 
   # Spawn additional worker panes
   for i in $(seq 2 "$TEAM_SIZE"); do
     tmux split-window -t "$SESSION" -h
-    tmux send-keys -t "$SESSION" "cd $WORK_DIR && claude --agent heimdall $PERMISSION_FLAG --plugin-dir $PLUGIN_DIR" Enter
+    team_type "$SESSION" "$(team_launch_line)"
     tmux select-layout -t "$SESSION" tiled
   done
-
-  if [ -n "$TASK" ]; then
-    sleep 2
-    tmux send-keys -t "$SESSION:lead.0" "$TASK" Enter
-  fi
 
   echo "  Attach: tmux attach -t $SESSION"
   echo "  Detach: Ctrl+B then D"

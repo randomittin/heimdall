@@ -150,7 +150,10 @@ cmd_wave() {
 
   ensure_dirs
   local count active=0
-  count=$(echo "$tasks" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)
+  # python3 -I: this runs from the caller's working directory (any project), which python would otherwise put on
+  # sys.path -- a json.py shipped by the project would be imported. Every program below is a single-quoted literal:
+  # data reaches it on stdin only, never in its source.
+  count=$(echo "$tasks" | python3 -I -c 'import json, sys; print(len(json.load(sys.stdin)))' 2>/dev/null)
   echo "wave: $count tasks, max_parallel=$MAX_PARALLEL"
 
   # Fed via process substitution (< <(...)) below, deliberately NOT a pipe
@@ -176,12 +179,12 @@ cmd_wave() {
     done
     fork_one "$tid" "$tprompt" "" "$trole"
     active=$((active + 1))
-  done < <(echo "$tasks" | python3 -c "
+  done < <(echo "$tasks" | python3 -I -c '
 import json, sys
 tasks = json.load(sys.stdin)
 for t in tasks:
-    print(t['id'] + '|' + t.get('role', '') + '|' + t['prompt'])
-" 2>/dev/null)
+    print(t["id"] + "|" + t.get("role", "") + "|" + t["prompt"])
+' 2>/dev/null)
 
   echo "wave: waiting for all tasks..."
   wait
@@ -201,19 +204,20 @@ cmd_run() {
 
   ensure_dirs
   local wave_count
-  wave_count=$(echo "$waves" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)
+  wave_count=$(echo "$waves" | python3 -I -c 'import json, sys; print(len(json.load(sys.stdin)))' 2>/dev/null)
   echo "run: $wave_count wave(s)"
 
-  echo "$waves" | python3 -c "
+  echo "$waves" | python3 -I -c '
 import json, sys
 waves = json.load(sys.stdin)
 for i, wave in enumerate(waves):
     for task in wave:
-        dep_results = ''
-        for dep in task.get('depends', []):
-            dep_results += f'dep:{dep}|'
-        print(f'{i}|{task[\"id\"]}|{task.get(\"role\", \"\")}|{task[\"prompt\"]}|{dep_results}')
-" 2>/dev/null | {
+        dep_results = ""
+        for dep in task.get("depends", []):
+            dep_results += f"dep:{dep}|"
+        tid, role, prompt = task["id"], task.get("role", ""), task["prompt"]
+        print(f"{i}|{tid}|{role}|{prompt}|{dep_results}")
+' 2>/dev/null | {
     current_wave=-1
     while IFS='|' read -r widx tid trole tprompt tdeps; do
       if [ "$widx" -ne "$current_wave" ]; then
