@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runhmd.dev/schemas/guardrails.manifest.v1.json",
+  "title": "guardrails.manifest/1",
+  "description": "guardrails.manifest.json: the inventory of every guardrail Heimdall enforces, each in exactly one tier. `core` = security and correctness gates: fail-closed, never switchable by any hmd command or config file. `recommended` = cost and discipline guards: on by default, listed, individually switchable by the operator. ANYTHING NOT POSITIVELY CLASSIFIED IS CORE: a row without a tier is invalid, never defaulted. A row describes one guardrail: either a hook of hooks/hooks.json (layer `hook`; `id` and `hook` are the hook's id in hooks/hooks.metadata.json) or a guard that lives inside a hook, a native git hook or a script (any other layer; `hook` names the container, or is null). The file is descriptive: it records the decision, enforcement lives in the guards themselves. THIS FILE IS THE CONTRACT: bin/lib/guardrails_manifest.py enforces it and test/guardrails-manifest-schema.test.sh fails when the two disagree. JSON Schema cannot express cross-field rules, so `x-invariants` lists the ones the validator adds; each is implemented in bin/lib/guardrails_manifest.py. `layer` is free-form kebab-case apart from the reserved value `hook` (conventional values: hook, precheck-bash, precheck-agent, native-git-hook, script). `fails` records the failure mode and is informational only: no rule reads it. `proof` names the suite that proves the guard; that the file exists is checked against the repository by the drift test, not by this schema.",
+  "x-invariants": [
+    {"id": "GM1", "rule": "schema is the integer 1: not true, not 1.0, not \"1\""},
+    {"id": "GM2", "rule": "ids are unique: one id has one row, so every reader sees the same tier for it"},
+    {"id": "GM3", "rule": "a row with kind guard has a proof: a non-blank string naming the suite that proves it"},
+    {"id": "GM4", "rule": "tier is always stated, never defaulted: anything not positively classified is core, so a row without a tier is invalid"},
+    {"id": "GM5", "rule": "hooks cross-check (validate --hooks-metadata): a row with layer hook is that hook itself (hook equals id, id is a hooks.metadata.json id), and a hook the metadata does not positively mark locked false is locked, so its row has tier core"},
+    {"id": "GM6", "rule": "hooks cross-check: every hooks.metadata.json hook has exactly one row with layer hook; a row with any other layer is a guard inside a hook, names it in hook, and may be recommended even when that hook is locked"},
+    {"id": "GM7", "rule": "no JSON object repeats a key: readers disagree on which value wins, so the file is refused"}
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "guardrails"],
+  "properties": {
+    "_comment": {"type": "string"},
+    "schema": {"const": 1},
+    "guardrails": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/guardrail"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"},
+    "guardrail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "tier", "layer", "why"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["guard", "feature"], "description": "guard = a guardrail; feature = a hook that is not a guardrail, listed so every hook has a row"},
+        "tier": {"enum": ["core", "recommended"], "description": "core = never switchable; recommended = on by default, switchable by the operator"},
+        "layer": {"type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$", "description": "where it is enforced; `hook` is reserved for a row that IS a hook of hooks/hooks.json"},
+        "hook": {"type": ["string", "null"], "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "description": "the hooks.metadata.json id: the row's own id for layer hook, otherwise the hook the guard lives inside"},
+        "fails": {"enum": ["open", "closed"], "description": "informational only"},
+        "operator_env": {"type": ["string", "null"], "pattern": "^[A-Za-z_][A-Za-z0-9_]*(=\\S*)?$", "description": "the per-process operator override the guard already honours, NAME or NAME=value"},
+        "proof": {"type": ["string", "null"], "pattern": "\\S", "description": "the suite that proves the guard; required for kind guard"},
+        "why": {"type": "string", "pattern": "\\S", "description": "the one-line rationale"},
+        "provisional": {"type": "boolean", "description": "the tier is a placeholder pending an operator decision"}
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema": 1,
+      "guardrails": [
+        {"id": "bash-gate-chain", "kind": "guard", "tier": "core", "layer": "hook", "hook": "bash-gate-chain",
+         "fails": "closed", "operator_env": null, "proof": "test/heimdall-precheck-bash.test.sh",
+         "why": "the commit and push gate stack"},
+        {"id": "ci-waste-guard", "kind": "guard", "tier": "recommended", "layer": "precheck-bash",
+         "hook": "bash-gate-chain", "fails": "open", "operator_env": "HMD_CI_RERUN_ALLOW=1",
+         "proof": "test/ci-waste-guard.test.sh", "why": "never pay CI minutes to re-roll a flaky result"}
+      ]
+    }
+  ]
+}
