@@ -38,7 +38,7 @@ Invoke these skills for thorough review coverage:
 4. **Check each file**: Review every changed file systematically
 5. **Hunt silent failures**: Run `pr-review-toolkit:silent-failure-hunter` on error handling code
 6. **Verify tests**: Ensure tests exist for new functionality
-7. **Check quality gates**: Verify lint and formatting are clean, and run the diff's own test file(s) ONCE — neighbouring suites and the full gate belong to the orchestrator's one sweep
+7. **Check quality gates**: Verify lint and formatting are clean, and run the diff's own test file(s) ONCE — neighbouring suites and the full gate are not yours: the full run is the developer's call at merge time
 8. **Record findings**: for each issue run `heimdall-findings add --severity BLOCKER|HIGH|MEDIUM|LOW --title T --where file:line` (CRITICAL → BLOCKER or HIGH, WARNING → MEDIUM, SUGGESTION → LOW); the tool routes MEDIUM/LOW to `.planning/BACKLOG.md` and keeps BLOCKER/HIGH open for the orchestrator
 
 ## Review Checklist

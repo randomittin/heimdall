@@ -102,18 +102,40 @@ linked co-author with an avatar.
 - No untested changes
 - Canonical checklist agents cross-check: `skills/heimdall/references/definition-of-done.md`
 
-## When the full gate runs — ONCE, immediately before the landing commit
+## When the full gate runs — recommended to the developer just before a merge, never started by an agent
 Test once, at the end — operator directive 2026-10-08: avoid over-testing the same
-stuff; save testing for the end. The full sweep (`bash test/run-all.sh`, ~524 suites,
-~45-60 min cold) runs at exactly one moment: on the final frozen tree, immediately before
-whichever of these comes first — the commit that lands a completed unit of work, the
-push, a demo, a `/hmd:save` checkpoint of finished work. One sweep serves all of them
-while the tree stays unedited. Not at session start, not after each file edit, not
-after each merge, not at mid-work checkpoints (`wip:` auto-commits, a save of
-unfinished work), not "whenever it feels done". Running it more often costs half an
-hour a pop and — worse — grades a tree that is still being edited, which attributes a
-verdict to a state of the code that never existed.
+stuff; save testing for the end. Refined by the operator on 2026-11-12, verbatim: *"full
+test runs should be recommended to devs along with explanation and token usage -- plus
+should always be suggested just before merge operations and not before."* So the full
+sweep (`bash test/run-all.sh`, ~524 suites, ~45-60 min cold) is a RECOMMENDATION to the
+developer, made at exactly one moment: immediately before a merge operation (a branch
+merge, a PR merge, a pull or push into the default branch), on the final frozen tree. The
+developer decides. An agent NEVER starts it on its own initiative: not after an agent's
+branch is merged, not before a checkpoint, a `/hmd:save` or a demo, not at session start,
+not after each file edit, not at mid-work checkpoints (`wip:` auto-commits, a save of
+unfinished work), not "to be safe", not "whenever it feels done". It runs only when the
+developer says so in that session, and silence is a no. During work the rule is unchanged:
+only the tests of the files you touched, once. One run covers a whole batch of merges
+while the tree stays unedited. Running it more often costs half an hour a pop
+and — worse — grades a tree that is still being edited, which attributes a verdict to a
+state of the code that never existed.
 
+- **What the developer is shown (the recommendation).** Three things, every time: why (what
+  the run proves for this merge), the command (`bash test/run-all.sh`; `--failed` after a
+  red) and the cost: wall time (~45-60 min cold; a cached run costs what the change reaches)
+  and tokens (an estimate: an agent that reads only the summary spends few, one that streams
+  the per-suite output spends many). `bin/lib/hmd_sweep_advice.py` prints it when a merge
+  operation is about to run; it only advises, never denies, and `HMD_SWEEP_ADVICE=off` in the
+  environment Claude Code runs in turns it off. An orchestrator does not rely on it: it puts
+  the same three things to the developer itself, right before the merge operation, and waits.
+  Not before: a recommendation at a checkpoint, a save, a demo or mid-work is noise the
+  developer learns to ignore.
+- **When the developer says yes.** Run it ONCE, on the frozen tree, in the background
+  (`run_in_background`; wait for the completion notification, never a poll loop: "Wait guard"
+  below) with nothing editing, and read only its summary: the lines after the dashed rule at
+  the end (the pass/fail counts and `sweep kind`) and, on a red, the names in the receipt's
+  `non_green_suites`, never the per-suite stream. The mechanics below (freeze, quiet gate,
+  disk floor, cache, `--failed`) apply to a run once it is chosen.
 - **Freeze the tree first.** `run-all.sh` reads the working tree as it finds it. No
   edits, and no agents editing, while it runs. A verdict over a moving tree is not a
   verdict.
@@ -152,11 +174,13 @@ verdict to a state of the code that never existed.
   that drives the REAL spawn hook pins `HMD_MIN_FREE_PCT=0` (as `agent-name-gate` pins
   `HMD_CTX_GATE_OFF=1`) so it never depends on the disk it runs on. `bin/heimdall-disk-floor
   check` shows where you stand. Proof: `test/disk-floor.test.sh`.
-- **Start it only when no follow-up fix is still possible.** A sweep begun while a
-  reviewer, verifier or agent can still hand back a change is spent the moment that
-  change lands: its receipt is stale and every suite that change reaches runs again.
+- **Recommend it, and start a chosen run, only when no follow-up fix is still possible.** A
+  sweep begun while a reviewer, verifier or agent can still hand back a change is spent the
+  moment that change lands: its receipt is stale and every suite that change reaches runs
+  again.
 - **Batch before you sweep (operator directive 2026-10-11).** Collect every pending
-  agent result and merge them ALL, then run ONE sweep. Never merge anything between a
+  agent result and merge them ALL, so ONE recommendation covers the batch and, on the
+  developer's yes, ONE sweep grades it. Never merge anything between a
   green sweep and its push. If new work arrives after a sweep started, queue it for
   the next batch instead of merging. A failing suite gets fixed, and the fix rides the
   next batch (`--failed`, below); a small follow-up batch costs what it reaches, since the
@@ -202,24 +226,29 @@ verdict to a state of the code that never existed.
   different tree), while a second run of an unchanged tree is the waste. A failure
   plausibly caused by machine load (timeout, port clash, agents running alongside)
   gets ONE solo re-run, then it is real: fix it or report it. Regressions elsewhere
-  are the sweep's job.
-- **The orchestrator does not re-run suites per merge.** It takes each agent's
-  reported run as given, integrates, and runs the one sweep at the end.
+  are for the merge-time full run, if the developer chooses one.
+- **The orchestrator does not re-run suites per merge, and does not start the sweep
+  itself.** It takes each agent's reported run as given, integrates, and, immediately
+  before the merge operation, recommends the one full run to the developer; only the
+  developer's yes starts it.
 - **Measured, 2026-10-08 chat-replies wave:** three coder agents hit their 50-turn
   limit mid-regression after running 10–25 neighbouring suites each, one suite was
   re-run three times under load, and the orchestrator re-ran the same suites after
   merging, then cancelled a full sweep when fixes landed.
 - **The `git push` hook stack is unchanged and stays.** It is a fail-closed backstop,
-  not a duplicate of this rule: the pre-commit sweep is the agent's discipline, the
-  pre-push gate is the machine's guarantee.
-- **Already machine-enforced.** `bin/heimdall-conformance` reads the session
+  not a duplicate of this rule: the merge-time recommendation is the developer's call,
+  the pre-push gate is the machine's guarantee. In this repo a push still needs a green
+  full-equivalent receipt, so a developer who declined the run meets that gate at the push.
+- **Already machine-enforced, in part.** `bin/heimdall-conformance` reads the session
   transcript and fails `gate-runs-once` (two full-gate runs with no edit between them)
   and `gates-at-end` (the first full-gate run must come AFTER real work). It also fails
   `sweep-staled-by-merge` (a green sweep, then a merge or commit of real work before
   the push, then another sweep) and `sweeps-overlap` (two full-gate runs whose
-  start/end intervals overlap). This section
-  is the human-readable statement of a rule the enforcer already checks — if the two
-  ever disagree, the enforcer is authoritative and this text is the bug.
+  start/end intervals overlap). Those grade the runs that happen: they read tool calls,
+  not the developer's yes, so "an agent starts no full run unasked" is held by this text
+  and the merge-time advice (which recommends and never blocks), not by a check. This
+  section is the human-readable statement of the rules the enforcer does check — if the
+  two ever disagree, the enforcer is authoritative and this text is the bug.
 
 ## Release convergence: one review, one sweep, then ship (2026-10-21)
 Operator directive, 2026-10-21: *fix the too-much-testing and reiterating loop; deliver well, not
@@ -236,7 +265,11 @@ what ate the day. The rules:
   fix made this release is triaged the same way; it does not restart the cycle unless it is HIGH.
 - **Background security-review findings** on hmd's own commits follow the same triage: HIGH → fix in
   this batch, otherwise backlog with one line. Never chain an agent per finding.
-- **One sweep, last.** Land every fix of the round, then ONE full sweep on the frozen tree, then ship.
+- **One sweep, last, and the developer's call.** Land every fix of the round, then recommend ONE full
+  sweep on the frozen tree to the developer (why, command, cost: "When the full gate runs"), run it on
+  their yes, then ship. The release script's receipt requirement stays: a release still needs the
+  green receipt it checks, but the run behind it happens because the developer chose it at merge or
+  release time, never because an agent started it to satisfy the script.
   A red suite after it: fix, commit, `run-all.sh --failed` (never a second full sweep).
 - **Scope a fix agent to its finding.** No "while you're there" exploration, no listing of new
   candidate defects unless asked: a list becomes the next round.
@@ -255,7 +288,9 @@ what ate the day. The rules:
   `run-all.sh` is no run), takes the repo from the script's own location, costs every other command one
   `case`, and FAILS OPEN like the CI waste guard (a missing or garbled receipt, a git failure or a timeout
   is one stderr line and an allow). The operator override is `HMD_SWEEP_ALLOW=1` in the environment Claude
-  Code runs in (an inline prefix reaches the sweep, not the hook). Best effort, not a security boundary.
+  Code runs in (an inline prefix reaches the sweep, not the hook). Once a run is chosen, this guard still
+  applies to it exactly as above; it recommends and starts nothing, so it neither replaces nor depends on
+  the merge-time advice. Best effort, not a security boundary.
   Proof: `test/sweep-guard.test.sh`.
 
 ## Pre-commit vs pre-push: what stays at commit, what dedups at push

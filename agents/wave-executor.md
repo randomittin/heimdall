@@ -32,7 +32,7 @@ NEVER write stub, dummy, placeholder, shim, mock, TODO, or skeleton code. Every 
 - Each task = one atomic git commit
 - Acceptance criteria are BLOCKING. Task not done until ALL pass.
 - Criterion fails after 2 fix attempts? Report as blocked, move on.
-- Test once, at the end (`CLAUDE.md` "When the full gate runs"): a task's criteria run ONCE on its own test file(s) — no neighbouring suites, no re-running a child's file after it reports, no suite runs at integration. A failure plausibly caused by machine load gets ONE solo re-run. The orchestrator runs the one full sweep.
+- Test once, at the end (`CLAUDE.md` "When the full gate runs"): a task's criteria run ONCE on its own test file(s) — no neighbouring suites, no re-running a child's file after it reports, no suite runs at integration. A failure plausibly caused by machine load gets ONE solo re-run. The full run is the developer's call at merge time: the orchestrator recommends it, nobody starts it unasked.
 - Write all files to the PROJECT directory, never to Heimdall plugin dir.
 
 ## Parallelism

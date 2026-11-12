@@ -35,7 +35,7 @@ Invoke these skills when they apply to your work (the orchestrator may specify a
 ## Working Protocol
 
 0. **Detect isolation**: Run `[ "$(git rev-parse --git-dir 2>/dev/null)" = "$(git rev-parse --git-common-dir 2>/dev/null)" ] && echo "main repo" || echo "worktree"`. If you are NOT in a worktree, invoke `Skill(superpowers:using-git-worktrees)` before any edits.
-1. **No baseline sweep**: do NOT run the project's whole test command before you change anything (on this repo that is the ~1600s full gate, which runs once, at the end — see Testing discipline below). If your own test file(s) later fail in code you did not touch, STOP and report it as a pre-existing failure — do not conflate it with your work.
+1. **No baseline sweep**: do NOT run the project's whole test command before you change anything (on this repo that is the ~1600s full gate, which is the developer's call at merge time and never yours — see Testing discipline below). If your own test file(s) later fail in code you did not touch, STOP and report it as a pre-existing failure — do not conflate it with your work.
 2. **Read first (batched)**: Send ALL Read calls for the files you need in ONE message. Sequential reads violate the project parallelism rule (CLAUDE.md).
 3. **Plan briefly**: Outline approach in 2-3 sentences ONLY if no plan was provided by the orchestrator/architect. Otherwise execute the provided plan.
 4. **Invoke skills**: Skill precedence — `superpowers:brainstorming` (if scope unclear) → `superpowers:writing-plans` (multi-step) → `superpowers:test-driven-development` (every feature/bugfix) → `superpowers:systematic-debugging` (any bug encounter) → `superpowers:verification-before-completion` (always, pre-DONE).
@@ -43,7 +43,7 @@ Invoke these skills when they apply to your work (the orchestrator may specify a
    a. Write the failing test FIRST.
    b. Run that test file → confirm RED with the expected failure reason quoted. This is the one run before the implementation: it proves the test can fail.
    c. Write the minimal code to GREEN and finish any refactor — ALL changes written before the next run.
-   d. Run that same test file ONCE → confirm PASS, output pristine. Your own file(s) only: "full suite still green" is the orchestrator's one sweep, not yours.
+   d. Run that same test file ONCE → confirm PASS, output pristine. Your own file(s) only: "full suite still green" is the developer's merge-time call, not yours.
    Skipping the cycle = revert and start over. "I'll test after" = bug.
 6. **Bug encounters**: Before proposing ANY fix, complete Phase 1 of `superpowers:systematic-debugging`: read error verbatim, reproduce, check recent changes, trace data flow to root cause. No fixes without root cause. After 3 failed fix attempts in a row, STOP — question the architecture, escalate up.
 7. **Verification Gate (BEFORE reporting status)**:
@@ -59,11 +59,11 @@ Invoke these skills when they apply to your work (the orchestrator may specify a
 
 Operator directive 2026-10-08: avoid over-testing the same stuff; save testing for the end. Measured: three coders hit their 50-turn limit mid-regression after running 10–25 neighbouring suites each, and one suite was re-run three times under load. Full rule: `CLAUDE.md` "When the full gate runs".
 
-- Run ONLY the test file(s) you add or edit, ONCE, after ALL your changes are written. No neighbouring, related or "regression" suites, no baseline sweep, no full gate — the orchestrator runs ONE full sweep on the final frozen tree, immediately before the landing commit / push / demo / checkpoint.
+- Run ONLY the test file(s) you add or edit, ONCE, after ALL your changes are written. No neighbouring, related or "regression" suites, no baseline sweep, no full gate, and no full run on your own initiative (not after your work lands, not before a checkpoint, a save or a demo, not "to be safe"): the full sweep is RECOMMENDED to the developer immediately before a merge operation, with why, the command and the cost, and runs only when the developer says so. If your spawn prompt says they did, run it ONCE in the background and read only its summary.
 - "Once" means once per state of the tree. The TDD RED run, a re-run after an edit that targets a failure, and a break-it-and-watch-it-go-RED check each run a different tree; a second run of an unchanged tree is the waste.
 - A failure plausibly caused by machine load (timeout, port clash, other agents running) gets ONE solo re-run — nothing else running. Fails again → it is real: fix it or report it. Never loop on it.
-- Regressions elsewhere are the sweep's job. A failure in code you did not touch → report it; don't chase it with more suites.
-- **Client (managed) repos** (operator directive 2026-11-12) — anywhere but heimdall's own repo, the tests you write are USE-CASE scenarios: one per real user journey your change touches ("book a cab", "search email"), given/when/then against the public entry point, real code end to end, fakes only at external boundaries (payments, network, LLM, third-party APIs); a unit test only to pin a specific bug. Run only the tests of the files you touched, once. No full unit-suite sweep, no offline-eval sweep, no "regression" run of unrelated suites, and never a full-sweep runner (`test/run-all.sh`) created to satisfy an hmd gate: the release gate is `lint` + `use-cases` in `.heimdall/repo-checks.json`. Rules, shape, example: `skills/heimdall/references/use-case-tests.md`.
+- Regressions elsewhere are for the merge-time full run, if the developer chooses one. A failure in code you did not touch → report it; don't chase it with more suites.
+- **Client (managed) repos** (operator directive 2026-11-12) — anywhere but heimdall's own repo, the tests you write are USE-CASE scenarios: one per real user journey your change touches ("book a cab", "search email"), given/when/then against the public entry point, real code end to end, fakes only at external boundaries (payments, network, LLM, third-party APIs); a unit test only to pin a specific bug. Run only the tests of the files you touched, once. No full unit-suite sweep, no offline-eval sweep, no "regression" run of unrelated suites, and never a full-sweep runner (`test/run-all.sh`) created to satisfy an hmd gate: the release gate is `lint` + `use-cases` in `.heimdall/repo-checks.json`, recommended to the developer at merge or release time and run when they say so, never on your own initiative. Rules, shape, example: `skills/heimdall/references/use-case-tests.md`.
 
 ## Parallelism — MANDATORY within your scope
 
@@ -153,7 +153,7 @@ Before you report any status, explicitly list the red flags you see (or state "n
 - **Stubs sneaking in** — placeholder returns, fake data, "temporary" hardcoding.
 - **Scope creep** — files touched outside your assigned scope.
 - **Fragile assumptions** — unvalidated inputs at a trust boundary, hardcoded values, order-dependent logic.
-- **Over-testing** — a suite beyond your own file(s), a baseline sweep, or the same file run twice on an unchanged tree. In a client repo also: a full unit-suite or offline-eval run, or a full-sweep runner created to satisfy a gate.
+- **Over-testing** — a suite beyond your own file(s), a baseline sweep, a full run nobody asked for, or the same file run twice on an unchanged tree. In a client repo also: a full unit-suite or offline-eval run, or a full-sweep runner created to satisfy a gate.
 
 Cross-check against the canonical `skills/heimdall/references/definition-of-done.md` — a box you cannot check with evidence is a red flag, not a DONE.
 

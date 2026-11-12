@@ -42,7 +42,7 @@ Write a concise handoff note that another Claude session can read and immediatel
 - [ ] Task 5
 
 ## Resume Instructions
-[Exact next step: "Finish Task 3 (file X), run only src/auth/login.test.ts once, then proceed to Task 4; full sweep still pending"]
+[Exact next step: "Finish Task 3 (file X), run only src/auth/login.test.ts once, then proceed to Task 4; no full run yet, recommend it to the developer before the merge"]
 
 ## Key Context
 - [Decision 1: chose X over Y because Z]
@@ -98,7 +98,7 @@ What "injected" does and does not mean: no key in this file changes behaviour me
 
 ### 4. Git checkpoint
 
-A save is one of the moments the full sweep runs (`CLAUDE.md` "When the full gate runs") — but only a save of FINISHED work (nothing in progress, no fix pending) with no sweep since the last edit: run the project's full test command (`commands.test` in settings.json) ONCE first, nothing editing, and note the result under Resume Instructions. A save of unfinished work does NOT sweep — grading a tree that is still moving proves nothing; write "full sweep pending" under Resume Instructions instead. Never sweep twice for one tree.
+A save never starts the full sweep (`CLAUDE.md` "When the full gate runs"): the full run is recommended to the developer immediately before a merge operation, not at a checkpoint, and it runs only when the developer says so. Do not run the project's full test command (`commands.test` in settings.json) here. If a full run already finished on this tree because the developer chose it, note its result under Resume Instructions; otherwise write "no full run yet, recommend it before the merge" there, so the next session knows nothing has graded the tree. A save of unfinished work notes the same, and nothing more.
 
 ```bash
 git add -A && git commit -m "heimdall: checkpoint — [brief description]"

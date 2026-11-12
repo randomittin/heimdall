@@ -95,7 +95,7 @@ Monitor via dispatch queue status: if `pending > 0` and `running < 10`, scale up
 ## Phase 6: Verify
 - Spawn a **verifier agent** to check ALL acceptance criteria across all waves — each criterion once, on the tree as it stands
 - Verify requirement coverage: every original requirement maps to a passing check
-- Last step, only once the verifier and reviewer have nothing left to hand back: ONE full sweep — full test suite, linter, type checker — on the frozen tree. It is the only full run in the pipeline (not per wave, not per merge), and a fix that lands after it spends it. Batch before you sweep: merge every pending agent result BEFORE it, never between a green sweep and the push; work that arrives mid-sweep waits for the next batch, and no second sweep starts while one runs (`CLAUDE.md` "When the full gate runs")
+- Last step, only once the verifier and reviewer have nothing left to hand back: RECOMMEND the ONE full sweep — full test suite, linter, type checker — to the developer immediately before the merge operation (why, command, cost) and run it only if they say yes: on the frozen tree, in the background, reading only its summary. It is the only full run in the pipeline (not per wave, not per merge, never started unasked), and a fix that lands after it spends it. Batch before you sweep: merge every pending agent result BEFORE it, never between a green sweep and the push; work that arrives mid-sweep waits for the next batch, and no second sweep starts while one runs (`CLAUDE.md` "When the full gate runs")
 - Update `.planning/PLAN-{phase}.md` with verification results
 
 ## Phase 7: Ship
@@ -121,7 +121,7 @@ After the planner creates a plan with acceptance criteria (Phase 3), synthesize 
 2. Aggregate into a single goal condition string (max 4000 chars)
 3. Focus on observable outcomes from conversation transcript (the evaluator has no filesystem access — it only reads what appears in the conversation)
 4. Always include baseline checks:
-   - "all tests pass" (met by the ONE full sweep's output reaching the transcript — never run suites mid-wave just to feed the evaluator)
+   - "all tests pass" (met by each task's own test run already in the transcript, plus the full sweep's output when the developer chose that run — never run suites mid-wave, or start a sweep, just to feed the evaluator)
    - "lint clean"
    - "build succeeds"
    - "no unfinished, skeleton, or dummy code in changed files"
@@ -183,7 +183,7 @@ while task_not_complete:
   2. IDENTIFY — Determine next actions (which agents to spawn/continue)
   3. EXECUTE — Spawn agents, respecting current autonomy level
   4. QUALITY — After each sub-project completes:
-     a. No suite run here — the sub-project's agent ran its own test file(s) once; the one full sweep is Phase 6
+     a. No suite run here — the sub-project's agent ran its own test file(s) once; the full sweep is Phase 6's recommendation to the developer
      b. Run lint (spawn lint-quality)
      c. Check for conflicts in conflict_log
   5. UPDATE — Write results to heimdall-state.json

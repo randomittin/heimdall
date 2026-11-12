@@ -152,7 +152,7 @@ Group related small fixes into a patch release. The agent prepares the release a
 who holds the credentials, runs it. Never run `release/ship.sh` or any tag, push or publish step yourself.
 
 1. Collect fixes from `maintainer.release_queue`
-2. Run the ONE full sweep on the frozen release tree — the only full run for the whole batch; per-fix runs neither substitute for it nor repeat
+2. RECOMMEND the ONE full sweep on the frozen release tree to the operator (why, command, cost: `CLAUDE.md` "When the full gate runs") and start it only on their yes — the only full run for the whole batch; the release script needs its green receipt, and the run behind it is the operator's choice, never started to satisfy the script; per-fix runs neither substitute for it nor repeat
 3. Bump version (patch for fixes, minor for features) on a `release/v<version>` branch
 4. Generate changelog from commit messages
 5. Open the release PR (version bump + changelog) with the exact release command for this repo's release

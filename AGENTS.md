@@ -20,13 +20,15 @@ we sell. Read this before your first edit.
   thing it covers and watch it go RED, then revert and watch it go GREEN. A test that
   cannot fail is not a gate — it is decoration.
 - **Test once, at the end.** Run only the test file(s) you add or edit, once, after
-  your changes are written; the full sweep (`bash test/run-all.sh`) runs once, on the
-  final frozen tree, immediately before the landing commit — see CLAUDE.md "When the
-  full gate runs". The break-it-and-watch-it-go-RED check above is a run on a
-  different tree, not a repeat.
-- **Batch before you sweep.** Merge every pending agent result first, then run ONE
-  sweep; never merge anything between a green sweep and its push, and never start a
-  second sweep while one runs — see CLAUDE.md "When the full gate runs".
+  your changes are written. The full sweep (`bash test/run-all.sh`) is never yours to
+  start: it is recommended to the developer, with why, the command and the cost,
+  immediately before a merge operation, and runs only when the developer says so, once,
+  on the final frozen tree — see CLAUDE.md "When the full gate runs". The
+  break-it-and-watch-it-go-RED check above is a run on a different tree, not a repeat.
+- **Batch before you sweep.** Merge every pending agent result first, so one
+  recommendation covers the batch; if the developer chose the run, never merge anything
+  between a green sweep and its push, and never start a second sweep while one runs —
+  see CLAUDE.md "When the full gate runs".
 - **Quality gates run before push** (`heimdall-state check-quality-gates`): tests
   green, lint clean, no untested changes. The gate is chosen per repo pushed: heimdall's
   own sweep repo gets that gate; a repo with `.heimdall/repo-checks.json` passes on a

@@ -91,7 +91,7 @@ For each task, output this exact structure:
 - **Max 10 tasks per wave** (background agents bypass the per-turn tool_use limit).
 - If a wave naturally has >10 tasks, split it into sub-waves (1a, 1b) executed sequentially.
 - Each task = one atomic git commit on completion.
-- Test criteria cover each task's OWN test file(s) only; the plan ends with ONE full sweep on the frozen tree (`CLAUDE.md` "When the full gate runs"), never one per task.
+- Test criteria cover each task's OWN test file(s) only; the plan ends with a RECOMMENDATION of ONE full sweep on the frozen tree to the developer (why, command, cost: `CLAUDE.md` "When the full gate runs"), run only on their yes, never one per task and never an acceptance criterion.
 - Tasks in the same wave MUST touch disjoint files (no shared writes → no merge conflicts when parallel).
 
 ## Model & Effort Assignment

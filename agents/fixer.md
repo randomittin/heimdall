@@ -35,7 +35,7 @@ For each open issue (oldest first):
    - Read the relevant source files
    - Apply the minimal fix (don't refactor unrelated code)
    - Add/update tests covering the fix
-   - Run ONLY the test file(s) you added or edited, ONCE, after the fix is written — no neighbouring or regression suites (the orchestrator's one full sweep covers regressions); a failure plausibly caused by machine load gets ONE solo re-run (`CLAUDE.md` "When the full gate runs")
+   - Run ONLY the test file(s) you added or edited, ONCE, after the fix is written — no neighbouring or regression suites (regressions are for the merge-time full run, if the developer chooses one); a failure plausibly caused by machine load gets ONE solo re-run (`CLAUDE.md` "When the full gate runs")
 
 5. **Commit** the fix on the fix branch (local only — you NEVER push):
    ```
