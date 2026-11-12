@@ -22,6 +22,10 @@
 #   G  `install owner/repo`, a repository the registry does not list, is gated like every other install
 #   H  a plugin tree without the gate (the partial trees of older suites) installs as it always did, said on stderr; a gate that cannot load defers
 #   I  SKILL.md generation no longer uses sed '1{/re/d}', which BSD sed (macOS) rejects: this suite's sed rejects it too, so B4 can go RED
+#   J  an approval by NAME (an allowlisted name, consent auto, an install that predates the model: C, D) counts only for the repository
+#      skills.manifest.json lists for that name. Any other repository (`install attacker/frontend-design` with frontend-design allowlisted, the
+#      one-argument and the two-argument form) is asked like consent=ask: exit 3 without a terminal, the menu with one, a yes still installs it. A manifest
+#      that cannot vouch for a repository (not valid, or the module that reads it missing) approves nothing
 #
 # HERMETIC. HOME, HEIMDALL_HOME and the project are throwaway directories, `git` is a PATH fake (it logs `clone` and makes the files a skill has),
 # the plugin tree is a copy of bin/discover-skills and the libraries a consented install reads, there is no network, nothing outside $WORK is touched.
@@ -44,7 +48,7 @@ echo "skills-consent-discover"
 
 command -v python3 >/dev/null 2>&1 || { echo "FATAL: python3 is required"; exit 2; }
 for f in "$DISCOVER" "$LOCKPY" "$REPO/bin/lib/skills_consent.sh" "$REPO/bin/lib/skills_config.py" "$REPO/bin/lib/select.sh" \
-         "$REPO/bin/lib/install-receipt.sh" "$REPO/skills.manifest.json" "$SELF_DIR/lib/py-pin.sh"; do
+         "$REPO/bin/lib/install-receipt.sh" "$REPO/bin/lib/skills_manifest.py" "$REPO/skills.manifest.json" "$SELF_DIR/lib/py-pin.sh"; do
   [ -f "$f" ] || { echo "FATAL: $f is missing"; exit 2; }
 done
 
@@ -115,7 +119,7 @@ make_plugin() {
   cp "$WORK/registry.json" "$1/skills-registry.json"
   case "$2" in
     yes)
-      cp "$REPO/bin/lib/skills_consent.sh" "$REPO/bin/lib/skills_config.py" "$REPO/bin/lib/select.sh" "$1/bin/lib/"
+      cp "$REPO/bin/lib/skills_consent.sh" "$REPO/bin/lib/skills_config.py" "$REPO/bin/lib/skills_manifest.py" "$REPO/bin/lib/select.sh" "$1/bin/lib/"
       cp "$REPO/skills.manifest.json" "$1/skills.manifest.json" ;;
     broken)
       : > "$1/bin/lib/skills_consent.sh" ;;
@@ -250,6 +254,36 @@ printf '# CLAUDE.md\nbody\n' > "$WORK/claude.md"
 PATH="$FAKEBIN:$PATH" sed '1{/^# CLAUDE\.md$/d}' "$WORK/claude.md" >/dev/null 2>&1; rc=$?
 if [ "$rc" -ne 0 ]; then ok "I1 sed '1{/re/d}' fails under the suite's sed (exit $rc)"; else bad "I1 the suite's sed accepted sed '1{/re/d}', so B4 proves nothing"; fi
 eq "I2 the same sed still does ordinary work" "body" "$(PATH="$FAKEBIN:$PATH" sed 1d "$WORK/claude.md")"
+
+# ╔═ J. an approval by name is not an approval of a repository ═════════════════════════════════════════════════════╗
+echo "J. an allowlisted name or consent auto approves the repository the manifest lists for that name, and no other: any other one is asked"
+FOREIGN_FD="attacker/frontend-design"   # frontend-design is a manifest id (a plugin): the finding's own example
+FOREIGN_UI="attacker/ui-ux-pro-max"     # ui-ux-pro-max is a manifest github-skill whose repository is $UI_REPO
+newcase; setcfg '{"consent": "allowlist", "allowlist": ["frontend-design"]}'; ds install "$FOREIGN_FD"
+eq  "J1 frontend-design allowlisted, attacker/frontend-design asked for: exit 3, nothing cloned, no skill directory" "3 0 absent" \
+    "$RC $(grep -c clone "$GIT_LOG") $([ -e "$(skill_dir frontend-design)" ] && echo present || echo absent)"
+has "J2 ... stdout names the repository a yes would install" "$(cat "$OUT")" "consent required: frontend-design (attacker/frontend-design) was not installed"
+has "J3 ... and stderr says why the allowlist did not apply" "$(cat "$ERR")" "attacker/frontend-design is not the repository the skills manifest lists for frontend-design"
+newcase; setcfg '{"consent": "allowlist", "allowlist": ["ui-ux-pro-max"]}'; ds install "$FOREIGN_UI"
+eq "J4 ui-ux-pro-max allowlisted, attacker/ui-ux-pro-max asked for: exit 3, nothing cloned, a suggested row" "3 0 suggested|n/a" "$RC $(grep -c clone "$GIT_LOG") $(state_consent ui-ux-pro-max)"
+ds install ui-ux-pro-max "$FOREIGN_UI"
+eq "J5 the two-argument form (NAME REPO) is bound the same way: exit 3, nothing cloned" "3 0" "$RC $(grep -c clone "$GIT_LOG")"
+newcase; setcfg '{"consent": "allowlist", "allowlist": ["ui-ux-pro-max", "godogen"]}'; ds install ui-ux-pro-max "$UI_REPO"
+eq "J6 the repository the manifest lists, named in the two-argument form: exit 0, installed, consent allowlist" "0 installed|allowlist" "$RC $(state_consent ui-ux-pro-max)"
+ds install "$GODO_REPO"
+eq "J7 ... and as owner/repo, where the repository's name is the id: exit 0, installed, consent allowlist" "0 installed|allowlist" "$RC $(state_consent godogen)"
+newcase; XENV="HMD_SKILLS_CONSENT=auto"; ds install "$FOREIGN_UI"
+eq "J8 consent auto does not approve another repository either: exit 3, nothing cloned" "3 0" "$RC $(grep -c clone "$GIT_LOG")"
+newcase; marker; ds install owner/plain-skill
+eq "J9 nor does an install that predates the model (setup marker, no settings file), for a repository the manifest does not list: exit 3, nothing cloned" "3 0" "$RC $(grep -c clone "$GIT_LOG")"
+newcase; setcfg '{"consent": "allowlist", "allowlist": ["frontend-design"]}'; XENV="HMD_SKILLS_YES=1"; ds install "$FOREIGN_FD"
+eq "J10 the person's yes still installs it: exit 0, installed, consent yes-flag" "0 installed|yes-flag" "$RC $(state_consent frontend-design)"
+newcase; setcfg '{"consent": "allowlist", "allowlist": ["frontend-design"]}'; XENV="HMD_SKILLS_ASSUME=tty"; keys 'k\n'; ds install "$FOREIGN_FD"
+eq "J11 on a terminal the same install is the menu, not a refusal: Install now installs it, consent prompt" "0 installed|prompt" "$RC $(state_consent frontend-design)"
+PLUG_BADMAN="$WORK/plugin-badmanifest"; make_plugin "$PLUG_BADMAN" yes; printf '{}\n' > "$PLUG_BADMAN/skills.manifest.json"
+newcase; setcfg '{"consent": "allowlist", "allowlist": ["ui-ux-pro-max"]}'; DSP="$PLUG_BADMAN"; ds install ui-ux-pro-max
+eq  "J12 a manifest that is not valid vouches for nothing, the registry's repository included: exit 3, nothing cloned" "3 0" "$RC $(grep -c clone "$GIT_LOG")"
+has "J13 ... and stderr says the manifest could not be used" "$(cat "$ERR")" "the skills manifest cannot vouch for a repository"
 
 echo
 echo "skills-consent-discover: $PASS passed, $FAIL failed"
