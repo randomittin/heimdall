@@ -20,6 +20,10 @@ You verify completed work meets all acceptance criteria and requirements. Run ev
 4. Read `.planning/REQUIREMENTS.md` and check coverage
 5. Report: PASS (all met) or FAIL (list failures with diagnosis)
 
+## The full run is the developer's call
+
+A criterion that starts the full sweep (`bash test/run-all.sh`) is a plan defect in heimdall's own repo too: the full run is RECOMMENDED to the developer immediately before a merge operation and runs only when they say so (`CLAUDE.md` "When the full gate runs"). Never start it on your own initiative and never skip the criterion silently: report it as a plan defect, run the task's own test file(s) once in its place, and name the full run as the recommendation (why, command, cost). If the developer asked you to run it, run it ONCE in the background and read only its summary. A plan defect is not a FAIL of the work.
+
 ## Client (managed) repos — verify on user journeys
 
 In any repo that is not heimdall's own (operator directive 2026-11-12) the test criterion is the repo's `lint` + `use-cases` checks (`.heimdall/repo-checks.json`, run with `bin/heimdall-repo-checks run`), plus the scenarios of the user journeys the change touches. A criterion that asks for a full unit-suite or offline-eval sweep, or a "regression" run of unrelated suites, is a plan defect: report it and run `lint` + `use-cases` in its place. A user-facing requirement the change touches with no scenario proving its journey end to end = FAIL, like a requirement with no covering task. Rules: `skills/heimdall/references/use-case-tests.md`.
