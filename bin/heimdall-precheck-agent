@@ -647,6 +647,11 @@ fi
 # and when the gate does substitute a brief, the block rides on the substituted prompt, in the same updatedInput. The rewrite takes the payload on stdin, never as an argument, so a very
 # large prompt cannot fail it on the argument-size limit.
 #
+# COMMIT RULE FOLLOWS ISOLATION (review finding F2, 2026-11-12). Only a spawn whose tool_input says isolation "worktree" has a checkout of its own, so only it is told to commit early and often. Any other spawn runs in
+# the MAIN checkout, next to the session and every parallel agent: told to commit early it would commit on main mid-task and sweep in whatever the others have edited. It gets rule 4 as "do not commit, leave your
+# changes for the orchestrator", and its report line does not ask for a commit sha. Anything but exactly "worktree" (absent, remote, not a string) is that safe default. The choice is made inside the rewrite's own jq
+# call, on the same parsed tool_input, so it cannot disagree with what is rewritten.
+#
 # IDEMPOTENT. The block opens with the marker line `[hmd agent rules]`; a prompt that already carries it is left alone, so a re-spawn of a rewritten prompt never doubles it.
 #
 # OPT-OUT. HMD_GP_RULES_OFF=1, in the environment Claude Code runs in (this hook reads its own environment, not the spawn's); only exactly 1 turns it off.
@@ -654,10 +659,17 @@ fi
 # FAILS OPEN on everything: no jq, an unparsable payload, no prompt or a prompt that is not a string, a jq call that fails on the rewrite. The spawn then goes through with the input the
 # harness sent, exactly as before this section existed. Nothing here can deny a spawn, and nothing here exits: allow() below is the one place that emits the rewrite.
 GP_RULES_MARKER='[hmd agent rules]'
-GP_RULES_BLOCK="$GP_RULES_MARKER
+GP_RULES_HEAD="$GP_RULES_MARKER
 1. Never poll in the foreground: no until/while/for + sleep loops, tail -f, or pgrep waits. They block you, burn turns and bloat your context.
 2. Start long jobs with run_in_background and wait for the completion notification (or use Monitor). Never sit in a Bash call waiting on a job.
-3. Set an explicit timeout on every Bash call that can run long.
+3. Set an explicit timeout on every Bash call that can run long."
+# Rules 4 and 6 are the only lines that depend on the spawn (COMMIT RULE above). GP_RULES_BLOCK is what a general-purpose spawn gets by default: it shares the main checkout, so it must not commit.
+GP_RULES_BLOCK="$GP_RULES_HEAD
+4. Do not commit: you share the main checkout with other agents. Leave your changes uncommitted for the orchestrator.
+5. Run only the tests you touched, once, after all edits.
+6. Report concisely: what changed, test result line."
+# The variant for a spawn whose tool_input says isolation "worktree": it commits in a checkout of its own.
+GP_RULES_BLOCK_WORKTREE="$GP_RULES_HEAD
 4. Commit early and often in your worktree, unless told not to.
 5. Run only the tests you touched, once, after all edits.
 6. Report concisely: what changed, commit sha, test result line."
@@ -668,7 +680,8 @@ gp_rules_apply() {
   [ "${HMD_GP_RULES_OFF:-}" != "1" ] || return 0
   case "${SATYPE:-}" in general-purpose|'') ;; *) return 0 ;; esac
   printf '%s' "$1" | jq -c --arg m "$GP_RULES_MARKER" --arg b "$GP_RULES_BLOCK" \
-    'if (.prompt | type) == "string" and (.prompt | length) > 0 and ((.prompt | contains($m)) | not) then .prompt += ("\n\n" + $b) else empty end' 2>/dev/null || true
+    'if (.prompt | type) == "string" and (.prompt | length) > 0 and ((.prompt | contains($m)) | not) then .prompt += ("\n\n" + (if .isolation == "worktree" then $w else $b end)) else empty end' \
+    --arg w "$GP_RULES_BLOCK_WORKTREE" 2>/dev/null || true
 }
 # -- end general-purpose agent rules ---------------------------------------------
 
