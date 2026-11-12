@@ -78,6 +78,20 @@ docker run --rm -it heimdall-sandbox                # hmd is already on PATH
 - **It is not a macOS sandbox.** The image is Linux, so launchd and the keychain do not exist inside it and the nightly LaunchAgent step is skipped as `unsupported`. That is the container being a different OS — not a boundary defending your account. `launchctl` and the keychain are **account-scoped**: a fake `$HOME` relocates only the plist *file*, while `launchctl load` still registers the job in your real per-user session. A sandboxed test in this repo learned that the hard way, by rewriting the developer's live LaunchAgent. The switch is `HEIMDALL_NO_DREAM_SCHEDULE=1` — never `$HOME`.
 - **The network is open.** The build clones from GitHub, and presence is on by default. `docker run --network none` gives the container zero egress; `hmd presence sever` does the same at the application level.
 
+## Recommended skills and consent
+
+The skill registry (`skills.manifest.json`) is behind the flag `skills.registry`, default off (env `HMD_SKILLS_REGISTRY`). With it off, install behaves as before.
+
+- **Existing installs are grandfathered:** consent mode `auto`, today's behaviour, nothing new asked.
+- **New installs default to `ask`:** hmd shows the recommended skills with their source and the reason, once, and installs only what you choose. A non-interactive run (an agent, mid-task) installs nothing and records the skill as `suggested`. Modes: `ask`, `allowlist`, `auto`; set with `hmd skills consent [ask|allowlist|auto]` and `hmd skills allow <id>`.
+- `hmd skills suggest` lists recommended skills not installed and the ones this project's files trigger; it never installs. `--reset` forgets earlier declines.
+- `hmd skills install <id|--recommended>` is the consented path. Without a tty it exits 3 ("consent required") unless you pass `--yes`.
+- `hmd skills list` shows tier, state, source and pin; `hmd skills why <id>` shows why a skill is in the lock; `hmd skills lock [--verify]` rebuilds the lock from what is installed (`--verify` reports drift without writing).
+- Consent settings are per operator (`$HEIMDALL_HOME/skills-config.json` or env); a repository cannot set them.
+- Consent is cooperative for a raw `claude plugins install` typed by an agent: the Bash hook does not deny it. Agents are told to go through `hmd skills install`.
+
+Guardrails are tiered in `guardrails.manifest.json`. `hmd guardrails list|why|off|on` shows and records the choice; `core` guards cannot be turned off. `hmd guardrails off` records the choice now; the per-guard switches inside the Bash and Agent hooks are pending operator approval and land with it.
+
 ## Self-maintenance (auto-update + self-heal)
 
 hmd keeps itself and its host current, in the background, on session start — both are
