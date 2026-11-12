@@ -21,8 +21,8 @@
 # --json         emit structured JSON instead of the human report (requires jq)
 # --run-tests    run ONLY the test files implicated by the touched-file set (this
 #                repo's bin/X <-> test/X.test.sh naming convention) — NEVER the
-#                full suite. The full sweep (test/run-all.sh) is reserved for the
-#                landing commit only; see CLAUDE.md "When the full gate runs". A
+#                full suite. The full sweep (test/run-all.sh) is recommended to the
+#                developer at merge time, never run here; see CLAUDE.md "Sweep advice". A
 #                test file this branch never touched is never executed here.
 #
 # EXIT: 0 on a successful brief — even one reporting staleness or dirt, which is

@@ -186,6 +186,11 @@ esac
 #      pre-filter has matched and before its helper starts, so a command that reaches none of them pays nothing new. bin/lib/hmd_guardrail_enabled.sh is the one definition: only
 #      its exit 1 means off; a core id, an id the manifest does not know, a relative HEIMDALL_HOME, no lib, no manifest or no jq leaves the guard on. The kill guard, git-guard,
 #      the secret scans, the push gates, the oracle and the corpus have no switch. Proof: test/guardrail-off-bash.test.sh.
+#  10. SWEEP ADVICE (2026-11-12; operator: "full test runs should be recommended to devs along with explanation and token usage, and always suggested just before merge operations and not before"). A command that mentions merge, push or pull (and git or gh) is read by
+#      bin/lib/hmd_sweep_advice.py (its docstring has the rule): a merge of refs, a pull request merge, a pull on the default branch, a push to it. For one, the hook prints ONE line of hook JSON on stdout, LAST -- after every gate has let the command through, so a command a gate denies prints only its deny: systemMessage for the developer,
+#      hookSpecificOutput.additionalContext so the agent relays it, never a permissionDecision. It says why a full run is (or is not) worth it, the exact command, what it costs in time and tokens (labelled estimates) and that the call is the developer's. It never blocks and never speaks for any other command. While the advice is printed the parallelism tracker's own
+#      output goes to stderr, so stdout stays one JSON object. OPERATOR OVERRIDE: HMD_SWEEP_ADVICE=off (also 0, false, no), read from THIS hook's environment (an inline prefix reaches the command, not this hook); `hmd guardrails off sweep-advice` (a recommended row of guardrails.manifest.json) turns it off too, asked through gp_guard_on beside the override. FAILS OPEN: a helper
+#      that is missing (silent), crashes or times out, or a command it cannot read, is one stderr line at most. The pre-filter is two builtin `case`s (merge|push|pull, then git|gh); the one statement a matching command runs before python is `[ -r helper ]`, which test/heimdall-precheck-bash.test.sh's equiv() drops on purpose. Proof: test/sweep-advice.test.sh.
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
 
 INPUT=$(cat)
@@ -514,4 +519,33 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
     fi
   fi
 fi
-"$PLUGIN/bin/parallelism-tracker" check Bash 2>&1 || true
+# SWEEP ADVICE (delta 10 in the header above), LAST: it is advice for a command that is going ahead, so it is computed only now, after every gate above let the command through, and printed as the one JSON object on stdout (a deny prints only its own).
+# The outer `case` is the operator's switch, the next two are the pre-filter (builtins only: an ordinary command pays nothing else); `[ -r helper ]` comes before the guardrail switch so a plugin root with no helper (a fixture root, a partial copy) is silent. The
+# helper's exit status is the verdict: 3 = advice (its stdout is the JSON), 0 = nothing to say, 4 = could not tell and anything else = the helper failed: ONE stderr line and the command goes on -- a nudge fails OPEN. The tracker's output goes to stderr while advice is
+# printed, so it can never corrupt the JSON; with no advice the last line is exactly what it always was.
+GP_SA_JSON=
+case ${HMD_SWEEP_ADVICE:-} in
+  [Oo][Ff][Ff]|0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]) ;;
+  *)
+    case $CMD in
+      *merge*|*push*|*pull*)
+        case $CMD in
+          *git*|*gh*)
+            if [ -r "$PLUGIN/bin/lib/hmd_sweep_advice.py" ] && gp_guard_on sweep-advice; then
+              GP_SA_CWD=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
+              GP_SA_OUT=$(python3 -I -S "$PLUGIN/bin/lib/hmd_sweep_advice.py" "$GP_SA_CWD" <<<"$CMD" 2>/dev/null)
+              GP_SA_RC=$?
+              case $GP_SA_RC in
+                0) ;;
+                3) GP_SA_JSON=$GP_SA_OUT ;;
+                4) printf 'heimdall sweep advice: %s -- no merge-time advice for this command\n' "$GP_SA_OUT" >&2 ;;
+                *) printf 'heimdall sweep advice: the helper itself failed (exit %s) -- no merge-time advice for this command\n' "$GP_SA_RC" >&2 ;;
+              esac
+            fi ;;
+        esac ;;
+    esac ;;
+esac
+case $GP_SA_JSON in
+  '') "$PLUGIN/bin/parallelism-tracker" check Bash 2>&1 || true ;;
+  *) printf '%s\n' "$GP_SA_JSON"; "$PLUGIN/bin/parallelism-tracker" check Bash >&2 || true ;;
+esac

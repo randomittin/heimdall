@@ -12,8 +12,8 @@
 #
 # WHAT THIS DOES NOT REPLACE. The full local sweep (`bash test/run-all.sh`, every suite,
 # measured 30-75 minutes at --jobs 6 on an M-series mac) stays the authoritative
-# pre-landing gate — see CLAUDE.md "When the full gate runs — ONCE, immediately before the
-# landing commit". Running the full sweep here on every push would either make CI too slow
+# gate, recommended to the developer at merge time — see CLAUDE.md "Sweep advice" and "When the full gate runs — ONCE,
+# on the frozen tree". Running the full sweep here on every push would either make CI too slow
 # for anyone to wait for, or need a large parallel matrix this repo has no evidence it
 # needs yet. Instead this workflow runs a curated, principled SUBSET: the suites that
 # enforce the MECHANISMS the rest of the gate stack depends on. If one of these is broken,

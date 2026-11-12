@@ -15,7 +15,7 @@
 #        locked-core             a hook row is core exactly when its hook is locked (a locked hook marked recommended would be
 #                                switchable; a core row for an unlocked hook would be a promise `hmd hooks disable` breaks)
 #        core-floor              at least 8 core rows
-#        sub-guard-tiers         the nine cost and discipline guards inside the two precheck hooks are the ONLY non-hook rows
+#        sub-guard-tiers         the ten cost and discipline guards inside the two precheck hooks are the ONLY non-hook rows
 #                                that may be recommended (the table in drift.py below: the decisions of record), each stating
 #                                its override; every other row is core, because anything not positively classified is core.
 #                                The validator lets a guard inside a locked hook be recommended, so without this check a push
@@ -69,6 +69,7 @@ RECOMMENDED = {
     "disk-floor": "HMD_MIN_FREE_PCT=0",
     "sweep-guard": "HMD_SWEEP_ALLOW=1",
     "wait-guard": "HMD_WAIT_ALLOW=1",
+    "sweep-advice": "HMD_SWEEP_ADVICE=off",
     "parallelism-check-bash": None,
     "named-agent-notice": "HEIMDALL_ALLOW_NAMED_AGENT=1",
     "context-gate": "HMD_CTX_GATE_OFF=1",
