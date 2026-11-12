@@ -381,6 +381,8 @@ OUT="$(bash "$REC" record "$WORK/nodir/x.json" 2>&1)"; RC=$?
 [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'nodir' && ok "B: an output directory that does not exist is refused before any work (exit 1, names it)" || bad "B: missing output dir: rc=$RC: $OUT"
 
 # a throwaway tree: the recorder, a matrix, and exactly the legacy files the recorder runs. The recorder finds the legacy code relative to ITSELF.
+# That includes the consent gate the legacy functions now ask before every install (T5.1) and the settings tool the gate reads: the recorder
+# sources the first and pins HMD_SKILLS_CONSENT=auto, which is what "legacy" means to them.
 mktree() {  # mktree <dir> <matrix json>
   local d="$1"
   mkdir -p "$d/bin/lib" "$d/test/lib" "$d/test/fixtures/skills-baseline"
@@ -388,6 +390,8 @@ mktree() {  # mktree <dir> <matrix json>
   cp "$REPO/bin/skill-manager" "$d/bin/skill-manager"
   cp "$REPO/bin/discover-skills" "$d/bin/discover-skills"
   cp "$REPO/bin/lib/install-receipt.sh" "$d/bin/lib/install-receipt.sh"
+  cp "$REPO/bin/lib/skills_consent.sh" "$d/bin/lib/skills_consent.sh"
+  cp "$REPO/bin/lib/skills_config.py" "$d/bin/lib/skills_config.py"
   cp "$REPO/bin/lib/skill_restore.py" "$d/bin/lib/skill_restore.py"
   cp "$REPO/heimdall-skills.json" "$d/heimdall-skills.json"
   cp "$REPO/skills-registry.json" "$d/skills-registry.json"

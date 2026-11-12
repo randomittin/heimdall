@@ -120,6 +120,13 @@ trap 'chmod -R u+w "$TPLUG" 2>/dev/null || true; rm -rf "$TPLUG" "$FAKE_DIR" 2>/
 # Any scenario asserting FIRST-RUN behaviour must call this first.
 cold_install_state() { rm -f "$TPLUG/.setup-done"; }
 
+# CONSENT (T5.1): the launcher asks bin/lib/skills_consent.sh before every recommended
+# install, and a home with no setup marker is a NEW install (consent `ask`, which with no
+# terminal installs nothing). This suite proves the bootstrap that installs the companions
+# in ONE run, which is the legacy (grandfathered) behaviour: consent `auto`. So every
+# launch below pins HMD_SKILLS_CONSENT=auto; the consent libs reach $TPLUG with the rest of
+# bin/ (cp -R above). What a NEW install does instead is test/skills-consent-launcher.test.sh's.
+#
 # run_launcher MODE WORKDIR HEIMDALL_HOME STDOUT_CAPTURE PATH — drive the launcher's
 # first-run path UNAUTHENTICATED (no ANTHROPIC_API_KEY, a fresh empty HOME so
 # heimdall_is_authed is false). HEIMDALL_TRACE_ORDER short-circuits before the real
@@ -144,7 +151,7 @@ run_launcher() {
     cat > "$runner" <<RUN
 #!/usr/bin/env bash
 exec env -i HOME="$(dirname "$hh")" TERM="dumb" PATH="$path" \
-  HEIMDALL_HOME="$hh" HEIMDALL_NO_INTRO=1 HEIMDALL_NO_REUSE_METRIC=1 \
+  HEIMDALL_HOME="$hh" HEIMDALL_NO_INTRO=1 HEIMDALL_NO_REUSE_METRIC=1 HMD_SKILLS_CONSENT=auto \
   HEIMDALL_TRACE_ORDER="$trace" \
   bash -c "cd '$wd' && exec '$LAUNCHER' 'noop bootstrap probe'"
 RUN
@@ -153,7 +160,7 @@ RUN
     pid=$!
   else
     env -i HOME="$(dirname "$hh")" TERM="dumb" PATH="$path" \
-      HEIMDALL_HOME="$hh" HEIMDALL_NO_INTRO=1 HEIMDALL_NO_REUSE_METRIC=1 \
+      HEIMDALL_HOME="$hh" HEIMDALL_NO_INTRO=1 HEIMDALL_NO_REUSE_METRIC=1 HMD_SKILLS_CONSENT=auto \
       HEIMDALL_TRACE_ORDER="$trace" \
       bash -c "cd '$wd' && exec '$LAUNCHER' 'noop bootstrap probe'" \
       </dev/null >"$out" 2>&1 &

@@ -64,6 +64,11 @@ cp "$REPO/bin/heimdall-telemetry" "$PLUG/bin/heimdall-telemetry"
 cp "$REPO/bin/lib/telemetry.py"   "$PLUG/bin/lib/telemetry.py"
 cp "$REPO/bin/lib/issue_queue.py" "$PLUG/bin/lib/issue_queue.py"
 cp "$REPO/bin/lib/install-receipt.sh" "$PLUG/bin/lib/install-receipt.sh"
+# The consent gate every first-run install now asks (T5.1) and the settings tool it reads. Without them hmd_skills_consent is
+# "command not found", the gate answers no, and the `skills` step is never entered. This suite is about telemetry, so run_setup
+# pins consent to auto (the legacy, grandfathered behaviour that installs); what a NEW install does is test/skills-consent-launcher.test.sh's.
+cp "$REPO/bin/lib/skills_consent.sh" "$PLUG/bin/lib/skills_consent.sh"
+cp "$REPO/bin/lib/skills_config.py"  "$PLUG/bin/lib/skills_config.py"
 chmod +x "$PLUG/bin/heimdall" "$PLUG/bin/heimdall-telemetry"
 
 # ── A fake-binary dir: stand-ins for every command first_run_setup shells out to,
@@ -133,6 +138,7 @@ run_setup() {
   local home="$1"
   PATH="$FAKEBIN:/usr/bin:/bin" HOME="$WORK/fakehome" \
     ANTHROPIC_API_KEY="sk-test-not-a-real-key" \
+    HMD_SKILLS_CONSENT=auto \
     HEIMDALL_HOME="$home" \
     "$PY" "$PTY_RUNNER" "$PLUG/bin/heimdall" --setup </dev/null >/dev/null 2>&1
 }
