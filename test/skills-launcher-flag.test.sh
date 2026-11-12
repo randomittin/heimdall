@@ -159,6 +159,7 @@ NOTICE = "using the built-in skill selection"
 SNIPPET = r'''
 set -euo pipefail
 . "$REPO/bin/lib/install-receipt.sh"
+. "$REPO/bin/lib/skills_consent.sh"
 eval "$(sed -n "/^${FN}()/,/^}/p" "$REPO/bin/heimdall")"
 WORK_DIR="$PROJ"
 PLUGIN_DIR="$PLUGIN"

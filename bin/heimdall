@@ -66,6 +66,13 @@ if [ -f "$PLUGIN_DIR/bin/lib/install-receipt.sh" ]; then
   # shellcheck disable=SC1091
   . "$PLUGIN_DIR/bin/lib/install-receipt.sh" 2>/dev/null || true
 fi
+# The consent gate (3.x M1, T5.1): hmd_skills_consent <id> <via> answers 0 install / 10 defer / 11 declined, and every recommended
+# install below asks it first. Sourced best-effort like the helpers above, and a missing file is the same broken checkout: the
+# install it gates then fails with "command not found" on stderr, it never goes ahead without asking.
+if [ -f "$PLUGIN_DIR/bin/lib/skills_consent.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$PLUGIN_DIR/bin/lib/skills_consent.sh" 2>/dev/null || true
+fi
 
 # ── First-run completion marker (USER-writable, NEVER the install dir) ──
 #
@@ -129,6 +136,23 @@ _write_setup_marker() {
   # consumer that still probes the pre-migration path in sync with a completed
   # install; a failure here never aborts or re-triggers setup.
   touch "$SETUP_MARKER_LEGACY" 2>/dev/null || true
+}
+
+# hmd_skills_consent_init — decide ONCE what this install's consent mode is (3.x M1, T5.1: the grandfather rule).
+# bin/lib/skills_config.py init writes $HEIMDALL_HOME/skills-config.json only when it does not exist yet: the setup marker
+# present (an install that predates the consent model) -> consent auto, grandfathered, today's behaviour; absent (a new
+# install) -> consent ask. It runs at launcher start, ahead of every path that can install and before `--setup` removes the
+# marker, so an existing user is grandfathered on the first launch of this code whatever that launch is. Routed through the
+# ONE home creator (a teardown never writes), a file that is already there is a bash test and no python start, and a tree
+# without the tool does nothing. A failed write is the tool's own stderr line: the gate then reads the same rule in memory.
+hmd_skills_consent_init() {
+  local cfg="$HEIMDALL_HOME_DIR/skills-config.json" tool="$PLUGIN_DIR/bin/lib/skills_config.py" flag=--marker-absent
+  if [ -e "$cfg" ] || [ -L "$cfg" ] || [ ! -f "$tool" ]; then
+    return 0
+  fi
+  _heimdall_home_ensure || return 0
+  if [ -f "$SETUP_MARKER" ]; then flag=--marker-present; fi
+  python3 -I "$tool" init "$flag" || true
 }
 
 # MIGRATE a pre-existing legacy marker to the user home so an ALREADY-set-up
@@ -1264,8 +1288,23 @@ first_run_setup() {
   # unaffected — see bin/heimdall-caveman's own migration/divergence-warning logic
   # for how the two coexist. See CLAUDE.md "Token Efficiency".
 
+  # Consent (3.x M1, T5.1): superpowers and the heimdall marketplace are the first-run set, and none of it is installed unless
+  # hmd_skills_consent (bin/lib/skills_consent.sh) says so. ONE decision covers the set: asked lazily at the first item that is
+  # missing, keyed on the manifest id `superpowers` (the marketplace has no manifest entry, so no lock row of its own). A person
+  # at a terminal answers ONE menu (install now / not now / never ask again), a non-interactive run defers (a `suggested` lock
+  # row, one stderr line), an install that predates the consent model (consent auto) installs as before. The `claude` calls
+  # below are the legacy ones in the legacy order; the gate adds none. The WHY and BASIS variables are local, so the install
+  # helpers' lock rows read them and nothing outlives this function.
+  local _fr_go="" HMD_INSTALL_WHY_RULE=first-run HMD_INSTALL_WHY_EVIDENCE=setup-done HMD_SKILLS_CONSENT_BASIS=""
+  _first_run_consent() {
+    if [ -z "$_fr_go" ]; then
+      if hmd_skills_consent superpowers first-run; then _fr_go=0; else _fr_go=1; fi
+    fi
+    return "$_fr_go"
+  }
+
   # superpowers (brainstorming, debugging) — part of the `skills` step.
-  if ! claude plugins list 2>/dev/null | grep -q "superpowers"; then
+  if ! claude plugins list 2>/dev/null | grep -q "superpowers" && _first_run_consent; then
     echo "  + superpowers (brainstorming, debugging)"
     local _sp_t0 _sp_rc=0
     _sp_t0="$(_tele_now_ms)"
@@ -1289,7 +1328,7 @@ first_run_setup() {
   # install on update (opt out: HEIMDALL_KEEP_CLAUDE_MEM=1); see CLAUDE.md.
 
   # heimdall marketplace — part of the `skills` step (marketplace registration).
-  if ! claude plugins marketplace list 2>/dev/null | grep -q "heimdall-marketplace"; then
+  if ! claude plugins marketplace list 2>/dev/null | grep -q "heimdall-marketplace" && _first_run_consent; then
     echo "  + heimdall marketplace"
     local _mk_t0 _mk_rc=0
     _mk_t0="$(_tele_now_ms)"
@@ -1706,6 +1745,7 @@ esac
 if [ "$HMD_LIB_ONLY" = 0 ]; then
 
 hmd_bump_run_count || true
+hmd_skills_consent_init
 
 case "${1:-}" in
   version|--version|-v|-V)
@@ -4208,6 +4248,11 @@ $(head -50 "$ctx")
 
 preinstall_plugins() {
   [ $# -eq 0 ] && return 0
+  # Consent (3.x M1, T5.1): every install below asks hmd_skills_consent <id> prompt-preinstall first. An install that predates the
+  # consent model (consent auto) goes straight on, so its `claude` calls are the legacy ones; any other answer installs nothing
+  # and the gate records a `suggested` row. The WHY and BASIS variables are local to this call: the install helper's lock row reads
+  # them, nothing outlives it. The trigger is named (prompt-keyword, project-file below), not quoted: the lock never holds prompt text.
+  local HMD_INSTALL_WHY_RULE=prompt-keyword HMD_INSTALL_WHY_EVIDENCE="" HMD_SKILLS_CONSENT_BASIS=""
   prompt_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
   installed=$(claude plugins list 2>/dev/null || echo "")
 
@@ -4224,6 +4269,7 @@ preinstall_plugins() {
       while IFS= read -r -u 3 ref; do
         [ -n "$ref" ] || continue
         echo "$installed" | grep -q "${ref%@*}" && continue
+        hmd_skills_consent "${ref%@*}" prompt-preinstall || continue
         printf "  \033[38;2;0;212;255m▸ Installing %s\033[0m\n" "${ref%@*}"
         hmd_install_known_plugin "${ref%@*}" "${ref##*@}" prompt-preinstall || true
       done 3<<< "$refs"
@@ -4235,6 +4281,7 @@ preinstall_plugins() {
 
   _try_install() {
     echo "$installed" | grep -q "$1" && return 0
+    hmd_skills_consent "$1" prompt-preinstall || return 0
     printf "  \033[38;2;0;212;255m▸ Installing %s\033[0m\n" "$1"
     # claude-plugins-official, named explicitly (a bare name used to resolve across EVERY registered
     # marketplace). Receipted; a failure is reported on stderr by the helper and the launch goes on
@@ -4253,6 +4300,7 @@ preinstall_plugins() {
   echo "$prompt_lower" | grep -qE 'mcp|tool.?server|model.?context' && _try_install "mcp-server-dev"
 
   # From project files (if they exist)
+  HMD_INSTALL_WHY_RULE=project-file
   [ -f "$WORK_DIR/package.json" ] && grep -q "react\|vue\|angular\|svelte" "$WORK_DIR/package.json" 2>/dev/null && _try_install "frontend-design"
   [ -f "$WORK_DIR/Dockerfile" ] || [ -f "$WORK_DIR/docker-compose.yml" ] && _try_install "devops-toolkit"
   [ -f "$WORK_DIR/prisma/schema.prisma" ] || [ -f "$WORK_DIR/ormconfig.json" ] && _try_install "database-toolkit"
@@ -4269,6 +4317,9 @@ discover_skills() {
   # Auto-install skills from registry based on task prompt keywords
   [ $# -eq 0 ] && return 0
   local prompt_lower skills_dir registry
+  # Consent (3.x M1, T5.1): every clone below asks hmd_skills_consent <name> discover_skills first (see preinstall_plugins). The loops read
+  # their list on fd 3, so the gate's menu, when a person is at a terminal, still reads the launcher's own stdin.
+  local HMD_INSTALL_WHY_RULE=prompt-keyword HMD_INSTALL_WHY_EVIDENCE="" HMD_SKILLS_CONSENT_BASIS=""
   prompt_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
   skills_dir="$HOME/.claude/skills"
   registry="$PLUGIN_DIR/skills-registry.json"
@@ -4281,13 +4332,14 @@ discover_skills() {
     local resolved rc=0
     resolved=$(printf '%s' "$prompt_lower" | python3 -I "$PLUGIN_DIR/bin/lib/skills_resolver.py" keyword-match --manifest "$PLUGIN_DIR/skills.manifest.json" --prompt-file /dev/stdin) || rc=$?
     if [ "$rc" -eq 0 ]; then
-      while IFS='|' read -r name repo; do
+      while IFS='|' read -r -u 3 name repo; do
         [ -n "$name" ] || continue
         [ -d "$skills_dir/$name" ] && continue  # already installed
+        hmd_skills_consent "$name" discover_skills || continue
         printf "  \033[38;2;0;212;255m▸ Installing skill: %s\033[0m (%s)\n" "$name" "$repo"
         mkdir -p "$skills_dir"
         hmd_skill_install "$name" "$repo" "$skills_dir/$name" discover_skills || true
-      done <<< "$resolved"
+      done 3<<< "$resolved"
       return 0
     fi
     printf 'hmd: skills registry is on but the resolver exited %s; using the built-in skill selection\n' "$rc" >&2
@@ -4318,16 +4370,17 @@ for skill in reg.get("skills", []):
 
   [ -z "$matches" ] && return 0
 
-  while IFS='|' read -r name repo; do
+  while IFS='|' read -r -u 3 name repo; do
     local skill_path="$skills_dir/$name"
     if [ -d "$skill_path" ]; then
       continue  # already installed
     fi
+    hmd_skills_consent "$name" discover_skills || continue
     printf "  \033[38;2;0;212;255m▸ Installing skill: %s\033[0m (%s)\n" "$name" "$repo"
     mkdir -p "$skills_dir"
     # Receipted; a failed clone is reported on stderr by the helper and the launch goes on without the skill.
     hmd_skill_install "$name" "$repo" "$skill_path" discover_skills || true
-  done <<< "$matches"
+  done 3<<< "$matches"
 }
 
 # ── First-run setup phase (ORDERED, gated, completes BEFORE first launch) ──
@@ -4995,7 +5048,7 @@ DURING work: when you encounter ANY of these signals, STOP and check for missing
 - Building diagrams/architecture docs → need mermaid skill?
 - Task quality would benefit from a specialized skill you don't have → search for it
 HOW TO CHECK: Run \`ls ~/.claude/skills/\` to see installed skills. Run \`$PLUGIN_DIR/bin/discover-skills search \"<domain>\"\` to find new ones. Run \`$PLUGIN_DIR/bin/discover-skills install <name-or-repo>\` to install.
-ALSO install plugins, only from the listed marketplace: Read React/Vue/CSS → \`claude plugins install frontend-design@claude-plugins-official\`. Read Dockerfile/k8s → \`claude plugins install devops-toolkit@claude-plugins-official\`. Read SQL/ORM → \`claude plugins install database-toolkit@claude-plugins-official\`. If an install fails say \"install failed, continuing without <name>\" and go on — never retry through another marketplace, never pass --yes.
+ALSO install plugins through hmd, never with a raw \`claude plugins install\`: Read React/Vue/CSS → \`hmd skills install frontend-design\`. Read Dockerfile/k8s → \`hmd skills install devops-toolkit\`. Read SQL/ORM → \`hmd skills install database-toolkit\`. Exit code 3 (\"consent required\") means the user has not agreed to that install: ask them, and run it again with \`--yes\` only after they say yes. If an install fails say \"install failed, continuing without <name>\" and go on — never retry through another marketplace.
 NEVER proceed with suboptimal output when a skill exists that could improve quality. Finding and installing the right skill mid-session is ALWAYS worth the 10-second cost.
 INVOKING SKILLS: Git-installed skills (in ~/.claude/skills/) appear in the Skill tool list by their name (NOT namespaced). Use \`Skill(ui-ux-pro-max)\` not \`Skill(superpowers:ui-ux-pro-max)\`. If a skill isn't in the list, check if it has SKILL.md — if not, read its CLAUDE.md directly via Read tool.
 
