@@ -53,13 +53,18 @@ heimdall-s6-manifest	2027-02-08	BY DESIGN — the S-6 C3 breadth-sweep manifest 
 heimdall-s6-sweep	2027-02-08	BY DESIGN — the S-6 C3 breadth-sweep runner: pinned-sha clone, soft-budget-gated real token spend, working-output verification, an unattended-sweep guard requiring --confirm-full for a full paid run. Same reusable-harness story as heimdall-s6-manifest above: the one completed study is archived, the harness itself is what a human re-runs for the next one. 25/25 test/s6-sweep.test.sh.
 #
 # ── KNOWN GAP ────────────────────────────────────────────────────────────────────
-heimdall-board	2026-11-08	KNOWN GAP — a read-only view whose siblings (watch/dashboard/verdict/badge/clip) all have hmd case arms; this one has none
-heimdall-queue-mcp	2026-11-08	KNOWN GAP — MCP stdio server NOT registered in .mcp.json, while its sibling heimdall-ledger-mcp is
-heimdall-registry-hygiene	2026-11-08	KNOWN GAP — self-described MONTHLY job with no in-repo scheduler (no cron, LaunchAgent or workflow calls it)
-heimdall-ast	2026-11-08	KNOWN GAP — thin CLI over the tree-sitter AST substrate (symbols/refs extraction); tested (test/treesitter-ast.test.sh drives it directly) and named in docs/analysis/token-efficiency-field-review.md as a built capability agent orientation should read through instead of whole-file Reads, but no agent prompt or dispatch path invokes it yet.
-heimdall-checkpoint-share	2026-11-08	KNOWN GAP — Shared Team Checkpoints (TEAM MODE P4) CLI: publish/read/roster/precheck/resume; no live entry point invokes it, and evals/oracles/team-checkpoint/COVERAGE.md cites a test/heimdall-checkpoint-share.test.sh that does not exist in this repo (verified via `git ls-files`). Team-mode plumbing awaiting its trigger.
-heimdall-md	2026-11-08	KNOWN GAP — document-to-markdown converter "for context building" (own header); tested (test/markitdown.test.sh), degrades cleanly when markitdown is absent, but nothing in the live graph calls it yet.
-heimdall-watch	2026-11-08	KNOWN GAP — H-3 sentinel watch-mode: runs sanity/security/doc-sync sentinels on human commits via heimdall-spawn. Its own header states the intended wiring explicitly ("wire it as a pre-push hook to make security blocking") and that hook was never added. Not an accidental naming collision — bin/heimdall's watch) arm execs heimdall-watch-tui on purpose (bin/heimdall:2275), and bin/heimdall:2270, bin/heimdall-drain:3 and bin/heimdall-watch-tui:4 each separately document the two are distinct tools.
+# TRIAGED 2026-11-12 — all seven rows that sat here had expired 2026-11-08; operator
+# decision: wire or delete, never re-date. WIRED (rows removed — a row for a
+# now-reachable name is itself STALE): heimdall-board = `hmd board`, heimdall-ast =
+# `hmd ast`, heimdall-md = `hmd md`, heimdall-checkpoint-share = `hmd checkpoint-share`,
+# heimdall-registry-hygiene = `hmd registry-hygiene`, heimdall-queue-mcp = `hmd queue mcp`
+# (a verb of the existing queue arm, like `drain`). DELETED: heimdall-watch (see the
+# 2026-08-22 section below). heimdall-queue-mcp is deliberately NOT in .mcp.json: a
+# registration there makes it and heimdall-queue LIVE (138 -> 140 of the scanned bins,
+# 61% once the two deleted bins leave the denominator), past the 60% anti-vacuity
+# ceiling (reach_vacuity_ceiling), and it would hand every plugin session a tool that
+# queues prompts for the autonomous drainer; `hmd queue mcp` is an explicit opt-in.
+#
 #
 heimdall-portable-brief	2026-11-26	KNOWN GAP — turns .planning/CHECKPOINT.md into a scrubbed, size-bounded brief for a fallback (possibly non-Claude) model; its own header names the natural caller as the fallback routing layer (bin/lib/issue_loop.py), not yet wired there. Deliberately NOT wired into bin/heimdall-fallback itself instead: heimdall-fallback is a state/config/safety-gate only (no transport, no brief composition), and this tool's own header insists compose and transmit stay structurally separate ("NEVER TRANSMITS ANYTHING ITSELF") so a composer bug can never exfiltrate — pairing it with a gate that has no reason to compose a brief would be a decorative caller, not genuine integration. heimdall-529-scan, shipped the same day, was tracked in its own DEAD row (recheck 2026-09-27) until 2026-10-01, when an `hmd 529-scan` dispatcher arm made it genuinely reachable and that row was removed (see the 2026-08-28 audit section below): the transitive reachability claimed here via bin/heimdall-session-usage's docstrings (bin/heimdall-session-usage:76,84,178,196,216,486) did not survive the 2026-08-28 python-docstring-stripping fix to bin/lib/reachability.sh — those six citations are prose design-parity commentary ("mirrors", "same contract as", "see ... for the full rationale"), never an invocation, so this was itself an instance of the prose-as-edge bug that fix closes, not an honest side effect.
 # ── DEAD — the 2026-08-08 transitive-liveness finding, awaiting triage ───────────
@@ -88,10 +93,10 @@ heimdall-portable-brief	2026-11-26	KNOWN GAP — turns .planning/CHECKPOINT.md i
 # ── DEAD — the 2026-08-22 comment-stripping + dispatcher-hop-ceiling audit ───────
 # Found after bin/lib/reachability.sh stopped counting comment-only mentions as
 # invocation edges and stopped crediting bin/heimdall's dispatch table with LIVE
-# status for hops it merely selects at runtime. heimdall-spawn below is a
-# two-corpse chain: its only real (non-comment) caller is itself unreachable,
-# recorded above as a KNOWN GAP rather than DEAD because ITS OWN header states a
-# concrete integration plan; the chain's tail here has none of its own.
+# status for hops it merely selects at runtime. heimdall-spawn was a
+# two-corpse chain: its only real (non-comment) caller, heimdall-watch, was itself
+# unreachable (a KNOWN GAP rather than DEAD because ITS OWN header named a concrete
+# integration plan); the chain's tail had none of its own.
 #
 # heimdall-queue was a second instance of the same shape, listed here alongside
 # heimdall-spawn, until 2026-08-23: the `hmd queue` dispatcher arm gave
@@ -101,7 +106,17 @@ heimdall-portable-brief	2026-11-26	KNOWN GAP — turns .planning/CHECKPOINT.md i
 # assumed from the commit message alone). That row, heimdall-drain's KNOWN GAP row
 # above, and the two heimdall-issue-* KNOWN GAP rows above (independently made
 # REACHABLE the same day via the new commands/maintain-check.md) are gone.
-heimdall-spawn	2026-10-23	DEAD — Background Spawn Framework orchestrator (spec H-3); its one real (non-comment) caller is bin/heimdall-watch (recorded above as KNOWN GAP — see that row for its own stated integration plan), which nothing yet triggers. RE-VERIFIED 2026-09-23 on this row's own recheck-by expiry (2026-09-21): the same-day merge landing bin/heimdall-app, bin/heimdall-relay-client, bin/heimdall-inbox-deliver and the new `app`/`inbox` dispatch arms touches neither heimdall-watch nor heimdall-spawn (checked via `heimdall-deadcode --why heimdall-spawn` / `--why heimdall-watch`, and by grepping both names across bin/ hooks/ .github/ commands/ agents/ skills/) — same two-corpse chain, still genuinely dead.
+#
+# TRIAGED 2026-11-12, on this chain's second recheck-by expiry (heimdall-spawn
+# 2026-10-23, heimdall-watch 2026-11-08) — operator decision: wire or delete, never
+# re-date. DELETED, both: heimdall-watch's whole body is a loop that hands each
+# sentinel to heimdall-spawn (it exits 2 at startup without it), it had no test and
+# no trigger, and the pre-push hook its own header asked for never landed in three
+# months; heimdall-spawn had no other caller. Gone with them: sentinels/lib/brief.sh
+# (the brief hydrator only spawn sourced — bin/heimdall-brief over bin/lib/brief-core.sh
+# is the one assembler now) and the spawn cases of test/brief-fail-closed.test.sh.
+# Kept: the standalone sentinels/*.sh scripts, each with its own CLI and report path.
+# Checked with `heimdall-deadcode --why` first, per this file's re-verify rule above.
 #
 # ── DEAD — the 2026-08-28 python-docstring-stripping audit ──────────────────────
 # Found after bin/lib/reachability.sh learned to stop tokenizing the CONTENT of a

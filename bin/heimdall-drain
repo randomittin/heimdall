@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # heimdall-drain — the LOCAL work-queue drainer (the `watch` loop for the local
-# continuous-intake queue). NOTE ON NAMING: `bin/heimdall-watch` is already taken
-# by the H-3 sentinel watch-mode feature (run sentinels on human commits), so this
-# distinct drainer is `heimdall-drain` to avoid clobbering that tool.
+# continuous-intake queue). NOTE ON NAMING: `bin/heimdall-watch` was once taken by
+# the H-3 sentinel watch-mode feature (retired 2026-11-12), which is why this drainer
+# is `heimdall-drain` rather than a second `watch`.
 #
 # It REUSES the merged pieces; it does NOT reimplement them:
 #   backpressure  bin/agent-pool wait     (block until a concurrency slot is free)

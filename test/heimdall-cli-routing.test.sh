@@ -548,6 +548,79 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 7l. The reachability-triage arms: `hmd board|ast|md|checkpoint-share|
+#     registry-hygiene` and `hmd queue mcp`. Each bin was reachable from NO live
+#     entry point (their bin/lib/reachability-exemptions.tsv rows expired
+#     2026-11-08 and the 2026-11-12 triage wired them rather than re-date them),
+#     and install.sh puts only `hmd`/`heimdall` on PATH, so an installed operator
+#     could not run any of them: `hmd board --plain` fell through to the
+#     goal-driven task prompt (a real `claude -p` spawn). Per arm: routes to its
+#     bin, forwards args verbatim, never reaches the Claude fall-through, and a
+#     missing target is a plain exit-1 error. `queue mcp` is a verb of the
+#     existing `queue` arm: it reaches the MCP server with `mcp` consumed, while
+#     every other queue verb still reaches heimdall-queue.
+# ══════════════════════════════════════════════════════════════════════════════
+while IFS='|' read -r arm_words arm_bin arm_args; do
+  make_stub "$arm_bin"
+
+  reset
+  # shellcheck disable=SC2086  # arm_words / arm_args are deliberately word-split
+  run_hmd $arm_words $arm_args </dev/null
+
+  if grep -qxF "$arm_bin ARGS: $arm_args" "$STUB_OUT" 2>/dev/null; then
+    ok "hmd $arm_words routes to $arm_bin and forwards args verbatim ($arm_args)"
+  else
+    bad "hmd $arm_words routes to $arm_bin and forwards args verbatim ($arm_args)"
+    cat "$STUB_OUT" >&2
+  fi
+
+  if ! claude_reached; then
+    ok "hmd $arm_words does NOT fall through to Claude"
+  else
+    bad "hmd $arm_words MUST NOT reach the Claude fall-through"
+  fi
+
+  # Target missing: a plain error and a non-zero exit — never the Claude fall-through.
+  reset
+  rm -f "$FAKE_BIN/$arm_bin"
+  # shellcheck disable=SC2086
+  ERR="$(hmd_capture $arm_words $arm_args 2>&1 >/dev/null </dev/null)"; RC=$?
+
+  if [ "$RC" -eq 1 ] && printf '%s' "$ERR" | grep -q "$arm_bin not found"; then
+    ok "hmd $arm_words with the target missing exits 1 with a not-found error"
+  else
+    bad "hmd $arm_words with the target missing exits 1 with a not-found error (rc=$RC err='$ERR')"
+  fi
+
+  if ! claude_reached; then
+    ok "hmd $arm_words with the target missing does NOT fall through to Claude"
+  else
+    bad "hmd $arm_words with the target missing MUST NOT reach the Claude fall-through"
+  fi
+done <<'ARMS'
+board|heimdall-board|--leaderboard --plain
+ast|heimdall-ast|symbols some/file.py --lang py
+md|heimdall-md|report.pdf -o out.md
+checkpoint-share|heimdall-checkpoint-share|precheck src/a.py src/b.py
+registry-hygiene|heimdall-registry-hygiene|--max-idle-days 30 --json
+queue mcp|heimdall-queue-mcp|--verbose
+ARMS
+
+# The carve-out must not swallow the queue's own verbs: they still reach heimdall-queue.
+make_stub heimdall-queue
+make_stub heimdall-queue-mcp
+reset
+run_hmd queue list --json </dev/null
+
+if grep -qxF 'heimdall-queue ARGS: list --json' "$STUB_OUT" 2>/dev/null \
+   && ! grep -q 'heimdall-queue-mcp ARGS' "$STUB_OUT" 2>/dev/null; then
+  ok "hmd queue list still routes to heimdall-queue, not the MCP server"
+else
+  bad "hmd queue list still routes to heimdall-queue, not the MCP server"
+  cat "$STUB_OUT" >&2
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 8. FALSIFIER — a task prompt falls through to Claude launch path
 #    A routed name must NOT reach fall-through; a multi-word prompt MUST. (A lone
 #    unknown word is not a prompt at all — 8a.)

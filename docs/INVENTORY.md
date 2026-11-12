@@ -296,7 +296,7 @@ Default posture is **network-on**: presence beats to the public control plane fr
 | Demo | `bin/heimdall-demo` (`hmd demo [--run]`) | dry by default; first-run narrated wake-up + a planted credential caught by the real `bin/secret-scan` (deny → fix → pass) |
 | Companion UI | `bin/heimdall-ui` (`hmd ui`) | loopback read-only web view (section 13) |
 | Companion app | `bin/heimdall-app` (`hmd app connect/status/disconnect/doctor`) | publishes `hmd ui` over Tailscale Funnel for the phone companion app (section 13) |
-| Watch TUI | `bin/heimdall-watch-tui` (`hmd watch`), `bin/heimdall-watch` | live dashboard; sentinels on human commits |
+| Watch TUI | `bin/heimdall-watch-tui` (`hmd watch`) | live dashboard |
 | Sentinels (spec H-3) | `sentinels/bloat.sh`, `doc-sync.sh`, `sanity.sh`, `security.sh`, `spec-drift.sh` | harness sentinels run per wave / pre-push |
 | Summary card | `bin/summary-card` | end-of-run card |
 
@@ -320,7 +320,6 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-init` | install the universal git core (Layer 0) in any repo |
 | `heimdall-hooks-link` | make a linked worktree's relative `core.hooksPath` resolve |
 | `session-fork` | spawn parallel Claude sessions for independent sub-tasks |
-| `heimdall-spawn` | Background Spawn Framework orchestrator (spec H-3) |
 | `agent-pool` | auto-scaling agent pool manager |
 | `decompose` | break tasks into dependency-ordered parallel sub-tasks |
 
@@ -405,11 +404,11 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-protocol` | umbrella for Token-Frugal Protocol v2 (H-4) |
 | `heimdall-validate` / `heimdall-resolve` / `heimdall-capsule` / `heimdall-brief` / `heimdall-ledger` | mechanisms 1–6: typed-message validator, symbol resolver, context capsules, delta-brief builder, token ledger |
 | `heimdall-task-result` | H-4 return path: an agent's finding becomes a capsule |
-| `heimdall-graph` / `heimdall-ast` | symbol-graph navigation; tree-sitter AST substrate |
+| `heimdall-graph` / `heimdall-ast` | symbol-graph navigation; tree-sitter AST substrate (`hmd ast`) |
 | `heimdall-comprehend` | SI-1 project-context comprehension capsule + orientation cache |
 | `heimdall-branch-context` | SI-3 git-backed branch-context reader |
 | `heimdall-memory` / `heimdall-vm-bench` | Verified-Memory CLI; its benchmark |
-| `heimdall-md` / `heimdall-web` | document → markdown converter; dependency-light web fetch/crawl |
+| `heimdall-md` / `heimdall-web` | document → markdown converter (`hmd md`); dependency-light web fetch/crawl |
 | `heimdall-tokens` / `heimdall-cost-forensics` | model-token accounting meter; portable token/cost forensics |
 | `heimdall-caveman` / `-block` / `-compliance` / `-eval` | output-compression level owner (ultra-only); system-prompt block; filler-density audit; multi-arm eval |
 | `heimdall-tier` / `heimdall-model-resolve` | declare/enforce/report model tier; tier → `--model` |
@@ -433,8 +432,8 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-presence` / `heimdall-presence-doctor` | server-synced presence client; self-healing autoenroll |
 | `heimdall-haid` / `heimdall-who` / `heimdall-identity` | Heimdall Agent Identifier registry; per-agent view; watchman identity/sigil seed |
 | `heimdall-claim` / `heimdall-ledger-mcp` | collision-prevention claims; MCP interop server |
-| `heimdall-activity` / `heimdall-collision` / `heimdall-task` / `heimdall-gate-surface` / `heimdall-checkpoint-share` | TEAM MODE P1–P4: activity record, same-target collision, task record, shared gate surface, shared checkpoints |
-| `heimdall-board` / `heimdall-seed-demo-wall` | live team wall; seed bot identities into a public demo team |
+| `heimdall-activity` / `heimdall-collision` / `heimdall-task` / `heimdall-gate-surface` / `heimdall-checkpoint-share` | TEAM MODE P1–P4: activity record, same-target collision, task record, shared gate surface, shared checkpoints (`hmd checkpoint-share`) |
+| `heimdall-board` / `heimdall-seed-demo-wall` | live team wall (`hmd board`); seed bot identities into a public demo team |
 | `heimdall-control-plane` / `heimdall-connect` / `heimdall-cp-inspect` / `heimdall-god` | thin CP CLI; lazy secret-safe credential connect; read-only Firestore inspector; owner-only god mode |
 | `heimdall-dashboard` | local side of device-flow dashboard login |
 | `heimdall-gh-app-token` | short-lived GitHub App installation token |
@@ -443,14 +442,14 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-funnel` | launch-funnel control + emit CLI |
 | `heimdall-telemetry` / `heimdall-telemetry-corpus` / `heimdall-holdout` / `heimdall-report` / `heimdall-metric` / `heimdall-metric-hook` / `heimdall-metric-compliance` | local telemetry surface; pre-merge corpus; A/B holdout; aggregate report; task-outcome emitter; SubagentStop bridge; read-back compliance |
 | `heimdall-issue-config` / `-corpus` / `-loop` / `-pr` / `-queue` | issue-resolution loop pieces: credentials, anonymized collection, state machine, PR + human-approval gate, queue |
-| `heimdall-cost-report` / `heimdall-cost-model-refresh` / `heimdall-registry-hygiene` | daily cost job + brake chain; weekly unit-cost re-validation; monthly registry TTL eviction |
-| `heimdall-queue` / `heimdall-queue-mcp` / `heimdall-drain` | local continuous-intake work queue; MCP server; drainer |
+| `heimdall-cost-report` / `heimdall-cost-model-refresh` / `heimdall-registry-hygiene` | daily cost job + brake chain; weekly unit-cost re-validation; monthly registry TTL eviction (`hmd registry-hygiene`, dry run unless `--apply`) |
+| `heimdall-queue` / `heimdall-queue-mcp` / `heimdall-drain` | local continuous-intake work queue; MCP server (`hmd queue mcp`); drainer (`hmd queue drain`) |
 | `heimdall-maintain-loop` | durable maintainer autopilot loop |
 | `heimdall-dream` / `-runner` / `-schedule` / `-notice` / `-permission` / `-bundle` | overnight autoresearch + maintainer sweep; launchd entry; nightly schedule; failure notice; permission ask; code-signing identity |
 | `heimdall-self-improve` | deliberate self-improvement loop |
 | `heimdall-rules` | V7: cluster corpus DENIES into candidate rules |
 | `heimdall-s6-manifest` / `heimdall-s6-sweep` | S-6 popular-10 cold generalization sweep |
-| `heimdall-watch` / `heimdall-watch-tui` | sentinels on human commits; TUI dashboard |
+| `heimdall-watch-tui` | TUI dashboard (`hmd watch`) |
 | `heimdall-feedback` / `report-issue` | team feedback issue; plugin bug report |
 
 ### HUD, identity, share units

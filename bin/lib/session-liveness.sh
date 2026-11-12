@@ -16,9 +16,9 @@
 #
 # Both questions are the SAME question, and a second copy of the answer would be
 # free to drift from the first. PROTOCOL.md already names this pattern as the
-# house fix (bin/lib/brief-core.sh, shared by bin/heimdall-brief and
-# sentinels/lib/brief.sh, "so the two entry points cannot drift into disagreeing
-# about what counts as resolved"). This is that, for liveness.
+# house fix (bin/lib/brief-core.sh, the one core every brief assembler shares — there
+# used to be two, now bin/heimdall-brief alone — "so a second entry point cannot drift
+# into disagreeing about what counts as resolved"). This is that, for liveness.
 #
 # EVIDENCE ORDER MATTERS — and it is not the obvious one.
 # MEASURED 2026-08-03 (recorded in the bin/heimdall-agents header): `pgrep -x

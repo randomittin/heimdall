@@ -16,20 +16,24 @@
 # bin/heimdall-dream-permission reading a completed run as a granted one —
 # completion is not evidence of success, and degradation is not resolution.
 #
+# 2026-11-12: bin/heimdall-spawn (and its only caller bin/heimdall-watch) and the
+# second assembler were DELETED in the reachability triage, so the two-assembler
+# drift this file used to guard can no longer happen; the cases that drove the spawn
+# path (a1-a3 and b7) went with it. What stays is the one assembler's failure
+# semantics, which every future entry point must keep, plus the structural check
+# that it still takes them from the shared core.
+#
 # The second assembler also read capsules from $root/capsules/ while
 # bin/heimdall-capsule writes $PLANNING_DIR/protocol/capsules/. A store nothing
 # ever writes to is empty forever and looks fine.
 #
-# COVERED — Hole 1 (unified assembler):
-#   (a1) the spawn path REFUSES an unresolvable capsule ref instead of skipping
-#   (a2) a refused brief means the sentinel never runs and writes no report
-#   (a3) both entry points return the SAME verdict on the SAME ref (drift guard)
+# COVERED — Hole 1 (one assembler, one failure semantics):
 #   (a4) capsules resolve from the CANONICAL store (bin/lib/protocol.sh's
 #        CAPSULE_DIR); the old $root/capsules/ path is no longer consulted
 #   (a5) EMPTY store (legitimate, exit 0/1) is distinguishable from UNREACHABLE
 #        store (NON_VERIFIED, exit 3) — an unreachable verifier is never OPEN
-#   (a6) STRUCTURAL: both assemblers source the one shared resolution+refusal
-#        core, so their failure behaviour cannot fork again
+#   (a6) STRUCTURAL: the assembler sources the one shared resolution+refusal
+#        core, so its failure behaviour cannot fork again
 #
 # COVERED — Hole 2 (invariants ref validated, not echoed):
 #   (b1) a ref whose file AND anchor resolve is reported as verified, exit 0
@@ -40,23 +44,20 @@
 #   (b6) the anchor resolver can go dark: the same anchor passes, then the
 #        heading is removed and it fails. A checker that always says yes is not
 #        a check.
-#   (b7) the spawn path validates context.invariants with the same semantics
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BRIEF="$ROOT/bin/heimdall-brief"
-SPAWN="$ROOT/bin/heimdall-spawn"
 CAPSULE="$ROOT/bin/heimdall-capsule"
 CORE="$ROOT/bin/lib/brief-core.sh"
-HYDRATOR="$ROOT/sentinels/lib/brief.sh"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
 bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 
 command -v jq >/dev/null 2>&1 || { echo "FATAL: jq required" >&2; exit 2; }
-for f in "$BRIEF" "$SPAWN" "$CAPSULE"; do
+for f in "$BRIEF" "$CAPSULE"; do
   [ -x "$f" ] || { echo "FATAL: $f not executable" >&2; exit 2; }
 done
 
@@ -103,91 +104,15 @@ run_brief() {
   set -e
 }
 
-# The spawn entry point. Writes a spawn json carrying the given context object.
-SJ="$WORK/spawn.json"
-spawn_json() { # spawn_json <context-json>
-  jq -n --argjson ctx "$1" \
-    '{haid:"haid:test", kind:"sanity", trigger:"watch", context:$ctx,
-      budget_tokens:100, timeout_min:1, lane:"background"}' > "$SJ"
-}
-run_spawn_brief() {
-  set +e
-  OUT="$(perl -e 'alarm 60; exec @ARGV' bash "$SPAWN" brief "$SJ" --repo "$REPO" 2>&1)"
-  RC=$?
-  set -e
-}
-
 echo "── Hole 1: one assembler, one failure semantics ──"
-
-# ── (a1) the spawn path REFUSES an unresolvable capsule ref ──────────────────
-spawn_json '{"capsules":["no_such_capsule"]}'
-run_spawn_brief
-if [ "$RC" -eq 1 ] && grep -q "INCOMPLETE" <<<"$OUT"; then
-  ok "(a1) spawn brief REFUSES a missing capsule (exit 1, says INCOMPLETE)"
-else
-  bad "(a1) spawn brief degraded instead of refusing (rc=$RC, want 1)"
-  printf '%s\n' "$OUT" | sed 's/^/      /'
-fi
-if grep -qi "skipped" <<<"$OUT"; then
-  bad "(a1) the brief still says 'skipped' — silent degradation survives"
-else
-  ok "(a1) no 'skipped' degradation marker — the ref is refused, not glossed"
-fi
-
-# ── (a2) a refused brief means the sentinel never runs ───────────────────────
-rm -rf "$REPO/.planning/spawns/reports"
-set +e
-ROUT="$(perl -e 'alarm 120; exec @ARGV' bash "$SPAWN" run "$SJ" --repo "$REPO" 2>&1)"
-RRC=$?
-set -e
-if [ "$RRC" -ne 0 ] && grep -q "INCOMPLETE" <<<"$ROUT"; then
-  ok "(a2) spawn run aborts on an incomplete brief, naming it (rc=$RRC)"
-else
-  bad "(a2) spawn run proceeded on an incomplete brief (rc=$RRC)"
-  printf '%s\n' "$ROUT" | sed 's/^/      /'
-fi
-# PROOF THE SENTINEL NEVER RAN, not merely that it left nothing behind. $REPO is
-# deliberately not a git repo, so sentinels/sanity.sh — the kind this spawn
-# dispatches — announces "not a git repo" as its FIRST act. Before the fix that
-# string was present: the brief degraded and the sentinel ran anyway. Its
-# absence is the dispatch never happening, which "no report file" alone cannot
-# distinguish from "ran and crashed early".
-if grep -q "not a git repo" <<<"$ROUT"; then
-  bad "(a2) the sentinel WAS dispatched on a thin brief (it reached its own repo check)"
-else
-  ok "(a2) the sentinel was never dispatched — refusal happens before any work"
-fi
-if [ -z "$(ls -A "$REPO/.planning/spawns/reports" 2>/dev/null)" ]; then
-  ok "(a2) and no report was written, so nothing downstream can read a verdict"
-else
-  bad "(a2) a report exists: the sentinel ran despite an incomplete brief"
-fi
-
-# ── (a3) both entry points, same ref, same verdict ───────────────────────────
-run_brief build --task T1 --spec "cite a ghost" --capsules no_such_capsule
-DIRECT_RC="$RC"; DIRECT_OUT="$OUT"
-spawn_json '{"capsules":["no_such_capsule"]}'
-run_spawn_brief
-if [ "$DIRECT_RC" -eq "$RC" ]; then
-  ok "(a3) DRIFT GUARD: both entry points agree on the exit code ($RC)"
-else
-  bad "(a3) DRIFT: heimdall-brief rc=$DIRECT_RC but the spawn path rc=$RC"
-fi
-if grep -q "THIS BRIEF IS INCOMPLETE" <<<"$DIRECT_OUT" \
-   && grep -q "THIS BRIEF IS INCOMPLETE" <<<"$OUT"; then
-  ok "(a3) DRIFT GUARD: both refuse with the same canonical refusal line"
-else
-  bad "(a3) DRIFT: the two entry points refuse in different words"
-fi
 
 # ── (a4) capsules resolve from the CANONICAL store only ──────────────────────
 "$CAPSULE" write realcap --what "a real capsule in the canonical store" >/dev/null
-spawn_json '{"capsules":["realcap"]}'
-run_spawn_brief
+run_brief build --task T4 --spec "read the canonical store" --capsules realcap
 if [ "$RC" -eq 0 ] && grep -q "a real capsule in the canonical store" <<<"$OUT"; then
-  ok "(a4) the spawn path reads the canonical store (\$PLANNING_DIR/protocol/capsules)"
+  ok "(a4) the brief reads the canonical store (\$PLANNING_DIR/protocol/capsules)"
 else
-  bad "(a4) canonical-store capsule did not hydrate on the spawn path (rc=$RC)"
+  bad "(a4) canonical-store capsule did not hydrate (rc=$RC)"
   printf '%s\n' "$OUT" | sed 's/^/      /'
 fi
 # The abandoned path must be dead: a capsule that exists ONLY at $root/capsules/
@@ -195,8 +120,7 @@ fi
 mkdir -p "$REPO/capsules"
 printf -- '---\nid: legacycap\ndepends:\nts: x\n---\nWHAT: only in the old place\n' \
   > "$REPO/capsules/legacycap.md"
-spawn_json '{"capsules":["legacycap"]}'
-run_spawn_brief
+run_brief build --task T4 --spec "read the legacy store" --capsules legacycap
 if [ "$RC" -eq 1 ] && ! grep -q "only in the old place" <<<"$OUT"; then
   ok "(a4) the abandoned \$root/capsules/ path is dead — one store, not two"
 else
@@ -249,13 +173,13 @@ else
   bad "(a5) empty and unreachable collapsed to the same exit code $ERC"
 fi
 
-# ── (a6) STRUCTURAL: one shared core, so the two cannot fork again ───────────
+# ── (a6) STRUCTURAL: one shared core, so a second one cannot fork again ───────────
 if [ -f "$CORE" ]; then
   ok "(a6) the shared resolution+refusal core exists: bin/lib/brief-core.sh"
 else
-  bad "(a6) no shared core — the two assemblers are still independent code"
+  bad "(a6) no shared core — the assembler carries its own resolution code"
 fi
-for f in "$BRIEF" "$HYDRATOR"; do
+for f in "$BRIEF"; do
   if grep -q "brief-core.sh" "$f"; then
     ok "(a6) $(basename "$f") sources the shared core"
   else
@@ -354,24 +278,6 @@ else
   bad "(b6) the anchor check does not track the file (before=$BEFORE_RC after=$AFTER_RC)"
 fi
 write_invariants
-
-# ── (b7) the spawn path validates context.invariants identically ─────────────
-spawn_json '{"invariants":"GONE.md"}'
-run_spawn_brief
-if [ "$RC" -eq 1 ] && grep -q "INCOMPLETE" <<<"$OUT"; then
-  ok "(b7) the spawn path refuses a dangling context.invariants ref too"
-else
-  bad "(b7) the spawn path still echoes a dangling invariants ref (rc=$RC)"
-  printf '%s\n' "$OUT" | sed 's/^/      /'
-fi
-spawn_json "$(jq -nc --arg a "INVARIANTS.md#$ANCHOR_OK" '{invariants:$a}')"
-run_spawn_brief
-if [ "$RC" -eq 0 ]; then
-  ok "(b7) and it accepts a ref that genuinely resolves — not a blanket refusal"
-else
-  bad "(b7) the spawn path rejected a valid invariants ref (rc=$RC)"
-  printf '%s\n' "$OUT" | sed 's/^/      /'
-fi
 
 # ── (b8) the refs the DOCS hand out must themselves resolve ─────────────────
 # Both PROTOCOL.md and the agent-template a spawning agent copies from used to

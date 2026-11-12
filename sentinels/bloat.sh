@@ -123,8 +123,8 @@ DET_STATUS="$(jq -r '.status' "$REPORT" 2>/dev/null || echo unknown)"
 #
 # Reference wiring (documented invocation point — the real model call is the
 # orchestrator's responsibility, this is the contract it must satisfy):
-#   HEIMDALL_BLOAT_SCORER='heimdall-spawn run .planning/spawns/bloat-llm.json'
-# or any command accepting:  <scorer> --diff <range> --criteria <ids>
+#   HEIMDALL_BLOAT_SCORER='<command>'   (heimdall-spawn, which this used to name, is retired)
+# where <command> accepts:  <scorer> --diff <range> --criteria <ids>
 # and printing a single JSON object {simplifiable:bool, top_2_suggestions:[...]}.
 LLM_JSON='{"status":"skipped","reason":"no LLM scorer wired (set HEIMDALL_BLOAT_SCORER); soft simplification layer not run"}'
 SIMPLIFY_DELTA=0

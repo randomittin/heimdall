@@ -79,6 +79,11 @@ authenticity-check
 queue
 quota-advisor
 529-scan
+board
+ast
+md
+checkpoint-share
+registry-hygiene
 delivery-audit
 unconnected
 wrap

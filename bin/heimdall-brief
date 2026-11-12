@@ -23,11 +23,12 @@
 # unresolved ref marks the whole brief INCOMPLETE and exits non-zero, and an
 # unreachable resolver is NON_VERIFIED (exit 3) — never downgraded to "absent".
 #
-# That policy is not implemented here. It lives in bin/lib/brief-core.sh, which
-# sentinels/lib/brief.sh — the assembler the spawn path uses — shares verbatim.
-# The two used to be independent code with OPPOSITE failure semantics, and the
-# one nobody was watching degraded silently. Two assemblers cannot be held in
-# agreement by intention; they can only share the decision.
+# That policy is not implemented here. It lives in bin/lib/brief-core.sh, which every
+# assembler shares verbatim. There used to be two (this one and the spawn path's
+# sentinels/lib/brief.sh, retired 2026-11-12 with heimdall-spawn) with OPPOSITE
+# failure semantics, and the one nobody was watching degraded silently. Two
+# assemblers cannot be held in agreement by intention; they can only share the
+# decision.
 #
 # Usage:
 #   heimdall-brief build --task <id> --spec <text> [--symbols a,b] [--files p,q]
