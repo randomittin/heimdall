@@ -180,6 +180,12 @@ esac
 #      and the sweep guard, and its pre-filter is one builtin `case` on the raw command (sleep, alarm, or tail followed by a flag with an f in it): every other command pays nothing else, and the jq read of run_in_background and python start only for a command that passes it. OPERATOR OVERRIDE: HMD_WAIT_ALLOW=1, read from THIS hook's environment (an
 #      inline prefix reaches the command, not this hook). A COST guard, not a security gate, so it FAILS OPEN like the CI waste guard: a helper that is missing (silent: a fixture root, a partial copy), crashes or times out, or a command it cannot read, is one stderr line and an allow, and only a form it READ denies. Best effort, not a boundary: a wait
 #      inside a script file, or a loop in another interpreter's own code, is not read. Proof: test/wait-guard.test.sh.
+#   9. GUARDRAIL SWITCHES (2026-11-12, task T6.1 of docs/superpowers/plans/2026-11-12-3x-m1-skill-registry.md). The four guards above that guardrails.manifest.json calls RECOMMENDED
+#      (ci-waste-guard, disk-floor, sweep-guard, wait-guard) can be switched off per operator: `hmd guardrails off <id>` writes the id to $HEIMDALL_HOME/guardrails-off, and that guard
+#      then runs none of itself and says nothing, as its env override does (the override keeps working as before). Each asks gp_guard_on <id> beside that override, once its own
+#      pre-filter has matched and before its helper starts, so a command that reaches none of them pays nothing new. bin/lib/hmd_guardrail_enabled.sh is the one definition: only
+#      its exit 1 means off; a core id, an id the manifest does not know, a relative HEIMDALL_HOME, no lib, no manifest or no jq leaves the guard on. The kill guard, git-guard,
+#      the secret scans, the push gates, the oracle and the corpus have no switch. Proof: test/guardrail-off-bash.test.sh.
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
 
 INPUT=$(cat)
@@ -187,6 +193,22 @@ CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty')
 PLUGIN="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}"
 SCAN="$PLUGIN/bin/secret-scan"
 GITGUARD="$PLUGIN/bin/heimdall-git-guard"
+# GUARDRAIL SWITCHES (delta 9 in the header above). gp_guard_on <id> returns 1 ONLY when bin/lib/hmd_guardrail_enabled.sh answers exactly 1 for <id> (the operator switched that
+# recommended guard off) and 0 for every other answer, a 127 or a lib that cannot be sourced included: a plumbing failure never turns a guard off. The lib is sourced at most once,
+# on the first ask, and only a guard whose pre-filter matched asks, so an ordinary command runs GP_GR_LIB= alone (a GP_ statement, dropped by equiv() in
+# test/heimdall-precheck-bash.test.sh; bash -x does not trace a function definition).
+GP_GR_LIB=
+gp_guard_on() {
+  case $GP_GR_LIB in
+    '')
+      GP_GR_LIB=unavailable
+      # shellcheck source=lib/hmd_guardrail_enabled.sh disable=SC1091  # the path is $PLUGIN-derived at runtime; the default run never opens sourced files, source= is for -x
+      if [ -r "$PLUGIN/bin/lib/hmd_guardrail_enabled.sh" ] && . "$PLUGIN/bin/lib/hmd_guardrail_enabled.sh" 2>/dev/null && command -v hmd_guardrail_enabled >/dev/null 2>&1; then GP_GR_LIB=sourced; fi ;;
+  esac
+  [ "$GP_GR_LIB" = sourced ] || return 0
+  hmd_guardrail_enabled "$1"
+  [ "$?" -ne 1 ]
+}
 # CI WASTE GUARD (delta 6 in the header above), FIRST in the chain so a refused command never runs git-guard or the secret scan. The `case`s are the cheap pre-filter and the ONLY statements an ordinary command runs: a command that mentions
 # none of the trigger words, once quotes and backslashes are removed (as the kill guard does, so --allow-"empty" and re"run" are still seen), never starts python. The helper's exit status is the verdict: 3 denies; 4 (could not read the command)
 # and anything else (a missing helper, a crash, python3 absent) is ONE stderr line and an allow -- a cost guard fails OPEN, like the disk floor. HMD_CI_RERUN_ALLOW=1 (exactly 1) is the operator's switch: none of it runs then.
@@ -198,8 +220,8 @@ case ${HMD_CI_RERUN_ALLOW:-} in
 esac
 case $GP_CI_NORM in
   *allow-empty*|*rerun*|*rerequest*|*dispatches*|*workflow*run*)
-    GP_CI_WHY=$(python3 -I -S "$PLUGIN/bin/lib/hmd_ci_guard.py" <<<"$CMD" 2>/dev/null)
-    GP_CI_RC=$?
+    GP_CI_RC=0
+    gp_guard_on ci-waste-guard && { GP_CI_WHY=$(python3 -I -S "$PLUGIN/bin/lib/hmd_ci_guard.py" <<<"$CMD" 2>/dev/null); GP_CI_RC=$?; }
     case $GP_CI_RC in
       0) ;;
       3)
@@ -243,7 +265,7 @@ case $CMD in
     if printf '%s\n' "$CMD" | grep -qE "$DF_RE"; then
       DF_LIB="$PLUGIN/bin/lib/hmd_disk_floor.sh"
       # shellcheck source=lib/hmd_disk_floor.sh disable=SC1091  # the path is $PLUGIN-derived at runtime; the default run never opens sourced files, source= is for -x
-      if [ -r "$DF_LIB" ] && . "$DF_LIB" 2>/dev/null && command -v hmd_disk_floor_check >/dev/null 2>&1; then
+      if gp_guard_on disk-floor && [ -r "$DF_LIB" ] && . "$DF_LIB" 2>/dev/null && command -v hmd_disk_floor_check >/dev/null 2>&1; then
         DF_CWD=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
         DF_LINES=$(hmd_disk_floor_check "${TMPDIR:-/tmp}" "${DF_CWD:-$PWD}")
         if [ $? -eq 1 ]; then
@@ -261,7 +283,7 @@ case ${HMD_SWEEP_ALLOW:-} in
   *)
     case $CMD in
       *run-all*)
-        if [ -r "$PLUGIN/bin/lib/hmd_sweep_guard.py" ]; then
+        if gp_guard_on sweep-guard && [ -r "$PLUGIN/bin/lib/hmd_sweep_guard.py" ]; then
           GP_SW_CWD=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
           GP_SW_WHY=$(python3 -I -S "$PLUGIN/bin/lib/hmd_sweep_guard.py" "$GP_SW_CWD" <<<"$CMD" 2>/dev/null)
           GP_SW_RC=$?
@@ -284,7 +306,7 @@ case ${HMD_WAIT_ALLOW:-} in
   *)
     case $CMD in
       *sleep*|*alarm*|*tail*-*[fF]*)
-        if [ -r "$PLUGIN/bin/lib/hmd_wait_guard.py" ]; then
+        if gp_guard_on wait-guard && [ -r "$PLUGIN/bin/lib/hmd_wait_guard.py" ]; then
           GP_WT_BG=$(jq -r '.tool_input.run_in_background // empty' <<<"$INPUT" 2>/dev/null)
           if [ "$GP_WT_BG" != true ]; then
             GP_WT_WHY=$(python3 -I -S "$PLUGIN/bin/lib/hmd_wait_guard.py" <<<"$CMD" 2>/dev/null)
