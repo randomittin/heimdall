@@ -160,7 +160,7 @@ mkdir -p "$T/not-mine/x"; : > "$T/leak-x"
 hmd_test_suite_tmp_settle "$T/not-mine" "$T/leak-x"
 if [ -d "$T/not-mine/x" ] && [ ! -s "$T/leak-x" ]; then ok "settle only ever touches a directory inside this run's temp root (a stray path is left alone)"; else bad "settle removed or recorded a path outside the root"; fi
 
-echo "-- 6. end-of-sweep tmp guard: limit, strict mode, outside-TMPDIR attribution --"
+echo "-- 6. end-of-sweep tmp guard: limit, strict mode, outside-TMPDIR attribution, other tools' temp dirs are not a suite's --"
 GW="$T/gwork"; mkdir -p "$GW" "$T/watch"
 # shellcheck disable=SC2034  # RUN is an input read by test/lib/run-all-guards.sh (orphan guard)
 RUN=("$T/a.test.sh" "$T/b.test.sh" "$T/c.test.sh")
@@ -194,6 +194,31 @@ HMD_TEST_TMP_WATCH="$T/watch" hmd_test_tmp_guard "$GW" >/dev/null
 if [ "${TMP_FINDINGS:-x}" = 0 ] && ! grep -q 'TMP LEAK OUTSIDE' "$GW/tmp-section.txt"; then ok "under the default 50 MB limit the same 2 MB outside entry is only a warning"; else bad "outside big, default limit: findings=${TMP_FINDINGS:-} section=$(cat "$GW/tmp-section.txt")"; fi
 HMD_TEST_TMP_OUTSIDE_MAX=1 HMD_TEST_TMP_WATCH="$T/watch" hmd_test_tmp_guard "$GW" >/dev/null
 if grep -q 'NOT FULLY CHECKED' "$GW/tmp-section.txt" && grep -q 'NOT examined' "$GW/tmp-summary.txt"; then ok "more new entries than HMD_TEST_TMP_OUTSIDE_MAX: the rest are counted and named in the section and the summary, never dropped silently"; else bad "outside cap: section=$(cat "$GW/tmp-section.txt") summary=$(cat "$GW/tmp-summary.txt")"; fi
+# 2026-11-12: `XcodeDistPipeline.~~~8aQbMc`, 143.6 MB, made by an Xcode distribution build of ANOTHER project running on the same machine, was attributed by mtime window to the suites running when it was
+# written and failed the sweep as TMP LEAK OUTSIDE TMPDIR. A name only another tool makes is never a suite's (hmd_test_tmp_foreign_name): listed as TMP FOREIGN, never a finding, strict or not; the names hmd's
+# own suites produce stay findings at the same size. Fresh work and watch dirs, so the entries (and findings) above do not count here; every suite's window is open for the whole block.
+GF="$T/gwork-fgn"; mkdir -p "$GF" "$T/watch-fgn"
+HMD_TEST_TMP_WATCH="$T/watch-fgn" hmd_test_tmp_snapshot "$GF/tmp-outside-before.txt"
+NOW="$(date +%s)"; echo "$((NOW - 5))" > "$GF/0.t0"; echo "$((NOW + 600))" > "$GF/0.t1"
+mkdir "$T/watch-fgn/XcodeDistPipeline.~~~8aQbMc"; dd if=/dev/zero of="$T/watch-fgn/XcodeDistPipeline.~~~8aQbMc/payload.bin" bs=1048576 count=51 2>/dev/null
+HMD_TEST_TMP_WATCH="$T/watch-fgn" hmd_test_tmp_guard "$GF" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 0 ] && grep -q 'TMP FOREIGN (1)' "$GF/tmp-section.txt" && grep -q 'XcodeDistPipeline\.~~~8aQbMc' "$GF/tmp-section.txt" && ! grep -q 'TMP LEAK' "$GF/tmp-section.txt" && [ ! -s "$GF/tmp-outside.tsv" ] && grep -q 'another tool' "$GF/tmp-summary.txt"; then ok "a 51 MB XcodeDistPipeline.~~~8aQbMc written while a suite was running (default 50 MB limit): no finding, listed as TMP FOREIGN, not attributed to the suite (not in tmp_outside), and the summary line says so"; else bad "foreign Xcode dir: findings=${TMP_FINDINGS:-} section=$(cat "$GF/tmp-section.txt") outside=$(cat "$GF/tmp-outside.tsv") summary=$(cat "$GF/tmp-summary.txt")"; fi
+mkdir "$T/watch-fgn/hmd-agents.leak1"; dd if=/dev/zero of="$T/watch-fgn/hmd-agents.leak1/blob" bs=1048576 count=51 2>/dev/null
+HMD_TEST_TMP_WATCH="$T/watch-fgn" hmd_test_tmp_guard "$GF" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 1 ] && grep -q 'TMP LEAK OUTSIDE TMPDIR (1)' "$GF/tmp-section.txt" && grep -qF "/hmd-agents.leak1"$'\t' "$GF/tmp-outside.tsv" && ! grep -q 'XcodeDistPipeline' "$GF/tmp-outside.tsv" && grep -q 'TMP FOREIGN (1)' "$GF/tmp-section.txt"; then ok "a 51 MB hmd-agents.leak1 beside it is still the one finding (TMP LEAK OUTSIDE TMPDIR, attributed, in tmp_outside); the Xcode dir stays foreign"; else bad "hmd-like dir beside the foreign one: findings=${TMP_FINDINGS:-} section=$(cat "$GF/tmp-section.txt") outside=$(cat "$GF/tmp-outside.tsv")"; fi
+HMD_TEST_STRICT_TMP=1 HMD_TEST_TMP_WATCH="$T/watch-fgn" hmd_test_tmp_guard "$GF" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 1 ]; then ok "HMD_TEST_STRICT_TMP=1 does not turn the foreign dir into a finding either: still one (hmd-agents.leak1), not two"; else bad "foreign dir under strict: findings=${TMP_FINDINGS:-} section=$(cat "$GF/tmp-section.txt")"; fi
+GP="$T/gwork-pat"; mkdir -p "$GP" "$T/watch-pat"
+HMD_TEST_TMP_WATCH="$T/watch-pat" hmd_test_tmp_snapshot "$GP/tmp-outside-before.txt"
+echo "$((NOW - 5))" > "$GP/0.t0"; echo "$((NOW + 600))" > "$GP/0.t1"
+FGN_NAMES=('XcodeDistPipeline.~~~hBisL4' 'cms~~~xAeW4l' 'MyApp_2026-11-12_00-05-48.770.xcdistributionlogs' 'ResultBundle_2026-12-11_00-06-0035.xcresult' 'com.apple.nsurlsessiond')
+OWN_NAMES=('hmd-agents.1234' 'heimdall-x1' 'tmp.AbCd1234' 'pip-unpack-ab12' 'hmd-com.apple.leak')
+for n in "${FGN_NAMES[@]}" "${OWN_NAMES[@]}"; do mkdir "$T/watch-pat/$n"; dd if=/dev/zero of="$T/watch-pat/$n/blob" bs=1048576 count=2 2>/dev/null; done
+HMD_TEST_TMP_LEAK_MAX_MB=1 HMD_TEST_TMP_WATCH="$T/watch-pat" hmd_test_tmp_guard "$GP" >/dev/null
+FGN_OK=1; for n in "${FGN_NAMES[@]}"; do grep -qF "/$n"$'\t' "$GP/tmp-foreign.tsv" && ! grep -qF "/$n"$'\t' "$GP/tmp-outside.tsv" || FGN_OK=0; done
+OWN_OK=1; for n in "${OWN_NAMES[@]}"; do grep -qF "/$n"$'\t' "$GP/tmp-outside.tsv" && ! grep -qF "/$n"$'\t' "$GP/tmp-foreign.tsv" || OWN_OK=0; done
+if [ "$FGN_OK" = 1 ] && grep -q 'TMP FOREIGN (5)' "$GP/tmp-section.txt"; then ok "every name on the foreign list (XcodeDistPipeline.*, cms~~~*, *.xcdistributionlogs, ResultBundle_*.xcresult, com.apple.*) over the limit is listed as foreign and never attributed to a suite"; else bad "foreign names: ok=$FGN_OK section=$(cat "$GP/tmp-section.txt") foreign=$(cat "$GP/tmp-foreign.tsv" 2>&1) outside=$(cat "$GP/tmp-outside.tsv")"; fi
+if [ "$OWN_OK" = 1 ] && [ "${TMP_FINDINGS:-x}" = 5 ] && grep -q 'TMP LEAK OUTSIDE TMPDIR (5)' "$GP/tmp-section.txt"; then ok "the names hmd's own suites produce (hmd-*, heimdall-*, tmp.*, pip-unpack-*) and one that merely CONTAINS a foreign name (hmd-com.apple.leak) stay findings at the same size: the list is anchored and never swallows a suite's leak"; else bad "own names: ok=$OWN_OK findings=${TMP_FINDINGS:-} section=$(cat "$GP/tmp-section.txt")"; fi
 
 echo "-- 7. through the REAL run-all.sh (fixture repo): own TMPDIR per suite, receipt, summary line, exit status --"
 FX="$T/fx"; mkdir -p "$FX/test/lib" "$FX/bin/lib" "$T/hh" "$T/watch2"

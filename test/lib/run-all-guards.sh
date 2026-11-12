@@ -54,9 +54,17 @@
 #           `env -i` (which drops TMPDIR): below the limit a warning is enough, above it a red sweep is the point. HMD_TEST_TMP_OUTSIDE_MAX (default
 #           2000) bounds how many new entries are examined, and the ones beyond it are COUNTED and said loudly (NOT FULLY CHECKED) -- the old fixed 300,
 #           taken in name order, skipped a pip-* dir behind 300 hmd-agents.* ones without a word.
+#         - THE EXCEPTION TO THAT IS A NAME ONLY ANOTHER TOOL MAKES (2026-11-12): a 143.6 MB XcodeDistPipeline.~~~8aQbMc, made by an Xcode distribution build of ANOTHER project
+#           running on the same machine, was attributed to whichever suites were running when it was written -- one is, at almost every moment of a sweep -- and failed a green sweep as
+#           TMP LEAK OUTSIDE TMPDIR. Nothing on the entry says who made it (no xattr; mtime, birth time and owner are a suite's too) and the tools that can watch a creator (fs_usage,
+#           dtrace) need root, so the one thing that tells another tool's entry from a suite's is its NAME: hmd_test_tmp_foreign_name (the list, and the tool behind each pattern, are
+#           there). Such an entry is never attributed -- not in tmp_outside, not a finding, strict or not -- and is counted in the `tmp outside:` summary line and, over the limit,
+#           listed as TMP FOREIGN ($WORK/tmp-foreign.tsv): reported, NOT removed. What hmd's own suites produce (hmd-*, heimdall-*, tmp.*, pip-unpack-*) is not on the list and keeps
+#           the failure above.
 #   Needs from the caller: RUN, TO_RUN, WORK (and RED/YEL/BLD/OFF for colour, optional). Sets TMP_ROOT (begin) and TMP_GUARD_RAN,
 #   TMP_FINDINGS, TMP_LEAK_SUITES, TMP_LEAK_BYTES, TMP_OUTSIDE_COUNT (guard); writes $WORK/tmp-leaks.tsv, tmp-outside.tsv (what the
-#   receipt is built from), tmp-section.txt (the loud text) and tmp-summary.txt (the summary lines).
+#   receipt is built from), tmp-foreign.tsv (path<TAB>bytes of the entries over the limit that carry another tool's name), tmp-section.txt
+#   (the loud text) and tmp-summary.txt (the summary lines).
 #
 # hmd_test_disk_preflight / hmd_test_sock_preflight   REFUSE TO START a sweep that cannot work (always on; run-all.sh calls them before the lock, the work dir,
 #     any trap or receipt exists, so a refusal leaves nothing behind; neither runs on a dry run).
@@ -271,11 +279,29 @@ _hmd_tmp_rows() {
   [ "$total" -le "$cap" ] || printf '  ... and %d more (all of them are in the receipt: tmp_leaks)\n' "$((total - cap))"
 }
 
+# hmd_test_tmp_foreign_name NAME -- 0 when NAME (the last component of a new top-level entry in a watched directory) is one that only ANOTHER tool's temp entries carry, 1 when it could
+# be a suite's. The outside check never attributes such an entry to a suite and never fails the run on it. Why a name: the entry itself says nothing about who made it, the tools that can
+# watch a creator (fs_usage, dtrace) need root, and the mtime window cannot tell a suite's write from another process's while a suite is running at almost every moment -- on 2026-11-12
+# an Xcode distribution build of another project wrote a 143.6 MB XcodeDistPipeline.~~~8aQbMc and a green sweep went red. THE LIST, one alternative per tool (every one of these was in
+# this machine's real TMPDIR that day):
+#   XcodeDistPipeline.* cms~~~*   Xcode's distribution pipeline (archive export / upload): its work directory, and the code-signing messages (a file, cms~~~xAeW4l) it leaves beside it
+#   *.xcdistributionlogs          the same pipeline's log bundle (<App>_2026-11-12_00-05-48.770.xcdistributionlogs)
+#   ResultBundle_*.xcresult       an xcodebuild result bundle
+#   com.apple.*                   a macOS system service's scratch (launchd, nsurlsessiond, ...)
+# NEVER put a name here that hmd's own suites or tools produce -- hmd-*, heimdall-*, tmp.*, pip-unpack-* (pip, in a child that dropped TMPDIR, made the 100 MB leak this check exists for):
+# an entry whose name is listed is one the runner will never see leak. test/run-all-guards.test.sh section 6 holds both lists and fails when they cross.
+hmd_test_tmp_foreign_name() {
+  case "$1" in
+    XcodeDistPipeline.*|cms~~~*|*.xcdistributionlogs|ResultBundle_*.xcresult|com.apple.*) return 0 ;;
+  esac
+  return 1
+}
+
 # hmd_test_tmp_guard WORK -- the end-of-sweep verdict (see the header). Prints nothing itself: the loud text is in $WORK/tmp-section.txt
 # and the summary lines in $WORK/tmp-summary.txt, which run-all.sh prints where its other sections go.
 hmd_test_tmp_guard() {
   local work="$1" tab=$'\t' max_mb="${HMD_TEST_TMP_LEAK_MAX_MB:-50}" strict=0 max_b i=0 j line b e s name rest why limit_txt dirs foreign_txt
-  local n_leak=0 n_over=0 sum_b=0 n_out=0 n_foreign=0 p mt kb cands s0 s1 sfx checked=0 n_out_big=0 n_new=0 n_skip=0 out_cap
+  local n_leak=0 n_over=0 sum_b=0 n_out=0 n_foreign=0 p mt kb cands s0 s1 sfx checked=0 n_out_big=0 n_new=0 n_skip=0 out_cap n_tool=0 n_tool_big=0
   local R="${RED:-}" Y="${YEL:-}" B="${BLD:-}" O="${OFF:-}"
   # shellcheck disable=SC2034  # read by test/run-all.sh (receipt tmp-guard section), which sources this file
   TMP_GUARD_RAN=1
@@ -289,7 +315,7 @@ hmd_test_tmp_guard() {
   out_cap="${HMD_TEST_TMP_OUTSIDE_MAX:-2000}"; case "$out_cap" in ''|*[!0-9]*|0) out_cap=2000 ;; esac
   if [ "$strict" -eq 1 ]; then limit_txt="the strict limit (any leftover)"; else limit_txt="the ${max_mb} MB limit"; fi
   : > "$work/tmp-leaks.tsv"; : > "$work/tmp-leaks-over.tsv"; : > "$work/tmp-leaks-under.tsv"
-  : > "$work/tmp-outside.tsv"; : > "$work/tmp-outside-big.tsv"; : > "$work/tmp-section.txt"; : > "$work/tmp-summary.txt"
+  : > "$work/tmp-outside.tsv"; : > "$work/tmp-outside-big.tsv"; : > "$work/tmp-foreign.tsv"; : > "$work/tmp-section.txt"; : > "$work/tmp-summary.txt"
   # name -> dir map, for attribution: which per-suite dir (s<N>) belonged to which suite, so a path found in a log, an orphan's cwd or a leftover traces back to its suite.
   : > "$work/tmp-dirs.tsv"
   while [ "$i" -lt "${TO_RUN:-0}" ]; do printf '%s\ts%d\n' "${RUN[$i]##*/}" "$i" >> "$work/tmp-dirs.tsv"; i=$((i + 1)); done
@@ -334,6 +360,17 @@ hmd_test_tmp_guard() {
     while IFS= read -r p; do
       [ -n "$p" ] || continue
       case "$p" in "${TMP_ROOT:-/nonexistent-root}") continue ;; esac
+      # A name only another tool makes (hmd_test_tmp_foreign_name) is not a suite's whatever the mtime window says: never attributed, never a finding (strict or not). Counted, and listed
+      # (path, bytes) when over the limit -- the one size at which it would have failed the run -- so what the guard chose not to fail on is still said.
+      if hmd_test_tmp_foreign_name "${p##*/}"; then
+        n_tool=$((n_tool + 1))
+        kb="$(du -sk "$p" 2>/dev/null | awk '{print $1}')"
+        if [ "$(( ${kb:-0} * 1024 ))" -gt "$max_b" ]; then
+          printf '%s\t%s\n' "$p" "$(( ${kb:-0} * 1024 ))" >> "$work/tmp-foreign.tsv"
+          n_tool_big=$((n_tool_big + 1))
+        fi
+        continue
+      fi
       mt="$(stat -c %Y "$p" 2>/dev/null || stat -f %m "$p" 2>/dev/null)"
       [ -n "$mt" ] || continue
       cands="$(awk -v m="$mt" '$1 - 1 <= m && m <= $2 + 1 { print $3 }' "$work/tmp-windows.txt" | LC_ALL=C sort -u | paste -sd' ' -)"
@@ -376,6 +413,13 @@ hmd_test_tmp_guard() {
     done
     [ "$n_out" -le 20 ] || printf '  ... and %d more (all of them are in the receipt: tmp_outside)\n' "$((n_out - 20))" >> "$work/tmp-section.txt"
   fi
+  if [ "$n_tool_big" -gt 0 ]; then
+    printf '%s%sTMP FOREIGN (%d)%s -- new top-level entr%s of more than %d MB in %s with a name only another tool makes (Xcode, macOS: hmd_test_tmp_foreign_name), so not a suite'"'"'s whatever the mtime says. Reported, NOT removed, and the run does not fail on it:\n' "$Y" "$B" "$n_tool_big" "$O" "$([ "$n_tool_big" = 1 ] && echo y || echo ies)" "$max_mb" "$dirs" >> "$work/tmp-section.txt"
+    LC_ALL=C sort -t "$tab" -k2,2nr "$work/tmp-foreign.tsv" | head -n 10 | while IFS="$tab" read -r p b; do
+      printf '  %-60s %9s\n' "$p" "$(hmd_test_fmt_bytes "$b")" >> "$work/tmp-section.txt"
+    done
+    [ "$n_tool_big" -le 10 ] || printf '  ... and %d more\n' "$((n_tool_big - 10))" >> "$work/tmp-section.txt"
+  fi
   if [ "$n_leak" -eq 0 ]; then
     echo "tmp dirs:   clean -- every suite's own TMPDIR was empty when its suite ended" >> "$work/tmp-summary.txt"
   else
@@ -384,6 +428,7 @@ hmd_test_tmp_guard() {
   if [ "$checked" -eq 1 ]; then
     foreign_txt=""
     [ "$n_foreign" -eq 0 ] || foreign_txt="; $n_foreign more had no suite running when written (other processes) and are ignored"
+    [ "$n_tool" -eq 0 ] || foreign_txt="$foreign_txt; $n_tool more carry another tool's name (Xcode, macOS) and are never attributed to a suite$([ "$n_tool_big" -eq 0 ] || printf ' (%d over the %d MB limit, listed above as TMP FOREIGN)' "$n_tool_big" "$max_mb")"
     [ "$n_skip" -eq 0 ] || foreign_txt="$foreign_txt; $n_skip more new entries were NOT examined (HMD_TEST_TMP_OUTSIDE_MAX=$out_cap)"
     if [ "$n_out" -gt 0 ]; then
       printf 'tmp outside: %d new entr%s at the top level of %s while suites ran (listed above, NOT removed)%s\n' "$n_out" "$([ "$n_out" = 1 ] && echo y || echo ies)" "$dirs" "$foreign_txt" >> "$work/tmp-summary.txt"
