@@ -142,10 +142,10 @@ need different repairs. The invariants ref takes `<path>` or `<path>#<anchor>`
 and both halves are verified — a dangling one would let a spawn believe it had
 inherited quality rules it never received.
 
-`bin/heimdall-brief` and `sentinels/lib/brief.sh` (the assembler on the
-`heimdall-spawn` path) share one implementation of that policy,
-`bin/lib/brief-core.sh`, so the two entry points cannot drift into disagreeing
-about what counts as resolved.
+`bin/heimdall-brief` is the one brief assembler, and it takes that policy from a
+single shared core, `bin/lib/brief-core.sh`, so a second entry point could not drift
+into disagreeing about what counts as resolved. (There was a second, the spawn
+path's `sentinels/lib/brief.sh`; it was retired with `heimdall-spawn`.)
 
 ## 5 — Blackboard
 

@@ -2443,8 +2443,8 @@ case "${1:-}" in
     ;;
   watch)
     # Pass-through to heimdall-watch-tui (the `hmd watch` TUI dashboard, spec C).
-    # DISTINCT bin from bin/heimdall-watch (the H-3 sentinel watch-mode tool),
-    # mirroring the heimdall-drain anti-clobber convention. The dashboard is a
+    # (bin/heimdall-watch, the H-3 sentinel watch-mode tool that once owned the bare
+    # name, was retired 2026-11-12; the -tui suffix stays.) The dashboard is a
     # renderer over local caches — zero additional server calls. Degrades to a
     # static wall+feed dump (+ pip install textual hint) when Textual is absent.
     shift
@@ -3000,7 +3000,7 @@ case "${1:-}" in
     ;;
   queue)
     # Pass-through to bin/heimdall-queue (LOCAL continuous-intake work queue:
-    # add/pick/complete/fail/reap/get/list/status/serve) with one carve-out:
+    # add/pick/complete/fail/reap/get/list/status/serve) with two carve-outs (drain, mcp):
     # `hmd queue drain` routes to the DISTINCT drainer bin/heimdall-drain instead
     # (heimdall-queue has no "drain" verb of its own — draining is a separate bin
     # on purpose). bin/lib/reachability-exemptions.tsv records both as a
@@ -3028,6 +3028,24 @@ case "${1:-}" in
         exit 1
       fi
       exec "$DRAIN_BIN" "$@"
+    fi
+    # `hmd queue mcp` — the MCP stdio frontend of the same queue (the third intake,
+    # beside `add` and `serve`): bin/heimdall-queue-mcp speaks JSON-RPC 2.0 on
+    # stdin/stdout and exposes ONE tool, queue_add, which shells to `heimdall-queue
+    # add`. An MCP client launches it as {"command":"hmd","args":["queue","mcp"]}.
+    # It is deliberately NOT registered in .mcp.json: that would hand every plugin
+    # session a tool that queues prompts for the autonomous drainer, and would make
+    # it (and heimdall-queue) LIVE, past the reachability gate's anti-vacuity
+    # ceiling. `mcp` is consumed here; everything after it goes to the server.
+    if [ "${1:-}" = "mcp" ]; then
+      shift
+      QUEUE_MCP_BIN="$PLUGIN_DIR/bin/heimdall-queue-mcp"
+      if [ ! -x "$QUEUE_MCP_BIN" ]; then
+        echo "  Error: heimdall-queue-mcp not found at $QUEUE_MCP_BIN" >&2
+        echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+        exit 1
+      fi
+      exec "$QUEUE_MCP_BIN" "$@"
     fi
     QUEUE_BIN="$PLUGIN_DIR/bin/heimdall-queue"
     if [ ! -x "$QUEUE_BIN" ]; then
@@ -3088,6 +3106,83 @@ case "${1:-}" in
     fi
     [ "$#" -gt 0 ] || set -- scan
     exec "$SCAN_529_BIN" "$@"
+    ;;
+  board)
+    # Pass-through to bin/heimdall-board: the live TEAM WALL — presence x claims x
+    # tasks x gate, JOINed from the stores that already compute each (heimdall-who,
+    # -claim, -task, the reuse scores); --leaderboard / --json / --plain. A read-only
+    # view whose siblings (watch, dashboard, verdict, badge, clip) all have arms; it
+    # had none, so heimdall-deadcode reported it unreachable and its
+    # bin/lib/reachability-exemptions.tsv row expired 2026-11-08. All args forward
+    # verbatim, so a routed run and a direct bin run are byte-identical.
+    shift
+    BOARD_BIN="$PLUGIN_DIR/bin/heimdall-board"
+    if [ ! -x "$BOARD_BIN" ]; then
+      echo "  Error: heimdall-board not found at $BOARD_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$BOARD_BIN" "$@"
+    ;;
+  ast)
+    # Pass-through to bin/heimdall-ast: thin CLI over the tree-sitter AST substrate
+    # (symbols / refs / all / check, JSON out) that SI-2 reuse, designmatch and Redum
+    # read through. tree-sitter is an OPTIONAL dep: absent, the tool prints a
+    # backend:"unavailable" JSON and exits 0 rather than abort a caller. Its
+    # reachability row expired 2026-11-08, and install.sh puts only `hmd`/`heimdall` on
+    # PATH, so an installed operator could not run it. All args forward verbatim.
+    shift
+    AST_BIN="$PLUGIN_DIR/bin/heimdall-ast"
+    if [ ! -x "$AST_BIN" ]; then
+      echo "  Error: heimdall-ast not found at $AST_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$AST_BIN" "$@"
+    ;;
+  md)
+    # Pass-through to bin/heimdall-md: document -> Markdown (PDF / docx / xlsx / pptx /
+    # html / ...) for context building. markitdown is an OPTIONAL dep: absent, the tool
+    # prints a one-line skip notice and exits 0; a refused remote URI or path escape
+    # exits 4 (a security gate, not a skip). Its reachability row expired 2026-11-08.
+    # All args forward verbatim.
+    shift
+    MD_BIN="$PLUGIN_DIR/bin/heimdall-md"
+    if [ ! -x "$MD_BIN" ]; then
+      echo "  Error: heimdall-md not found at $MD_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$MD_BIN" "$@"
+    ;;
+  checkpoint-share)
+    # Pass-through to bin/heimdall-checkpoint-share: Shared Team Checkpoints (TEAM MODE
+    # P4) — publish / read / roster / precheck / resume over the git-committed per-HAID
+    # store; publishing honours the presence consent gate (off = zero-write no-op). Its
+    # reachability row expired 2026-11-08. All args forward verbatim.
+    shift
+    CHECKPOINT_SHARE_BIN="$PLUGIN_DIR/bin/heimdall-checkpoint-share"
+    if [ ! -x "$CHECKPOINT_SHARE_BIN" ]; then
+      echo "  Error: heimdall-checkpoint-share not found at $CHECKPOINT_SHARE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$CHECKPOINT_SHARE_BIN" "$@"
+    ;;
+  registry-hygiene)
+    # Pass-through to bin/heimdall-registry-hygiene: the MONTHLY haid->pubkey registry
+    # TTL-eviction job (cost-governance section 3). A DRY RUN unless --apply. It had no
+    # scheduler, and install.sh puts only `hmd`/`heimdall` on PATH, so an installed
+    # operator could not run it at all — the same gap the `529-scan)` arm above closes
+    # for another tool. All args forward verbatim.
+    shift
+    REGISTRY_HYGIENE_BIN="$PLUGIN_DIR/bin/heimdall-registry-hygiene"
+    if [ ! -x "$REGISTRY_HYGIENE_BIN" ]; then
+      echo "  Error: heimdall-registry-hygiene not found at $REGISTRY_HYGIENE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$REGISTRY_HYGIENE_BIN" "$@"
     ;;
   delivery-audit)
     # Pass-through to bin/heimdall-delivery-audit (delivery-claim falsifier — makes
@@ -3635,6 +3730,12 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall ui [--repo D] [--port N]  Live companion web UI for this session (loopback + token)"
   echo "  heimdall inbox <stop|prompt|tmux|status> [--repo D]  Deliver companion-app inbox messages into this session"
   echo "  heimdall app <connect|status|disconnect|doctor> [--repo D]  Publish hmd ui over Tailscale Funnel for the companion phone app"
+  echo "  heimdall board [--leaderboard|--json|--plain]  Live team wall: presence, claims, tasks, gate verdicts"
+  echo "  heimdall ast <symbols|refs|all|check> [file]  Tree-sitter symbols and call/import edges of a source file (JSON)"
+  echo "  heimdall md <file> [-o out.md]  Convert a PDF/docx/xlsx/pptx/html document to Markdown"
+  echo "  heimdall checkpoint-share <publish|read|roster|precheck|resume>  Shared team checkpoints (no-rewrite guard, handoff)"
+  echo "  heimdall registry-hygiene [--apply]  Evict idle identity bindings (monthly job; dry run unless --apply)"
+  echo "  heimdall queue mcp        Local work-queue intake as an MCP stdio server (tool: queue_add)"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"

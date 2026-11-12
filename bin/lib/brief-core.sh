@@ -8,7 +8,9 @@
 # and returned 0. So the real spawn path handed out silently-thin briefs. That
 # is strictly worse than a fat brief: the agent cannot tell the context it was
 # promised is absent, so it produces confidently wrong work and every downstream
-# gate sees a green run.
+# gate sees a green run. (That second assembler and bin/heimdall-spawn were retired
+# 2026-11-12, leaving bin/heimdall-brief the one entry point; the shared core stays
+# so a second one cannot fork again.)
 #
 # Two assemblers cannot be kept in agreement by intention. So the resolution and
 # the refusal live HERE, once, and both entry points call in. They keep their

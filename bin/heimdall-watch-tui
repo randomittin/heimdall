@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # heimdall-watch-tui — `hmd watch`, the TUI dashboard (spec section C).
 #
-# NAME: this is a DISTINCT bin from bin/heimdall-watch (the H-3 sentinel watch-mode
-# tool), mirroring the heimdall-drain anti-clobber convention. The dispatcher routes
-# `hmd watch` here; the sentinel keeps its own direct/git-hook invocation.
+# NAME: the `-tui` suffix is historical — bin/heimdall-watch (the H-3 sentinel
+# watch-mode tool) once owned the bare name and was retired 2026-11-12 with
+# heimdall-spawn. The dispatcher routes `hmd watch` here.
 #
 # The dashboard lives inside the dev's own terminal (iTerm/Ghostty/tmux/Warp) and is
 # a RENDERER over Heimdall's local caches — it makes ZERO additional server calls

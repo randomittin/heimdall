@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # work_queue.py — the LOCAL continuous-intake work queue (the durable store behind
-# `bin/heimdall-queue` + the `bin/heimdall-watch` drainer).
+# `bin/heimdall-queue` + the `bin/heimdall-drain` drainer).
 #
 # This GENERALIZES bin/lib/issue_queue.py's durability discipline (atomic writes,
 # fsync, claim-before-work, idempotent-by-hash ingest, prioritized pick) into a
