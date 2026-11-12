@@ -13,7 +13,7 @@ Builds on `main` @ 63a1a82a. No version bump, no release, no tag: operator revie
 
 ### Deltas against the spec ladder (call out to operator)
 - Spec puts the consent model in 3.1.0 and says 3.0.0 has "None" behaviour change. Operator ask pulls consent forward for NEW installs only. Consequence: `goals.yaml` `skills-registry-3-0` guard `install_surface_changed == false` no longer holds for new installs. Heimdall must PROPOSE the goals.yaml amendment as a PR; this plan does not edit it (open decision O1).
-- Spec is written against v2.4.7. Repo is **2.4.10**. The 2.4.8 interim fixes already landed: no `|| true`, no third-party marketplace fallback, every install receipted (`bin/lib/install-receipt.sh`, `test/plugin-install-receipt.test.sh`). `git ls-files` shows no tracked `.heimdall/*` runtime state (only two `*.example` files). What is still missing is exactly the consent model (`install-receipt.sh:16-19` says so) and the one-source-of-truth.
+- Spec is written against v2.4.7. Repo was at the release current at planning time (`VERSION` at `63a1a82a`). The 2.4.8 interim fixes already landed: no `|| true`, no third-party marketplace fallback, every install receipted (`bin/lib/install-receipt.sh`, `test/plugin-install-receipt.test.sh`). `git ls-files` shows no tracked `.heimdall/*` runtime state (only two `*.example` files). What is still missing is exactly the consent model (`install-receipt.sh:16-19` says so) and the one-source-of-truth.
 - Spec's Stage 0 "skill-selection traces" (Jev) do not exist in this repo. The deterministic selection code is shell/python; "recorded behaviour" here = outputs of the legacy code over a committed input matrix, recorded BEFORE any new code (W0-W1).
 
 ---
@@ -494,7 +494,7 @@ Conventions for every task: Agent `hmd:coder`, model `sonnet` + `default` unless
 
 **T7.2 docs-and-changelog** (deps all)
 - Files: Modify `docs/INVENTORY.md` (rows: `skills.manifest.json`, `guardrails.manifest.json`, `bin/lib/skills_*`, `bin/heimdall-skills`, `bin/heimdall-guardrails`, `hmd_guardrail_enabled.sh`), `docs/INSTALL.md` (short "recommended skills and consent" section), `CHANGELOG.md` (`## [Unreleased]` entry; create heading if absent; NO version bump).
-- Acceptance: `grep -q 'skills.manifest.json' docs/INVENTORY.md`; `grep -q 'guardrails.manifest.json' docs/INVENTORY.md`; `grep -q 'hmd skills suggest' docs/INSTALL.md`; `grep -q '\[Unreleased\]' CHANGELOG.md`; `test "$(cat VERSION)" = "2.4.10"`; `jq -r .version .claude-plugin/plugin.json` still `2.4.10`; no sentence claims "no data collection"/"audited" (house truth rules, `test/truth-pass-claims.test.sh` runs in the sweep).
+- Acceptance: `grep -q 'skills.manifest.json' docs/INVENTORY.md`; `grep -q 'guardrails.manifest.json' docs/INVENTORY.md`; `grep -q 'hmd skills suggest' docs/INSTALL.md`; `grep -q '\[Unreleased\]' CHANGELOG.md`; `test "$(cat VERSION)" = "$(git show 63a1a82a:VERSION)"`; `test "$(jq -r .version .claude-plugin/plugin.json)" = "$(git show 63a1a82a:VERSION)"`; no sentence claims "no data collection"/"audited" (house truth rules, `test/truth-pass-claims.test.sh` runs in the sweep).
 - Verify: the greps above. Done when: docs mention every new surface, version untouched.
 
 ### Wave 8 — review and the one sweep (orchestrator steps, not parallel coders)
