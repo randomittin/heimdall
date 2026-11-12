@@ -47,3 +47,4 @@
 - [ ] LOW: --team mktemp task file (0600) left in /tmp if pane shell never runs the read line; fix: trap cleanup on launcher exit (bin/heimdall:--team; review; release after v2.4.10)
 - [ ] LOW: hmd --skills install now captures git clone progress via hmd_skill_install; user sees no progress; fix: stream stderr (bin/heimdall:--skills; review; release after v2.4.10)
 - [ ] LOW: checkpoint write exit 5 (deferred for sweep) reported by /hmd:continue as a generic failure; fix: map rc 5 to 'deferred during sweep' (bin/lib/hmd_continue.py:287; review; release after v2.4.10)
+- [2026-11-12] skills consent tty menu header shows the manifest repo for a name even when a foreign repo was requested (stderr line names the real repo just before); build the header from the requested repo.
