@@ -34,3 +34,5 @@
 
 - [2026-11-12] sentinels/{sanity,security,doc-sync,spec-drift}.sh have no dispatcher after heimdall-watch+spawn deletion (637bcede): wire to a direct runner or delete.
 - [2026-11-12] SessionEnd worker logs `heimdall-checkpoint write` rc 5 (deferred: sweep live) as "write failed"; treat rc 5 as deferred in hooks.json worker. `/hmd:save` (LLM path) not sweep-guarded.
+- [2026-11-12] bin/heimdall-hooks and bin/lib/hmd_guardrail_enabled.sh still fall back to /tmp/.heimdall when HOME is unset (heimdall-guardrails no longer does, 0abd16dc): drop the fallback (a planted /tmp guardrails-off could switch off recommended guards).
+- [2026-11-12] hmd_marketplace_add (first-run marketplace) is not recorded in skills.lock; INV-S6 covers plugin+skill lines only.
