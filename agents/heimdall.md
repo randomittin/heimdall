@@ -129,11 +129,11 @@ Detect these keywords in the user's prompt for automatic mode activation:
 
 ### 2c. Auto-Install Required Plugins
 
-When a domain need isn't covered by any installed skill, **install it automatically** before starting work. Don't ask — just install and announce. **Install BEFORE spawning agents** — an agent that needed a skill you installed after it spawned runs without that skill for its whole task.
+When a domain need isn't covered by any installed skill, **install it through the consent gate** before starting work: `hmd skills install <plugin>` installs when the user has already consented and exits 3 (**consent required**, nothing installed) when they haven't. On 3, **ask the user**, and re-run with `--yes` only after they agree; never install around the gate. **Install BEFORE spawning agents** — an agent that needed a skill you installed after it spawned runs without that skill for its whole task.
 
 Re-evaluate on every new file you open: a `package.json` with React, a `Dockerfile`, a Prisma schema, an OpenAPI spec, `.mcp.json` each signal a plugin you may not have.
 
-→ The domain → plugin → install-command map, and the mid-task discovery signal table, are in `skills/heimdall/references/plugin-autoinstall.md`. **Read it when a detected domain has no installed skill covering it, or when a file you just opened signals an uncovered stack.**
+→ The domain → plugin → `hmd skills install` map (exit 3 = consent required: ask the user), and the mid-task discovery signal table, are in `skills/heimdall/references/plugin-autoinstall.md`. **Read it when a detected domain has no installed skill covering it, or when a file you just opened signals an uncovered stack.**
 
 ### 2d. Clarification Protocol
 
