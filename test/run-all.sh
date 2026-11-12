@@ -60,7 +60,8 @@
 #      fails the run (TMP LEAK); a smaller leftover is a loud warning (TMP LEFTOVERS). New top-level entries in /tmp and
 #      in the real $TMPDIR (a hard-coded /tmp path) are reported and attributed by mtime window (tmp_outside): a
 #      warning, never deleted; a failure under strict, and when one is over the same MB limit (TMP LEAK OUTSIDE TMPDIR: a child
-#      started with env -i drops TMPDIR and writes to the real one). It exists because free space dropped 1.6 GB while agents
+#      started with env -i drops TMPDIR and writes to the real one). An entry whose NAME only another tool makes (Xcode's XcodeDistPipeline.*, macOS's com.apple.*:
+#      hmd_test_tmp_foreign_name in test/lib/run-all-guards.sh) is never attributed to a suite and never fails the run; over the limit it is listed as TMP FOREIGN. It exists because free space dropped 1.6 GB while agents
 #      ran suites that never removed their mktemp dirs, and nothing said so. Without test/lib/run-all-guards.sh next
 #      to this script (a fixture copy) suites share TMPDIR as before. Proof: test/run-all-guards.test.sh sections 5-8.
 #  10. THE ACCOUNT'S OWN HOME IS NOT WRITTEN. bin/lib/hmd_pair_optin.py records the per-repo "pair by code" choice in the account's own heimdall home -- <pw_dir>/.heimdall, pw_dir from the
