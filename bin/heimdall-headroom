@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# heimdall-headroom — turn the Headroom compression proxy on or off, on demand.
+#
+#   hmd headroom status                 what is on, what is routed, and what points at the proxy
+#   hmd headroom on                     enable it: add the module if absent, clear an opt-out, re-enable its launchd job
+#   hmd headroom off [--next-session] [--backup-dir DIR]
+#                                       disable it: opt out of the module (route, wrap and the wrap shim then decline it),
+#                                       remove a launchd supervisor job, remove an ANTHROPIC_BASE_URL entry that points a
+#                                       session at the proxy from Claude's settings.json env, and stop the proxy when no
+#                                       session is routed through it. Prints exactly what it changed and how to undo each.
+#
+#   off refuses (exit 3, nothing changed) inside a session that is routed through the proxy: stopping it would fail every
+#   request of that session. --next-session changes configuration only: it never stops the proxy, needs no tty, is
+#   idempotent and exits 0 when Headroom is already off. Everything off changes is backed up first, under
+#   ~/.heimdall/headroom/off-backup/<UTC-stamp>/ or DIR (--backup-dir, or HMD_HEADROOM_BACKUP_DIR), with a CHANGES.txt
+#   that gives the undo for each change. A run that changes nothing writes nothing.
+#
+# Exit: 0 ok | 1 a change was attempted and failed | 2 usage or a precondition | 3 refused: this session is routed
+
+# WHY THIS EXISTS (operator directive 2026-11-12). Headroom is a local proxy that reads every prompt on its way out and
+# keeps an ML stack resident. It used to be in hmd's default module set (heimdall-autoupdate acquired it on any machine
+# that lacked it); it is now off by default and used only once it is asked for. `on` is the explicit act; nothing else
+# installs it, loads a launchd job for it, or points a base URL at it. Existing installs keep it until `off`.
+#
+# WHAT `off` MUST NEVER DO: leave anyone without a working route. The route a session has is the one in its own
+# environment, fixed at launch, so:
+#   · it never stops the proxy under a session that uses it (this one, any Claude Code process that carries the proxy URL,
+#     any process holding a live connection to it, any shell rc that exports the URL), and says which one stopped it;
+#   · it removes only a base URL that IS the proxy's. A corporate gateway or OmniRoute in the same file is the operator's;
+#   · it only ever signals a process it has verified is the Headroom proxy (its /health pid, the listening pid and its own
+#     command line all agree); a stranger on the port is never touched;
+#   · it leaves the `claude() { hmd route claude "$@"; }` rc function alone. That function is also how the OmniRoute
+#     fallback gate routes a launch, and with Headroom off it simply declines Headroom: the launch goes to OmniRoute when
+#     the gate says ROUTE, and direct otherwise. The proxy is client -> headroom -> api.anthropic.com (its upstream is
+#     verified); OmniRoute is never chained behind it, so there is no OmniRoute mount for `off` to repoint.
+#
+# Seams (the same family as bin/heimdall-headroom-supervise): HMD_MODULES_BIN (the module tool), LAUNCHCTL,
+# HEIMDALL_LAUNCH_AGENTS_DIR, HMD_HEADROOM_SUPERVISOR_LABEL, HEADROOM_PORT, HMD_MODULES_STATE, HEIMDALL_HOME,
+# CLAUDE_CONFIG_DIR, HMD_HEADROOM_STOP_POLLS (4 per second; default 40). ps and lsof are found on PATH.
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+MODULES_BIN="${HMD_MODULES_BIN:-$BIN_DIR/heimdall-modules}"
+SUPERVISE_BIN="$BIN_DIR/heimdall-headroom-supervise"
+
+# The chain is a library; sourcing it defines functions and routes nothing. Every probe below is ITS probe, so this
+# script can never disagree with `hmd route` or `hmd wrap` about what is on the port or what the module's state is.
+# shellcheck source=lib/hmd-headroom-chain.sh disable=SC1091
+if [ -r "$BIN_DIR/lib/hmd-headroom-chain.sh" ]; then
+  . "$BIN_DIR/lib/hmd-headroom-chain.sh"
+else
+  echo "hmd headroom: the headroom chain library is missing from this install ($BIN_DIR/lib/hmd-headroom-chain.sh)" >&2
+  exit 2
+fi
+
+# The interpreter for the settings.json check is the repo's own resolver (it avoids a version-manager shim; HMD_PYTHON is
+# its test seam). python3 is not a hard requirement of hmd, so its absence is handled, never assumed away: a settings file
+# that cannot be checked is reported, and while one exists the proxy is not stopped (it may still point at it).
+# shellcheck source=lib/hmd-python.sh disable=SC1091
+[ -r "$BIN_DIR/lib/hmd-python.sh" ] && . "$BIN_DIR/lib/hmd-python.sh"
+SETTINGS_PY=""
+settings_python() {
+  [ -n "$SETTINGS_PY" ] && return 0
+  local p=""
+  if type hmd_python >/dev/null 2>&1; then p="$(hmd_python 2>/dev/null)"; else p="$(command -v python3 2>/dev/null)"; fi
+  if [ -n "$p" ] && [ -x "$p" ]; then SETTINGS_PY="$p"; fi
+  [ -n "$SETTINGS_PY" ]
+}
+joined() { printf '%s' "$1" | tr '\n' ';' | sed 's/;$//; s/;/; /g'; }
+
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$SELF"; }
+die()   { echo "hmd headroom: $*" >&2; exit 2; }
+
+STATE_DIR="$(_hmd_headroom_state "$PLUGIN_DIR")"
+PORT="$(hmd_headroom_port)"
+OURS="http://127.0.0.1:$PORT"
+SETTINGS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+LABEL="$(hmd_headroom_supervisor_label)"
+LC="${LAUNCHCTL:-launchctl}"
+DOMAIN="gui/$(id -u)"
+RC_FILES=(.zshrc .zprofile .zshenv .bashrc .bash_profile .profile)
+BACKUP_DIR_ARG="${HMD_HEADROOM_BACKUP_DIR:-}"
+
+# ── what is true right now (all read-only) ───────────────────────────────────────────────────────────
+module_installed() { hmd_headroom_installed "$PLUGIN_DIR"; }
+optout_record()    { [ -f "$STATE_DIR/.modstate/headroom/optout.json" ]; }
+env_opted_out() {
+  case "${HMD_HEADROOM_DISABLE:-}" in 1|true|TRUE|yes|YES) return 0 ;; esac
+  case ",${HMD_MODULE_OPTOUT:-}," in *",headroom,"*) return 0 ;; esac
+  return 1
+}
+routed_here()  { [ "${ANTHROPIC_BASE_URL:-}" = "$OURS" ] || [ "${ANTHROPIC_BASE_URL:-}" = "$OURS/" ]; }
+launchd_ok()   { _hmd_headroom_launchd_reachable; }
+# awk reads to the end on purpose: a `grep -q` last stage exits early, and under pipefail the SIGPIPE it can cause to the writer
+# would make an already-disabled job read as enabled, so a second --next-session would "change" it again.
+job_disabled() { "$LC" print-disabled "$DOMAIN" 2>/dev/null | awk -v l="\"$LABEL\" =>" 'index($0, l) && $0 ~ /=> (disabled|true)$/ { f = 1 } END { exit !f }'; }
+
+listener_pid() {
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p//p' | head -1
+}
+proxy_is_headroom() {   # its own command line says `headroom proxy`
+  local argv; argv="$(ps -ww -o command= -p "$1" 2>/dev/null)"
+  case "$argv" in *headroom*" proxy "*) return 0 ;; esac
+  return 1
+}
+# probe_proxy — sets PROXY_STATE to dead | silent | foreign | unverified | ours (and PROXY_PID, PROXY_UPSTREAM for ours).
+# `ours` needs three witnesses to agree: /health says headroom-proxy pointed at the real provider (the chain's own
+# test), the pid it reports is the pid LISTENING on the port, and that process's command line is `headroom proxy`.
+probe_proxy() {
+  local body hp lp
+  PROXY_PID=""; PROXY_UPSTREAM=""
+  PROXY_STATE="$(hmd_headroom_port_state "$PORT")"
+  [ "$PROXY_STATE" = answering ] || return 0
+  if ! body="$(hmd_headroom_health "$PORT")"; then PROXY_STATE=foreign; return 0; fi
+  hp="$(printf '%s' "$body" | jq -r '.config.pid // empty' 2>/dev/null)"
+  lp="$(listener_pid)"
+  if [ -n "$hp" ] && [ "$hp" = "$lp" ] && proxy_is_headroom "$hp"; then
+    PROXY_STATE=ours; PROXY_PID="$hp"
+    PROXY_UPSTREAM="$(printf '%s' "$body" | jq -r '.checks.upstream.url // empty' 2>/dev/null)"
+  else
+    PROXY_STATE=unverified
+  fi
+}
+
+# pinned_sessions — one "pid name" line per process that would lose its route if the proxy stopped: a Claude Code
+# process carrying the proxy URL in its environment, or any process holding a live connection to the port. NOT every
+# process that has the variable: a daemon that merely inherited it from a routed shell (postgres, a hook's python)
+# never talks to the proxy, and counting it would make `off` impossible for ever.
+pinned_sessions() {
+  {
+    ps axeww -o pid=,command= 2>/dev/null | awk -v port="$PORT" '
+      BEGIN { re = "ANTHROPIC_BASE_URL=http://127\\.0\\.0\\.1:" port "(/| |$)" }
+      $0 ~ re { for (i = 2; i <= 4 && i <= NF; i++) { n = split($i, p, "/"); if (p[n] == "claude" || $i ~ /claude-code/) { print $1; break } } }'
+    if command -v lsof >/dev/null 2>&1; then lsof -nP -iTCP:"$PORT" -sTCP:ESTABLISHED -Fp 2>/dev/null | sed -n 's/^p//p'; fi
+  } | sort -u | while read -r pid; do
+    [ -n "$pid" ] && [ "$pid" != "$$" ] && [ "$pid" != "${PROXY_PID:-}" ] || continue
+    printf '%s %s\n' "$pid" "$(ps -o comm= -p "$pid" 2>/dev/null | sed 's|.*/||')"
+  done
+}
+
+# rc_scan pin|launcher — "file:line: text" for the non-comment lines of the user's shell rc files that
+#   pin       export the proxy URL: every new shell would point every tool at a proxy that is about to stop
+#   launcher  run `hmd route claude`: harmless with Headroom off, and also how the OmniRoute fallback gate routes a launch
+rc_scan() {
+  local f pat
+  case "$1" in
+    pin)      pat="ANTHROPIC_BASE_URL=[\"']?http://(127\\.0\\.0\\.1|localhost):$PORT" ;;
+    launcher) pat='hmd route claude|heimdall-route claude' ;;
+  esac
+  for f in "${RC_FILES[@]}"; do
+    [ -f "$HOME/$f" ] || continue
+    grep -n -E "$pat" "$HOME/$f" 2>/dev/null | grep -v -E '^[0-9]+:[[:space:]]*#' | while IFS= read -r l; do
+      printf '%s:%s\n' "$HOME/$f" "$(printf '%s' "$l" | tr -s '[:space:]' ' ')"
+    done
+  done
+}
+
+# settings_mount check|strip <file> — the proxy's URL as env.ANTHROPIC_BASE_URL in a Claude settings file. Only a value
+# that equals ours is ever touched. Exit 0: it was there (for strip: and is gone), 11: nothing to do, 1: the rewrite failed.
+# The rewrite is atomic (temp file in the same directory, then rename), keeps the file's mode and indentation, and follows
+# a symlinked dotfile to its target rather than replacing the link.
+settings_mount() {
+  "$SETTINGS_PY" -I -c '
+import json, os, sys, tempfile
+mode, path, url = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    path = os.path.realpath(path)
+    raw = open(path, encoding="utf-8").read()
+    d = json.loads(raw)
+except (OSError, ValueError):
+    sys.exit(11)
+env = d.get("env") if isinstance(d, dict) else None
+v = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+ours = isinstance(v, str) and v.rstrip("/") == url.rstrip("/")  # FALSIFIER:ours
+if not ours:
+    sys.exit(11)
+if mode == "check":
+    sys.exit(0)
+del env["ANTHROPIC_BASE_URL"]
+if not env:
+    del d["env"]
+indent = "  "
+for line in raw.splitlines():
+    if line[:1] in (" ", "\t"):
+        indent = line[: len(line) - len(line.lstrip(" \t"))]
+        break
+st = os.stat(path)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".hmd-headroom-off.")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, indent=indent, ensure_ascii=False)
+        fh.write("\n")
+    os.chmod(tmp, st.st_mode & 0o777)
+    os.replace(tmp, path)
+except OSError:
+    os.unlink(tmp)
+    sys.exit(1)
+' "$1" "$2" "$OURS"
+}
+
+# ── backup and the change record ─────────────────────────────────────────────────────────────────────
+BACKUP=""; CHANGED=0; PROBLEMS=0; LEFT=""
+begin_backup() {   # at the moment a change is certain, so a run that changes nothing writes nothing
+  [ -z "$BACKUP" ] || return 0
+  BACKUP="${BACKUP_DIR_ARG:-${HEIMDALL_HOME:-$HOME/.heimdall}/headroom/off-backup/$(date -u +%Y%m%dT%H%M%SZ)}"
+  if ! { mkdir -p "$BACKUP/files" && chmod 0700 "$BACKUP" "$BACKUP/files"; }; then
+    die "cannot create the backup directory $BACKUP — nothing was changed"
+  fi
+  printf 'hmd headroom %s — %s (user %s)\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(id -un)" >> "$BACKUP/CHANGES.txt"
+}
+backup_file() {    # the FIRST copy is the original; a later change to the same file never overwrites it
+  local dest
+  dest="$(saved_as "$1")"
+  [ -e "$dest" ] || cp -p "$1" "$dest" || die "cannot back up $1 — nothing was changed"
+}
+saved_as() { printf '%s/files/%s' "$BACKUP" "$(printf '%s' "$1" | tr '/' '_')"; }
+change() {         # change <what happened> <how to undo it>
+  CHANGED=$((CHANGED + 1))
+  printf '  - %s\n      undo: %s\n' "$1" "$2"
+  printf '%s\n  undo: %s\n' "$1" "$2" >> "$BACKUP/CHANGES.txt"
+}
+problem() { PROBLEMS=$((PROBLEMS + 1)); printf '  ! %s\n' "$1" >&2; }
+left()    { LEFT="${LEFT}  - $1"$'\n'; }
+
+stop_proxy_pid() {   # SIGTERM, then wait (bounded) until nothing listens; never SIGKILL
+  local pid="$1" i=0 polls="${HMD_HEADROOM_STOP_POLLS:-40}"
+  case "$polls" in ''|*[!0-9]*) polls=40 ;; esac
+  kill -TERM "$pid" 2>/dev/null || return 1
+  while [ "$i" -lt "$polls" ]; do
+    [ "$(hmd_headroom_port_state "$PORT")" = dead ] && return 0
+    sleep 0.25; i=$((i + 1))
+  done
+  return 1
+}
+
+# ── status ───────────────────────────────────────────────────────────────────────────────────────────
+cmd_status() {
+  [ $# -eq 0 ] || case "$1" in -h|--help) usage; exit 0 ;; *) die "status takes no arguments (got: $1)" ;; esac
+  local on=OFF mod f line pinned mounts=""
+  probe_proxy
+  module_installed && ! optout_record && ! env_opted_out && on=ON
+  printf 'headroom: %s\n' "$on"
+  if ! module_installed; then mod='not added (enable it on demand: hmd headroom on)'
+  elif env_opted_out;     then mod='installed, opted out by the environment (HMD_HEADROOM_DISABLE or HMD_MODULE_OPTOUT)'
+  elif optout_record;     then mod='installed, opted out (hmd headroom on enables it)'
+  else mod='installed and enabled: a launch routed through hmd starts the proxy on demand'; fi
+  printf '  module:       %s\n' "$mod"
+  case "$PROXY_STATE" in
+    dead)       printf '  proxy:        nothing is listening on 127.0.0.1:%s\n' "$PORT" ;;
+    silent)     printf '  proxy:        something listens on 127.0.0.1:%s but does not answer%s\n' "$PORT" "$(_hmd_headroom_held_by "$PORT")" ;;
+    foreign)    printf '  proxy:        127.0.0.1:%s answers but is not a Headroom proxy pointed at %s (or its /health did not reply within %ss)%s\n' "$PORT" "$HMD_HEADROOM_UPSTREAM" "$HMD_HEADROOM_HEALTH_MAX_TIME" "$(_hmd_headroom_held_by "$PORT")" ;;
+    unverified) printf '  proxy:        127.0.0.1:%s answers as Headroom but its pid or command line does not check out%s\n' "$PORT" "$(_hmd_headroom_held_by "$PORT")" ;;
+    ours)       printf '  proxy:        running, pid %s on 127.0.0.1:%s, forwarding to %s\n' "$PROXY_PID" "$PORT" "$PROXY_UPSTREAM" ;;
+  esac
+  if hmd_headroom_supervised; then
+    printf '  supervision:  launchd job %s is installed%s\n' "$LABEL" "$(launchd_ok && job_disabled && printf ' (disabled for the next login)')"
+  else
+    printf '  supervision:  none (opt in with: hmd modules supervise headroom install)\n'
+  fi
+  if routed_here; then printf '  this session: ROUTED through the proxy (ANTHROPIC_BASE_URL=%s): hmd headroom off needs --next-session here\n' "$ANTHROPIC_BASE_URL"
+  else printf '  this session: not routed through the proxy\n'; fi
+  if [ "$PROXY_STATE" = ours ]; then
+    pinned="$(pinned_sessions)"
+    [ -z "$pinned" ] || printf '  sessions:     %s still routed through the proxy: %s\n' "$(printf '%s\n' "$pinned" | grep -c .)" "$(joined "$pinned")"
+  fi
+  for f in "$SETTINGS_DIR/settings.json" "$SETTINGS_DIR/settings.local.json"; do
+    [ -f "$f" ] || continue
+    if settings_python; then
+      settings_mount check "$f" && mounts="${mounts}    $f: env.ANTHROPIC_BASE_URL is the proxy"$'\n'
+    else
+      mounts="${mounts}    $f: NOT CHECKED (no usable python3)"$'\n'
+    fi
+  done
+  while IFS= read -r line; do [ -n "$line" ] && mounts="${mounts}    $line   (exports the proxy URL)"$'\n'; done <<< "$(rc_scan pin)"
+  while IFS= read -r line; do [ -n "$line" ] && mounts="${mounts}    $line   (launcher: kept, see hmd headroom off)"$'\n'; done <<< "$(rc_scan launcher)"
+  if [ -n "$mounts" ]; then printf '  mounts:\n%s' "$mounts"; else printf '  mounts:       none found (Claude settings env, shell rc)\n'; fi
+}
+
+# ── on ───────────────────────────────────────────────────────────────────────────────────────────────
+cmd_on() {
+  [ $# -eq 0 ] || case "$1" in -h|--help) usage; exit 0 ;; *) die "on takes no arguments (got: $1)" ;; esac
+  local did=0 rc
+  env_opted_out && die "Headroom is opted out by the environment (HMD_HEADROOM_DISABLE or HMD_MODULE_OPTOUT): unset it first, hmd headroom on cannot change your environment"
+  if optout_record; then
+    "$MODULES_BIN" optin headroom --quiet >/dev/null 2>&1
+    optout_record && die "could not clear the opt-out record ($STATE_DIR/.modstate/headroom/optout.json)"
+    echo "  cleared the module opt-out"; did=1
+  fi
+  if ! module_installed; then
+    echo "  adding the headroom module (hmd modules add headroom):"
+    "$MODULES_BIN" add headroom
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "hmd headroom: Headroom was not enabled: hmd modules add headroom exited $rc (its output is above). Fix that, then run hmd headroom on again." >&2
+      exit "$rc"
+    fi
+    did=1
+  fi
+  if hmd_headroom_supervised && launchd_ok && job_disabled; then
+    if "$LC" enable "$DOMAIN/$LABEL" >/dev/null 2>&1; then echo "  re-enabled the launchd job $LABEL"; did=1
+    else echo "hmd headroom: warning: launchctl enable $DOMAIN/$LABEL failed; the job stays disabled" >&2; fi
+  fi
+  if [ "$did" -eq 0 ]; then echo "headroom is already on."; else echo "headroom is on."; fi
+  hmd_headroom_bin >/dev/null 2>&1 || echo "  note: the headroom CLI is not installed on this machine yet; hmd modules add printed the command that installs it."
+  echo "  Nothing is routed yet: the proxy starts on the first launch routed through it, with \`hmd route claude\` or \`hmd wrap claude\`."
+  echo "  To route every launch, keep this in your shell rc:  claude() { command hmd route claude \"\$@\"; }"
+  echo "  Turn it off again: hmd headroom off"
+}
+
+# ── off ──────────────────────────────────────────────────────────────────────────────────────────────
+cmd_off() {
+  local next=0 f line cmdline="off"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --next-session) next=1; shift ;;
+      --backup-dir)   [ -n "${2:-}" ] || die "--backup-dir needs a directory"; BACKUP_DIR_ARG="$2"; shift 2 ;;
+      --backup-dir=*) BACKUP_DIR_ARG="${1#--backup-dir=}"; shift ;;
+      -h|--help)      usage; exit 0 ;;
+      *)              die "off: unknown argument: $1 (hmd headroom off [--next-session] [--backup-dir DIR])" ;;
+    esac
+  done
+  [ "$next" -eq 0 ] || cmdline="off --next-session"
+
+  if routed_here && [ "$next" -eq 0 ]; then # FALSIFIER:refuse
+    cat >&2 <<EOF
+hmd headroom off: refused. This session is routed through the Headroom proxy (ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL).
+  Switching it off now would take the proxy away under this session: every request would fail with ECONNREFUSED, and a
+  running session cannot re-point itself. Nothing was changed. Either:
+    hmd headroom off --next-session    change the configuration only: this session keeps working, new launches go direct
+    run hmd headroom off from a shell that is not routed (a new terminal) once the sessions that use the proxy have ended
+EOF
+    exit 3
+  fi
+
+  # ── plan (read-only) ──
+  local was_supervised=0 plan_optout=0 plan_unload=0 plan_disable=0 plan_stop=0 pinned="" unchecked="" unchecked_said=0 rc_pins rc_launch can_stop=1
+  local mount_files=()
+  probe_proxy
+  hmd_headroom_supervised && was_supervised=1
+  [ "$next" -eq 1 ] || pinned="$(pinned_sessions)"
+  rc_pins="$(rc_scan pin)"; rc_launch="$(rc_scan launcher)"
+  module_installed && ! optout_record && plan_optout=1
+  for f in "$SETTINGS_DIR/settings.json" "$SETTINGS_DIR/settings.local.json"; do
+    [ -f "$f" ] || continue
+    if settings_python; then settings_mount check "$f" && mount_files+=("$f")
+    else unchecked="${unchecked}${unchecked:+; }$f"; fi
+  done
+  # Stopping anything is allowed only when nothing can lose its route by it.
+  [ "$next" -eq 0 ] || can_stop=0
+  [ -z "$pinned" ] || can_stop=0 # FALSIFIER:pinned
+  [ -z "$rc_pins" ] || can_stop=0
+  [ -z "$unchecked" ] || can_stop=0 # FALSIFIER:unchecked
+  if [ "$was_supervised" -eq 1 ]; then
+    if ! launchd_ok; then left "launchd job $LABEL left alone: this HOME is not the real one, so the real launchctl is never called"
+    elif [ "$can_stop" -eq 1 ]; then plan_unload=1
+    elif ! job_disabled; then plan_disable=1; fi
+  fi
+  [ "$PROXY_STATE" = ours ] && [ "$can_stop" -eq 1 ] && { module_installed || [ "$was_supervised" -eq 1 ]; } && plan_stop=1
+
+  # ── why a running proxy is left alone ──
+  case "$PROXY_STATE" in
+    ours)
+      if [ "$plan_stop" -eq 0 ]; then
+        if [ "$next" -eq 1 ]; then
+          left "left running: the Headroom proxy (pid $PROXY_PID). --next-session never stops it, so sessions routed through it keep working. Stop it once they have ended: hmd headroom off"
+        elif [ -n "$pinned" ]; then
+          left "left running: the Headroom proxy (pid $PROXY_PID). $(printf '%s\n' "$pinned" | grep -c .) process(es) are still routed through it: $(joined "$pinned"). Stopping it would break them. When they have ended: hmd headroom off"
+        elif [ -n "$rc_pins" ]; then
+          left "left running: the Headroom proxy (pid $PROXY_PID): a shell rc exports its URL (below), so new shells would point at a dead port if it stopped. Delete that line, then: hmd headroom off"
+        elif [ -n "$unchecked" ]; then
+          unchecked_said=1
+          left "left running: the Headroom proxy (pid $PROXY_PID): $unchecked could not be checked (no usable python3) for a base URL that points at it, so it is not stopped. Install python3 or check by hand, then: hmd headroom off"
+        else
+          left "left running: the Headroom proxy (pid $PROXY_PID) is not part of an hmd-managed install (the module is not added), so it is not touched"
+        fi
+      fi ;;
+    foreign)    left "port $PORT answers but is not a Headroom proxy pointed at $HMD_HEADROOM_UPSTREAM (or its /health did not reply within ${HMD_HEADROOM_HEALTH_MAX_TIME}s)$(_hmd_headroom_held_by "$PORT"): not touched" ;;
+    unverified) left "the listener on port $PORT answers as Headroom but its /health pid is not the listening pid, or its command line is not \`headroom proxy\`$(_hmd_headroom_held_by "$PORT"): not touched" ;;
+    silent)     left "something listens on port $PORT but did not answer$(_hmd_headroom_held_by "$PORT"): not touched" ;;
+  esac
+  [ -z "$rc_pins" ] || left "$(joined "$rc_pins"): this line exports the proxy URL, so every new shell points its tools at the proxy, and at a dead port once it is stopped. Delete it"
+  [ -z "$unchecked" ] || [ "$unchecked_said" -eq 1 ] || left "$unchecked could not be checked (no usable python3) for a base URL that points at the proxy: check by hand"
+  while IFS= read -r line; do
+    [ -n "$line" ] && left "$line — the claude() function stays: with Headroom off \`hmd route claude\` declines it, and it is also how the OmniRoute fallback gate routes a launch. Delete it only if you want plain claude"
+  done <<< "$rc_launch"
+
+  if [ "$plan_optout" -eq 0 ] && [ "${#mount_files[@]}" -eq 0 ] && [ "$plan_unload" -eq 0 ] && [ "$plan_disable" -eq 0 ] && [ "$plan_stop" -eq 0 ]; then
+    echo "headroom is already off: nothing changed."
+    [ -z "$LEFT" ] || printf 'left alone:\n%s' "$LEFT"
+    exit 0
+  fi
+
+  # ── back up first: every failure here happens before anything is changed ──
+  begin_backup "$cmdline"
+  for f in ${mount_files[@]+"${mount_files[@]}"}; do backup_file "$f"; done
+  [ "$plan_unload" -eq 0 ] || backup_file "$(hmd_headroom_supervisor_plist)"
+
+  echo "changed:"
+  if [ "$plan_optout" -eq 1 ]; then
+    "$MODULES_BIN" optout headroom --quiet >/dev/null 2>&1
+    if optout_record; then change "opted out of the headroom module: route, wrap and the wrap shim now decline it, so new launches go direct (or to the OmniRoute fallback when its gate says ROUTE)" "hmd headroom on"
+    else problem "could not record the opt-out ($STATE_DIR/.modstate/headroom/optout.json): hmd modules optout headroom"; fi
+  fi
+  for f in ${mount_files[@]+"${mount_files[@]}"}; do
+    if settings_mount strip "$f"; then change "removed env.ANTHROPIC_BASE_URL=$OURS from $f" "put \"ANTHROPIC_BASE_URL\": \"$OURS\" back under \"env\" in $f (original: $(saved_as "$f"))"
+    else problem "could not rewrite $f: it still points sessions at the proxy (original untouched; backup: $(saved_as "$f"))"; fi
+  done
+  if [ "$plan_unload" -eq 1 ]; then
+    if "$SUPERVISE_BIN" uninstall --quiet; then change "unloaded the launchd job $LABEL and removed its plist (a supervised proxy stops with it)" "hmd headroom on, then: hmd modules supervise headroom install (original plist: $(saved_as "$(hmd_headroom_supervisor_plist)"))"
+    else problem "could not unload the launchd job $LABEL: hmd modules supervise headroom uninstall"; fi
+  elif [ "$plan_disable" -eq 1 ]; then
+    if "$LC" disable "$DOMAIN/$LABEL" >/dev/null 2>&1; then change "disabled the launchd job $LABEL for the next login (it is not unloaded: its proxy keeps running for the sessions that use it)" "hmd headroom on (or: launchctl enable $DOMAIN/$LABEL)"
+    else problem "could not disable the launchd job $LABEL: launchctl disable $DOMAIN/$LABEL"; fi
+  fi
+  if [ "$plan_stop" -eq 1 ]; then
+    probe_proxy   # unloading the job may already have stopped it
+    if [ "$PROXY_STATE" = ours ]; then
+      if stop_proxy_pid "$PROXY_PID"; then change "stopped the Headroom proxy (pid $PROXY_PID)" "it starts again on the first launch routed through it, after: hmd headroom on"
+      else problem "the Headroom proxy (pid $PROXY_PID) did not exit; not forcing it. If it is hung: kill -9 $PROXY_PID"; fi
+    fi
+  fi
+  [ "$CHANGED" -gt 0 ] || echo "  (nothing)"
+  [ -z "$LEFT" ] || printf 'left alone:\n%s' "$LEFT"
+  printf 'backup: %s (CHANGES.txt lists each change and how to undo it)\n' "$BACKUP"
+  [ "$PROBLEMS" -eq 0 ] || exit 1
+  return 0
+}
+
+case "${1:-}" in
+  status)           shift; cmd_status "$@" ;;
+  on)               shift; cmd_on "$@" ;;
+  off)              shift; cmd_off "$@" ;;
+  -h|--help|help|'') usage; exit 0 ;;
+  *)                echo "hmd headroom: unknown command: $1 (status | on | off)" >&2; usage >&2; exit 2 ;;
+esac

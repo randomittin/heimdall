@@ -15,6 +15,15 @@
 # would have left the behaviour wrong; fixing the behaviour alone would have left the
 # message wrong. This suite pins BOTH, and W7 pins that they cannot drift apart again.
 #
+# HEADROOM IS OPT-IN NOW (operator directive 2026-11-12: `default_included` is false in
+# modules/headroom/manifest.json), so the real registry has no default module and the
+# updater's reconcile loop never reaches it. W1 is that opt-in proof. Everything this file
+# asks about what the updater does with headroom's REAL waiver, classes and disclosure is
+# asked of a temp registry holding the SHIPPED manifest with `default_included` forced to
+# true and nothing else changed (mk_headroom_default_registry): W1b, W7 and F1. W1b is also
+# W1's RED arm: the identical run with ONLY that flag flipped DOES select the module, so
+# W1's silence is the flag at work and never a registry the updater cannot read.
+#
 # WHAT IS UNDER TEST IS THE PRECEDENCE, NOT HEADROOM. Both binaries compute it the same
 # way, and W2 runs it over synthetic modules this repo has never heard of:
 #   1. the union of the declared CLASSES decides whether consent is required at all;
@@ -22,8 +31,11 @@
 #   3. a waiver with no `consent_text` is inert, because obtain_consent refuses it too.
 #
 # THE INVARIANTS, each of which cost something to establish:
-#   W1  headroom's real manifest waives → the updater ACQUIRES instead of deferring, and
-#       the sentence that contradicted `hmd modules add` is gone.
+#   W1  the REAL registry has no default module: headroom is opt-in, so an update neither
+#       acquires it, defers it, nor mentions it, and installs nothing.
+#   W1b headroom's real manifest, forced into the default set, waives → the updater
+#       ACQUIRES instead of deferring, and the sentence that contradicted `hmd modules
+#       add` is gone.
 #   W2  the waiver is PER-MODULE. A synthetic traffic-proxy module WITHOUT the waiver, in
 #       the SAME registry reading the SAME class contract, still DEFERS. A waiver that
 #       leaked to the class is the outcome the owner explicitly rejected, so it is proven
@@ -36,7 +48,7 @@
 #       a false "installed".
 #   W6  `--yes` is never passed, on the waived path either.
 #   W7  the updater's decision matches heimdall-modules' declared posture, module for
-#       module, over the real registry.
+#       module, over headroom's real manifest forced into the default set.
 #   F1-F4 FALSIFIERS. Four mutants, one per load-bearing claim, each restoring a real
 #       defect: the class-only read (the original bug), a class-wide waiver, a dropped
 #       opt-out guard, a dropped disclosure. Every one must produce the broken behaviour,
@@ -83,6 +95,18 @@ mk_registry() {
   local reg="$1"
   mkdir -p "$reg/_classes"
   cp "$REPO"/modules/_classes/*.json "$reg/_classes/" 2>/dev/null
+  printf '%s' "$reg"
+}
+
+# Headroom's SHIPPED manifest in a registry where it IS default-included. The shipped file
+# is opt-in (`default_included: false`, operator directive 2026-11-12), so the real registry
+# never feeds it to the updater; this is how "what does the updater do with headroom's REAL
+# waiver and classes" is still asked. ONLY `default_included` differs from the shipped bytes,
+# and W1b asserts that rather than assuming it.
+mk_headroom_default_registry() {
+  local reg; reg="$(mk_registry "$1")"
+  mkdir -p "$reg/headroom"
+  jq '.default_included = true' "$REPO/modules/headroom/manifest.json" > "$reg/headroom/manifest.json"
   printf '%s' "$reg"
 }
 
@@ -147,10 +171,33 @@ decision() { grep "reconcile: $2 " "$1/autoupdate.log" 2>/dev/null; }
 
 printf "\n\033[1mautoupdate-consent-waiver — the updater and the installer agree on who is asked\033[0m\n\n"
 
-# ── W1. The real registry: headroom acquires, and the contradiction is gone ──────
-printf "\033[1mW1  the real registry — headroom's own waiver makes the update acquire it\033[0m\n"
+# ── W1. The real registry: headroom is OPT-IN, so an update never reaches it ─────
+printf "\033[1mW1  the real registry — headroom is opt-in, so the updater leaves it entirely alone\033[0m\n"
 H="$(mk_home)"; S="$(mk_state)"
 OUT="$(run_dry "$BIN" "$H" "$REPO/modules" "$S")"
+RC=$?
+[ "$RC" -eq 0 ] && ok "update exits 0 with no default module in the registry" || bad "update exited $RC"
+[ "$(jq -r '.default_included' "$REPO/modules/headroom/manifest.json")" = "false" ] \
+  && ok "headroom IS in the real registry and ships default_included:false — what follows is the opt-in flag at work, not a missing module" \
+  || bad "headroom's shipped manifest is not opt-in (default_included=$(jq -r '.default_included' "$REPO/modules/headroom/manifest.json"))"
+[ -z "$(decision "$H" headroom)" ] \
+  && ok "no reconcile decision is logged for headroom — not would-acquire, not defer-consent" \
+  || bad "headroom reached the reconcile loop though it is opt-in: $(decision "$H" headroom)"
+grep -qE 'headroom|acquiring' <<<"$OUT" \
+  && bad "update names headroom or starts an acquisition though it is opt-in: $OUT" \
+  || ok "update neither names headroom nor starts an acquisition — an opt-in module is not advertised"
+[ ! -f "$S/headroom/receipt.json" ] \
+  && ok "nothing was installed (no receipt)" \
+  || bad "a receipt appeared for an opt-in module"
+
+# ── W1b. The SAME run, headroom's real manifest forced into the default set ──────
+printf "\n\033[1mW1b headroom's real manifest as a DEFAULT module — its own waiver makes the update acquire it\033[0m\n"
+H="$(mk_home)"; S="$(mk_state)"; HREG="$(mk_headroom_default_registry "$TMPROOT/reg-headroom-default")"
+[ "$(jq -r '.default_included' "$HREG/headroom/manifest.json")" = "true" ] \
+  && [ "$(jq -S 'del(.default_included)' "$HREG/headroom/manifest.json")" = "$(jq -S 'del(.default_included)' "$REPO/modules/headroom/manifest.json")" ] \
+  && ok "the registry holds the SHIPPED manifest with default_included flipped to true and nothing else changed" \
+  || bad "the forced-default registry is not the shipped manifest plus the one flag — W1b would be judging a fixture"
+OUT="$(run_dry "$BIN" "$H" "$HREG" "$S")"
 RC=$?
 [ "$RC" -eq 0 ] && ok "update exits 0" || bad "update exited $RC"
 decision "$H" headroom | grep -q 'would-acquire' \
@@ -326,26 +373,35 @@ grep -q -- '--yes' "$TMPROOT/argv-disclose.log" 2>/dev/null \
 
 # ── W7. The two binaries agree, module for module ────────────────────────────────
 printf "\n\033[1mW7  no drift — the updater's decision matches heimdall-modules' declared posture\033[0m\n"
-H="$(mk_home)"; S="$(mk_state)"
-run_dry "$BIN" "$H" "$REPO/modules" "$S" >/dev/null 2>&1
+# The shipped registry has no default module (W1), so this runs over headroom's REAL
+# manifest forced into the default set, and BOTH binaries read that one registry: the
+# updater's dry run and heimdall-modules' own status. A default module the updater logged
+# no decision for fails here rather than passing: nothing would have been compared.
+H="$(mk_home)"; S="$(mk_state)"; W7REG="$(mk_headroom_default_registry "$TMPROOT/reg-w7")"
+run_dry "$BIN" "$H" "$W7REG" "$S" >/dev/null 2>&1
 COMPARED=0; DISAGREE=0
 while IFS= read -r n; do
   [ -n "$n" ] || continue
-  mf="$REPO/modules/$n/manifest.json"
+  mf="$W7REG/$n/manifest.json"
   [ -f "$mf" ] || continue
   # The UPDATER's decision, read off the log it just wrote.
+  if ! decision "$H" "$n" | grep -qE 'defer-consent|would-acquire'; then
+    DISAGREE=$((DISAGREE+1))
+    bad "the updater logged no decision for default module \"$n\" — there was nothing to compare"
+    continue
+  fi
   upd_defers=0
   decision "$H" "$n" | grep -q 'defer-consent' && upd_defers=1
   # The INSTALLER's posture, read from its own read-only JSON surface. `add` is never
   # invoked: this asks what heimdall-modules would DO, without doing it.
-  waived="$(env HOME="$H" HEIMDALL_HOME="$H" HMD_MODULES_REGISTRY="$REPO/modules" \
+  waived="$(env HOME="$H" HEIMDALL_HOME="$H" HMD_MODULES_REGISTRY="$W7REG" \
               HMD_MODULES_STATE="$S" "$MODS_BIN" --json status "$n" 2>/dev/null </dev/null \
             | jq -r '.consent_waiver.waived // false' 2>/dev/null)"
   [ -n "$waived" ] || waived=false
   cls_requires=0
   while IFS= read -r cls; do
     [ -n "$cls" ] || continue
-    cf="$REPO/modules/_classes/$cls.json"
+    cf="$W7REG/_classes/$cls.json"
     [ -f "$cf" ] || continue
     [ "$(jq -r '.consent_required // false' "$cf")" = "true" ] && cls_requires=1
   done <<< "$(jq -r '.permission_class | if type=="array" then .[] else . end' "$mf")"
@@ -356,7 +412,7 @@ while IFS= read -r n; do
     DISAGREE=$((DISAGREE+1))
     bad "DRIFT on \"$n\": updater defers=$upd_defers, installer asks=$inst_asks"
   fi
-done <<< "$(jq -r 'select(.default_included == true) | .name' "$REPO"/modules/*/manifest.json 2>/dev/null)"
+done <<< "$(jq -r 'select(.default_included == true) | .name' "$W7REG"/*/manifest.json 2>/dev/null)"
 [ "$COMPARED" -gt 0 ] \
   && ok "the comparison ran over $COMPARED real default module(s) — not vacuous" \
   || bad "no default module was compared; W7 proved nothing"
@@ -370,16 +426,17 @@ done <<< "$(jq -r 'select(.default_included == true) | .name' "$REPO"/modules/*/
 # above it is not gripping the code.
 printf "\n\033[1mF   FALSIFIERS — four mutants, four assertions proven able to go RED\033[0m\n"
 
-# F1 — THE ORIGINAL BUG: module_needs_consent consults only the CLASS contract.
+# F1 — THE ORIGINAL BUG: module_needs_consent consults only the CLASS contract. Asked of
+# the forced-default registry: the shipped one no longer selects headroom at all.
 sed 's|module_consent_waived "$mf" && return 1|:|' "$BIN" > "$MUTANT"; chmod +x "$MUTANT"
 if ! grep -q '^  :$' "$MUTANT"; then
   bad "F1 could not find the waiver precedence line — the test has lost its grip on the code"
 else
-  H="$(mk_home)"; S="$(mk_state)"
-  run_dry "$MUTANT" "$H" "$REPO/modules" "$S" >/dev/null 2>&1
+  H="$(mk_home)"; S="$(mk_state)"; HREG="$(mk_headroom_default_registry "$TMPROOT/reg-f1")"
+  run_dry "$MUTANT" "$H" "$HREG" "$S" >/dev/null 2>&1
   decision "$H" headroom | grep -q 'defer-consent' \
-    && ok "F1 class-only read → headroom DEFERS again → W1 can go RED" \
-    || bad "F1 mutant still acquired headroom — W1 may be passing vacuously"
+    && ok "F1 class-only read → headroom DEFERS again → W1b can go RED" \
+    || bad "F1 mutant still acquired headroom — W1b may be passing vacuously"
 fi
 rm -f "$MUTANT"
 

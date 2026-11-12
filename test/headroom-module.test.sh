@@ -16,10 +16,11 @@
 # ($PLUGIN_DIR/.heimdall/modules) — a directory whose contents are simply whatever
 # the operator installed. That made five assertions here statements about the
 # developer's machine, and they went RED the day the owner ran `hmd modules add
-# headroom` for real. Headroom is `default_included: true`, so HAVING it is the
-# normal state for everyone: a suite that only passes on machines that never
-# adopted the feature is worthless exactly when it matters. Every list/status
-# assertion below therefore runs against a scratch --state this file creates.
+# headroom` for real. Headroom is opt-in (`default_included: false`, operator
+# directive 2026-11-12), but whoever runs `hmd headroom on` HAS it, and a suite that
+# only passes on machines that never adopted the feature is worthless exactly when it
+# matters. Every list/status assertion below therefore runs against a scratch --state
+# this file creates.
 #
 # THIS SUITE OWNS ITS CONTROL PLANE, TOO. H1b, H3, H5 and H6's green arm drive the
 # REAL manifest through `add`, and its traffic-proxy `no-signed-traffic-routing`
@@ -77,8 +78,9 @@
 #   H8  a consent-required class with no consent_text is REFUSED.
 #   H9  tier is `available`, and `suggested` is UNREACHABLE without
 #       tier_evidence.receipt — the A/B has not run.
-#   H10 default_included is a boolean distribution fact, kept separate from tier,
-#       and it does not waive the disclosure text.
+#   H10 default_included is a boolean distribution fact (false: headroom is opt-in),
+#       kept separate from tier, and neither opting in nor default inclusion waives
+#       the disclosure text (the default-set gate is driven on a forced-default copy).
 #   H11 DEPEND, DON'T CLONE — the module directory holds a manifest and nothing
 #       else, and no Headroom source is vendored anywhere in the tree. The verdict
 #       is taken from a candidate directory's CONTENTS, never its path, and H11b
@@ -284,9 +286,10 @@ echo "H1b — and honest about PRESENCE, against a root this file really install
 # THE FALSIFIER FOR H1. Identical surfaces, a state root where the module is
 # genuinely installed, opposite answers. Without this arm, every "not installed"
 # above would pass just as happily against a tool that printed the words
-# unconditionally. It is also the case an operator is actually in: headroom is
-# default_included, so PRESENT is the normal state and deserves its own honesty
-# assertions rather than being the case nobody checked.
+# unconditionally. It is also the case an operator is in once they run `hmd headroom
+# on`: headroom is opt-in (default_included:false), so ABSENT is a fresh machine's
+# state and PRESENT every adopter's, and each deserves its own honesty assertions
+# rather than being the case nobody checked.
 PIN="$(jq -r '.pinned_version.version' "$MANIFEST")"
 # (the add into $PRESENT_STATE was started in the PRE-LAUNCH block above)
 wait "$PID_H1B"
@@ -418,10 +421,10 @@ if [ -f "$INV" ]; then
   else
     bad "receipt lost a class"
   fi
-  if [ "$(jq -r '.default_included' "$ST/headroom/receipt.json")" = "true" ]; then
-    ok "the receipt records default_included"
+  if [ "$(jq -r '.default_included' "$ST/headroom/receipt.json")" = "false" ]; then
+    ok "the receipt records default_included as false — headroom is opt-in"
   else
-    bad "receipt lost default_included"
+    bad "receipt lost default_included, or records something other than the manifest's false"
   fi
 else
   bad "no invariant record from the real add"
@@ -643,11 +646,11 @@ fi
 restore
 
 echo
-echo "H10 — default_included is a distribution fact, kept apart from tier"
-if [ "$(jq -r '.default_included' "$MANIFEST")" = "true" ]; then
-  ok "headroom is marked default_included"
+echo "H10 — default_included is a distribution fact (false: headroom is opt-in), kept apart from tier"
+if [ "$(jq -r '.default_included' "$MANIFEST")" = "false" ]; then
+  ok "headroom is NOT default-included — it is opt-in (operator directive 2026-11-12)"
 else
-  bad "default_included is not set"
+  bad "headroom is default-included, or default_included is unset — the base install and hmd update must never acquire it"
 fi
 if [ "$(jq -r '.default_included | type' "$MANIFEST")" = "boolean" ]; then
   ok "default_included is a boolean"
@@ -662,20 +665,39 @@ else
   bad "a non-boolean was accepted"
 fi
 restore
-# Default inclusion must NOT be able to launder itself into an evidence claim.
-if jq -e '.tier == "available" and .default_included == true' "$MANIFEST" >/dev/null 2>&1; then
-  ok "default-included AND unproven are stated together, not conflated"
+# The distribution decision must NOT be able to launder itself into an evidence claim.
+if jq -e '.tier == "available" and .default_included == false' "$MANIFEST" >/dev/null 2>&1; then
+  ok "opt-in AND unproven are stated together, not conflated"
 else
   bad "distribution and evidence are conflated"
 fi
-# A default-included module reaches every machine, so its disclosure must exist
-# before it ships — enforced at validate, not at a prompt nobody may see.
+# Opting in is not a way around the disclosure: with no consent_text the add is refused
+# (validate's waiver rule fires first for this waived manifest).
 mutate 'del(.consent_text)'
+OUT="$(add_mut optinnodisclosure)"; RC=$?
+if [ "$RC" -ne 0 ]; then
+  ok "an opt-in module with no disclosure text is refused"
+else
+  bad "an opt-in module shipped with no disclosure"
+fi
+restore
+# A default-included module reaches every machine, so its disclosure must exist before it
+# ships — enforced at validate, not at a prompt nobody may see. Headroom is opt-in, so the
+# shipped manifest cannot reach that gate; the SAME manifest forced into the default set
+# can, once its waiver is stripped (a waiver with no text is refused by the waiver rule
+# before the default-set gate runs). The refusal must come from the default-set gate: it
+# names default_included, which no other refusal in the add pipeline does.
+mutate '.default_included = true | del(.consent_text, .consent_waived, .consent_waived_reason)'
 OUT="$(add_mut defaultnodisclosure)"; RC=$?
 if [ "$RC" -ne 0 ]; then
-  ok "a default-included module with no disclosure text is refused"
+  ok "a module forced into the default set with no disclosure text is refused"
 else
   bad "a default-included module shipped with no disclosure"
+fi
+if grep -q 'default_included' <<<"$OUT"; then
+  ok "the refusal is the default-set gate: it names default_included, not just the consent prompt"
+else
+  bad "the refusal did not come from the default-set gate: $OUT"
 fi
 restore
 

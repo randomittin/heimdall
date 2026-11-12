@@ -80,7 +80,7 @@ minisign -Vp release/heimdall-signing.pub -m heimdall-install.sh -x install.sh.m
 - macOS only: a nightly 03:00 LaunchAgent, `~/Library/LaunchAgents/com.heimdall.dream.plist` (opt out with `HEIMDALL_NO_DREAM_SCHEDULE=1`).
 - `~/.heimdall/team.json`: an auto-minted solo team secret, a bearer capability: treat it like a credential.
 
-**A default module is a local proxy that can read your prompts.** Headroom is `default_included: true`, but nothing installs it for you: until you run `hmd modules add headroom`, `hmd modules status headroom` reports `NOT ATTEMPTED`, and that command is a remote code install with no digest verified. Disclosure in full: [docs/INSTALL.md](docs/INSTALL.md) and [SECURITY.md](SECURITY.md#the-headroom-proxy--a-local-process-that-reads-your-prompts).
+**Headroom, an optional local proxy that can read your prompts, is off by default.** A fresh install never installs it, loads no launchd job for it and never points `ANTHROPIC_BASE_URL` at it; `hmd modules status headroom` reports `NOT ATTEMPTED` until you run `hmd headroom on`. That command runs `hmd modules add headroom` if the module is absent (a remote code install with no digest verified) and starts nothing itself: the proxy starts on the first launch you route through `hmd route claude` or `hmd wrap claude`. `hmd headroom off` undoes it (`hmd headroom off --next-session` from inside a routed session), and an install that already has the module keeps it until you run that. Disclosure in full: [docs/INSTALL.md](docs/INSTALL.md) and [SECURITY.md](SECURITY.md#the-headroom-proxy--a-local-process-that-reads-your-prompts).
 
 ## Check the proof yourself
 

@@ -18,15 +18,20 @@
 # payload, and no write outside a throwaway HOME / temp registry / temp state root.
 #
 # WHAT IT PROVES (each with the falsifier that makes it mean something):
-#   R1. REAL registry: headroom is in the default set, is absent, is not opted out, and
-#       its own manifest WAIVES the consent question → update ACQUIRES it, records that
-#       the waiver (not a prompt) is why, and stops claiming an update "will never
-#       install it for you". The decide-only seam still writes no receipt.
-#       R1 read the other way round until the updater was fixed: it consulted only the
+#   R1. REAL registry: headroom is OPT-IN (`default_included: false`, operator directive
+#       2026-11-12), so the registry has no default module and an update acquires,
+#       defers and mentions nothing: no reconcile decision, no receipt.
+#   R1b headroom's REAL manifest forced into the default set (a temp registry holding the
+#       shipped file with ONLY `default_included` flipped, which R1b asserts): absent, not
+#       opted out, and its own manifest WAIVES the consent question → update ACQUIRES it,
+#       records that the waiver (not a prompt) is why, and stops claiming an update "will
+#       never install it for you". The decide-only seam still writes no receipt. It is
+#       R1's RED arm: the identical run with that one flag flipped DOES select the module.
+#       R1b read the other way round until the updater was fixed: it consulted only the
 #       CLASS contract, so it deferred a module `hmd modules add` installs with no
 #       prompt, and the two binaries disagreed about the same module. The waiver-aware
-#       transitions live in test/autoupdate-consent-waiver.test.sh; R1 pins the one
-#       decision the REAL registry produces today.
+#       transitions live in test/autoupdate-consent-waiver.test.sh; R1b pins the one
+#       decision headroom's real manifest produces as a default module.
 #   R2. HEALTHY → no-op: zero stdout, zero stderr, and the registry + state trees are
 #       BYTE-IDENTICAL before and after (a tree signature over names + content hashes).
 #   R3. BROKEN (receipt present, payload gone) is NOT re-acquired — it belongs to the
@@ -43,11 +48,13 @@
 #   R8. `--yes` is NEVER passed to `heimdall-modules` from the updater (structural).
 #       Auto-consent from a background SessionStart process is the trust incident.
 #   R9. uv ABSENT (PATH scrubbed): `update` still exits 0, no receipt appears, and
-#       `status` NAMES uv as the blocker with its remedy.
+#       `status` NAMES uv as the blocker with its remedy. Run over headroom's REAL manifest
+#       forced into the default set: the shipped registry has no default module to block.
 #   R10. A FAILING acquisition never breaks the update: a stub modules bin that exits 1
 #       leaves `update` at exit 0.
 #   R11. Reconcile NEVER prompts and never reads a terminal (structural + behavioural:
-#        it runs identically with stdin closed).
+#        it runs identically with stdin closed, over the forced-default registry so there
+#        is a real candidate for it to decide on).
 #
 # Exit 0 = every proof holds.
 
@@ -118,6 +125,19 @@ add_manifest() {
     > "$reg/$name/manifest.json"
 }
 
+# Headroom's SHIPPED manifest in a registry where it IS default-included. The shipped file
+# is opt-in (`default_included: false`, operator directive 2026-11-12), so the real registry
+# has no default module and never feeds the reconcile loop; every case that needs the REAL
+# manifest's shape in the default set (its waiver, its classes, its uv fetch) reads this
+# one. ONLY `default_included` differs from the shipped bytes, and R1b asserts that rather
+# than assuming it.
+mk_headroom_default_registry() {
+  local reg; reg="$(mk_registry "$1")"
+  mkdir -p "$reg/headroom"
+  jq '.default_included = true' "$REPO/modules/headroom/manifest.json" > "$reg/headroom/manifest.json"
+  printf '%s' "$reg"
+}
+
 # A stand-in for bin/heimdall-modules that RECORDS its argv instead of installing
 # anything. `exit_code` lets a test make acquisition fail on purpose (R10).
 mk_stub_modules() {
@@ -144,10 +164,36 @@ run_upd() {
 
 printf "\n\033[1mmodule-reconcile — an install that predates a default module acquires it\033[0m\n\n"
 
-# ── R1. REAL registry: headroom is in the default set, absent, not opted out ─────
-printf "\033[1mR1  real registry — headroom's own waiver makes the update acquire it\033[0m\n"
+# ── R1. REAL registry: headroom is OPT-IN, so the update leaves it entirely alone ─
+printf "\033[1mR1  real registry — headroom is opt-in (default_included:false): an update never reaches it\033[0m\n"
 H="$(mk_home)"; S="$(mk_state)"
 OUT="$(run_upd "$H" "$REPO/modules" "$S" HEIMDALL_MODULE_RECONCILE_DRYRUN=1 "$BIN" update 2>&1)"
+RC=$?
+[ "$RC" -eq 0 ] && ok "update exits 0 with no default module in the registry" \
+                || bad "update exited $RC (a registry with no default module must never fail the update)"
+[ "$(jq -r '.default_included' "$REPO/modules/headroom/manifest.json")" = "false" ] \
+  && ok "headroom IS in the real registry and ships default_included:false — the silence below is the opt-in flag, not a missing module" \
+  || bad "headroom's shipped manifest is not opt-in (default_included=$(jq -r '.default_included' "$REPO/modules/headroom/manifest.json"))"
+if grep -q 'reconcile: headroom' "$H/autoupdate.log" 2>/dev/null; then
+  bad "headroom reached the reconcile loop though it is opt-in: $(grep 'reconcile: headroom' "$H/autoupdate.log")"
+else
+  ok "no reconcile decision is logged for headroom — not would-acquire, not defer-consent"
+fi
+grep -qE 'headroom|acquiring' <<<"$OUT" \
+  && bad "update names headroom or starts an acquisition though it is opt-in: $OUT" \
+  || ok "update neither names headroom nor starts an acquisition — an opt-in module is not advertised"
+[ ! -f "$S/headroom/receipt.json" ] \
+  && ok "nothing was installed (no receipt)" \
+  || bad "a receipt appeared for an opt-in module"
+
+# ── R1b. The SAME run, headroom's real manifest forced into the default set ──────
+printf "\n\033[1mR1b headroom's real manifest as a DEFAULT module — its own waiver makes the update acquire it\033[0m\n"
+H="$(mk_home)"; S="$(mk_state)"; HREG="$(mk_headroom_default_registry "$TMPROOT/reg-headroom-default")"
+[ "$(jq -r '.default_included' "$HREG/headroom/manifest.json")" = "true" ] \
+  && [ "$(jq -S 'del(.default_included)' "$HREG/headroom/manifest.json")" = "$(jq -S 'del(.default_included)' "$REPO/modules/headroom/manifest.json")" ] \
+  && ok "the registry holds the SHIPPED manifest with default_included flipped to true and nothing else changed" \
+  || bad "the forced-default registry is not the shipped manifest plus the one flag — R1b would be judging a fixture"
+OUT="$(run_upd "$H" "$HREG" "$S" HEIMDALL_MODULE_RECONCILE_DRYRUN=1 "$BIN" update 2>&1)"
 RC=$?
 [ "$RC" -eq 0 ] && ok "update exits 0 with a default module absent" \
                 || bad "update exited $RC (a missing module must never fail the update)"
@@ -307,7 +353,9 @@ grep -q -- '--yes' "$ARGV" 2>/dev/null \
 
 # ── R9. uv ABSENT — update survives, status names the reason ─────────────────────
 printf "\n\033[1mR9  uv absent — hmd still updates, and status NAMES uv as the blocker\033[0m\n"
-H="$(mk_home)"; S="$(mk_state)"
+# Over headroom's real manifest forced into the default set: the shipped registry has no
+# default module, so against it there would be nothing for status to name a blocker for.
+H="$(mk_home)"; S="$(mk_state)"; HREG="$(mk_headroom_default_registry "$TMPROOT/reg-no-uv")"
 # A PATH with no uv on it. This machine HAS uv, so absence is simulated deliberately
 # rather than assumed — the test must hold on both kinds of machine.
 NOUV_PATH="$TMPROOT/nouv-bin"; mkdir -p "$NOUV_PATH"
@@ -318,7 +366,7 @@ command -v uv >/dev/null 2>&1 && ok "uv IS present on this machine — absence i
                               || ok "uv is absent on this machine (the scrubbed PATH matches reality)"
 [ ! -x "$NOUV_PATH/uv" ] && ok "the scrubbed PATH genuinely has no uv" || bad "the scrubbed PATH still exposes uv"
 OUT="$(env -i PATH="$NOUV_PATH" HOME="$H" HEIMDALL_HOME="$H" \
-        HMD_MODULES_REGISTRY="$REPO/modules" HMD_MODULES_STATE="$S" \
+        HMD_MODULES_REGISTRY="$HREG" HMD_MODULES_STATE="$S" \
         HEIMDALL_LATEST_OVERRIDE="$VER" HEIMDALL_INSTALLED_OVERRIDE="$VER" \
         HEIMDALL_AUTOUPDATE_DRYRUN=1 HMD_PREFLIGHT_NO_NET=1 \
         bash "$BIN" update 2>&1)"
@@ -328,7 +376,7 @@ RC=$?
 [ ! -f "$S/headroom/receipt.json" ] && ok "the module stays absent (nothing faked)" \
                                     || bad "a receipt appeared without uv"
 ST="$(env -i PATH="$NOUV_PATH" HOME="$H" HEIMDALL_HOME="$H" \
-        HMD_MODULES_REGISTRY="$REPO/modules" HMD_MODULES_STATE="$S" \
+        HMD_MODULES_REGISTRY="$HREG" HMD_MODULES_STATE="$S" \
         HEIMDALL_LATEST_OVERRIDE="$VER" HEIMDALL_INSTALLED_OVERRIDE="$VER" \
         HMD_PREFLIGHT_NO_NET=1 bash "$BIN" status 2>&1)"
 grep -q 'headroom' <<<"$ST" \
@@ -360,11 +408,16 @@ RC=$?
 
 # ── R11. Never prompts, never reads a terminal ───────────────────────────────────
 printf "\n\033[1mR11 reconcile never prompts\033[0m\n"
-H="$(mk_home)"; S="$(mk_state)"
-OUT="$(run_upd "$H" "$REPO/modules" "$S" HEIMDALL_MODULE_RECONCILE_DRYRUN=1 "$BIN" update 2>&1 <&-)"
+# Over headroom's real manifest forced into the default set, so reconcile has a real
+# candidate to decide on with stdin closed: against the shipped registry it decides nothing.
+H="$(mk_home)"; S="$(mk_state)"; HREG="$(mk_headroom_default_registry "$TMPROOT/reg-stdin-closed")"
+OUT="$(run_upd "$H" "$HREG" "$S" HEIMDALL_MODULE_RECONCILE_DRYRUN=1 "$BIN" update 2>&1 <&-)"
 RC=$?
 [ "$RC" -eq 0 ] && ok "update runs to completion with stdin CLOSED (nothing waits on a human)" \
                 || bad "update exited $RC with stdin closed — something tried to read input"
+grep -q 'reconcile: headroom would-acquire' "$H/autoupdate.log" 2>/dev/null \
+  && ok "reconcile reached its decision for a real candidate with stdin closed — the run was not empty" \
+  || bad "reconcile made no decision for headroom with stdin closed: $(cat "$H/autoupdate.log" 2>/dev/null)"
 # The real hazard is not `read` as such — every loop here reads from a heredoc. It is
 # reading a TERMINAL, or prompting. Either would let a backgrounded SessionStart process
 # seize a tty the caller never offered, or block forever waiting for a human who is not

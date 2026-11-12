@@ -502,8 +502,9 @@ repair_modules() {
 # second one.
 #
 # THE RULE IS NOT "INSTALL HEADROOM". It is: for every manifest the registry marks
-# `default_included`, make the installed set match. Headroom is simply the only module
-# that currently answers to it. The next default module is picked up by the same loop
+# `default_included`, make the installed set match. Headroom WAS the only module that
+# answered to it and no longer is (2026-11-12: it is opt-in, `hmd headroom on`), so today
+# the loop selects nothing. The next default module is picked up by the same loop
 # with no new code, which is the whole point of deriving the set from data.
 #
 # THE FOUR TRANSITIONS, and why each behaves the way it does:
@@ -541,8 +542,9 @@ repair_modules() {
 # non-TTY refusal never runs for it. One gate stands, not two.
 #
 # WHAT STANDS IN THE SECOND GATE'S PLACE FOR A WAIVED MODULE — and why the owner chose
-# it. Headroom ships as part of hmd: that is a DISTRIBUTION decision, so hmd discloses
-# what it does rather than staging a question whose answer was already made. The waiver
+# it. Headroom shipped as part of hmd (until 2026-11-12, when it became opt-in): that was
+# a DISTRIBUTION decision, so hmd discloses what it does rather than staging a question
+# whose answer was already made. The waiver
 # is not a hole in the consent system, it is a named, bounded exception to it:
 #   PER-MODULE   it lives in modules/headroom/manifest.json, NOT in
 #                modules/_classes/traffic-proxy.json. The class contract still sets
