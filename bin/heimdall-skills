@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# heimdall-skills -- `hmd skills`: what hmd installs for you, and why (3.x M1, task T6.3 of
+# docs/superpowers/plans/2026-11-12-3x-m1-skill-registry.md).
+#
+# Usage:
+#   hmd skills list [--json] | why <id> | lock [--verify]     the read side    (bin/lib/skills_cli_read.py)
+#   hmd skills suggest | install | consent | allow            the install side (bin/lib/skills_cli_install.py)
+#   hmd skills help | --help                                   the usage
+#
+# A dispatcher and nothing more. Each module owns its arguments, its output and its exit code; this script picks the
+# one that owns the command and ends in `exec`, so the module IS the process: stdin stays the caller's (the consent
+# prompt needs the terminal) and the exit code is the module's (install: 3 = consent required, the caller asks the
+# person; 4 = declined). It never starts Claude: it is a script of its own, not a branch of bin/heimdall's task-prompt
+# path, so a mistyped `hmd skills lisst` is a usage error (exit 2), never a task for an agent.
+#
+# Interpreter: bin/lib/hmd-python.sh's hmd_python (cached, shim-avoiding; HMD_PYTHON overrides), run as `python3 -I`
+# the way both modules are written for. It is resolved HERE, in this script's own process, and not in the bin/heimdall
+# dispatcher, for the reason heimdall-dash gives (heimdall-landmine-lint class 5, ORDER-DESTROY).
+#
+# Exit: 0 the usage, on request; 1 a module or the interpreter is missing; 2 an unknown command; otherwise the module's own.
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+LIB_DIR="$(cd "$(dirname "$SELF")" && pwd)/lib"
+
+usage() {
+  cat <<'EOF'
+hmd skills -- what hmd installs for you, and why
+
+Usage: hmd skills <command> [options]
+
+  list [--json]                  every manifest entry: tier, installed here?, source, consent, lock state
+  why <id>                       why an id is on this machine: its lock row, the manifest's pointers, the receipts
+  lock [--verify]                adopt what is installed into the lock; --verify reports drift and writes nothing
+  suggest [--reset]              what this project could use; prints, never installs
+  install <id> | --recommended [--yes]
+                                 the consented install path
+  consent [ask|allowlist|auto]   show or set how installs are agreed to
+  allow <id>                     add a manifest id to the allowlist (used in allowlist mode)
+  help                           this usage
+
+Every command takes --help.
+Exit: 0 ok; 1 failed (why: installed and unexplained; lock --verify: drift); 2 usage; 3 install: consent required
+(no terminal and no --yes: ask the person, then run it again with --yes); 4 install: declined, why: unknown id.
+EOF
+}
+
+case "${1:-}" in
+  ""|help|-h|--help) usage; exit 0 ;;
+  list|why|lock) MODULE="$LIB_DIR/skills_cli_read.py" ;;
+  suggest|install|consent|allow) MODULE="$LIB_DIR/skills_cli_install.py" ;;
+  *)
+    # The word is typed by a person (or an agent): shown printable, so an escape sequence in it cannot reach the terminal.
+    shown="$(printf '%s' "$1" | LC_ALL=C tr -c ' -~' '?' | cut -c1-64)"
+    echo "hmd skills: unknown command: $shown" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [ ! -r "$MODULE" ]; then
+  echo "  Error: ${MODULE##*/} not found at $MODULE" >&2
+  echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+  exit 1
+fi
+
+PY3=""
+if [ -r "$LIB_DIR/hmd-python.sh" ]; then
+  # shellcheck source=lib/hmd-python.sh disable=SC1091
+  . "$LIB_DIR/hmd-python.sh"
+  PY3="$(hmd_python 2>/dev/null || true)"
+fi
+if [ -z "$PY3" ]; then
+  echo "hmd skills needs a working python3 (none resolved by bin/lib/hmd-python.sh)." >&2
+  echo "Install python3, or set HMD_PYTHON=/path/to/python3, then re-run: hmd skills $*" >&2
+  exit 1
+fi
+
+exec "$PY3" -I "$MODULE" "$@"

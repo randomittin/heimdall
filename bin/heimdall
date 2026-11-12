@@ -2656,6 +2656,41 @@ case "${1:-}" in
     fi
     echo "error: heimdall-hooks not found at $_hk" >&2; exit 2
     ;;
+  skills)
+    # `hmd skills list|why|lock|suggest|install|consent|allow`: what hmd installs for you, and why (3.x M1, T6.3 of
+    # docs/superpowers/plans/2026-11-12-3x-m1-skill-registry.md). Pass-through to bin/heimdall-skills, which picks the
+    # module that owns the command (bin/lib/skills_cli_read.py, bin/lib/skills_cli_install.py). `hmd skills list` is
+    # two words, so without this arm it fell through to the task-prompt path below and started a Claude run with
+    # "skills list" as the task. Bare `skills`, `skills help` and a mistyped command are answered by the tool itself
+    # (usage, exit 2), never by the launch path. All args forward verbatim and the tool ends in `exec`, so the
+    # module's exit code comes back unchanged (install: 3 = consent required, the caller asks the person). The older
+    # `--skills` flag block further down is a different command and keeps working.
+    shift
+    SKILLS_BIN="$PLUGIN_DIR/bin/heimdall-skills"
+    if [ ! -x "$SKILLS_BIN" ]; then
+      echo "  Error: heimdall-skills not found at $SKILLS_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$SKILLS_BIN" "$@"
+    ;;
+  guardrails)
+    # `hmd guardrails list|why|off|on`: the guardrails of guardrails.manifest.json, each in a tier. Core ones are always
+    # on, and `off` of one exits 2 and writes nothing; recommended ones are switchable one at a time (3.x M1, T3.6 is
+    # the tool, T6.3 this arm). Pass-through to bin/heimdall-guardrails: its reachability row expired by being wired
+    # here. All args forward verbatim, so a routed run and a direct bin run are byte-identical, exit codes included.
+    # Bare `guardrails` and `guardrails help` map to --help like the hooks arm (argparse has no `help` sub); without
+    # an arm `hmd guardrails list` fell through to the task-prompt path and started a Claude run.
+    shift
+    GUARDRAILS_BIN="$PLUGIN_DIR/bin/heimdall-guardrails"
+    if [ ! -x "$GUARDRAILS_BIN" ]; then
+      echo "  Error: heimdall-guardrails not found at $GUARDRAILS_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    case "${1:-}" in ""|help) exec "$GUARDRAILS_BIN" --help ;; esac
+    exec "$GUARDRAILS_BIN" "$@"
+    ;;
   caveman-audit)
     # READ-BACK for the caveman compression instruction. The caveman plugin
     # wires SessionStart + UserPromptSubmit and BOTH only ever INJECT rules
@@ -3902,7 +3937,12 @@ for s in reg.get("skills", []):
     fi
     mkdir -p "$skills_dir"
     printf "  Installing %s from %s...\n" "$name" "$repo"
-    git clone --depth 1 "https://github.com/${repo}.git" "$skill_path"
+    # Through hmd_skill_install (bin/lib/install-receipt.sh), not a bare `git clone`: the install lands in this run's
+    # receipt and in the skills lock like every other install path (3.x M1 T6.3). A person named the skill on the
+    # command line, so the lock row says so (why.rule and consent: explicit). A failed clone is reported on stderr by
+    # the helper and ends the command with git's own status, as the bare clone did under `set -e`.
+    HMD_INSTALL_WHY_RULE="${HMD_INSTALL_WHY_RULE:-explicit}" HMD_SKILLS_CONSENT_BASIS=explicit \
+      hmd_skill_install "$name" "$repo" "$skill_path" hmd-skills-flag || exit $?
     echo "  ✔ Installed to $skill_path"
     exit 0
   fi
