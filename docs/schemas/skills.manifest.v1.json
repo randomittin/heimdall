@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runhmd.dev/schemas/skills.manifest.v1.json",
+  "title": "skills.manifest/1",
+  "description": "The skills manifest: ONE source for every skill and plugin hmd knows about, skills.manifest.json in the repo root. It is to replace heimdall-skills.json (which plugins a project activates), skills-registry.json (GitHub skills matched by keyword) and the auto-install table of skills/heimdall/references/plugin-autoinstall.md with the preinstall code that implements it; while the flag skills.registry is off those three stay authoritative and the manifest only records them, every legacy mapping once, each with a legacy[] pointer to where it came from. THIS FILE AND bin/lib/skills_manifest.py STATE ONE CONTRACT: the validator holds the rules in code and never reads this file at run time (a sandbox that copies bin/lib alone still validates), and test/skills-manifest-schema.test.sh fails when the version, kinds, tiers, patterns or key sets of the two differ. The keywords used here are the subset docs/schemas/runhmd.*.v1.json already uses; JSON Schema cannot express cross-field rules, so `x-invariants` lists the extra rules the validator enforces. WHAT AN ENTRY IS: kind plugin (a Claude Code plugin, ref <plugin>@<marketplace>), github-skill (cloned from GitHub, matched by keywords) or bundled (ships in-tree, never installed). tier says how it is offered: bundled (in-tree), recommended (suggested to a new install, installed only on consent), detected (offered when the project's files or the prompt call for it), on_demand (kept for an explicit request), community (reserved: never auto-suggested). install false marks an activation-only entry that hmd never installs. A marketplace outside the allow-list can therefore appear on an install:false entry and nowhere else.",
+  "x-invariants": [
+    {"id": "SM1", "applies_to": "skills.manifest/1", "rule": "schema is the integer 1: not 1.0, not true, not a string; any other version is a different contract"},
+    {"id": "SM2", "applies_to": "skills.manifest/1", "rule": "entry ids are unique"},
+    {"id": "SM3", "applies_to": "skills.manifest/1", "rule": "a plugin entry's ref is <plugin>@<marketplace> with the same marketplace as its marketplace field; when install is true that marketplace is a key of marketplaces, the allow-list: no other marketplace is ever passed to claude"},
+    {"id": "SM4", "applies_to": "skills.manifest/1", "rule": "every entry has a non-empty legacy array: no mapping exists without a pointer to the legacy mechanism it came from"},
+    {"id": "SM5", "applies_to": "skills.manifest/1", "rule": "triggers.prompt_ere compiles (Python re) and does not match the empty string, which would fire the entry on every prompt; triggers.order values are unique positive integers"},
+    {"id": "SM6", "applies_to": "skills.manifest/1", "rule": "a community entry has install false or explicit_consent true"},
+    {"id": "SM7", "applies_to": "skills.manifest/1", "rule": "an entry of kind bundled or tier bundled never has install true"},
+    {"id": "SM8", "applies_to": "skills.manifest/1", "rule": "a plugin entry has ref and marketplace; a github-skill entry has repo, keywords, category and description; marketplace is null or absent on every other kind"},
+    {"id": "SM9", "applies_to": "skills.manifest/1", "rule": "references resolve: detection_rules.*.entries name existing entry ids, activate.detect names existing detection_rules keys, keyword_skills names existing github-skill entries"},
+    {"id": "SM10", "applies_to": "skills.manifest/1", "rule": "every path or glob (triggers.files[].path, detection_rules.*.files[]) is project-relative: no leading slash and no .. segment"},
+    {"id": "SM11", "applies_to": "skills.manifest/1", "rule": "free text (why, description, category, keywords, ref, legacy pointers) is non-blank and single-line; the document is strict JSON of at most 1 MiB with no duplicate object keys"}
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "marketplaces", "entries"],
+  "properties": {
+    "schema": {"const": 1},
+    "marketplaces": {
+      "description": "The install allow-list: marketplace name -> where it comes from. An install:true plugin entry may only name a marketplace listed here; an activation-only (install:false) entry may name another.",
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/marketplace"}
+    },
+    "entries": {
+      "description": "Every skill and plugin, one entry each.",
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/entry"}
+    },
+    "detection_rules": {
+      "description": "Verbatim from heimdall-skills.json: rule name -> the project files (globs) that switch its entries on.",
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/detectionRule"}
+    },
+    "keyword_skills": {
+      "description": "Optional: ids of the github-skill entries in the order the legacy registry lists them.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/id"}
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "pluginRef": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}@[a-z0-9][a-z0-9._-]{0,63}$"},
+    "ownerRepo": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "pin": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"},
+    "text": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000-\\u001f\\u007f]+$"},
+    "relpath": {"type": "string", "minLength": 1, "maxLength": 256},
+    "marketplace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": {"$ref": "#/$defs/ownerRepo"},
+        "pin": {"$ref": "#/$defs/pin"}
+      }
+    },
+    "legacyPointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mechanism", "path"],
+      "properties": {
+        "mechanism": {"$ref": "#/$defs/text"},
+        "path": {"$ref": "#/$defs/text"}
+      }
+    },
+    "fileTrigger": {
+      "description": "A project file whose presence triggers the entry; with contains_any, only when the file holds one of the words.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relpath"},
+        "contains_any": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/text"}}
+      }
+    },
+    "triggers": {
+      "description": "The legacy preinstall rule: prompt_ere is matched unanchored (Python re) against the lower-cased prompt, files are alternatives, order is the position the legacy code emits it in.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["order"],
+      "properties": {
+        "order": {"type": "integer", "minimum": 1},
+        "prompt_ere": {"type": "string", "minLength": 1},
+        "files": {"type": "array", "items": {"$ref": "#/$defs/fileTrigger"}}
+      }
+    },
+    "activate": {
+      "description": "permanent: always on; detect: the detection_rules that switch it on.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["permanent", "detect"],
+      "properties": {
+        "permanent": {"type": "boolean"},
+        "detect": {"type": "array", "items": {"$ref": "#/$defs/id"}}
+      }
+    },
+    "detectionRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files", "entries"],
+      "properties": {
+        "files": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/relpath"}},
+        "entries": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}}
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "tier", "install", "why", "legacy"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["plugin", "github-skill", "bundled"]},
+        "tier": {"enum": ["bundled", "recommended", "detected", "on_demand", "community"]},
+        "install": {"type": "boolean"},
+        "why": {"description": "One line, shown wherever the entry is offered or explained.", "$ref": "#/$defs/text"},
+        "legacy": {
+          "description": "Where this mapping came from: the legacy mechanism and the place in it. At least one.",
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/legacyPointer"}
+        },
+        "ref": {"description": "plugin: <plugin>@<marketplace>; bundled: its in-tree path; github-skill: optional.", "$ref": "#/$defs/text"},
+        "marketplace": {"description": "plugin entries only: the marketplace of ref; null or absent on every other kind.", "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+        "activate": {"$ref": "#/$defs/activate"},
+        "triggers": {"$ref": "#/$defs/triggers"},
+        "explicit_consent": {"description": "community entries: true lets an install:true entry through, because the operator consents to it explicitly, every time.", "type": "boolean"},
+        "repo": {"description": "github-skill entries: the GitHub owner/repo it is cloned from.", "$ref": "#/$defs/ownerRepo"},
+        "keywords": {"description": "github-skill entries: matched as whole words against the prompt.", "type": "array", "minItems": 1, "items": {"$ref": "#/$defs/text"}},
+        "category": {"$ref": "#/$defs/text"},
+        "description": {"$ref": "#/$defs/text"}
+      }
+    }
+  }
+}
