@@ -1163,16 +1163,17 @@ heimdall_is_authed() {
   local claude_cfg="$HOME/.claude.json"
   if [ -f "$claude_cfg" ] && command -v python3 &>/dev/null; then
     local has_account
-    has_account=$(python3 -c "
-import json
+    # The path is argv[1], never spliced into the program: a HOME holding a quote is not python source.
+    has_account=$(python3 -I -c '
+import json, sys
 try:
-    with open('$claude_cfg') as f:
+    with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    acct = cfg.get('oauthAccount', {})
-    print('true' if acct.get('accountUuid') else 'false')
+    acct = cfg.get("oauthAccount", {})
+    print("true" if acct.get("accountUuid") else "false")
 except Exception:
-    print('false')
-" 2>/dev/null)
+    print("false")
+' "$claude_cfg" 2>/dev/null)
     [ "$has_account" = "true" ] && return 0
   fi
   return 1
@@ -1332,15 +1333,15 @@ apply_heimdall_theme() {
   export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
   local claude_cfg="$HOME/.claude.json"
   if [ -f "$claude_cfg" ] && command -v python3 &>/dev/null; then
-    python3 -c "
+    python3 -I -c '
 import json, sys
 try:
-    with open('$claude_cfg') as f: cfg = json.load(f)
-    if cfg.get('theme') != 'dark':
-        cfg['theme'] = 'dark'
-        with open('$claude_cfg','w') as f: json.dump(cfg, f, indent=2)
+    with open(sys.argv[1]) as f: cfg = json.load(f)
+    if cfg.get("theme") != "dark":
+        cfg["theme"] = "dark"
+        with open(sys.argv[1], "w") as f: json.dump(cfg, f, indent=2)
 except Exception: pass
-" 2>/dev/null || true
+' "$claude_cfg" 2>/dev/null || true
   fi
 }
 
@@ -3588,26 +3589,27 @@ if [[ "${1:-}" == "--resume" || "${1:-}" == "-r" ]]; then
   # Restore active goal from state or checkpoint
   GOAL_CONDITION=""
   if [ -f "$WORK_DIR/heimdall-state.json" ]; then
-    GOAL_CONDITION=$(python3 -c "
-import json
+    # The path is argv[1]: a working directory named with a quote is not python source.
+    GOAL_CONDITION=$(python3 -I -c '
+import json, sys
 try:
-    with open('$WORK_DIR/heimdall-state.json') as f:
+    with open(sys.argv[1]) as f:
         s = json.load(f)
-    cond = s.get('goal', {}).get('condition')
+    cond = s.get("goal", {}).get("condition")
     if cond: print(cond)
 except: pass
-" 2>/dev/null)
+' "$WORK_DIR/heimdall-state.json" 2>/dev/null)
   fi
   if [ -z "$GOAL_CONDITION" ] && [ -f "$WORK_DIR/.planning/settings.json" ]; then
-    GOAL_CONDITION=$(python3 -c "
-import json
+    GOAL_CONDITION=$(python3 -I -c '
+import json, sys
 try:
-    with open('$WORK_DIR/.planning/settings.json') as f:
+    with open(sys.argv[1]) as f:
         s = json.load(f)
-    cond = s.get('goal', {}).get('condition')
+    cond = s.get("goal", {}).get("condition")
     if cond: print(cond)
 except: pass
-" 2>/dev/null)
+' "$WORK_DIR/.planning/settings.json" 2>/dev/null)
   fi
 
   # Write preamble for resume
@@ -3804,14 +3806,15 @@ if [[ "${1:-}" == "--skills" ]]; then
       repo="$name"
       name=$(basename "$repo" | sed 's/\.git$//')
     elif [ -f "$registry" ]; then
-      repo=$(python3 -c "
-import json
-with open('$registry') as f:
+      # NAME is argv[2], never spliced into the program: a skill name holding a quote is just an unknown name.
+      repo=$(python3 -I -c '
+import json, sys
+with open(sys.argv[1]) as f:
     reg = json.load(f)
-for s in reg.get('skills', []):
-    if s['name'] == '$name':
-        print(s['repo']); break
-" 2>/dev/null)
+for s in reg.get("skills", []):
+    if s["name"] == sys.argv[2]:
+        print(s["repo"]); break
+' "$registry" "$name" 2>/dev/null)
     fi
     if [ -z "$repo" ]; then
       echo "  Skill '$name' not found in registry. Use: heimdall --skills install owner/repo"
@@ -3882,16 +3885,17 @@ for s in reg.get('skills', []):
   if [ -f "$registry" ]; then
     echo ""
     printf "  \033[1mAvailable from registry:\033[0m\n"
-    python3 -c "
-import json
-with open('$registry') as f:
+    # The registry path is argv[1]; the program is a quoted here-document (nothing in it is expanded by bash).
+    python3 -I - "$registry" 2>/dev/null <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
     reg = json.load(f)
 import os
 skills_dir = os.path.expanduser('~/.claude/skills')
 for s in reg.get('skills', []):
     installed = '✔' if os.path.isdir(os.path.join(skills_dir, s['name'])) else ' '
-    print(f'  {installed} {s[\"name\"]:<25} {s[\"description\"]}')
-" 2>/dev/null
+    print(f'  {installed} {s["name"]:<25} {s["description"]}')
+PYEOF
   fi
 
   echo ""
@@ -4215,19 +4219,25 @@ discover_skills() {
   [ -f "$registry" ] || return 0
   command -v python3 &>/dev/null || return 0
 
-  # Match prompt against registry keywords, return repos to install
+  # Match prompt against registry keywords, return repos to install.
+  # The prompt is DATA, never program text (prompts can arrive from the paired phone): it reaches python on
+  # stdin, the registry path as argv[1], and the program is one fixed single-quoted string. Splicing the prompt
+  # into the source (prompt = '''...''') made a prompt holding ''' a SyntaxError -- an aborted launch under
+  # set -e -- and a crafted one arbitrary code. -I keeps the cwd off sys.path (no json.py from the project dir).
+  # A matcher that fails means no skills to install, never an aborted launch. The program holds no ' because it
+  # is a single-quoted string: a here-document would do, but bash 3.2 cannot parse one inside a command substitution.
   local matches
-  matches=$(python3 -c "
+  matches=$(printf '%s' "$prompt_lower" | python3 -I -c '
 import json, re, sys
-prompt = '''$prompt_lower'''
-with open('$registry') as f:
+prompt = sys.stdin.buffer.read().decode("utf-8", "replace")
+with open(sys.argv[1]) as f:
     reg = json.load(f)
-for skill in reg.get('skills', []):
-    for kw in skill.get('keywords', []):
-        if re.search(r'\b' + re.escape(kw) + r'\b', prompt):
-            print(skill['name'] + '|' + skill['repo'])
+for skill in reg.get("skills", []):
+    for kw in skill.get("keywords", []):
+        if re.search(r"\b" + re.escape(kw) + r"\b", prompt):
+            print(skill["name"] + "|" + skill["repo"])
             break
-" 2>/dev/null)
+' "$registry" 2>/dev/null) || matches=""
 
   [ -z "$matches" ] && return 0
 
