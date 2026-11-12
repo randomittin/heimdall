@@ -4176,6 +4176,28 @@ preinstall_plugins() {
   prompt_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
   installed=$(claude plugins list 2>/dev/null || echo "")
 
+  # skills.registry=on (operator flag, off by default: bin/lib/skills_config.py): the rules below are answered by bin/lib/skills_resolver.py from
+  # skills.manifest.json -- the same plugin refs in the same order, duplicates kept -- and installed by the same helper. The prompt reaches the
+  # resolver on stdin (data, never program text). The resolver never installs and does not know what is installed, so the skip of an installed
+  # plugin (a grep -q of its name in `claude plugins list`, as _try_install does) is applied here. A resolver that cannot answer (any non-zero
+  # exit) is said on stderr and the rules below run: the flag can never leave a launch without its plugins.
+  if [ "$(python3 -I "$PLUGIN_DIR/bin/lib/skills_config.py" get registry 2>/dev/null)" = on ]; then
+    local refs ref rc=0
+    refs=$(printf '%s' "$prompt_lower" | python3 -I "$PLUGIN_DIR/bin/lib/skills_resolver.py" preinstall --manifest "$PLUGIN_DIR/skills.manifest.json" --prompt-file /dev/stdin --project "$WORK_DIR") || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      # fd 3, not stdin: the install helpers (and the claude they run) keep the launcher's own stdin, as they do in the rules below
+      while IFS= read -r -u 3 ref; do
+        [ -n "$ref" ] || continue
+        echo "$installed" | grep -q "${ref%@*}" && continue
+        printf "  \033[38;2;0;212;255m▸ Installing %s\033[0m\n" "${ref%@*}"
+        hmd_install_known_plugin "${ref%@*}" "${ref##*@}" prompt-preinstall || true
+      done 3<<< "$refs"
+      printf "\n"
+      return 0
+    fi
+    printf 'hmd: skills registry is on but the resolver exited %s; using the built-in skill selection\n' "$rc" >&2
+  fi
+
   _try_install() {
     echo "$installed" | grep -q "$1" && return 0
     printf "  \033[38;2;0;212;255m▸ Installing %s\033[0m\n" "$1"
@@ -4215,6 +4237,26 @@ discover_skills() {
   prompt_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
   skills_dir="$HOME/.claude/skills"
   registry="$PLUGIN_DIR/skills-registry.json"
+
+  # skills.registry=on (operator flag, off by default: bin/lib/skills_config.py): the matching below is answered by bin/lib/skills_resolver.py from
+  # skills.manifest.json -- the same `name|repo` lines, registry order -- and the skills are cloned by the same helper in the same way. The prompt
+  # reaches the resolver on stdin, as it reaches the matcher below (data, never program text). A resolver that cannot answer (any non-zero exit) is
+  # said on stderr and the matcher below runs: the flag can never leave a launch without its skills.
+  if [ "$(python3 -I "$PLUGIN_DIR/bin/lib/skills_config.py" get registry 2>/dev/null)" = on ]; then
+    local resolved rc=0
+    resolved=$(printf '%s' "$prompt_lower" | python3 -I "$PLUGIN_DIR/bin/lib/skills_resolver.py" keyword-match --manifest "$PLUGIN_DIR/skills.manifest.json" --prompt-file /dev/stdin) || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      while IFS='|' read -r name repo; do
+        [ -n "$name" ] || continue
+        [ -d "$skills_dir/$name" ] && continue  # already installed
+        printf "  \033[38;2;0;212;255m▸ Installing skill: %s\033[0m (%s)\n" "$name" "$repo"
+        mkdir -p "$skills_dir"
+        hmd_skill_install "$name" "$repo" "$skills_dir/$name" discover_skills || true
+      done <<< "$resolved"
+      return 0
+    fi
+    printf 'hmd: skills registry is on but the resolver exited %s; using the built-in skill selection\n' "$rc" >&2
+  fi
 
   [ -f "$registry" ] || return 0
   command -v python3 &>/dev/null || return 0
