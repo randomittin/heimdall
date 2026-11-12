@@ -10,6 +10,7 @@ fi
 PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 SKILLS_DIR="$HOME/.claude/skills"
 REGISTRY="$PLUGIN_DIR/skills-registry.json"
+MANIFEST="$PLUGIN_DIR/skills.manifest.json"
 
 # Receipted installs (bin/lib/install-receipt.sh). HMD_RUN_ID is inherited from the launching session, so a
 # skill installed mid-session lands in that run's receipt; run by hand it goes to the "manual" one.
@@ -17,6 +18,30 @@ if [ -f "$PLUGIN_DIR/bin/lib/install-receipt.sh" ]; then
   # shellcheck disable=SC1091
   . "$PLUGIN_DIR/bin/lib/install-receipt.sh"
 fi
+
+# registry_on — is skills.registry on? Asked as the launcher and skill-manager ask it, `python3 -I bin/lib/skills_config.py get registry` (the
+# environment, else the operator's $HEIMDALL_HOME/skills-config.json, else off; never a file of the repository). Anything but a clean "on" is off:
+# the legacy code.
+registry_on() {
+  [ "$(python3 -I "$PLUGIN_DIR/bin/lib/skills_config.py" get registry 2>/dev/null)" = on ]
+}
+
+# registry_answer SUBCOMMAND [ARGS...] — print the answer of `skills_resolver.py SUBCOMMAND --manifest M ARGS...`, the registry reader the caller
+# replaces. Non-zero, with nothing printed on stdout, when the flag is off or the resolver could not answer (any non-zero exit: an invalid manifest is
+# exit 3, a crash): the caller then runs its legacy code, which stays authoritative in M1. The callers answer the two legacy non-zero results (an empty
+# prompt, a missing file) themselves before they ask, so a non-zero here is never an answer. The answer is captured before it is printed, so a failed
+# run never leaves half of one on stdout; the trailing x keeps the final newlines the substitution would cut. The resolver reads the caller's stdin.
+registry_answer() {
+  local subcommand="$1" answer
+  shift
+  registry_on || return 1
+  if answer="$(python3 -I "$PLUGIN_DIR/bin/lib/skills_resolver.py" "$subcommand" --manifest "$MANIFEST" "$@" && printf x)"; then
+    printf '%s' "${answer%x}"
+    return 0
+  fi
+  echo "discover-skills: the skills registry resolver could not answer; using the legacy $subcommand" >&2
+  return 1
+}
 
 # File extension → skill domain mapping (bash 3.2 compatible)
 ext_to_domain() {
@@ -145,6 +170,10 @@ cmd_detect() {
   [ -f "$REGISTRY" ] || { echo "No registry found"; return 0; }
   command -v python3 &>/dev/null || { echo "python3 required"; return 0; }
 
+  # skills.registry on: the resolver's `detect` answers. The prompt is DATA for it too: it arrives on stdin (a here-string, the same text the legacy
+  # program below reads plus a newline, which no keyword can tell from the end of the text), never in its command line.
+  registry_answer detect --prompt-file /dev/stdin <<< "$prompt_lower" && return 0
+
   # The prompt is DATA: it reaches python on stdin and the registry path as argv[1]; the program is one fixed
   # single-quoted string (it holds no '), run with -I. Splicing the prompt into the source (prompt = '''...''') made a
   # prompt holding ''' a SyntaxError -- an aborted script under set -e -- and a crafted one arbitrary code.
@@ -177,6 +206,10 @@ if not found:
 cmd_detect_file() {
   local file="$1"
   [ -f "$file" ] || { echo "File not found: $file"; return 1; }
+
+  # skills.registry on: the resolver's `detect-file` answers the whole command (find_skills_for_domain below stays legacy: this is its only caller, and
+  # on a resolver that cannot answer the legacy code is what runs). --file=PATH keeps a path that starts with a dash a value, never an option.
+  registry_answer detect-file --file="$file" && return 0
 
   # Detect domain from extension
   local ext="${file##*.}"
@@ -229,6 +262,9 @@ cmd_gaps() {
   # Show all uninstalled skills from registry
   [ -f "$REGISTRY" ] || { echo "No registry found"; return 0; }
   command -v python3 &>/dev/null || return 0
+
+  # skills.registry on: the resolver's `gaps` answers, header and footer included.
+  registry_answer gaps && return 0
 
   echo "Skill gaps (not installed):"
   echo ""
