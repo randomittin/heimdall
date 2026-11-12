@@ -10,6 +10,12 @@
 # plugins, the ERE of each preinstall rule, the keywords, the marketplaces, the doc rows, the bundled skills) is read FROM THE LEGACY FILES when
 # the suite runs, and the manifest is held to it field by field.
 #
+# plugin-autoinstall.md is the one legacy file whose legacy text is no longer on disk: since 93532a61 (T5.3) its install rows are GENERATED from
+# the manifest (bin/lib/skills_render_doc.py), so the `claude plugins install` rows this suite transcribes are read from git history, as the doc
+# stood the last time it carried no `BEGIN GENERATED skills.manifest` block. That commit is found by CONTENT, never by a SHA, so a rebase cannot
+# move it. With no history to read it from (a shallow clone, a tree with no .git) the suite FAILS and says why: it never skips, and it never
+# reads the generated rows in their place. The doc mutants of D change that extracted legacy text; the live doc and the manifest are not touched.
+#
 # Proven here:
 #   A. the validator (bin/lib/skills_manifest.py, T0.3) accepts the manifest;
 #   B. transcription, one line per group:
@@ -27,6 +33,9 @@
 #        bundled           one entry per skills/<name>/SKILL.md, in-tree, never installed
 #        pointers          legacy[]: every legacy mapping (a heimdall-skills.json bucket, a preinstall rule, a plugin-autoinstall.md row, a registry
 #                          skill, a bundled skill) is pointed at by exactly one pointer, and no pointer points nowhere
+#      The legacy plugin-autoinstall.md behind those rows is found in history, and that lookup is run against seven throwaway repositories as
+#      well: it reads the newest revision with no generated block (not the oldest), passes over every generated revision and a deletion, and
+#      FAILS, naming the reason, on a doc generated from its first commit, on a shallow clone and on a repository with no commit;
 #   C. the commit that added skills.manifest.json changed no legacy file (while it is uncommitted: the work tree and index hold no edit of one);
 #      the check is run against five throwaway repositories as well, so it is known to go RED;
 #   D. every check above can go RED: ONE fact of the manifest, or of a legacy file, is changed at a time, in memory, and the check that guards it
@@ -60,6 +69,7 @@ cat > "$WORK/check.py" <<'PYEOF'
 """check.py -- the proofs of skills-manifest-transcription.test.sh that are easier in python than in bash.
 
     check.py transcription REPO MANIFEST   the manifest against the legacy files, one line per group
+    check.py legacydoc REPO                the legacy plugin-autoinstall.md is found in history (and that lookup goes RED when it is not there)
     check.py history REPO                  the commit that added the manifest changed no legacy file (and that check goes RED on a bad one)
     check.py mutants REPO MANIFEST         each check goes RED when ONE fact of the manifest or of a legacy file is changed
 Every line printed is `ok<TAB>text`, `bad<TAB>text` or `skip<TAB>text`; the exit status is 0 unless the program itself broke.
@@ -93,6 +103,8 @@ FIELDS = {
 }
 AUTO_ROW = re.compile(r"^\| [^|]+ \| ([a-z0-9][a-z0-9._-]*) \| `claude plugins install ([a-z0-9][a-z0-9._-]*)@([a-z0-9][a-z0-9._-]*)` \|$", re.M)
 MID_ROW = re.compile(r"^\| [^|]+ \| `([a-z0-9][a-z0-9._-]*)` \|$", re.M)
+# the line that opens a generated block (BEGIN_PREFIX of bin/lib/skills_render_doc.py): a doc that holds one is not legacy text
+GENERATED = re.compile(r"^<!-- BEGIN GENERATED skills\.manifest", re.M)
 WORD = r"([A-Za-z0-9._-]+)"
 
 
@@ -100,22 +112,60 @@ class Legacy(Exception):
     """The legacy files cannot be read the way this suite reads them (a shape it does not know is a failure, never a pass)."""
 
 
+def git(repo, *args):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"})
+    try:
+        done = subprocess.run(["git", "-C", repo] + list(args), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, "", str(exc)
+    return done.returncode, done.stdout, done.stderr
+
+
+def legacy_doc(repo):
+    """(commit, text) of plugin-autoinstall.md as it stood the last time it carried no generated block.
+
+    Its install rows are generated from the manifest now, so the `claude plugins install` rows the manifest transcribes live only in history.
+    The commit is found by CONTENT (the newest revision of the doc with no `BEGIN GENERATED skills.manifest` line), never by a SHA a rebase
+    would move. No history to find it in is a Legacy failure that says so: never a pass, and the generated rows are never read in its place."""
+    rc, out, err = git(repo, "log", "--format=%H", "--topo-order", "--diff-filter=d", "--", DOC)
+    if rc != 0:
+        raise Legacy("%s: its legacy rows live in git history (it is generated from %s now) and git cannot read it: %s"
+                     % (DOC, MANIFEST, err.strip()[:120]))
+    commits = out.split()
+    for commit in commits:
+        rc, text, err = git(repo, "show", "%s:./%s" % (commit, DOC))
+        if rc != 0:
+            raise Legacy("%s: cannot read it as of %s: %s" % (DOC, commit[:10], err.strip()[:120]))
+        if not GENERATED.search(text):
+            return commit, text
+    shallow = git(repo, "rev-parse", "--is-shallow-repository")[1].strip() == "true"
+    raise Legacy("%s: its legacy rows live in git history, but no commit of this clone holds it without a generated block (%d read)%s"
+                 % (DOC, len(commits), "; this clone is shallow: git fetch --unshallow" if shallow else ""))
+
+
 class Source:
-    """The legacy side. Every fact the manifest must carry is read from these files now; `over` replaces the text of a file and `bundled`
-    the list of bundled skills (the mutants, in memory), nothing else is ever substituted."""
+    """The legacy side. Every fact the manifest must carry is read from these files now (plugin-autoinstall.md from history: see legacy_doc);
+    `over` replaces the text of a file and `bundled` the list of bundled skills (the mutants, in memory), nothing else is ever substituted."""
 
     def __init__(self, repo, over=None, bundled=None):
         self.repo, self.over, self.names, self.cache = repo, dict(over or {}), bundled, {}
+
+    def read(self, rel):
+        if rel == DOC:
+            return legacy_doc(self.repo)[1]
+        try:
+            with open(os.path.join(self.repo, rel), encoding="utf-8") as handle:
+                return handle.read()
+        except OSError as exc:
+            raise Legacy("cannot read %s: %s" % (rel, exc.strerror or exc))
 
     def text(self, rel):
         if rel in self.over:
             return self.over[rel]
         if rel not in self.cache:
-            try:
-                with open(os.path.join(self.repo, rel), encoding="utf-8") as handle:
-                    self.cache[rel] = handle.read()
-            except OSError as exc:
-                raise Legacy("cannot read %s: %s" % (rel, exc.strerror or exc))
+            self.cache[rel] = self.read(rel)
         return self.cache[rel]
 
     def bundled(self):
@@ -362,7 +412,7 @@ def problems(src, doc):
 
 
 DESCRIBE = {
-    "legacy": "legacy: read %(plugins)d plugin refs, %(github)d registry skills, %(bundled)d bundled skills, %(prompt)d prompt rules, %(files)d file rules and %(rows)d plugin-autoinstall.md rows",
+    "legacy": "legacy: read %(plugins)d plugin refs, %(github)d registry skills, %(bundled)d bundled skills, %(prompt)d prompt rules, %(files)d file rules and %(rows)d plugin-autoinstall.md rows (read from history)",
     "marketplaces": "marketplaces: equal to the %(markets)d case arms of hmd_marketplace_source(), and the one first_run_setup registers is listed",
     "plugins": "plugins: %(plugins)d entries, one per plugin ref the legacy mechanisms name, each with its marketplace and install flag; none without a legacy source",
     "tiers": "tiers: recommended = first-run + preinstall + auto-install, on_demand = the on_demand list in order, other plugins and registry skills detected, skills/ bundled",
@@ -387,10 +437,11 @@ def transcription(repo, path):
         return
     src = Source(repo)
     found = problems(src, doc)
-    try:
-        counts = expect(src)["counts"]
-    except Legacy:
-        counts = {}
+    if found["legacy"]:  # the legacy files cannot be read, so no other group was checked: none of them may print an ok
+        for reason in found["legacy"]:
+            say("bad", "legacy: %s" % reason)
+        return
+    counts = expect(src)["counts"]
     for group in GROUPS:
         if not found[group]:
             say("ok", DESCRIBE[group] % counts)
@@ -402,17 +453,6 @@ def transcription(repo, path):
 
 
 # ── C. the commit that added the manifest changed no legacy file ───────────────────────
-def git(repo, *args):
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"})
-    try:
-        done = subprocess.run(["git", "-C", repo] + list(args), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              universal_newlines=True, timeout=60)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return 127, "", str(exc)
-    return done.returncode, done.stdout, done.stderr
-
-
 def legacy_untouched(repo):
     """(verdict, text): did the commit that added skills.manifest.json leave every legacy file alone? skip = history cannot tell."""
     rc, out, _ = git(repo, "rev-parse", "--is-inside-work-tree")
@@ -443,39 +483,40 @@ def legacy_untouched(repo):
     return "ok", "history: %s changed no legacy file" % where
 
 
+def write_file(root, rel, text):
+    full = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def commit_all(root, message):
+    git(root, "add", "-A")
+    rc, _, err = git(root, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+                     "-c", "core.hooksPath=" + os.devnull, "commit", "-q", "-m", message)
+    if rc != 0:
+        raise RuntimeError("git commit failed: %s" % err.strip()[:120])
+
+
 def throwaway(manifest_commit, edit_in_commit=False, edit_dirty=False, single_commit=False):
     """A repository holding every legacy file, in the shape asked for; the verdict of legacy_untouched() on it."""
     root = tempfile.mkdtemp()
-
-    def write(rel, text):
-        full = os.path.join(root, rel)
-        os.makedirs(os.path.dirname(full), exist_ok=True)
-        with open(full, "w") as handle:
-            handle.write(text)
-
-    def commit(message):
-        git(root, "add", "-A")
-        rc, _, err = git(root, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
-                         "-c", "core.hooksPath=" + os.devnull, "commit", "-q", "-m", message)
-        if rc != 0:
-            raise RuntimeError("git commit failed: %s" % err.strip()[:120])
-
     try:
         git(root, "init", "-q")
         for rel in LEGACY_FILES:
-            write(rel, "v1\n")
+            write_file(root, rel, "v1\n")
         if single_commit:
-            write(MANIFEST, "{}\n")
-            commit("one")
+            write_file(root, MANIFEST, "{}\n")
+            commit_all(root, "one")
         else:
-            commit("base")
+            commit_all(root, "base")
             if edit_in_commit:
-                write("bin/skill-manager", "v2\n")
+                write_file(root, "bin/skill-manager", "v2\n")
             if manifest_commit:
-                write(MANIFEST, "{}\n")
-                commit("manifest")
+                write_file(root, MANIFEST, "{}\n")
+                commit_all(root, "manifest")
             elif edit_dirty:
-                write("bin/skill-manager", "v2\n")
+                write_file(root, "bin/skill-manager", "v2\n")
         return legacy_untouched(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -501,6 +542,70 @@ def history(repo):
             say("ok", "history self-check: %s -> %s" % (name, verdict))
         else:
             say("bad", "history self-check: %s wants %s naming '%s', got %s: %s" % (name, verdict, fragment, got, text))
+
+
+# ── the legacy plugin-autoinstall.md is found in history, and the lookup goes RED when it is not there ──────
+GEN = ("<!-- BEGIN GENERATED skills.manifest part=auto-install flavour=ask -->\n| Slack | slack | `hmd skills install slack` |\n"
+       "<!-- END GENERATED skills.manifest -->\n")
+# (what it shows, the commits of the doc as (subject, the text it commits; None deletes the doc), whether the lookup is made in a depth-1
+# clone of that repository, the verdict, what the verdict names: the subject of the commit read, or a part of the failure)
+DOC_SCENARIOS = [
+    ("the newest revision with no generated block is read, not the oldest",
+     [("legacy 1", "rows 1\n"), ("legacy 2", "rows 2\n"), ("generated 1", GEN)], False, "ok", "legacy 2"),
+    ("every generated revision after it is passed over, not only the newest",
+     [("legacy 1", "rows 1\n"), ("generated 1", GEN + "a\n"), ("generated 2", GEN + "b\n"), ("generated 3", GEN + "c\n")], False, "ok", "legacy 1"),
+    ("a deletion in between holds no text and is passed over",
+     [("legacy 1", "rows 1\n"), ("deleted", None), ("generated 1", GEN)], False, "ok", "legacy 1"),
+    ("a doc that was never generated is its own legacy text", [("legacy 1", "rows 1\n")], False, "ok", "legacy 1"),
+    ("a doc generated from its first commit has no legacy revision", [("generated 1", GEN)], False, "bad", "without a generated block"),
+    ("a shallow clone has no revision before the generated one",
+     [("legacy 1", "rows 1\n"), ("generated 1", GEN)], True, "bad", "this clone is shallow"),
+    ("a repository with no commit has no history to read", [], False, "bad", "git cannot read it")]
+
+
+def doc_lookup(steps, shallow):
+    """('ok', the subject of the commit legacy_doc() reads) or ('bad', why it cannot), on a throwaway repository with one commit per step."""
+    roots = [tempfile.mkdtemp()]
+    try:
+        git(roots[0], "init", "-q")
+        for subject, text in steps:
+            if text is None:
+                os.remove(os.path.join(roots[0], DOC))
+            else:
+                write_file(roots[0], DOC, text)
+            commit_all(roots[0], subject)
+        where = roots[0]
+        if shallow:
+            where = tempfile.mkdtemp()
+            roots.append(where)
+            rc, _, err = git(roots[0], "clone", "-q", "--depth", "1", "file://" + roots[0], where)
+            if rc != 0:
+                raise RuntimeError("git clone failed: %s" % err.strip()[:120])
+        try:
+            commit = legacy_doc(where)[0]
+        except Legacy as exc:
+            return "bad", str(exc)
+        return "ok", git(where, "log", "-1", "--format=%s", commit)[1].strip()
+    finally:
+        for path in roots:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def legacydoc(repo):
+    try:
+        say("ok", "legacy doc: %s read as of %s, the last commit before it was generated from %s" % (DOC, legacy_doc(repo)[0][:10], MANIFEST))
+    except Legacy as exc:
+        say("bad", "legacy doc: %s" % exc)
+    for name, steps, shallow, verdict, fragment in DOC_SCENARIOS:
+        try:
+            got, text = doc_lookup(steps, shallow)
+        except (OSError, RuntimeError) as exc:
+            say("bad", "legacy doc self-check \"%s\": cannot build its repository: %s" % (name, exc))
+            continue
+        if got == verdict and fragment in text:
+            say("ok", "legacy doc self-check: %s -> %s" % (name, verdict))
+        else:
+            say("bad", "legacy doc self-check: %s wants %s naming '%s', got %s: %s" % (name, verdict, fragment, got, text))
 
 
 # ── D. every check goes RED on a one-fact defect ───────────────────────────────────────
@@ -663,7 +768,7 @@ def mutants(repo, path):
                 say("bad", "%s mutant \"%s\": the %s check did not fire (fired: %s)" % (side, name, group, [g for g in GROUPS if fired[g]] or "nothing"))
 
 
-COMMANDS = {"transcription": (transcription, 2), "history": (history, 1), "mutants": (mutants, 2)}
+COMMANDS = {"transcription": (transcription, 2), "legacydoc": (legacydoc, 1), "history": (history, 1), "mutants": (mutants, 2)}
 
 if __name__ == "__main__":
     command = COMMANDS.get(sys.argv[1]) if len(sys.argv) > 1 else None
@@ -704,7 +809,8 @@ else
   bad "A: the validator does not accept skills.manifest.json (rc=$RC): ${OUT:0:400}"
 fi
 
-# B. transcription, C. history, D. mutants
+# B. the legacy doc and the transcription, C. history, D. mutants
+run_check B legacydoc "$REPO"
 run_check B transcription "$REPO" "$MANIFEST"
 run_check C history "$REPO"
 run_check D mutants "$REPO" "$MANIFEST"
