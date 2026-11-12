@@ -88,7 +88,7 @@ Constraints:
 - Only modify files in [SCOPE]
 - Do not touch [OUT-OF-SCOPE areas]
 - Write tests alongside implementation
-- Test once, at the end: run ONLY the test file(s) you add or edit, ONCE, after all changes are written — no neighbouring or regression suites, no baseline sweep; ONE solo re-run for a failure plausibly caused by machine load. The orchestrator runs the one full sweep.
+- Test once, at the end: run ONLY the test file(s) you add or edit, ONCE, after all changes are written — no neighbouring or regression suites, no baseline sweep; ONE solo re-run for a failure plausibly caused by machine load. The orchestrator runs the one full sweep (client repo: `lint` + the use-case suite instead — write use-case scenarios for the user journeys your change touches and name them in your report).
 
 After completion, run:
   heimdall-state set '.plan.sub_projects[INDEX].status' '"complete"'
@@ -96,21 +96,21 @@ After completion, run:
 
 ## Test Runner Agent
 
-Two uses; name which one in the prompt. **Write/extend tests**: scope is the file list you give it — it runs ONLY those, ONCE, after writing them. **THE final sweep**: spawn it ONCE, on the final frozen tree, immediately before the landing commit / push / demo / `/hmd:save` checkpoint, and only when no fix can still land (`CLAUDE.md` "When the full gate runs") — never per wave, never per merge.
+Three uses; name which one in the prompt. **Write/extend tests**: scope is the file list you give it — it runs ONLY those, ONCE, after writing them; in a client repo they are USE-CASE scenarios, one per real user journey (given/when/then against the public entry point, real code end to end, fakes only at external boundaries), and a unit test only pins a specific bug. **THE final sweep (heimdall's own repo only)**: spawn it ONCE, on the final frozen tree, immediately before the landing commit / push / demo / `/hmd:save` checkpoint, and only when no fix can still land (`CLAUDE.md` "When the full gate runs") — never per wave, never per merge. **THE client-repo gate**: in a client repo the final run is `lint` + the use-case suite (`bin/heimdall-repo-checks run`, the checks `lint` + `use-cases` in `.heimdall/repo-checks.json`), never a full unit-suite or offline-eval sweep and never a full-sweep `test/run-all.sh` created to satisfy a gate (`skills/heimdall/references/use-case-tests.md`).
 
 ```
-Run [ONLY these test files, once: <list> | THE ONE FINAL SWEEP — the full test suite, tree frozen, edit nothing] for the [PROJECT] project and report results.
+Run [ONLY these test files, once: <list> | THE ONE FINAL SWEEP (heimdall's own repo) — the full test suite, tree frozen, edit nothing | THE CLIENT-REPO GATE — lint + the use-case suite via bin/heimdall-repo-checks run, tree frozen, edit nothing] for the [PROJECT] project and report results.
 
 Focus areas:
-- [Specific modules to test]
+- [Specific modules to test — in a client repo, the user journeys to prove]
 - [New features that need coverage]
 
 Protocol:
 1. Discover test framework from package.json/config
 2. Run the scope above ONCE — no re-run of an unchanged tree; ONE solo re-run only if a failure is plausibly caused by machine load
-3. Report pass/fail/skip counts and name the scope that ran
+3. Report pass/fail/skip counts and name the scope that ran (client repo: name the user journeys proven — journey → scenario → result)
 4. Flag any untested code paths in recently changed files
-5. If the FULL sweep passed: run `heimdall-state mark-clean` (a scoped run never clears it)
+5. If the FULL sweep passed (heimdall's own repo): run `heimdall-state mark-clean` (a scoped run never clears it)
 6. If failures: report details with file paths and error messages
 ```
 
@@ -298,7 +298,7 @@ Agent(subagent_type: "hmd:design",       description: "UI/UX, component design, 
 Agent(subagent_type: "hmd:coder",        description: "auth module — src/auth/**")
 Agent(subagent_type: "hmd:coder",        description: "API endpoints — src/api/**")
 Agent(subagent_type: "hmd:coder",        description: "UI components — src/components/**")
-Agent(subagent_type: "hmd:test-runner",  description: "THE one full sweep, frozen tree, last wave")
+Agent(subagent_type: "hmd:test-runner",  description: "final gate, frozen tree, last wave (own repo: THE one full sweep; client repo: lint + use-cases)")
 Agent(subagent_type: "hmd:lint-quality", description: "lint after each coder completes")
 Agent(subagent_type: "hmd:reviewer",     description: "review all changes before merge")
 Agent(subagent_type: "hmd:docs-writer",  description: "sync docs with implementation")
@@ -316,7 +316,7 @@ Coordination is wave ordering, not one flat batch:
 - Wave 2: frontend coder — depends on API + design
 - Wave 3: lint-quality + reviewer — after all coders (each coder already ran its own test file(s), once)
 - Wave 4: docs-writer — with full context
-- Wave 5: test-runner — THE one full sweep, on the frozen tree, once nothing above can hand back a fix
+- Wave 5: test-runner — the final gate on the frozen tree, once nothing above can hand back a fix: THE one full sweep in heimdall's own repo, `lint` + the use-case suite in a client repo
 
 Within a wave: ALL agents in ONE message. Between waves: let the wave return first. Every implementation spawn prompt carries the test rule: run ONLY your own test file(s), ONCE, after all changes are written (`CLAUDE.md` "When the full gate runs").
 
