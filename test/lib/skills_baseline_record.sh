@@ -11,7 +11,8 @@
 #
 # WHAT IT RUNS (every case in its own throwaway HOME, HEIMDALL_HOME, project tree and fake-claude state):
 #   preinstall, preinstall_installed   preinstall_plugins() of bin/heimdall, extracted with sed exactly as test/plugin-install-receipt.test.sh does, run
-#                                      with the real bin/lib/install-receipt.sh against a recording fake `claude`. Recorded: the ordered
+#                                      with the real bin/lib/install-receipt.sh and bin/lib/skills_consent.sh (the consent gate every install now asks;
+#                                      HMD_SKILLS_CONSENT=auto below is what "legacy" means to it) against a recording fake `claude`. Recorded: the ordered
 #                                      `claude plugins install <id>` attempts, duplicates kept (the plan's quirks C3 and C4).
 #   keyword_match                      discover_skills() of bin/heimdall against skills-registry.json and a recording fake `git`. Recorded: the ordered
 #                                      "name|repo" of every clone it started, which is the match list it computed.
@@ -128,6 +129,7 @@ BASH = shutil.which("bash", path="/usr/bin:/bin")
 PREINSTALL = r'''
 set -euo pipefail
 . "$REPO/bin/lib/install-receipt.sh"
+. "$REPO/bin/lib/skills_consent.sh"
 eval "$(sed -n '/^preinstall_plugins()/,/^}/p' "$REPO/bin/heimdall")"
 WORK_DIR="$PROJ"
 PLUGIN_DIR="$REPO"
@@ -136,6 +138,7 @@ preinstall_plugins "$PROMPT"
 KEYWORD = r'''
 set -euo pipefail
 . "$REPO/bin/lib/install-receipt.sh"
+. "$REPO/bin/lib/skills_consent.sh"
 eval "$(sed -n '/^discover_skills()/,/^}/p' "$REPO/bin/heimdall")"
 WORK_DIR="$PROJ"
 PLUGIN_DIR="$REPO"

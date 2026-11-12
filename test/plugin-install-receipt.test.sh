@@ -45,6 +45,8 @@ mkdir -p "$TPLUG/bin/lib" "$WORK/fakehome" "$WORK/state" "$WORK/proj" "$WORK/non
 cp "$REPO/bin/heimdall" "$TPLUG/bin/heimdall"
 cp "$REPO/skills-registry.json" "$TPLUG/skills-registry.json"
 cp "$REPO/bin/lib/install-receipt.sh" "$TPLUG/bin/lib/install-receipt.sh" 2>/dev/null || true
+# the consent gate every install now asks (T5.1) and the settings tool it reads; this suite is about receipts, so fake_env pins consent to auto (legacy)
+cp "$REPO/bin/lib/skills_consent.sh" "$REPO/bin/lib/skills_config.py" "$TPLUG/bin/lib/" 2>/dev/null || true
 chmod +x "$TPLUG/bin/heimdall"
 
 FAKEBIN="$WORK/fakebin"; mkdir -p "$FAKEBIN"
@@ -121,7 +123,7 @@ reset_fake() { : > "$STATE/installed"; : > "$STATE/markets"; : > "$CALLS"; : > "
 # Env every launcher/lib run shares. The fakes are first on PATH; /usr/bin:/bin carry coreutils.
 fake_env() {  # $1 = run id ; remaining args = extra VAR=value
   local rid="$1"; shift
-  env PATH="$FAKEBIN:/usr/bin:/bin" HOME="$WORK/fakehome" HEIMDALL_HOME="$HH" HMD_RUN_ID="$rid" \
+  env PATH="$FAKEBIN:/usr/bin:/bin" HOME="$WORK/fakehome" HEIMDALL_HOME="$HH" HMD_RUN_ID="$rid" HMD_SKILLS_CONSENT=auto \
     FAKE_STATE="$STATE" FAKE_CALLS="$CALLS" FAKE_GIT_CALLS="$GITCALLS" \
     ANTHROPIC_API_KEY="sk-test-not-a-real-key" "$@"
 }
@@ -178,6 +180,7 @@ run_fn() {  # $1 run id, $2 function name, $3 prompt ; extra env via FAKE_* in c
   fake_env "$rid" TPLUG="$TPLUG" WORKD="$WORK/proj" FN="$fn" "$@" bash -c '
     set -euo pipefail
     . "$TPLUG/bin/lib/install-receipt.sh"
+    . "$TPLUG/bin/lib/skills_consent.sh"
     eval "$(sed -n "/^${FN}()/,/^}/p" "$TPLUG/bin/heimdall")"
     WORK_DIR="$WORKD"; PLUGIN_DIR="$TPLUG"
     "$FN" "$1"
