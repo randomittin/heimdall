@@ -54,17 +54,21 @@ find_skills_for_domain() {
   local domain="$1"
   [ -f "$REGISTRY" ] || return 0
   command -v python3 &>/dev/null || return 0
-  python3 -c "
-import json, os
-with open('$REGISTRY') as f:
+  # Every python program in this file is fixed text: the registry path and the domain/name/prompt reach it as argv (or
+  # stdin), never spliced into its source, so a value holding a quote, ''' or a newline is a value, not code. -I keeps
+  # the working directory (any project the user is in) off sys.path, so a planted json.py is never imported. The
+  # here-document delimiter is quoted: bash expands nothing in it.
+  python3 -I - "$REGISTRY" "$domain" 2>/dev/null <<'PYEOF'
+import json, os, sys
+with open(sys.argv[1]) as f:
     reg = json.load(f)
 skills_dir = os.path.expanduser('~/.claude/skills')
 for s in reg.get('skills', []):
-    if s.get('category') == '$domain':
+    if s.get('category') == sys.argv[2]:
         installed = os.path.isdir(os.path.join(skills_dir, s['name']))
         status = 'installed' if installed else 'NOT INSTALLED'
-        print(f\"{s['name']}|{s['repo']}|{status}|{s['description']}\")
-" 2>/dev/null
+        print(f"{s['name']}|{s['repo']}|{status}|{s['description']}")
+PYEOF
 }
 
 install_skill() {
@@ -78,14 +82,16 @@ install_skill() {
 
   # Look up in registry if no repo given
   if [ -z "$repo" ] && [ -f "$REGISTRY" ]; then
-    repo=$(python3 -c "
-import json
-with open('$REGISTRY') as f:
+    # REGISTRY is argv[1], the skill name argv[2]: a name holding a quote is just an unknown name. A single-quoted
+    # program, not a here-document: bash 3.2 cannot parse a here-document inside a command substitution.
+    repo=$(python3 -I -c '
+import json, sys
+with open(sys.argv[1]) as f:
     reg = json.load(f)
-for s in reg.get('skills', []):
-    if s['name'] == '$name':
-        print(s['repo']); break
-" 2>/dev/null)
+for s in reg.get("skills", []):
+    if s["name"] == sys.argv[2]:
+        print(s["repo"]); break
+' "$REGISTRY" "$name" 2>/dev/null)
   fi
 
   if [ -z "$repo" ]; then
@@ -108,7 +114,7 @@ for s in reg.get('skills', []):
     if [ ! -f "$skill_path/SKILL.md" ] && [ -f "$skill_path/CLAUDE.md" ]; then
       local desc=""
       if [ -f "$skill_path/skill.json" ] && command -v python3 &>/dev/null; then
-        desc=$(python3 -c "import json; print(json.load(open('$skill_path/skill.json')).get('description',''))" 2>/dev/null || true)
+        desc=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("description", ""))' "$skill_path/skill.json" 2>/dev/null || true)
       fi
       [ -z "$desc" ] && desc="Skill installed from $repo"
       {
@@ -139,27 +145,31 @@ cmd_detect() {
   [ -f "$REGISTRY" ] || { echo "No registry found"; return 0; }
   command -v python3 &>/dev/null || { echo "python3 required"; return 0; }
 
+  # The prompt is DATA: it reaches python on stdin and the registry path as argv[1]; the program is one fixed
+  # single-quoted string (it holds no '), run with -I. Splicing the prompt into the source (prompt = '''...''') made a
+  # prompt holding ''' a SyntaxError -- an aborted script under set -e -- and a crafted one arbitrary code.
   local gaps
-  gaps=$(python3 -c "
-import json, re, os
-prompt = '''${prompt_lower}'''
-with open('$REGISTRY') as f:
+  gaps=$(printf '%s' "$prompt_lower" | python3 -I -c '
+import json, re, os, sys
+prompt = sys.stdin.buffer.read().decode("utf-8", "replace")
+with open(sys.argv[1]) as f:
     reg = json.load(f)
-skills_dir = os.path.expanduser('~/.claude/skills')
+skills_dir = os.path.expanduser("~/.claude/skills")
 found = []
-for skill in reg.get('skills', []):
-    if os.path.isdir(os.path.join(skills_dir, skill['name'])):
+for skill in reg.get("skills", []):
+    if os.path.isdir(os.path.join(skills_dir, skill["name"])):
         continue
-    for kw in skill.get('keywords', []):
-        if re.search(r'\b' + re.escape(kw) + r'\b', prompt):
+    for kw in skill.get("keywords", []):
+        if re.search(r"\b" + re.escape(kw) + r"\b", prompt):
             found.append(skill)
             break
 for s in found:
-    print(f\"MISSING: {s['name']} ({s['repo']}) — {s['description']}\")
-    print(f\"  Install: discover-skills install {s['name']}\")
+    name, repo, desc = s["name"], s["repo"], s["description"]
+    print(f"MISSING: {name} ({repo}) — {desc}")
+    print(f"  Install: discover-skills install {name}")
 if not found:
-    print('No skill gaps detected.')
-" 2>/dev/null)
+    print("No skill gaps detected.")
+' "$REGISTRY" 2>/dev/null)
 
   echo "$gaps"
 }
@@ -222,22 +232,22 @@ cmd_gaps() {
 
   echo "Skill gaps (not installed):"
   echo ""
-  python3 -c "
-import json, os
-with open('$REGISTRY') as f:
+  python3 -I - "$REGISTRY" 2>/dev/null <<'PYEOF'
+import json, os, sys
+with open(sys.argv[1]) as f:
     reg = json.load(f)
 skills_dir = os.path.expanduser('~/.claude/skills')
 missing = 0
 for s in reg.get('skills', []):
     if not os.path.isdir(os.path.join(skills_dir, s['name'])):
         missing += 1
-        print(f\"  ⚠ {s['name']:<25} {s['description']}\")
-        print(f\"    Install: discover-skills install {s['name']}\")
+        print(f"  ⚠ {s['name']:<25} {s['description']}")
+        print(f"    Install: discover-skills install {s['name']}")
 if missing == 0:
     print('  All registry skills installed!')
 else:
     print(f'\n  {missing} skill(s) not installed.')
-" 2>/dev/null
+PYEOF
 }
 
 # Dispatch
