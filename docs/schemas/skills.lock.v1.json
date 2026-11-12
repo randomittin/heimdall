@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runhmd.dev/schemas/skills.lock.v1.json",
+  "title": "skills.lock/1",
+  "description": "The skills lockfile: what hmd installed or suggested, and WHY. One format, two scopes: <project>/.planning/skills.lock (this project triggered or needs the skill; meant to be committed) and $HEIMDALL_HOME/skills.lock (machine scope: the first-run rows, such as superpowers and the marketplace). bin/lib/skills_lock.py writes and verifies it (`record`, `read`, `verify`); test/skills-lock.test.sh pins this file to that code's enums, caps and patterns, so the two cannot drift apart. ROWS: one per id per file. In the canonical text they are sorted by id, one per line, with a fixed key order, so the same records always give the same bytes and a committed lock diffs cleanly. A row is append-only except its state: suggested, declined and failed move freely among themselves and into installed or adopted; installed never goes back to suggested, declined or failed; adopted can only become installed. WHY: why.evidence is the matched token or file path ONLY, at most 64 characters with control and format characters removed, and never prompt text: the project file is committed. The other free-text fields (ref, version, source, pin, rule, via, run) are printable ASCII, the same rule the install receipt (bin/lib/install-receipt.sh) applies, so a receipt line and its lock row agree. `manifest_sha256` is the sha256 of skills.manifest.json when the file was last written, or null when the manifest could not be read; `at` and why.run say when, and in which run, the row last changed. `content_hash` is a git commit id for a cloned skill and null for a plugin (the CLI exposes no hash). JSON Schema cannot express cross-field rules, so `x-invariants` lists the extra rules `verify` enforces.",
+  "x-invariants": [
+    {"id": "SL1", "rule": "entry ids are unique within the file"},
+    {"id": "SL2", "rule": "an entry's `at` is a real UTC calendar time (no 30 February, no hour 25)"},
+    {"id": "SL3", "rule": "why.evidence is stored in its cleaned form: no control, format or separator characters and no leading or trailing space"}
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "manifest_sha256", "entries"],
+  "properties": {
+    "schema": {"const": 1},
+    "manifest_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "entries": {"type": "array", "items": {"$ref": "#/$defs/entry"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._@/+:-]{0,127}$"},
+    "text64": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[ -~]+$"},
+    "text200": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[ -~]+$"},
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "ref", "state", "version", "source", "pin", "content_hash", "consent", "at", "why"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["plugin", "github-skill", "marketplace", "bundled"]},
+        "ref": {"$ref": "#/$defs/text200"},
+        "state": {"enum": ["installed", "suggested", "declined", "failed", "adopted"]},
+        "version": {"$ref": "#/$defs/text64"},
+        "source": {"$ref": "#/$defs/text200"},
+        "pin": {"$ref": "#/$defs/text64"},
+        "content_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{7,64}$"},
+        "consent": {"enum": ["auto-legacy", "prompt", "allowlist", "yes-flag", "explicit", "n/a"]},
+        "at": {"type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"},
+        "why": {"$ref": "#/$defs/why"}
+      }
+    },
+    "why": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry", "rule", "evidence", "via", "run"],
+      "properties": {
+        "entry": {"$ref": "#/$defs/id"},
+        "rule": {"$ref": "#/$defs/text64"},
+        "evidence": {"type": ["string", "null"], "minLength": 1, "maxLength": 64},
+        "via": {"$ref": "#/$defs/text64"},
+        "run": {"$ref": "#/$defs/text64"}
+      }
+    }
+  }
+}
