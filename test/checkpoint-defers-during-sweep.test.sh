@@ -13,11 +13,20 @@
 # on every run, and the notes live in the untracked .heimdall/, so the first write after the sweep saves what a deferred one would
 # have. Anything it cannot read as a live sweep of this checkout is no sweep (fails open): the old behaviour, a write.
 #
+# THE SECOND HOLE (2026-11-12, three more sweeps red on the same TREE INTEGRITY VIOLATION): the check asked for the lock only in
+# ${HEIMDALL_HOME:-<checkout>/.heimdall}. test/install-stranger.test.sh ran install.sh from the checkout (the sweep's cwd); install.sh exports
+# HEIMDALL_HOME="$PLUGIN_DIR/.heimdall" (a throwaway home) and boots a REAL headless claude for its validation gate; that session's SessionEnd
+# hook ran the stranger's own copy of this writer against the checkout, which looked for the sweep's lock in the stranger's home, found none and
+# rewrote CHECKPOINT.md + settings.json (and published two haid_unknown ledger records). The lock names the checkout in repo=, so the checkout's
+# own .heimdall is asked as well, whatever HEIMDALL_HOME the writer carries (A, C). The suite no longer starts the stranger in the checkout either
+# (test/install-stranger.test.sh, "(0b)").
+#
 #   A. THE PREDICATE   hmd_sweep_live: a live pid in this checkout's lock is a sweep; a dead pid, a blank or garbled lock, pid 0 or 1,
-#                      no repo=, another checkout's repo=, no lock, a lock that is a link / a FIFO / a directory, no git: none
+#                      no repo=, another checkout's repo=, no lock, a lock that is a link / a FIFO / a directory, no git: none; a writer's
+#                      HEIMDALL_HOME that is not the sweep's does not hide the checkout's own lock
 #   B. LIVE SWEEP      the writer: rc 5, both tracked files byte-identical, git status clean, one stderr line naming the pid, stdout
 #                      empty, nothing derived at all; `note` still records (the store is untracked)
-#   C. HEIMDALL_HOME   the lock is found where the runner puts it
+#   C. HEIMDALL_HOME   the lock is found where the runner puts it; a writer carrying a foreign HEIMDALL_HOME (install.sh's) still defers
 #   D. PRECOMPACT      the real hook says "deferred", never "saved", still exits 0 with an empty stdout, keeps its note
 #   E. THE SWEEP ENDS  blank lock, the same call saves, and the note recorded mid-sweep is in the checkpoint (nothing was lost)
 #   F. THE LATE LOOK   a sweep that starts AFTER the writer's first look and before its first write (the derivation takes seconds)
@@ -131,6 +140,30 @@ got="$(HEIMDALL_HOME="$HX" hmd_sweep_live "$PU" 2>/dev/null)"; rc=$?
 set_lock "$HX" "$LIVE" "$TMPROOT/some-other-checkout"
 got="$(HEIMDALL_HOME="$HX" hmd_sweep_live "$PU" 2>/dev/null)"; rc=$?
 { [ "$rc" -eq 1 ] && [ -z "$got" ]; } && ok "a shared HEIMDALL_HOME holding another checkout's live sweep is none of this one's" || bad "another checkout's sweep counted (rc=$rc, pid '$got')"
+# The writer's HEIMDALL_HOME is the WRITER's home, not necessarily the sweep's (see THE SECOND HOLE above): the sweep's lock sits in the checkout's own
+# .heimdall (its HEIMDALL_HOME was unset) while the writer carries a home with no lock in it. repo= still ties a lock to a working tree, so each way a
+# lock can fail to be this checkout's live sweep stays "none" behind the foreign home too.
+HF="$TMPROOT/hh-foreign"
+foreign_live() { # <default-lock pid> <default-lock repo> <what> [foreign-lock pid repo]
+  local got rc
+  set_lock "$HU" "$1" "$2"
+  rm -rf "$HF"; mkdir -p "$HF/receipts"
+  [ -z "${4:-}" ] || set_lock "$HF" "$4" "$5"
+  got="$(HEIMDALL_HOME="$HF" hmd_sweep_live "$PU" 2>/dev/null)"; rc=$?
+  if [ "$1" = "$LIVE" ] && [ "$2" = "$PU" ]; then
+    { [ "$rc" -eq 0 ] && [ "$got" = "$LIVE" ]; } && ok "$3" || bad "$3 (rc=$rc, pid '$got', wanted $LIVE)"
+  else
+    { [ "$rc" -eq 1 ] && [ -z "$got" ]; } && ok "$3" || bad "$3 (rc=$rc, pid '$got')"
+  fi
+}
+foreign_live "$LIVE" "$PU" "a foreign HEIMDALL_HOME with no lock in it does not hide the live sweep in THIS checkout's own .heimdall"
+foreign_live "$LIVE" "$PU" "another checkout's live lock in the foreign home does not end the search: this checkout's own lock is still read" "$LIVE" "$TMPROOT/some-other-checkout"
+foreign_live "$DEAD" "$PU" "a foreign HEIMDALL_HOME and a dead pid in this checkout's lock: no sweep"
+foreign_live "$LIVE" "$TMPROOT/some-other-checkout" "a foreign HEIMDALL_HOME and this checkout's .heimdall holding another checkout's live sweep: none of this one's"
+rm -rf "$HU/receipts/sweep.lock"
+rm -rf "$HF"; mkdir -p "$HF/receipts"
+got="$(HEIMDALL_HOME="$HF" hmd_sweep_live "$PU" 2>/dev/null)"; rc=$?
+{ [ "$rc" -eq 1 ] && [ -z "$got" ]; } && ok "a foreign HEIMDALL_HOME and no lock anywhere: no sweep" || bad "a sweep conjured from nothing (rc=$rc, pid '$got')"
 rm -rf "$HU/receipts/sweep.lock";                     expect_none "$PU" "no lock file"
 mkdir "$HU/receipts/sweep.lock";                      expect_none "$PU" "a directory where the lock should be"
 rm -rf "$HU/receipts/sweep.lock"
@@ -184,6 +217,16 @@ if [ "$RC2" -eq 5 ] && [ "$(tracked_digest "$P2")" = "$T2" ] && [ -z "$(git -C "
   ok "a lock under HEIMDALL_HOME naming this checkout defers the write (rc 5, nothing changed)"
 else
   bad "HEIMDALL_HOME lock: rc=$RC2, status: $(status_of "$P2")"
+fi
+# ...and a writer whose HEIMDALL_HOME is NOT the sweep's: what install.sh's headless claude carries (HEIMDALL_HOME="$PLUGIN_DIR/.heimdall") when its SessionEnd hook runs the stranger's own copy of this writer in the checkout.
+P2B="$(make_project foreign)"
+set_lock "$P2B/.heimdall" "$LIVE" "$P2B"                      # the sweep's lock: in the checkout, its own HEIMDALL_HOME was unset
+T2B="$(tracked_digest "$P2B")"
+env HEIMDALL_HOME="$TMPROOT/stranger-home/.heimdall" SHIM_CALLED="$TMPROOT/called-foreign" PATH="$SHIM:$PATH" "$CKPT" write "$P2B" >"$TMPROOT/out2b" 2>"$TMPROOT/err2b"; RC2B=$?
+if [ "$RC2B" -eq 5 ] && [ "$(tracked_digest "$P2B")" = "$T2B" ] && [ -z "$(git -C "$P2B" status --porcelain)" ] && [ ! -e "$TMPROOT/called-foreign" ] && [ ! -s "$TMPROOT/out2b" ] && grep -q "pid $LIVE" "$TMPROOT/err2b"; then
+  ok "a writer carrying a foreign HEIMDALL_HOME still defers to this checkout's sweep (rc 5, nothing measured, nothing written, the pid named)"
+else
+  bad "foreign HEIMDALL_HOME writer: rc=$RC2B, measured=$([ -e "$TMPROOT/called-foreign" ] && echo yes || echo no), status: $(status_of "$P2B"), stderr: $(head -c 200 "$TMPROOT/err2b")"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
