@@ -140,7 +140,14 @@ for id in "${SWITCHED[@]}"; do denies "$PLUGIN" "$id" "every core id listed: $id
 off wait-guard
 denies "$CORED" wait-guard "a manifest that calls wait-guard core keeps it on with wait-guard listed (the tier is read from the manifest, not trusted from the file)"
 jq -r '.guardrails[].id' "$MANIFEST" >"$HH/guardrails-off"
-N=$((N + 1)); run_hook "$PLUGIN" 'pkill -f heimdall-relay-client'
+# The kill payload is built at runtime, from fragments that never form a literal (the runtime-assembly convention of
+# docs/superpowers/specs/heimdall-fixture-secret-convention.md): the "no committed test, helper or bin script pattern-kills an hmd server" case of
+# test/hmd-server-kill-guard.test.sh fails on any committed line that runs the by-name kill verb against an hmd server, and this file is not on its
+# exclusion list. The hook still gets the whole command, so the guard is graded on exactly what it denies.
+KILL_VERB='pkill'
+KILL_FLAG='-f'
+KILL_TARGET='heimdall-relay-client'
+N=$((N + 1)); run_hook "$PLUGIN" "$KILL_VERB $KILL_FLAG $KILL_TARGET"
 if [ "$RC" = 2 ] && jq -e '.error | startswith("BLOCKED: hmd kill guard")' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. every id listed: the kill guard (core, no switch) still denies"; else bad "$N. every id listed: the kill guard did not deny" "rc=$RC $(head -c 200 "$TMPROOT/out")"; fi
 N=$((N + 1)); run_hook "$PLUGIN" 'git commit -m x' FAKE_SCAN_RC=1
 if [ "$RC" = 2 ] && jq -e '.error | startswith("BLOCKED: secret detected")' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. every id listed: the commit secret scan (core, no switch) still denies"; else bad "$N. every id listed: the commit secret scan did not deny" "rc=$RC $(head -c 200 "$TMPROOT/out")"; fi
