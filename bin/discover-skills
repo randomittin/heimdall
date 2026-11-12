@@ -96,11 +96,35 @@ for s in reg.get('skills', []):
 PYEOF
 }
 
+# manifest_binds_repo NAME REPO -- 0 only when skills.manifest.json lists NAME as a github-skill whose repo is exactly REPO; 1 for anything else: another
+# repository, a name the manifest lists as a plugin or does not list, a manifest that cannot be read or is not valid (the reason goes to stderr: a
+# manifest that cannot vouch for a repository vouches for none). The consent gate decides by NAME (an allowlist line, consent auto), so on its own it
+# approves `attacker/NAME` exactly as it approves the repository the manifest lists for NAME: this is what ties an approval to the repository. The
+# manifest is read the way every reader of it reads it (bin/lib/skills_manifest.py: strict JSON, the whole contract checked). Fixed program text, NAME
+# and REPO reach it as argv; -I keeps the working directory off sys.path and no .pyc is left in the plugin directory.
+manifest_binds_repo() {
+  python3 -I -c '
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+try:
+    import skills_manifest
+    doc = skills_manifest.load(sys.argv[2])
+    reasons = skills_manifest.validate(doc)
+    if reasons:
+        raise ValueError(reasons[0])
+except Exception as exc:
+    sys.exit("discover-skills: the skills manifest cannot vouch for a repository: %s" % exc)
+sys.exit(0 if any(e["id"] == sys.argv[3] and e["kind"] == "github-skill" and e["repo"] == sys.argv[4] for e in doc["entries"]) else 1)
+' "$PLUGIN_DIR/bin/lib" "$MANIFEST" "$1" "$2"
+}
+
 # install_skill NAME [OWNER/REPO] -- clone a skill into ~/.claude/skills, once somebody has said yes. A NEW install asks bin/lib/skills_consent.sh
 # first (3.x M1, T5.2 of docs/superpowers/plans/2026-11-12-3x-m1-skill-registry.md, "Consent model"): with a terminal and consent=ask the person gets
 # the Install now / Not now / Never ask again menu; with no terminal (this is what an agent calls mid-session) nothing is cloned, the skill becomes a
-# `suggested` row in the skills lock and the exit status is 3, so the agent relays the question to the person. A yes is HMD_SKILLS_YES=1, consent auto
-# (chosen, or an install that predates the model), an allowlisted name or "Install now". A name the registry does not know and a skill that is already
+# `suggested` row in the skills lock and the exit status is 3, so the agent relays the question to the person. A yes is HMD_SKILLS_YES=1 or "Install
+# now"; consent auto (chosen, or an install that predates the model) and an allowlisted name are a yes only for the repository the manifest lists for
+# that name (manifest_binds_repo): any other repository is asked like consent=ask. A name the registry does not know and a skill that is already
 # installed never reach the gate. Exit: 0 installed or already there | 1 unknown skill or the clone failed | 3 consent required | 4 declined.
 install_skill() {
   local name="$1" repo="${2:-}"
@@ -149,7 +173,16 @@ for s in reg.get("skills", []):
       return 3
     fi
     # `|| consent_rc=$?`, the form the gate's header gives for a caller under set -e: its 10 (defer) and 11 (declined) are answers, not failures.
-    hmd_skills_consent "$name" discover-skills || consent_rc=$?
+    # The gate answers by NAME, and whoever runs this command chooses the repository (an agent mid-session, on the word of whatever it read), so an
+    # allowlisted name or consent auto would approve `attacker/NAME` as readily as the repository the manifest lists for NAME. Such an approval counts
+    # only for that repository: for any other one the gate runs with consent=ask, the way bin/lib/skills_cli_install.py asks an explicit_consent
+    # entry (a terminal gets the menu, nothing else clones without a yes).
+    if manifest_binds_repo "$name" "$repo"; then
+      hmd_skills_consent "$name" discover-skills || consent_rc=$?
+    else
+      echo "discover-skills: $repo is not the repository the skills manifest lists for $name; only a yes installs it, whatever the consent mode (an allowlist, consent auto)" >&2
+      HMD_SKILLS_CONSENT=ask hmd_skills_consent "$name" discover-skills || consent_rc=$?
+    fi
     case "$consent_rc" in
       0) ;;
       11)
