@@ -10,11 +10,13 @@
 # Falsifiable both ways: general-purpose, an absent and an empty subagent_type each get the block, after the original prompt, marker once, rules
 # present, terse; hmd:* and every other type (fork, Explore, a type that only CONTAINS the words) get nothing at all on stdout; a prompt that
 # already carries the marker is not rewritten again; HMD_GP_RULES_OFF=1 opts out and only exactly 1 does; every other tool_input field survives
-# (model, run_in_background, isolation, description); it composes with the brief-adoption gate (the block is NOT counted against the brief word
+# (model, run_in_background, isolation, description); the commit rule follows the spawn's isolation (isolation "worktree" has a checkout of its own and is
+# told to commit early; every other spawn runs in the MAIN checkout, where a commit sweeps in parallel agents' edits, so it is told NOT to commit and to leave
+# its changes to the orchestrator: review finding F2); it composes with the brief-adoption gate (the block is NOT counted against the brief word
 # threshold, and a prompt that gate DOES replace carries the block too, in the same updatedInput); every shape it cannot rewrite, a malformed or
 # empty payload and a jq that fails on the rewrite leave the spawn untouched (exit 0, nothing on stdout); the section has no `exit`, so it cannot
-# deny; the shipped hooks.json Agent command delivers the rewrite; and three mutants of the hook (opt-out ignored, idempotence gone, every type
-# matched) each go wrong in the way an assertion above catches.
+# deny; the shipped hooks.json Agent command delivers the rewrite; and five mutants of the hook (opt-out ignored, idempotence gone, every type
+# matched, isolation ignored, isolation never recognised) each go wrong in the way an assertion above catches.
 #
 # Hermetic: every invocation runs the REAL hook under `env -i` from a scratch cwd with its own HOME/HEIMDALL_HOME/planning dir, with
 # HMD_MIN_FREE_PCT=0 (the disk-floor fence would otherwise read THIS machine's free space) and HMD_CTX_GATE_OFF=1 (the context fence would
@@ -78,6 +80,8 @@ marker_lines() { printf '%s\n' "$1" | grep -cxF -- "$MARKER"; }                 
 block_of() { printf '%s\n' "$1" | sed -n '/^\[hmd agent rules\]$/,$p'; }          # the marker line and everything after it
 marker_after_spec() { printf '%s\n' "$1" | awk -v m="$MARKER" 'index($0, "TASK SPEC:") == 1 { s = NR } $0 == m { b = NR } END { exit !(s > 0 && b > s) }'; }
 lacks() { ! grep -qF -- "$1" "$2"; }                                              # lacks <text> <file>   true when the file does not contain the text
+has_text() { grep -qiF -- "$1" <<<"$2"; }                                         # has_text <text> <string>   true when the string contains the text (case-insensitive)
+lacks_text() { ! has_text "$1" "$2"; }
 words() { awk -v n="$1" 'BEGIN { for (i = 1; i <= n; i++) printf "word%d ", i }'; }
 
 echo "gp-agent-rules harness"
@@ -110,7 +114,7 @@ MISSING=""
 for tok in 'until' 'tail -f' 'pgrep' 'run_in_background' 'Monitor' 'timeout' 'commit' 'once' 'concise'; do
   grep -qiF -- "$tok" <<<"$BLOCK" || MISSING="$MISSING [$tok]"
 done
-[ -z "$MISSING" ] && ok "general-purpose: the block carries every rule (no foreground polling, run_in_background + Monitor, explicit timeout, commit early, tests once, concise report)" \
+[ -z "$MISSING" ] && ok "general-purpose: the block carries every rule (no foreground polling, run_in_background + Monitor, explicit timeout, a commit rule, tests once, concise report)" \
   || bad "general-purpose: the block is missing:$MISSING"
 BLOCK_LINES="$(printf '%s\n' "$BLOCK" | wc -l | tr -d ' ')"
 [ "$BLOCK_LINES" -ge 5 ] && [ "$BLOCK_LINES" -le 10 ] && ok "general-purpose: the block is terse (5 to 10 lines, it is $BLOCK_LINES)" || bad "general-purpose: the block is $BLOCK_LINES lines, want 5 to 10"
@@ -152,6 +156,31 @@ check "every field but the prompt is carried over unchanged (updatedInput is the
 check "model, run_in_background, isolation, description and subagent_type are really in the output (the comparison above is not vacuous)" \
   jqt '.hookSpecificOutput.updatedInput | .model == "sonnet" and .run_in_background == true and .isolation == "worktree" and .description == "probe" and .subagent_type == "general-purpose"' "$OUT"
 
+# ── 5b. the commit rule follows the spawn's isolation (review finding F2) ─────────────────────
+# A spawn with isolation "worktree" has a checkout of its own, so "commit early and often" is safe for it. Any other spawn runs in the MAIN checkout: told to commit early it would commit on main
+# mid-task and sweep in whatever parallel agents have edited, so it is told NOT to commit and to leave its changes to the orchestrator, and it is not asked for a commit sha either.
+# gp.json (section 1) carries no isolation at all.
+fire "$SANDBOX/gp.json"
+SHARED_BLOCK="$(block_of "$(newprompt)")"
+check "no isolation: the block tells the agent NOT to commit" has_text 'Do not commit' "$SHARED_BLOCK"
+check "no isolation: the block does not tell the agent to commit early" lacks_text 'commit early' "$SHARED_BLOCK"
+check "no isolation: the report line does not ask for a commit sha (an agent told not to commit has none to give)" lacks_text 'commit sha' "$SHARED_BLOCK"
+
+payload "$SANDBOX/wt.json" general-purpose "$P1" '{"isolation":"worktree"}'
+fire "$SANDBOX/wt.json"
+WT_BLOCK="$(block_of "$(newprompt)")"
+check "isolation worktree: the block tells the agent to commit early and often in its worktree" has_text 'Commit early and often in your worktree' "$WT_BLOCK"
+check "isolation worktree: the block does not tell the agent to refrain from committing" lacks_text 'do not commit' "$WT_BLOCK"
+check "isolation worktree: the report line still asks for the commit sha" has_text 'commit sha' "$WT_BLOCK"
+check "the two variants differ only in rules 4 and 6: the marker and every other rule are the same line for line" \
+  test "$(printf '%s\n' "$WT_BLOCK" | grep -v '^[46]\. ')" = "$(printf '%s\n' "$SHARED_BLOCK" | grep -v '^[46]\. ')"
+
+payload "$SANDBOX/remote.json" general-purpose "$P1" '{"isolation":"remote"}'
+fire "$SANDBOX/remote.json"
+REMOTE_BLOCK="$(block_of "$(newprompt)")"
+check "isolation present but not worktree (remote): the block tells the agent NOT to commit" has_text 'Do not commit' "$REMOTE_BLOCK"
+check "isolation present but not worktree (remote): the block does not tell the agent to commit early" lacks_text 'commit early' "$REMOTE_BLOCK"
+
 # ── 6. it composes with the brief-adoption gate ───────────────────────────────────────────────
 BIGWORDS="$(words 400)"
 payload "$SANDBOX/big.json" general-purpose "$BIGWORDS" '{"model":"sonnet"}'
@@ -166,6 +195,11 @@ check "oversized prompt: the brief-adoption notice is still announced" grep -q '
 check "oversized prompt: the block rides on the substituted prompt, once" test "$(marker_lines "$BIGP")" = 1
 check "oversized prompt: the block comes after the brief's TASK SPEC (appended, not prepended)" marker_after_spec "$BIGP"
 check "oversized prompt: model survives the double rewrite" jqt '.hookSpecificOutput.updatedInput | .model == "sonnet" and .subagent_type == "general-purpose"' "$OUT"
+check "oversized prompt, no isolation: the block on the substituted brief tells the agent NOT to commit" has_text 'Do not commit' "$(block_of "$BIGP")"
+payload "$SANDBOX/bigwt.json" general-purpose "$BIGWORDS" '{"isolation":"worktree"}'
+fire "$SANDBOX/bigwt.json"
+check "oversized prompt, isolation worktree: the block on the substituted brief tells the agent to commit early (isolation survives the brief rewrite)" \
+  has_text 'commit early' "$(block_of "$(newprompt)")"
 
 MIDWORDS="$(words 290)"
 payload "$SANDBOX/mid.json" general-purpose "$MIDWORDS"
@@ -221,7 +255,7 @@ check "hooks.json wires the Agent hook to bin/heimdall-precheck-agent" grep -q '
 RC=$?
 check "the shipped hooks.json Agent command rewrites a general-purpose spawn" rewrote
 
-# ── 9. the assertions bite: three mutants of the hook each go wrong ───────────────────────────
+# ── 9. the assertions bite: five mutants of the hook each go wrong ────────────────────────────
 # Each mutant is a lone copy of the hook (no sibling libs or binaries, so every other fence is inert and only the section under test runs).
 mutant() { # mutant <name> <sed expression>   writes $SANDBOX/mut/<name>; false when the expression changed nothing
   sed "$2" "$REAL_HOOK" >"$SANDBOX/mut/$1"
@@ -241,6 +275,16 @@ if mutant every-type "s/general-purpose|'')/*)/"; then
   payload "$SANDBOX/coder.json" hmd:coder "$P1"
   fire_hook "$SANDBOX/mut/every-type" "$SANDBOX/coder.json"
   check "RED-PROOF: a hook that matches every subagent_type rewrites hmd:coder (so the untouched assertions above bite)" rewrote
+fi
+if mutant ignores-isolation 's/\.isolation == "worktree"/true/'; then
+  fire_hook "$SANDBOX/mut/ignores-isolation" "$SANDBOX/gp.json"
+  check "RED-PROOF: a hook that treats every spawn as isolated tells a no-isolation spawn to commit early (so the no-isolation assertions above bite)" \
+    has_text 'commit early' "$(block_of "$(newprompt)")"
+fi
+if mutant never-isolated 's/\.isolation == "worktree"/false/'; then
+  fire_hook "$SANDBOX/mut/never-isolated" "$SANDBOX/wt.json"
+  check "RED-PROOF: a hook that never recognises isolation worktree tells that spawn NOT to commit (so the isolation worktree assertions above bite)" \
+    has_text 'Do not commit' "$(block_of "$(newprompt)")"
 fi
 
 echo "--------------------------------------------------------------------"
