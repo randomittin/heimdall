@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""heimdall-guardrails -- list, explain and switch the guardrails of guardrails.manifest.json.
+
+    heimdall-guardrails list [--json]
+    heimdall-guardrails why ID
+    heimdall-guardrails off ID
+    heimdall-guardrails on ID
+
+This is `hmd guardrails` (the launcher arm is wave 6 of docs/superpowers/plans/2026-11-12-3x-m1-skill-registry.md; the CLI is task T3.6).
+
+TIERS. guardrails.manifest.json puts every guardrail in one of two:
+
+  core         security and correctness gates. Always on: no command here, no file and no variable turns one off (INV-G1).
+  recommended  cost and discipline guards. On by default, listed, switchable one at a time (INV-G3).
+
+TWO SWITCHES, ONE PER KIND OF ROW. The state is per operator, under $HEIMDALL_HOME (HEIMDALL_HOME, else $HOME/.heimdall: the rule bin/heimdall-hooks and both readers use,
+minus their last resort, see NEVER FOLLOWS A LINK), never in a repository (INV-G7).
+
+  hook rows   a row with layer "hook" IS a hook of hooks/hooks.json. `off` runs `heimdall-hooks disable ID`, which lists the id in hooks-disabled, the file the
+              hook's own prefix reads (bin/lib/hook-enabled.sh); `on` runs `heimdall-hooks enable ID`.
+  guard rows  any other row is a guard living INSIDE a hook (ci-waste-guard inside the Bash hook), out of reach of `hmd hooks disable`. `off` adds the id to
+              guardrails-off as one line and `on` removes it; the guard asks bin/lib/hmd_guardrail_enabled.sh, which reads that file.
+
+THE FORMAT OF guardrails-off IS THE READER'S, EXACTLY. One id per line, matched as a WHOLE line (grep -qxF: no trimming, no comments, no globs), read only under an ABSOLUTE
+home (a relative HEIMDALL_HOME is the cwd, and a repository could ship the file). So `off` and `on` refuse a relative home rather than write a file nothing reads. A line
+they did not write is kept byte for byte, and a line that is not exactly the id (`id ` or `id` and a CR) is not theirs to remove: the reader would not have matched it
+either. A switch that finds nothing to do (`off` of a guard already off, `on` of one already on) exits 0 and writes nothing, not even a directory.
+
+NEVER FOLLOWS A LINK, NEVER USES /tmp (the security review of T3.6). `off` and `on` touch a switch only after walking to $HEIMDALL_HOME without following a link at its own name and
+checking what was opened (fstat of the descriptor): a directory this user owns and nobody else can write to. A link there could send the write anywhere, and a group- or world-writable
+home lets anyone plant a switch file; either is exit 1 with nothing written (`off` creates a missing home 0700). guardrails-off itself is read and written through
+bin/lib/hmd_nofollow_write.py: a link, a directory, a FIFO or a file with another hard link at that name is refused, never followed, replaced or written through; the write is a temp
+file beside it (O_EXCL, never through a link), fsynced, renamed over it. With neither HEIMDALL_HOME nor HOME set there is no home: the readers fall back to /tmp/.heimdall, where any
+local user could plant a file, and this tool exits 1 instead (for hook rows too, so the delegate never gets to fall back). The read-only commands do follow a link: they report what the
+readers will do, a planted link included.
+
+WHAT COUNTS AS CORE is everything not positively recommended: a row whose tier is core, and a hook row whose hook hooks/hooks.metadata.json does not mark `locked: false`
+(a locked hook, or one the metadata does not list). `off` of one exits 2, says why and writes nothing; `on` of one exits 0 ("always on") and writes nothing. The readers
+check the same thing themselves (a core id typed into either file is ignored, and `list` says so when it finds one): this is the front door, not the only lock.
+
+WHICH MANIFEST. The one the guards believe, in the readers' order: $HMD_GUARDRAILS_MANIFEST (and $HMD_HOOKS_METADATA for the metadata), then $CLAUDE_PLUGIN_ROOT, then
+this checkout; never the cwd, so a relative path is refused. The manifest must pass bin/lib/guardrails_manifest.py (strict JSON, the v1 rules) and the metadata must
+load, or nothing is read or written (exit 1): a writer that guessed a tier could switch off what the reader calls core.
+
+EXIT. 0 ok. 1 an unknown id, or whatever stopped the command: a manifest or metadata that is missing or invalid, a home that is missing from the environment, relative, a link, not
+ours or writable by others, a switch file that is refused or cannot be read or written. 2 REFUSED because the id is core, or a usage error (the exits of bin/heimdall-hooks). stdlib only.
+"""
+import argparse
+import contextlib
+import io
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.append(os.path.join(HERE, "lib"))  # appended, not inserted: nothing in bin/lib can shadow a stdlib module
+
+import guardrails_manifest  # noqa: E402  the validator: the strict loader and the v1 rules
+import hmd_nofollow_write as nf  # noqa: E402  the no-follow walk and atomic write every switch goes through
+
+HOOK_LAYER = guardrails_manifest.HOOK_LAYER
+HOOKS_TOOL = os.path.join(HERE, "heimdall-hooks")
+GUARDRAILS_OFF = "guardrails-off"  # read by bin/lib/hmd_guardrail_enabled.sh
+HOOKS_DISABLED = "hooks-disabled"  # read by bin/lib/hook-enabled.sh, written by bin/heimdall-hooks
+ALWAYS_ON = "always on"
+
+
+class CliError(Exception):
+    """Something the operator can act on: main() prints it and exits 1."""
+
+
+def warn(message):
+    sys.stderr.write("heimdall-guardrails: %s\n" % message)
+
+
+def shown(value):
+    """A value as one short line for a message: ids and files are typed or edited by hand, the message is not."""
+    text = repr(value)
+    return text if len(text) <= 60 else text[:57] + "..."
+
+
+def heimdall_home():
+    """HEIMDALL_HOME, else $HOME/.heimdall (an empty variable is an unset one); None when neither is set. The readers fall back to /tmp/.heimdall then. This never does: /tmp is no
+    place for state that decides which guards run."""
+    explicit = os.environ.get("HEIMDALL_HOME")
+    if explicit:
+        return explicit
+    user_home = os.environ.get("HOME")
+    return os.path.join(user_home, ".heimdall") if user_home else None
+
+
+def guardrails_off_path():
+    """For the read-only commands: $HEIMDALL_HOME/guardrails-off, or None (said on stderr) when there is no home to read or it is relative: hmd_guardrail_enabled reads the file only
+    under an absolute one."""
+    home = heimdall_home()
+    if home is None:
+        warn("neither HEIMDALL_HOME nor HOME is set: no switch file is read (the readers fall back to /tmp/.heimdall, this tool never does), so every guard shows on")
+        return None
+    if not os.path.isabs(home):
+        warn("HEIMDALL_HOME %s is not absolute: guardrails-off is not read from it, so no guard shows off" % shown(home))
+        return None
+    return os.path.join(home, GUARDRAILS_OFF)
+
+
+def plugin_file(override, relative):
+    """The file the guards believe, in the readers' order: the override variable (the tests' seam), else CLAUDE_PLUGIN_ROOT, else this checkout."""
+    path = os.environ.get(override) or os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT") or REPO, relative)
+    if not os.path.isabs(path):
+        raise CliError("%s is not an absolute path: the guards never read a manifest relative to the cwd" % shown(path))
+    return path
+
+
+class Registry:
+    """guardrails.manifest.json and hooks.metadata.json, read once and strictly: the tiers every command here goes by."""
+
+    def __init__(self):
+        self.manifest_path = plugin_file("HMD_GUARDRAILS_MANIFEST", "guardrails.manifest.json")
+        self.metadata_path = plugin_file("HMD_HOOKS_METADATA", os.path.join("hooks", "hooks.metadata.json"))
+        try:
+            manifest = guardrails_manifest.load(self.manifest_path)
+            self.locked = guardrails_manifest.load_hooks_metadata(self.metadata_path)
+        except guardrails_manifest.ManifestError as exc:
+            raise CliError("%s: nothing was read or written" % exc)
+        errors = guardrails_manifest.validate(manifest)
+        if errors:
+            raise CliError("%s is not a valid guardrails manifest, so no tier can be trusted (nothing was read or written):\n  %s"
+                           % (self.manifest_path, "\n  ".join(errors)))
+        self.rows = manifest["guardrails"]
+
+    def row(self, row_id):
+        for row in self.rows:
+            if row["id"] == row_id:
+                return row
+        raise CliError("unknown guardrail id %s (see: hmd guardrails list)" % shown(row_id))
+
+    def refusal(self, row):
+        """None when the row may be switched; else why not. Core is not switchable, and neither is a hook the metadata does not positively mark unlocked."""
+        if row["tier"] != "recommended":
+            return "a core guardrail"
+        if row["layer"] == HOOK_LAYER and self.locked.get(row["id"], True):
+            return "recommended in the manifest, but its hook is locked (or not listed) in hooks.metadata.json, so it is treated as core"
+        return None
+
+
+def listed_lines(path):
+    """The whole lines of a switch file, as the readers see them (they follow a link, so this does). A missing file lists nothing, and so does one that cannot be read, which is what a
+    reader makes of it: enabled."""
+    try:
+        with open(path, "rb") as handle:
+            return set(handle.read().split(b"\n"))
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        warn("cannot read %s (%s): reading it as empty, so every guard there shows on" % (path, exc.strerror or exc))
+        return set()
+
+
+def writable_home():
+    """The home a switch may be written under: set, and absolute (hmd_guardrail_enabled reads guardrails-off only under an absolute one)."""
+    home = heimdall_home()
+    if home is None:
+        raise CliError("neither HEIMDALL_HOME nor HOME is set: the readers would fall back to /tmp/.heimdall, where any local user could plant a switch file, so nothing is written. "
+                       "Set HEIMDALL_HOME to an absolute path")
+    if not os.path.isabs(home):
+        raise CliError("HEIMDALL_HOME %s is not an absolute path: hmd_guardrail_enabled reads guardrails-off only under an absolute one (a relative one is the cwd, and a repository "
+                       "could ship the file), so a switch there would never take effect. Nothing read, nothing written" % shown(home))
+    return home
+
+
+def vet_home(home, create):
+    """Walk to `home` without following a link at its own name and check what was opened: a directory this user owns that no one else can write to. Returns (parent, name) for the
+    helper's own walks, or None when the home is not there and `create` is not set; `create` makes a missing home 0700. A link, a plain file, another account's directory or one others
+    can write to is a CliError, and nothing was written."""
+    parent, name = os.path.split(home.rstrip("/"))
+    if not name or name in (".", ".."):
+        raise CliError("HEIMDALL_HOME %s does not name a directory" % shown(home))
+    if create:
+        os.makedirs(parent, exist_ok=True)
+        parent_fd = os.open(os.path.realpath(parent), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+    try:
+        fd = nf.open_dir(parent, name)
+    except nf.Refused as exc:
+        raise CliError("HEIMDALL_HOME %s is not a plain directory (%s): it is never followed, so nothing was written" % (shown(home), exc))
+    except FileNotFoundError:
+        if create:
+            raise
+        return None
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if info.st_uid != os.geteuid():
+        raise CliError("HEIMDALL_HOME %s belongs to uid %d, not to you (uid %d): nothing was written" % (shown(home), info.st_uid, os.geteuid()))
+    if info.st_mode & 0o022:
+        raise CliError("HEIMDALL_HOME %s can be written by its group or by others (mode %04o), so anyone could plant a switch file there: chmod go-w it. Nothing was written"
+                       % (shown(home), info.st_mode & 0o7777))
+    return parent, name
+
+
+def read_guard_file(parent, name):
+    """guardrails-off under the vetted home, never through a link: empty when it is not there; Refused when it is a link, a directory, a FIFO or hard-linked."""
+    sink = io.BytesIO()
+    try:
+        nf.read(parent, name, GUARDRAILS_OFF, sink)
+    except FileNotFoundError:
+        return b""
+    return sink.getvalue()
+
+
+def row_state(registry, row, guard_lines, hook_lines):
+    if registry.refusal(row) is not None:
+        return ALWAYS_ON
+    listed = hook_lines if row["layer"] == HOOK_LAYER else guard_lines
+    return "off" if row["id"].encode("ascii") in listed else "on"
+
+
+def read_states():
+    """(guard_lines, hook_lines): what guardrails-off and hooks-disabled list, for the read-only commands."""
+    guard_path = guardrails_off_path()
+    home = heimdall_home()
+    return (listed_lines(guard_path) if guard_path else set(),
+            listed_lines(os.path.join(home, HOOKS_DISABLED)) if home else set())
+
+
+def say_ignored(registry, guard_lines):
+    """guardrails-off is plain text anyone can edit: say when it holds lines that switch nothing (an unknown id, a core id, a hook row, free text). Never what they say: the file may be
+    a link to something else."""
+    switching = {row["id"].encode("ascii") for row in registry.rows if row["layer"] != HOOK_LAYER and registry.refusal(row) is None}
+    inert = [line for line in guard_lines if line.strip() and line not in switching]
+    if inert:
+        warn("guardrails-off has %d line(s) that switch nothing (an unknown id, a core guardrail, a hook row or free text): see %s" % (len(inert), guardrails_off_path()))
+
+
+def cmd_list(args):
+    registry = Registry()
+    guard_lines, hook_lines = read_states()
+    entries = []
+    for row in registry.rows:
+        state = row_state(registry, row, guard_lines, hook_lines)
+        switchable = state != ALWAYS_ON
+        entries.append({
+            "id": row["id"],
+            "tier": "recommended" if switchable else "core",
+            "kind": row["kind"],
+            "layer": row["layer"],
+            "hook": row.get("hook"),
+            "switchable": switchable,
+            "state": state,
+            "enabled": state != "off",
+        })
+    say_ignored(registry, guard_lines)
+    if args.json:
+        print(json.dumps(entries, indent=2))
+        return 0
+    header = ("ID", "TIER", "KIND", "STATE", "LAYER")
+    table = [(e["id"], e["tier"], e["kind"], e["state"], e["layer"]) for e in entries]
+    widths = [max(len(line[i]) for line in [header] + table) for i in range(4)]
+    fmt = "  ".join("%%-%ds" % width for width in widths) + "  %s"
+    print(fmt % header)
+    for line in table:
+        print(fmt % line)
+    core = sum(1 for e in entries if not e["switchable"])
+    off = sum(1 for e in entries if e["state"] == "off")
+    print("\n%d guardrails: %d core (always on), %d recommended (%d off)" % (len(entries), core, len(entries) - core, off))
+    return 0
+
+
+def cmd_why(args):
+    registry = Registry()
+    row = registry.row(args.id)
+    reason = registry.refusal(row)
+    guard_lines, hook_lines = read_states()
+    if reason is None:
+        tier, switch = "recommended: switchable", "hmd guardrails off %s | on %s" % (row["id"], row["id"])
+    else:
+        tier, switch = "core: %s" % ("always on" if row["tier"] == "core" else reason), "none"
+    layer = row["layer"] + (", inside the hook %s" % row["hook"] if row["layer"] != HOOK_LAYER and row.get("hook") else "")
+    fields = [
+        ("tier", tier),
+        ("state", row_state(registry, row, guard_lines, hook_lines)),
+        ("kind", row["kind"]),
+        ("layer", layer),
+        ("why", row["why"]),
+        ("fails", row.get("fails") or "n/a"),
+        ("operator env", row.get("operator_env") or "none"),
+        ("proof", row.get("proof") or "none"),
+    ]
+    if row.get("provisional"):
+        fields.append(("provisional", "core only because it has not been classified yet (plan open decision O5)"))
+    fields.append(("switch", switch))
+    print(row["id"])
+    for label, value in fields:
+        print("  %-13s %s" % (label, value))
+    return 0
+
+
+def delegate(verb, row_id, metadata_path):
+    """A hook row is switched by bin/heimdall-hooks, against the same metadata this command classified it with; its output and exit status are ours."""
+    if not os.path.isfile(HOOKS_TOOL):
+        raise CliError("cannot find %s, which switches hook rows" % HOOKS_TOOL)
+    sys.stdout.flush()
+    return subprocess.run([sys.executable, HOOKS_TOOL, verb, "--metadata", metadata_path, row_id]).returncode
+
+
+def edit_guard_file(row_id, turn_on, home, place):
+    """`off` lists the id in guardrails-off, `on` removes it. Everything else in the file stays as it was. `place` is vet_home's (parent, name)."""
+    path = os.path.join(home, GUARDRAILS_OFF)
+    parent, name = place
+    wanted = row_id.encode("ascii")
+    try:
+        data = read_guard_file(parent, name)
+        lines = data.split(b"\n")
+        if turn_on:
+            if wanted not in lines:
+                print("heimdall-guardrails: %s is already on (not listed in %s)" % (row_id, path))
+                return 0
+            nf.write(parent, name, GUARDRAILS_OFF, b"\n".join(line for line in lines if line != wanted))
+            print("heimdall-guardrails: switched on %s (removed from %s)" % (row_id, path))
+            return 0
+        if wanted in lines:
+            print("heimdall-guardrails: %s is already off (%s)" % (row_id, path))
+            return 0
+        separator = b"" if not data or data.endswith(b"\n") else b"\n"
+        nf.write(parent, name, GUARDRAILS_OFF, data + separator + wanted + b"\n")
+        print("heimdall-guardrails: switched off %s -> %s" % (row_id, path))
+        return 0
+    except nf.Refused as exc:
+        raise CliError("%s is refused (%s): it is never followed, replaced or written through, so nothing was written" % (path, exc))
+
+
+def cmd_switch(args, turn_on):
+    registry = Registry()
+    row = registry.row(args.id)
+    reason = registry.refusal(row)
+    if reason is not None:
+        if turn_on:
+            print("heimdall-guardrails: %s is always on (%s): nothing to switch on" % (row["id"], reason))
+            return 0
+        sys.stderr.write("heimdall-guardrails off: REFUSED -- %s is %s. A core guardrail is always on: no command and no file switches it off, "
+                         "by design. Nothing written (see: hmd guardrails why %s).\n" % (shown(row["id"]), reason, row["id"]))
+        return 2
+    home = writable_home()
+    place = vet_home(home, create=not turn_on)
+    if place is None:
+        print("heimdall-guardrails: %s is already on (%s does not exist)" % (row["id"], home))
+        return 0
+    if row["layer"] == HOOK_LAYER:
+        return delegate("enable" if turn_on else "disable", row["id"], registry.metadata_path)
+    return edit_guard_file(row["id"], turn_on, home, place)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="heimdall-guardrails",
+        description="List, explain and switch the guardrails of guardrails.manifest.json. Core guardrails are always on; recommended ones can be switched off one by one.",
+        epilog="exit: 0 ok, 1 unknown id or an error, 2 REFUSED (a core id) or usage",
+    )
+    commands = parser.add_subparsers(dest="cmd")
+    listing = commands.add_parser("list", help="every guardrail: id, tier, kind, state (core: always on)")
+    listing.add_argument("--json", action="store_true")
+    for name, text in (
+        ("why", "tier, rationale, fail mode, operator override and proof suite of one guardrail"),
+        ("off", "switch a recommended guardrail off (exit 2 for a core one, nothing written)"),
+        ("on", "switch a recommended guardrail back on"),
+    ):
+        commands.add_parser(name, help=text).add_argument("id")
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.cmd is None:
+        parser.print_help()
+        return 0
+    try:
+        if args.cmd == "list":
+            return cmd_list(args)
+        if args.cmd == "why":
+            return cmd_why(args)
+        return cmd_switch(args, turn_on=args.cmd == "on")
+    except CliError as exc:
+        warn(str(exc))
+        return 1
+    except OSError as exc:
+        warn("%s failed: %s" % (args.cmd, exc))
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
