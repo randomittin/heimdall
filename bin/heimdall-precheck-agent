@@ -71,8 +71,31 @@ BRIEF_BIN="$BIN_DIR/heimdall-brief"
 
 INPUT="$(cat 2>/dev/null || true)"
 
+# -- guardrail switches (T6.2) --------------------------------------------------
+# Five guards below are RECOMMENDED, not core (guardrails.manifest.json), so the operator may switch each one off with `hmd guardrails off <id>`: the named-agent notice
+# (named-agent-notice), the disk floor fence (disk-floor), the context gate (context-gate), the fix-chain advisory (fix-chain-advisory) and the general-purpose agent rules
+# (gp-agent-rules). Each asks guardrail_off <id> next to the env override it already honours, and that override keeps its exact meaning. The concurrency cap, the adjudication
+# fallback fence, the coop fence and the brief-adoption gate are core and never ask: their ids in guardrails-off change nothing. bin/lib/hmd_guardrail_enabled.sh is the one reader,
+# sourced once here (its header has the rules: per operator under $HEIMDALL_HOME, never a repository; a core id is never switchable; any doubt is enabled).
+#
+# FAILS OPEN: no lib beside this script (a sandbox copy), a lib that will not source or defines no function, or any answer but exactly 1 leaves the guard running.
+# Proof: test/guardrail-off-agent.test.sh.
+GUARDRAIL_LIB="$BIN_DIR/lib/hmd_guardrail_enabled.sh"
+GUARDRAIL_LIB_OK=0
+# shellcheck source=lib/hmd_guardrail_enabled.sh disable=SC1091  # path is $BIN_DIR-derived at runtime; the default run never opens sourced files, source= is for -x
+if [ -r "$GUARDRAIL_LIB" ] && . "$GUARDRAIL_LIB" 2>/dev/null && command -v hmd_guardrail_enabled >/dev/null 2>&1; then
+  GUARDRAIL_LIB_OK=1
+fi
+# guardrail_off <id>: true only when the operator switched that recommended guard off (hmd_guardrail_enabled exits exactly 1); false, so the guard runs, on every other answer.
+guardrail_off() {
+  [ "$GUARDRAIL_LIB_OK" = 1 ] || return 1
+  hmd_guardrail_enabled "$1"
+  [ "$?" -eq 1 ]
+}
+# -- end guardrail switches ------------------------------------------------------
+
 # -- named-agent notice -------------------------------------------------------
-if [ "${HEIMDALL_ALLOW_NAMED_AGENT:-}" != "1" ]; then
+if [ "${HEIMDALL_ALLOW_NAMED_AGENT:-}" != "1" ] && ! guardrail_off named-agent-notice; then
   TAIL="A named spawn goes MAILBOX-RESIDENT - the harness parks it to receive instructions via mailbox, so it never self-terminates and never returns a result to the spawn call. Do NOT await it (measured over 109 spawns in one session: 0 of 43 named ever completed, vs 59 of 66 unnamed) - collect its work another way. THE SPAWNER OWNS THE CLEANUP: call TaskStop on this agent once its work is done. TaskStop only reaches agents THIS session spawned, so a cross-session stop returns \"No task found with ID\". Find leaked ones with: bin/heimdall-agents orphans. If you did not want a mailbox, identify the work with description: instead of name: (convention R13). Set HEIMDALL_ALLOW_NAMED_AGENT=1 to silence this notice."
   if [ -z "$INPUT" ]; then
     printf '⚠️  BIFRÖST — Heimdall named-agent notice: the spawn payload was EMPTY, so a name: cannot be ruled out - warning rather than assuming this spawn is unnamed. %s\n' "$TAIL" >&2
@@ -100,10 +123,11 @@ fi
 # FAILS OPEN, like the cap (the other resource ceiling here) and the opposite of the adjudication fence: no lib next to this script (a sandbox
 # copy), a lib that will not source, no jq (the cwd then falls back to this process's), or a df that cannot answer (the lib warns on stderr) is
 # ALLOW. Only a volume that was READ and is under the floor denies. No bypass flag beyond the knob itself: HMD_MIN_FREE_PCT=<n> lowers the
-# floor and 0 switches it off, in the environment Claude Code runs in (this hook reads its own environment, not the spawn's).
+# floor and 0 switches it off, in the environment Claude Code runs in (this hook reads its own environment, not the spawn's). The operator switch `hmd guardrails off disk-floor`
+# skips this fence (one id, shared with the Bash hook's floor; test/run-all.sh keeps its own floor, INV-G8).
 DISK_LIB="$BIN_DIR/lib/hmd_disk_floor.sh"
 # shellcheck source=lib/hmd_disk_floor.sh disable=SC1091  # path is $BIN_DIR-derived at runtime; the default run never opens sourced files, source= is for -x
-if [ -r "$DISK_LIB" ] && . "$DISK_LIB" 2>/dev/null && command -v hmd_disk_floor_check >/dev/null 2>&1; then
+if ! guardrail_off disk-floor && [ -r "$DISK_LIB" ] && . "$DISK_LIB" 2>/dev/null && command -v hmd_disk_floor_check >/dev/null 2>&1; then
   DISK_CWD=""
   if [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
     DISK_CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)" || DISK_CWD=""
@@ -535,9 +559,11 @@ fi
 # unlike the adjudication and coop fences (deliberately no bypass: both guard
 # a correctness/routing question a human override could get wrong), a stalled
 # context gate blocks forward progress on a live session with nothing left to
-# check it against, so this one keeps an operator escape hatch.
-if [ "${HMD_CTX_GATE_OFF:-}" = "1" ]; then
-  : # escape hatch -- fence skipped entirely for this spawn
+# check it against, so this one keeps an operator escape hatch. The operator
+# switch `hmd guardrails off context-gate` skips it for every spawn until it is
+# switched back on.
+if [ "${HMD_CTX_GATE_OFF:-}" = "1" ] || guardrail_off context-gate; then
+  : # escape hatch or operator switch -- fence skipped entirely for this spawn
 elif [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
   CTXGATE_BIN="$BIN_DIR/heimdall-ctx-meter"
   if [ -x "$CTXGATE_BIN" ]; then
@@ -606,13 +632,14 @@ fi
 #
 # FAILS OPEN on everything: no jq, no lib next to this script (a sandbox copy), an unparsable payload, no session_id (never grade a spawn against another session's count: the context
 # fence's measured lesson), an unwritable or occupied state dir, a counter path that is not a file. HMD_FIX_CHAIN_ALLOW=1 silences it and skips the whole section, counting included; set
-# it in the environment Claude Code runs in (this hook reads its own environment), and only exactly 1 lifts it.
+# it in the environment Claude Code runs in (this hook reads its own environment), and only exactly 1 lifts it. The operator switch `hmd guardrails off fix-chain-advisory` does the
+# same, counting included, until it is switched back on; it is asked only past the pre-filter, so a spawn with no "fix" in it still pays that one comparison and nothing else.
 if [ "${HMD_FIX_CHAIN_ALLOW:-}" != "1" ] && [ -n "$INPUT" ]; then
   case "$INPUT" in
     *[Ff][Ii][Xx]*)
       FIXCHAIN_LIB="$BIN_DIR/lib/hmd_fix_chain.sh"
       # shellcheck source=lib/hmd_fix_chain.sh disable=SC1091  # path is $BIN_DIR-derived at runtime; the default run never opens sourced files, source= is for -x
-      if command -v jq >/dev/null 2>&1 && [ -r "$FIXCHAIN_LIB" ] && . "$FIXCHAIN_LIB" 2>/dev/null && command -v hmd_fix_chain_max >/dev/null 2>&1; then
+      if ! guardrail_off fix-chain-advisory && command -v jq >/dev/null 2>&1 && [ -r "$FIXCHAIN_LIB" ] && . "$FIXCHAIN_LIB" 2>/dev/null && command -v hmd_fix_chain_max >/dev/null 2>&1; then
         FIXCHAIN_SID="$(printf '%s' "$INPUT" | jq -r "$HMD_FIX_CHAIN_JQ"' (.tool_input // {}) as $t | if hmd_finding_fix($t.description; $t.prompt) then (.session_id // "" | tostring) else empty end' 2>/dev/null)" || FIXCHAIN_SID=""
         case "$FIXCHAIN_SID" in
           ''|.*|*[!A-Za-z0-9._-]*) ;;
@@ -649,7 +676,8 @@ fi
 #
 # IDEMPOTENT. The block opens with the marker line `[hmd agent rules]`; a prompt that already carries it is left alone, so a re-spawn of a rewritten prompt never doubles it.
 #
-# OPT-OUT. HMD_GP_RULES_OFF=1, in the environment Claude Code runs in (this hook reads its own environment, not the spawn's); only exactly 1 turns it off.
+# OPT-OUT. HMD_GP_RULES_OFF=1, in the environment Claude Code runs in (this hook reads its own environment, not the spawn's); only exactly 1 turns it off. The operator switch
+# `hmd guardrails off gp-agent-rules` turns it off too; it is asked only for a spawn the block would apply to.
 #
 # FAILS OPEN on everything: no jq, an unparsable payload, no prompt or a prompt that is not a string, a jq call that fails on the rewrite. The spawn then goes through with the input the
 # harness sent, exactly as before this section existed. Nothing here can deny a spawn, and nothing here exits: allow() below is the one place that emits the rewrite.
@@ -662,11 +690,12 @@ GP_RULES_BLOCK="$GP_RULES_MARKER
 5. Run only the tests you touched, once, after all edits.
 6. Report concisely: what changed, commit sha, test result line."
 
-# gp_rules_apply <tool_input_json>: prints the tool_input with the rules block appended to .prompt, or NOTHING when no rewrite applies (opted out, not a general-purpose spawn, no string
-# prompt, block already there, or jq failed). Always returns 0.
+# gp_rules_apply <tool_input_json>: prints the tool_input with the rules block appended to .prompt, or NOTHING when no rewrite applies (opted out or switched off, not a general-purpose
+# spawn, no string prompt, block already there, or jq failed). Always returns 0.
 gp_rules_apply() {
   [ "${HMD_GP_RULES_OFF:-}" != "1" ] || return 0
   case "${SATYPE:-}" in general-purpose|'') ;; *) return 0 ;; esac
+  ! guardrail_off gp-agent-rules || return 0
   printf '%s' "$1" | jq -c --arg m "$GP_RULES_MARKER" --arg b "$GP_RULES_BLOCK" \
     'if (.prompt | type) == "string" and (.prompt | length) > 0 and ((.prompt | contains($m)) | not) then .prompt += ("\n\n" + $b) else empty end' 2>/dev/null || true
 }
