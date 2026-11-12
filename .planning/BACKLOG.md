@@ -38,3 +38,4 @@
 - [2026-11-12] hmd_marketplace_add (first-run marketplace) is not recorded in skills.lock; INV-S6 covers plugin+skill lines only.
 - [2026-11-12] discover-skills install of a raw owner/repo not in the manifest: consent gate's suggested lock row likely fails (skills_lock needs --kind); unverified. Also dead sed shim in test/discover-skills-bin-injection.test.sh:97-106.
 - [2026-11-12] parallelism-check-bash has no guardrail off switch (T6.1): any check there changes the byte-identity trace in test/heimdall-precheck-bash.test.sh; put the switch inside bin/parallelism-tracker or widen that test's filter.
+- [2026-11-12] launch nudge count (T7.1) parses `suggest`'s first line, which includes detected entries, so it says N recommended when some are detected-only (10 vs 9). Add a --json/--tier filter to suggest and count recommended only.
