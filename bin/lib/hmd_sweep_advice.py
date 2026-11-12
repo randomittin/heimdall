@@ -18,10 +18,17 @@ message, a script written to disk) is no merge, as it is no sweep to the sweep g
   the subject the commits that stand to land: HEAD, plus what a merge or a pull brings in (the refs named, else the upstream), or, for a push, the commits it sends.
               A ref that cannot be placed in this checkout is said so, and it keeps the commits from being called proven
   its class   read from the commit like the push gate does (bin/lib/hmd_push_target.py commit_class):
-              sweep        test/run-all.sh names last-sweep.json: heimdall's own regime. The records are receipts/last-sweep.json and last-full-green.json (in
-                           $HEIMDALL_HOME/receipts, else <repo>/.heimdall/receipts, as the runner works them out). A PROOF is a green full receipt of a clean tree
-                           that is full-equivalent and recorded for this checkout; a commit is covered by it when it is the receipt's own, or only the hooks' own
-                           journal and ledger records came after it. Run: bash test/run-all.sh, or --failed after a red sweep, or wait for the one already running
+              sweep        test/run-all.sh names last-sweep.json: heimdall's own regime. The records are receipts/last-sweep.json, last-full-green.json (the anchor)
+                           and the archive receipts/full-green/<head_sha>.json (in $HEIMDALL_HOME/receipts, else <repo>/.heimdall/receipts, as the runner works
+                           them out). A PROOF is a green full receipt of a clean tree that is full-equivalent and recorded for this checkout; a commit is covered by
+                           it when it is the receipt's own, or only the hooks' own journal and ledger records came after it. Only a proof says "already proven".
+                           The Why and the Cost measure from the NEWEST green full run among the records (the one that leaves the fewest commits uncovered, then
+                           the latest finished_at): a proof, or a green full run of a clean tree that is NOT full-equivalent. That second kind is why last-sweep.json
+                           is read at all: test/run-all.sh moves the anchor and writes the archive only for a full-equivalent green (its anchor block, after the
+                           receipt is written), so a green sweep in which one suite passed only on its solo re-run (no cache record for it, full_equivalent=false)
+                           lives in last-sweep.json alone and the anchor lags behind it BY DESIGN, not by a runner bug -- measuring from the anchor alone said "202
+                           commits since" and 8m12s when the run that had just finished took 47m53s. `bash test/run-all.sh --failed` completes such a receipt.
+                           Run: bash test/run-all.sh, or --failed after a red sweep, or wait for the one already running
               repo-checks  .heimdall/repo-checks.json is declared: its own receipt (bin/lib/hmd_repo_receipt.py) must be green and current for the commit, and it
                            attests ONE commit. Run: bin/heimdall-repo-checks run --repo <repo>
               unmanaged    neither (or a declaration that cannot be used): lint plus the use-case suite, skills/heimdall/references/use-case-tests.md
@@ -76,6 +83,9 @@ PULL_VALUE_OPTS = frozenset(("-s", "--strategy", "-X", "--strategy-option", "--d
 PUSH_VALUE_OPTS = pt.PUSH_VALUE_OPTS | frozenset(("--repo",))
 GH_VALUE_OPTS = frozenset(("-R", "--repo"))
 NAME_OK = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
+FULL_GREEN_KEEP = 20  # how many receipts/full-green/<head_sha>.json the runner keeps (test/run-all.sh FULL_GREEN_KEEP, newest by modification time): the most of them this reads
+STAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")  # a receipt's finished_at, `date -u '+%Y-%m-%dT%H:%M:%SZ'`: stamps of this form sort as text
+NOT_FULL_EQUIVALENT = "not full-equivalent (a suite has no cache record, e.g. one that passed only on its solo re-run), so the push gate takes it for no proof"
 
 U_DEEP = sg.U_DEEP
 U_TIMEOUT = "reading the command and the records took longer than %gs (HMD_SWEEP_ADVICE_TIMEOUT_S), so no advice was given"
@@ -506,7 +516,8 @@ def load_receipt(rdir, name, top):
 
 
 def receipt_kind(receipt):
-    """("proof", None) for a green full receipt of a clean tree that is full-equivalent and names a commit; ("red", None); or ("partial", why not a proof)."""
+    """("proof", None) for a green full receipt of a clean tree that is full-equivalent and names a commit; ("green", None) for the same that is NOT full-equivalent (the run was
+    green, but a suite that passed only on its solo re-run has no cache record, so the gate takes no commit on its word); ("red", None); or ("partial", why it is none of those)."""
     sha = receipt.get("head_sha")
     if not isinstance(sha, str) or not sg.COMMIT.match(sha):
         return "partial", "the sweep receipt names no commit"
@@ -521,9 +532,39 @@ def receipt_kind(receipt):
         return "partial", "the last sweep receipt is of kind %s, not a full run" % kind
     if receipt.get("tree_clean") is not True:
         return "partial", "the last sweep ran on a tree with uncommitted changes, so it proves no commit"
-    if receipt.get("full_equivalent") is False:
-        return "partial", "the last sweep was composed from the suite cache and is not full-equivalent"
-    return "proof", None
+    return ("green", None) if receipt.get("full_equivalent") is False else ("proof", None)
+
+
+def archived(rdir):
+    """The names under receipts/full-green/ that are <head_sha>.json, newest first (the runner's own order: modification time), at most FULL_GREEN_KEEP of them."""
+    folder = os.path.join(rdir, "full-green")
+    try:
+        names = [n for n in os.listdir(folder) if n.endswith(".json") and sg.COMMIT.match(n[:-5])]
+        names.sort(key=lambda n: os.stat(os.path.join(folder, n)).st_mtime, reverse=True)
+    except OSError:
+        return []
+    return ["full-green/" + n for n in names[:FULL_GREEN_KEEP]]
+
+
+def finished(receipt):
+    """finished_at when it is the runner's own UTC stamp (those sort as text), else "": a receipt with no usable time counts as the oldest."""
+    stamp = receipt.get("finished_at")
+    return stamp if isinstance(stamp, str) and STAMP.match(stamp) else ""
+
+
+def green_sweeps(rdir, top, last):
+    """[(receipt, "proof" or "green")], newest finished_at first, of every green full sweep of a clean tree on file for this checkout: last-sweep.json (`last`, already read),
+    last-full-green.json and the receipts/full-green/ archive. The runner moves the anchor and writes the archive only for a sweep that is full-equivalent, so a green run in which a
+    suite passed only on its solo re-run (kind "green") lives in last-sweep.json alone and the anchor lags behind it by design: only all three together hold the last green run.
+    Receipts of equal time keep that order, and one run found under two names counts once. A record that is missing, unreadable, red, partial or of another checkout is not one."""
+    found, seen = [], set()
+    for r in [last] + [load_receipt(rdir, name, top)[0] for name in ["last-full-green.json"] + archived(rdir)]:
+        kind = receipt_kind(r)[0] if r is not None else None
+        key = (r["head_sha"], finished(r)) if kind in ("proof", "green") else None
+        if key is not None and key not in seen:
+            seen.add(key)
+            found.append((r, kind))
+    return sorted(found, key=lambda f: finished(f[0]), reverse=True)
 
 
 def covered(top, receipt, sha, owned):
@@ -561,15 +602,10 @@ def assess_sweep(top, subs, head):
     rdir = os.path.join(home or os.path.join(top, ".heimdall"), "receipts")
     owned = owned_shape()[0]
     last, why_last = load_receipt(rdir, "last-sweep.json", top)
-    anchor = load_receipt(rdir, "last-full-green.json", top)[0]
     shas = subs.shas()
-    best, left = None, None
-    for r in (last, anchor):  # the proof that leaves the least uncovered (last-sweep.json first when they tie)
-        if r is None or receipt_kind(r)[0] != "proof":
-            continue
-        uncovered = [sha for sha in shas if not covered(top, r, sha, owned)]
-        if left is None or len(uncovered) < len(left):
-            best, left = r, uncovered
+    scored = [(r, kind, [sha for sha in shas if not covered(top, r, sha, owned)]) for r, kind in green_sweeps(rdir, top, last)]  # (receipt, kind, what it leaves uncovered), newest first
+    baseline = min(scored, key=lambda s: len(s[2]), default=None)  # what the Why and the Cost measure from: the newest of the green sweeps that leave the fewest commits uncovered
+    proof = min((s for s in scored if s[1] == "proof"), key=lambda s: len(s[2]), default=None)  # what may say "proven": a full-equivalent sweep, never a green one that is not
     red = None
     if last is not None and receipt_kind(last)[0] == "red":
         try:
@@ -578,13 +614,15 @@ def assess_sweep(top, subs, head):
         except sg.Unread:
             red = None
     unplaced = ("; %s cannot be placed in this checkout, so what it brings is not counted" % ", ".join(subs.unplaced)) if subs.unplaced else ""
-    when = best.get("finished_at", "time unknown") if best is not None else ""
-    if best is not None and not left and not subs.unplaced and not red:
-        suites = best.get("suites_total")
+    if proof is not None and not proof[2] and not subs.unplaced and not red:
+        suites = proof[0].get("suites_total")
         count = ", %s" % plural(suites, "suite") if isinstance(suites, int) and not isinstance(suites, bool) else ""
-        return {"proven": True, "what": subs.describe(), "by": "the last full sweep (%s%s)" % (when, count)}
-    if best is not None:
-        why = "%s since the last green full sweep (%s, %s)" % (counted(top, best["head_sha"], left or shas), best["head_sha"][:12], when)
+        return {"proven": True, "what": subs.describe(), "by": "the last full sweep (%s%s)" % (proof[0].get("finished_at", "time unknown"), count)}
+    if baseline is not None:
+        base, kind, left = baseline
+        why = "%s since the last green full sweep (%s, %s)" % (counted(top, base["head_sha"], left or shas), base["head_sha"][:12], base.get("finished_at", "time unknown"))
+        if kind != "proof":
+            why += ", which is " + NOT_FULL_EQUIVALENT
         if left:
             why += "; not covered: %s" % subs.describe(left)
         if red:
@@ -602,7 +640,7 @@ def assess_sweep(top, subs, head):
         run, where = "wait: a sweep is already running (pid %d); a second one is refused until it ends" % pid, None
     else:
         run, where = ("bash test/run-all.sh --failed" if red else "bash test/run-all.sh"), "(in %s, on the tree you are about to land)" % top
-    basis = best if best is not None else last
+    basis = baseline[0] if baseline is not None else last
     return {"proven": False, "why": why, "run": run, "where": where, "cost": cost_sweep(top, basis)}
 
 
