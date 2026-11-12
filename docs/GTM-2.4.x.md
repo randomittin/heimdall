@@ -2,12 +2,14 @@
 # GTM plan: hmd 2.4.8 and the runhmd phone app
 
 > **DRAFT. NOT APPROVED.** Nothing here is posted, published, submitted or sent until the operator approves this plan. Every post, store entry and release command below is an operator act or waits for one. **OPEN** marks a fact the repo cannot answer.
-> Drafted 2026-10-14 on `release/2.4.8` (7ee401fb). Read: CHANGELOG.md, README.md, DATA.md, relay/, bin/heimdall-app, release/, and, read-only, the app repo `hmdapp` and the site repo `heimdall-site`. Revised 2026-10-14 with the operator's decisions; still a draft.
+> Drafted 2026-10-14 on `release/2.4.8` (7ee401fb). Read: CHANGELOG.md, README.md, DATA.md, relay/, bin/heimdall-app, release/, and, read-only, the app repo `hmdapp` and the site repo `heimdall-site`. Revised 2026-10-14 with the operator's decisions, and 2026-11-12 for agent-neutral positioning and the phone-support sentence (operator directive and decision); still a draft.
 
 ## Who, what, headline
 
-- **For:** Claude Code users running long sessions.
-- **Headline (operator decision, 2026-10-14):** answer and steer your Claude Code session from your phone (runhmd for iOS and Android). Message contents are end-to-end encrypted; the relay sees only metadata (session ID, sizes, timing, IP); push notification text isn't encrypted; --confirm adds a 6-digit check.
+- **For:** developers running long coding-agent sessions.
+- **What hmd is:** a harness for the coding agent you already use, not a plugin for any one agent; no headline, tagline or audience line names an agent (operator directive, 2026-11-12).
+- **Works with, today:** Claude Code and Cursor (the pre-push gate holds for both). Where copy needs a support line, state this list once, plainly, never in a headline or as the identity. No other agent is supported today, so no copy claims one; any mention of another is a clearly labelled roadmap line, never a current fact. **Phone control currently supports Claude Code only.** (Operator decision, 2026-11-12: pairing, answer delivery and deny from the phone run on hooks hmd registers with Claude Code only, `hooks/hooks.json`; docs/ARCHITECTURE.md, "What you don't get under Cursor", lists none for Cursor.) State that sentence, as written, beside every phone claim in copy.
+- **Headline (operator decision, 2026-10-14; agent-neutral wording and phone scope, 2026-11-12):** answer and steer your coding-agent session from your phone (runhmd for iOS and Android). Phone control currently supports Claude Code only. Message contents are end-to-end encrypted; the relay sees only metadata (session ID, sizes, timing, IP); push notification text isn't encrypted; --confirm adds a 6-digit check.
 - **In the launch:** hmd 2.4.8, and the runhmd app moving from internal testers to a public TestFlight link and a Play open test.
 
 | Item | State today | Source |
@@ -18,38 +20,40 @@
 
 | Claim | Evidence | Say it with this caveat |
 |---|---|---|
-| Answer and steer a live session | The phone sends a message, answers the agent's question, stops a turn, saves a checkpoint and denies (DATA.md sections 8-9). | Do not say "run": the app source has no start-a-session action (its only "launch" is app launch) and hmd's `remote-launch` is off by default. Deny only, never approve. |
+| Answer and steer a live session | The phone sends a message, answers the agent's question, stops a turn, saves a checkpoint and denies (DATA.md sections 8-9). | Phone control currently supports Claude Code only. Do not say "run": the app source has no start-a-session action (its only "launch" is app launch) and hmd's `remote-launch` is off by default. Deny only, never approve. |
 | Message contents are end-to-end encrypted | X25519, HKDF-SHA256, ChaCha20-Poly1305: `bin/lib/hmd_relay_e2e.py`, app `src/relay/crypto.ts`, DATA.md section 9. | No outside audit is recorded in the repo: never write "audited". |
 | The relay sees only metadata | It stores and forwards ciphertext and holds no session key (relay/README.md:33-37). It sees session id, sequence numbers, sizes, timing, IP and the phone's public key, and keeps the newest sealed state frame. | The relay sees only metadata (session ID, sizes, timing, IP). Default pair-by-code trusts the relay to deliver the right keys (a relay that swapped its key could read the session); `hmd app connect --confirm` adds a 6-digit check (DATA.md:650-653). Self-host with `--relay URL`. Decided 2026-10-14: `--confirm` stays opt-in. |
 | Push notification text isn't encrypted | Expo and Apple/Google can read it: title 48, body 120 chars (DATA.md push section). | `HMD_PUSH=0` turns it off. The store listing's "only ever sees encrypted data" is looser than DATA.md: align it. |
 | The gh token reaches the relay once per code, never on a timer (pairing is on by default for every repo since 2026-10-20; the old claim, "only after `hmd app connect`", is withdrawn) | Pair-by-code sends `gh auth token`; the relay makes one `GET /user` and, by INV-39, never stores or logs it (a promise about relay code, not checkable from the client). At 5b22234a the pair-window SessionStart hook still sends it on every window registration, about every 350 s, while gh is signed in (bin/heimdall-app:75-77, 144-190; DATA.md:608-645). README:121 says it goes "while the code is offered": update it with the fix. Do not post this claim until the fix lands. | Sent once for each code registered for a phone to claim (a session start of a repo with no phone paired, `hmd app connect`, `hmd app add-device`), only while gh is signed in, with no 5-minute resend. `--no-code` pairs by QR and sends no token. Off for one repo with `hmd app disconnect` or `hmd app connect --no-code`, for the machine with `HMD_PAIR_WINDOW=0` or `hmd hooks disable pair-window-start`. The app also needs a GitHub sign-in, and the relay learns the numeric id and login. |
-| Do not say | audited; zero-knowledge; a bare "no data collection" (fails `test/truth-pass-claims.test.sh`); no account needed; public release (both are test tracks); start a session from the phone. | |
+| Do not say | audited; zero-knowledge; a bare "no data collection" (fails `test/truth-pass-claims.test.sh`); no account needed; public release (both are test tracks); start a session from the phone; hmd as a plugin for any one agent; a coding agent by name outside the Works-with line and the phone sentence; support for any agent not on that line; phone control for any agent that sentence does not name. | |
 
 ## Channels
 
 | Channel | Asset and lead | Owner |
 |---|---|---|
-| GitHub release notes | `ship.sh` derives them from commits; the prose is editable after (CHANGELOG [2.4.8]). Lead: "Your phone stays paired when the laptop client stops, restarts or Claude Code resumes; re-pair once after upgrading. Second phone: `hmd app add-device`." Publishing the Release is what rolls existing installs forward (auto-update). | hmd drafts, operator edits |
-| Site changelog, homepage | Separate repo (release/HOSTING.md); a push deploys it. It has no changelog page (`log.html` is "The Log"): OPEN new page or log.html. Homepage phone section (`index.html:292-311`) is stale: "not in a tagged release", invite-only, diff and attach "not built", "paired by QR"; so is `how-it-works.html:430`. Privacy page still says "No accounts" (`privacy.html:83`, effective 2026-10-05); corrected text: hmdapp `docs/store/privacy-page.md`. Add both store links; site version pins are manual in 2.4.8. Deferred out of 2.4.8: BACKLOG. | hmd drafts, operator pushes |
-| npm README | `runheimdall`'s is a byte copy of README.md (`test/npm-readme-drift.test.sh`); `runhmd` has its own. A README ships in the tarball, so land a short Phone section before ship, with scoped claims only. OPEN: NAMING.md:9 says the `runhmd` npm name is not yet claimed. | hmd drafts, operator ships |
+| GitHub release notes | `ship.sh` derives them from commits; the prose is editable after (CHANGELOG [2.4.8]). Lead: "Your phone stays paired when the laptop client stops, restarts or your coding agent resumes; re-pair once after upgrading. Second phone: `hmd app add-device`. Phone control currently supports Claude Code only." Publishing the Release is what rolls existing installs forward (auto-update). | hmd drafts, operator edits |
+| Site changelog, homepage | Separate repo (release/HOSTING.md); a push deploys it. It has no changelog page (`log.html` is "The Log"): OPEN new page or log.html. Homepage phone section (`index.html:292-311`) is stale: "not in a tagged release", invite-only, diff and attach "not built", "paired by QR"; so is `how-it-works.html:430`. Privacy page still says "No accounts" (`privacy.html:83`, effective 2026-10-05); corrected text: hmdapp `docs/store/privacy-page.md`. Add both store links and put the phone sentence (Works with) in the homepage phone section; site version pins are manual in 2.4.8. Deferred out of 2.4.8: BACKLOG. | hmd drafts, operator pushes |
+| npm README | `runheimdall`'s is a byte copy of README.md (`test/npm-readme-drift.test.sh`); `runhmd` has its own. A README ships in the tarball, so land a short Phone section before ship, with scoped claims only and the phone sentence (Works with). OPEN: NAMING.md:9 says the `runhmd` npm name is not yet claimed. | hmd drafts, operator ships |
 | X post, Show HN, demo | Below. House HN rules (docs/specs/heimdall-ship-spec.md L1): no superlatives, Tue/Wed/Thu 7-8pm IST. `launch-docs/SHOW-HN-DRAFT.md` is a different story marked READY TO POST, with no record of posting: OPEN which Show HN goes first. | operator posts and records |
 
 ## Draft copy
 
-**X post** (275 chars, one link; the homepage carries the store links):
+**X post** (260 chars, one link; the homepage carries the store links; the 2.4.8 line is in the second reply so the phone sentence fits):
 
 ```text
-Answer and steer your Claude Code session from your phone. runhmd (iOS, Android) pairs with hmd on your laptop. Message contents are end-to-end encrypted; the relay sees only metadata. hmd 2.4.8: the phone stays paired when the laptop client restarts. https://runheimdall.dev
+Answer and steer your coding-agent session from your phone. Phone control currently supports Claude Code only. runhmd (iOS, Android) pairs with hmd on your laptop. Message contents are end-to-end encrypted; the relay sees only metadata. https://runheimdall.dev
 ```
 
 Reply (223 chars): `Scope: message contents are end-to-end encrypted; the relay sees only metadata (session ID, sizes, timing, IP); push notification text isn't encrypted; --confirm adds a 6-digit check. Details: DATA.md section 9 in the repo.`
 
-**Show HN title** (66 chars): `Show HN: Answer and steer your Claude Code session from your phone`
+Second reply (117 chars): `hmd 2.4.8: the phone stays paired when the laptop client restarts. Phone control currently supports Claude Code only.`
+
+**Show HN title** (67 chars; the phone sentence leads the body): `Show HN: Answer and steer your coding-agent session from your phone`
 
 **Show HN body** (URL field: https://github.com/randomittin/heimdall):
 
 ```text
-hmd is an MIT-licensed Claude Code plugin; its pre-push gate runs checks the agent did not write. This post is about its phone companion, runhmd (iOS and Android), which lets you answer and steer your Claude Code session from your phone. It pairs with a session running on your laptop (hmd app connect). From the phone you can read the session's status and chat, answer the agent's questions, send it a message, stop a turn and deny a pending action. The phone can deny; it cannot approve.
+hmd is an MIT-licensed harness for the coding agent you already use; its pre-push gate runs checks the agent did not write. This post is about its phone companion, runhmd (iOS and Android), which lets you answer and steer your coding-agent session from your phone. Phone control currently supports Claude Code only. It pairs with a session running on your laptop (hmd app connect). From the phone you can read the session's status and chat, answer the agent's questions, send it a message, stop a turn and deny a pending action. The phone can deny; it cannot approve.
 
 Laptop and phone talk through a Cloudflare Worker whose source is relay/ in the repo. Message contents are end-to-end encrypted (X25519, HKDF-SHA256, ChaCha20-Poly1305). The relay sees only metadata (session ID, sizes, timing, IP): it stores and forwards ciphertext, and it keeps the newest encrypted state frame so a reconnecting phone can catch up. hmd can use a relay you run (--relay URL).
 
@@ -64,13 +68,13 @@ The app has an offline demo mode on sample data, so you can look before installi
 
 | Time | Shot | What is on screen |
 |---|---|---|
-| 0:00-0:06 | Long session, away from the desk | Terminal, Claude Code mid-task, statusline showing the 5-character session code; phone beside it |
-| 0:06-0:16 | Pair | `hmd app connect` prints SESSION CODE and a QR; phone: runhmd, Pair a session, type the code; "phone paired", and a notice lands in the Claude session (bin/heimdall-app:52-66) |
-| 0:16-0:28 | Answer | Chat tab shows the last turns; the agent asks a question; type the answer on the phone; cut to the laptop where Claude takes it as the operator's answer |
-| 0:28-0:40 | Deny | Claude tries a risky command (a `git push`); the phone holds a Deny card for up to 10 s (DATA.md section 8); Face ID; denied on the laptop. Caption: "The phone can deny. It can't approve." |
+| 0:00-0:06 | Long session, away from the desk | Terminal, the coding agent mid-task, statusline showing the 5-character session code; phone beside it |
+| 0:06-0:16 | Pair | `hmd app connect` prints SESSION CODE and a QR; phone: runhmd, Pair a session, type the code; "phone paired", and a notice lands in the coding-agent session (bin/heimdall-app:52-66) |
+| 0:16-0:28 | Answer | Chat tab shows the last turns; the agent asks a question; type the answer on the phone; cut to the laptop where the agent takes it as the operator's answer |
+| 0:28-0:40 | Deny | The agent tries a risky command (a `git push`); the phone holds a Deny card for up to 10 s (DATA.md section 8); Face ID; denied on the laptop. Caption: "The phone can deny. It can't approve." |
 | 0:40-0:50 | What the relay holds | `relay/contract/wire.json` `frames.state.wire` with the ciphertext cut short (`v`, `session_id`, `seq`, `sender`, `type`, `nonce`, `ciphertext`). Caption: "Fixture, not live traffic. The relay forwards this and has no key." |
 | 0:50-0:57 | 2.4.8 resume | Ctrl-C the connect client, run `hmd app connect` again; the phone reconnects with no re-pair |
-| 0:57-1:00 | End card | runheimdall.dev, store links [OPEN], one line: "Answer and steer your Claude Code session from your phone. Message contents are end-to-end encrypted; push notification text isn't encrypted: DATA.md section 9" |
+| 0:57-1:00 | End card | runheimdall.dev, store links [OPEN], one line: "Answer and steer your coding-agent session from your phone. Phone control currently supports Claude Code only. Message contents are end-to-end encrypted; push notification text isn't encrypted: DATA.md section 9" |
 
 Dry-run on a clean machine first: hmdapp's TEAM-QUICKSTART section 7 says phone deny needs `HMD_PHONE_DENY=1`; DATA.md section 8 says it is on by default.
 
@@ -83,7 +87,7 @@ Dry-run on a clean machine first: hmdapp's TEAM-QUICKSTART section 7 says phone 
 | 3 | Encryption forms: `ITSAppUsesNonExemptEncryption` is still false in app.json; `docs/IOS-STORE-COMPLIANCE.md` argues false, `docs/RELEASE-READINESS-2026-10-08.md` F2 and `docs/RELEASING.md` say true (option B); if non-exempt, BIS self-classification due 1 Feb 2027 and France (ANSSI declaration or untick France). Counsel's call | operator | OPEN (operator's side) |
 | 4 | Privacy forms: ASC App Privacy labels and Play Data safety (answers drafted in hmdapp `docs/store/`; both held the 1.1.0 push-only answers on 2026-10-08); publish the privacy page | operator | OPEN (operator's side; hmd diffs the page on request) |
 | 5 | Sign-in proof: the GitHub App authorizable by a non-owner account (O6) and the browser sign-in round trip on a real iPhone and Android phone (O7), both open on 2026-10-08. Relay origin: app `hmdRelayUrl` and the hmd default (`hmd-relay.therishabh16.workers.dev`) must match, and the code-pairing secrets must be set in prod (else 503) | operator | OPEN |
-| 6 | Store screenshots: retake the Android set of 5, confirm the iOS set of 4 (1320 x 2868) against the 1.2.0 UI (F5, A8); listing lead still says "Proof for AI coding agents", not the headline | operator | OPEN (operator's side; hmd drafts text on request) |
+| 6 | Store screenshots: retake the Android set of 5, confirm the iOS set of 4 (1320 x 2868) against the 1.2.0 UI (F5, A8); listing lead still says "Proof for AI coding agents", not the headline, and needs the phone sentence (Works with) | operator | OPEN (operator's side; hmd drafts text on request) |
 | 7 | Store review status: external TestFlight group and Beta App Review for the newest build (build 8 was rejected 2026-10-10; the demo sign-in fix is in build 12 and later; the outcome is not recorded); Play open-test track, listing and declarations (the repo documents internal testing only) | operator | OPEN: unknown (operator's side) |
 | 8 | Support or feedback contact, one for listings, README and Show HN: `rj@runheimdall.dev` (privacy page), GitHub issues (`package.json` bugs URL), site root (ASC support URL); `docs/PRIVACY.md` Contact is still TBD-OPERATOR; ASC review-contact fields are not in the repo | operator | OPEN (operator's side) |
 | 9 | Land the README Phone section and the CHANGELOG lead before ship | hmd | on approval |
