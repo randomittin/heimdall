@@ -896,7 +896,7 @@ def s_q6():
                 res["fds_0_1_2"] = run_out(["/usr/sbin/lsof", "-p", str(cpid), "-a", "-d", "0,1,2"])
                 res["pid_pgid_tpgid_stat_ignored_caught"] = run_out(["/bin/ps", "-o", "pid=,pgid=,tpgid=,stat=,ignored=,caught=", "-p", str(cpid)])
                 res["bash_pid_pgid_tpgid"] = run_out(["/bin/ps", "-o", "pid=,pgid=,tpgid=,stat=,ignored=", "-p", str(r.pid)])
-            if res["claude_became_interactive_idle"]:
+            if res["claude_became_interactive_idle"] and test == "keys":
                 m = r.mark()
                 r.write(b"hello")
                 r.pump(seconds=1.5)
@@ -914,6 +914,13 @@ def s_q6():
                 res["resize_redraw_metrics"] = redraw_metrics(bytes(r.buf[m:]))
                 r.write(b"\x03")
                 res["exited_after_second_ctrl_c"] = r.wait_exit(20)
+            elif res["claude_became_interactive_idle"] and test == "sigint":
+                r.send_to_claude(signal.SIGINT)
+                res["wrapper_exited_within_8s_after_SIGINT_to_claude"] = r.wait_exit(8)
+                if not res["wrapper_exited_within_8s_after_SIGINT_to_claude"]:
+                    res["claude_survived_SIGINT_alive"] = True
+                    r.send_to_claude(signal.SIGTERM)
+                    res["wrapper_exited_after_followup_SIGTERM"] = r.wait_exit(20)
             else:
                 res["stream_tail_when_not_interactive"] = r.text()[-800:]
                 r.wait_exit(8)
