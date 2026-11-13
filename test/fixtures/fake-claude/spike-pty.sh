@@ -258,6 +258,12 @@ def prep_home(tui):
         settings["tui"] = "fullscreen"
     with open(os.path.join(HOME, ".claude", "settings.json"), "w") as f:
         json.dump(settings, f, indent=1)
+    # auth: the real binary reads its OAuth item through `security`, which finds the login keychain via
+    # $HOME/Library/Keychains; link the real directory in (no credential is copied, read or printed here)
+    os.makedirs(os.path.join(HOME, "Library"), exist_ok=True)
+    kc = os.path.join(HOME, "Library", "Keychains")
+    if not os.path.lexists(kc):
+        os.symlink(os.path.join(REAL_HOME, "Library", "Keychains"), kc)
 
 
 def child_env(hooklog, tui):
@@ -397,10 +403,13 @@ class Run:
     def _find_claude_pid(self):
         if not os.path.isdir(SESS_DIR):
             return
+        cands = [fn for fn in os.listdir(SESS_DIR) if fn.endswith(".json") and fn[:-5].isdigit()]
+        if not cands:
+            return
         mine = {self.pid} | {row[0] for row in descendants_of(self.pid)}
-        for fn in os.listdir(SESS_DIR):
+        for fn in cands:
             stem = fn[:-5]
-            if fn.endswith(".json") and stem.isdigit() and int(stem) in mine:
+            if int(stem) in mine:
                 self.claude_pid = int(stem)
                 self.log("claude pid = %d (sessions file %s)" % (self.claude_pid, fn))
                 return
@@ -652,7 +661,7 @@ def s_q3():
     sid = str(uuid.uuid4())
     marker = os.path.join(ROOT, "marker.txt")
     res = {"session_id": sid}
-    r1 = Run("q3-session1", claude_argv(["--session-id", sid, "--effort", "low", "--append-system-prompt-file", marker]), tui="fullscreen")
+    r1 = Run("q3-session1", claude_argv(["--session-id", sid, "--permission-mode", "manual", "--effort", "low", "--append-system-prompt-file", marker]), tui="fullscreen")
     try:
         res["ready1"] = r1.wait_ready()
         res["banner1_models"] = sorted(set(re.findall(r"(Haiku|Sonnet|Opus|Fable)[ 0-9.\-]*", r1.text())))
@@ -693,8 +702,32 @@ def s_q3():
         res["transcript_after_kill"] = transcript_info(r1.transcript_path())
     finally:
         r1.finish(res)
-    r2 = Run("q3-resume", [BIN, "--resume", sid], tui="fullscreen")
-    res2 = {"session_id": sid, "resume_argv": ["claude", "--resume", "<id>"]}
+    rb = Run("q3-resume-bare", [BIN, "--resume", sid], tui="fullscreen")
+    resb = {"session_id": sid, "resume_argv": ["claude", "--resume", "<id>"], "purpose": "no model call: what claude itself restores with no other flag"}
+    try:
+        resb["ready"] = rb.wait_ready(timeout=60)
+        rb.pump(seconds=2.0)
+        t = rb.text()
+        resb["screen_text_head"] = t[:1500]
+        resb["footer_mode_words"] = sorted(set(re.findall(r"(auto mode on|accept edits on|plan mode on|bypass permissions on|manual)", t)))
+        resb["conversation_visible"] = {"PONG": "PONG" in t, "edit1": ("w0-edit-1" in t) or ("DONE1" in t)}
+        resb["draft_restored"] = "UNSUBMITTED-DRAFT-123" in t
+        resb["banner_models"] = sorted(set(re.findall(r"(Haiku|Sonnet|Opus|Fable) ?[0-9.]*", t)))
+        resb["banner_effort_words"] = sorted(set(re.findall(r"[◐◑◒◓●○] ?(low|medium|high|xhigh|max)", t)))
+        for label, cmd in (("model_view", "/model"), ("effort_view", "/effort")):
+            m = rb.mark()
+            rb.type_line(cmd)
+            rb.pump(seconds=2.0)
+            resb[label] = rb.text(m)[-900:]
+            rb.write(b"\x1b")
+            rb.pump(seconds=0.8)
+        resb["sessions_file"] = rb.status()
+        rb.type_line("/exit")
+        resb["exited_via_slash_exit"] = rb.wait_exit(20)
+    finally:
+        rb.finish(resb)
+    r2 = Run("q3-resume", [BIN, "--resume", sid, "--permission-mode", "manual"], tui="fullscreen")
+    res2 = {"session_id": sid, "resume_argv": ["claude", "--resume", "<id>", "--permission-mode", "manual"]}
     try:
         res2["ready2"] = r2.wait_ready(timeout=60)
         r2.pump(seconds=2.0)
@@ -740,7 +773,7 @@ def s_q3():
 
 
 def s_q4():
-    r = Run("q4-status", claude_argv(), tui="fullscreen")
+    r = Run("q4-status", claude_argv(["--permission-mode", "manual"]), tui="fullscreen")
     res = {"phases": {}}
 
     def parsed():
@@ -846,8 +879,8 @@ def s_q5():
 
 
 def s_q6():
-    for variant, body in (("plain", SUP_PLAIN), ("fd0", SUP_FD0)):
-        path = os.path.join(ROOT, "sup-%s.sh" % variant)
+    for variant, body, test in (("plain", SUP_PLAIN, "keys"), ("fd0", SUP_FD0, "keys"), ("fd0-sigint", SUP_FD0, "sigint")):
+        path = os.path.join(ROOT, "sup-%s.sh" % variant.split("-")[0])
         with open(path, "w") as f:
             f.write(body)
         os.chmod(path, 0o755)
