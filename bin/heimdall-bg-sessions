@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""heimdall-bg-sessions -- the background Claude Code sessions of a directory, for `hmd --resume` and `hmd agents`.
+
+    heimdall-bg-sessions rows (--dir DIR | --match SELECTOR)
+    heimdall-bg-sessions list [--dir DIR]
+
+WHY. `claude --continue`, which `hmd --resume` runs, refuses a conversation that is running in the background (a session
+started with `claude --bg`, or sent away with the left arrow) and exits with "Your most recent conversation is running in the
+background". The facts this tool rests on, read on Claude Code 2.1.323 from `claude --help`, `claude agents --help`, a live
+`claude agents --json` and code.claude.com/docs/en/sessions.md and agent-view.md:
+  * `claude agents --json [--all] [--cwd DIR]` prints the sessions as a JSON array. Every entry has cwd, kind (interactive or
+    background) and startedAt (ms). A background one has `id` (the short id) and `state` (working, blocked, done, failed,
+    stopped); `pid` and `status` (busy, waiting, idle) are there only while its process is alive; `sessionId` (the UUID) and
+    `name` when set. `--cwd` also lists the interactive sessions, and the sessions below DIR.
+  * `claude attach <id|name>` opens a running background session in this terminal. It takes no other flag.
+  * `claude --resume <session id>` does the same attach, but refuses any flag that configures a session (--model, --agent,
+    --settings, ...), so hmd's launch flags cannot ride along on either route.
+A session is RUNNING in the background when its kind is background and it has a live process. An entry without one is a session
+whose process exited: `--continue` loads it normally and `claude attach` would restart it, so only running ones are offered.
+
+rows   One TSV line per running background session, most recent first: id, session id ("-" when unknown), title, menu label.
+       --dir DIR    those whose cwd is DIR (the same directory by stat, so links, case and a trailing slash do not matter).
+       --match SEL  those anywhere whose id or session id starts with SEL, or whose name contains it (case-insensitive).
+       Exit 0 rows printed, 1 none, 3 claude could not list (not on PATH, too old, did not answer, printed no JSON array).
+list   DIR's background sessions, running or exited, and the command that re-attaches. Exit 0, or 3.
+
+MOST RECENT is the latest write to the session's transcript (~/.claude/projects/*/<session id>.jsonl, CLAUDE_CONFIG_DIR
+honoured): `--continue` means the conversation last worked in, so a session started later but never prompted, which has no
+transcript, must not outrank it. Sessions with equal or no transcript writes fall back to the start time.
+HMD_BG_SESSIONS_TIMEOUT_S (default 8) bounds the answer of `claude agents`: a stalled background service must not hang a resume.
+Every name printed is cleaned of control characters, so a session title cannot reach the terminal as an escape sequence.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f  ]")
+
+
+class Unavailable(Exception):
+    """claude could not list its sessions; the message says why."""
+
+
+def timeout_s():
+    try:
+        value = float(os.environ.get("HMD_BG_SESSIONS_TIMEOUT_S", "8"))
+    except ValueError:
+        return 8.0
+    return value if value > 0 else 8.0
+
+
+def claude_agents(extra):
+    """The parsed JSON array of `claude agents --json EXTRA`; raises Unavailable(reason)."""
+    limit = timeout_s()
+    with tempfile.TemporaryFile() as out:
+        try:
+            proc = subprocess.run(["claude", "agents", "--json"] + extra, stdin=subprocess.DEVNULL, stdout=out,
+                                  stderr=subprocess.DEVNULL, timeout=limit)
+        except FileNotFoundError:
+            raise Unavailable("claude is not on PATH")
+        except subprocess.TimeoutExpired:
+            raise Unavailable("claude agents --json did not answer within %gs" % limit)
+        except OSError as err:
+            raise Unavailable("claude could not be run: %s" % err.strerror)
+        if proc.returncode != 0:
+            raise Unavailable("claude agents --json exited %d" % proc.returncode)
+        out.seek(0)
+        raw = out.read()
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        raise Unavailable("claude agents --json did not print JSON")
+    if not isinstance(data, list):
+        raise Unavailable("claude agents --json did not print a JSON array")
+    return data
+
+
+def number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def is_uuid(value):
+    return isinstance(value, str) and bool(UUID_RE.match(value))
+
+
+def is_running(rec):
+    pid = rec.get("pid")
+    return (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0) or isinstance(rec.get("status"), str)
+
+
+def background(records):
+    """The background entries with an id that is safe to hand to `claude attach` as an argument."""
+    return [r for r in records
+            if isinstance(r, dict) and r.get("kind") == "background" and isinstance(r.get("id"), str) and ID_RE.match(r["id"])]
+
+
+def same_dir(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def last_write(session_id):
+    """mtime of the session's transcript; 0.0 when it has none (a session that never ran a turn)."""
+    if not is_uuid(session_id):
+        return 0.0
+    root = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    newest = 0.0
+    for path in glob.glob(os.path.join(glob.escape(root), "projects", "*", session_id + ".jsonl")):
+        try:
+            newest = max(newest, os.stat(path).st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def most_recent_first(records):
+    return sorted(records, key=lambda r: (last_write(r.get("sessionId")), number(r.get("startedAt"))), reverse=True)
+
+
+def matches(rec, needle):
+    return (rec["id"].lower().startswith(needle)
+            or str(rec.get("sessionId", "")).lower().startswith(needle)
+            or needle in str(rec.get("name", "")).lower())
+
+
+def clean(text, limit):
+    text = CONTROL_RE.sub(" ", text if isinstance(text, str) else "").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def title(rec):
+    name = clean(rec.get("name"), 60)
+    return name if name and name != rec["id"] else "(untitled)"
+
+
+def age(rec, now):
+    started = number(rec.get("startedAt"))
+    if not started:
+        return "?"
+    secs = max(0, int(now - started / 1000))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return "%d%s" % (secs // size, unit)
+    return "%ds" % secs
+
+
+def state(rec):
+    value = rec.get("state")
+    if not isinstance(value, str):
+        value = rec.get("status")
+    return clean(value, 12) or "-"
+
+
+def process(rec):
+    if not is_running(rec):
+        return "exited"
+    return clean(rec.get("status"), 10) or "-"
+
+
+def label(rec, width, now):
+    return "%-*s  %-8s  %-7s  %4s  %s" % (width, rec["id"], state(rec), process(rec), age(rec, now), title(rec))
+
+
+def cmd_rows(args):
+    try:
+        records = claude_agents([] if args.match is not None else ["--cwd=" + args.dir])
+    except Unavailable as err:
+        print("heimdall-bg-sessions: %s" % err, file=sys.stderr)
+        return 3
+    found = [r for r in background(records) if is_running(r)]
+    if args.match is not None:
+        needle = args.match.lower()
+        found = [r for r in found if matches(r, needle)]
+    else:
+        found = [r for r in found if same_dir(r.get("cwd"), args.dir)]
+    if not found:
+        return 1
+    found = most_recent_first(found)
+    now, width = time.time(), max(len(r["id"]) for r in found)
+    for rec in found:
+        sid = rec["sessionId"] if is_uuid(rec.get("sessionId")) else "-"
+        print("%s\t%s\t%s\t%s" % (rec["id"], sid, title(rec), label(rec, width, now)))
+    return 0
+
+
+def cmd_list(args):
+    shown = clean(args.dir, 200)
+    try:
+        records = claude_agents(["--cwd=" + args.dir])
+    except Unavailable as err:
+        print("hmd agents: %s (this needs a Claude Code with `claude agents --json`; try: claude agents)" % err, file=sys.stderr)
+        return 3
+    here = most_recent_first([r for r in background(records) if same_dir(r.get("cwd"), args.dir)])
+    if not here:
+        print("No background sessions in %s. (claude agents lists every directory.)" % shown)
+        return 0
+    now, width = time.time(), max(len(r["id"]) for r in here)
+    print("Background sessions in %s, most recent first:" % shown)
+    for rec in here:
+        print("  " + label(rec, width, now))
+    running = [r for r in here if is_running(r)]
+    print()
+    if running:
+        print("Re-attach: hmd --resume %s   (or: claude attach %s)" % (running[0]["id"], running[0]["id"]))
+    else:
+        print("None is running: claude attach %s restarts it from its saved conversation." % here[0]["id"])
+    return 0
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="heimdall-bg-sessions", description="The background Claude Code sessions of a directory.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    rows = commands.add_parser("rows", help="TSV of the running background sessions, most recent first")
+    which = rows.add_mutually_exclusive_group(required=True)
+    which.add_argument("--dir", help="the sessions whose cwd is this directory")
+    which.add_argument("--match", help="the sessions anywhere whose id or session id starts with this, or whose name contains it")
+    rows.set_defaults(run=cmd_rows)
+    listing = commands.add_parser("list", help="the directory's background sessions and the command that re-attaches")
+    listing.add_argument("--dir", default=os.getcwd(), help="the directory (default: the current one)")
+    listing.set_defaults(run=cmd_list)
+    args = parser.parse_args(argv)
+    return args.run(args)
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    sys.exit(main(sys.argv[1:]))

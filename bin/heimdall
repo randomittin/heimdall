@@ -2482,6 +2482,20 @@ case "${1:-}" in
     fi
     exec "$FUNNEL_BIN" "$@"
     ;;
+  agents)
+    # `hmd agents`: the background Claude Code sessions of this directory (`claude --bg`, or sent away with the left arrow),
+    # each with the command that re-attaches it: `hmd --resume <id>`, which attaches instead of letting `claude --continue`
+    # refuse a conversation that is running in the background (bin/heimdall-bg-sessions has the facts). Not the tracker of
+    # Agent-tool SUBAGENTS in bin/heimdall-agents, which is a different thing. Exit: 0 listed (or none), 3 claude could not list.
+    shift
+    BG_SESSIONS_BIN="$PLUGIN_DIR/bin/heimdall-bg-sessions"
+    if [ ! -x "$BG_SESSIONS_BIN" ]; then
+      echo "  Error: heimdall-bg-sessions not found at $BG_SESSIONS_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$BG_SESSIONS_BIN" list --dir "$WORK_DIR" "$@"
+    ;;
   watch)
     # Pass-through to heimdall-watch-tui (the `hmd watch` TUI dashboard, spec C).
     # (bin/heimdall-watch, the H-3 sentinel watch-mode tool that once owned the bare
@@ -3660,6 +3674,66 @@ _heimdall_skills_activate() {
   fi
 }
 
+# _heimdall_resume_attach_bg [ID|NAME] -- re-attach the background session that `claude --continue` would refuse.
+#
+# `claude --continue`, which --resume runs, exits with "Your most recent conversation is running in the background" when that
+# conversation lives in a background session (`claude --bg`, or one sent away with the left arrow). bin/heimdall-bg-sessions
+# lists the RUNNING ones of this directory (with ID|NAME: the matching ones anywhere; its header has the facts about
+# `claude agents --json` and `claude attach`), and this attaches with `claude attach <id>`, which takes no other flag, so the
+# session keeps the agent, plugins and permissions it was started with and none of hmd's launch flags reach it. One session:
+# attach it. Several: a menu on a terminal (Esc resumes normally instead), otherwise the most recent one, with a note. After an
+# attach it exits with attach's status. It RETURNS 0 having attached nothing when none is running, nothing matches, or this
+# claude cannot list sessions (said in one line, with the manual command), so the caller goes on with `claude --continue`.
+_heimdall_resume_attach_bg() {
+  local sel="${1:-}" tool="$PLUGIN_DIR/bin/heimdall-bg-sessions" rows="" rc=0
+  [ -x "$tool" ] || return 0
+  if [ -n "$sel" ]; then
+    rows="$("$tool" rows --match "$sel" 2>/dev/null)" || rc=$?
+  else
+    rows="$("$tool" rows --dir "$WORK_DIR" 2>/dev/null)" || rc=$?
+  fi
+  case "$rc" in
+    0) ;;
+    1)
+      if [ -n "$sel" ]; then
+        # The word is typed by a person: shown printable, so an escape sequence in it cannot reach the terminal.
+        printf '  ▸ no running background session matches "%s": resuming the last conversation here (hmd agents lists them)\n' \
+          "$(printf '%s' "$sel" | LC_ALL=C tr -c ' -~' '?' | cut -c1-40)"
+      fi
+      return 0 ;;
+    *)
+      echo "  ▸ could not list background sessions (claude agents --json is missing or did not answer): if claude says your conversation is running in the background, attach with: claude attach <id>   (ids: claude agents)" >&2
+      return 0 ;;
+  esac
+
+  local -a ids=() titles=() labels=()
+  local row_id row_title row_label
+  while IFS=$'\t' read -r row_id _ row_title row_label; do
+    [ -n "$row_id" ] || continue
+    ids+=("$row_id"); titles+=("$row_title"); labels+=("$row_label")
+  done <<< "$rows"
+  local n="${#ids[@]}" pick=0 lead="" interactive=0 attach_rc=0
+  [ "$n" -ge 1 ] || return 0
+
+  if { [ -t 0 ] && [ -t 1 ] || [ "${HMD_SELECT_FORCE_TTY:-0}" = "1" ]; } && command -v hmd_select >/dev/null 2>&1; then
+    interactive=1
+  fi
+  if [ "$n" -gt 1 ] && [ "$interactive" = 1 ]; then
+    hmd_select 0 "  $n background sessions here, most recent first. Pick one to re-attach (Esc: resume the last conversation instead):" "${labels[@]}"
+    if [ "${HMD_SELECT_ABORTED:-0}" = "1" ]; then
+      echo "  ▸ not attaching: resuming the last conversation here"
+      return 0
+    fi
+    pick="$HMD_SELECT_INDEX"
+  elif [ "$n" -gt 1 ]; then
+    lead="$n background sessions and no terminal to pick on: "
+  fi
+  printf '  ▸ %sre-attaching to background session %s (%s) · detach: ← · skip this: hmd --resume --foreground\n' \
+    "$lead" "${ids[$pick]}" "${titles[$pick]}"
+  claude attach "${ids[$pick]}" || attach_rc=$?
+  exit "$attach_rc"
+}
+
 # --resume: continue the last Claude session AND load .planning/ state
 if [[ "${1:-}" == "--resume" || "${1:-}" == "-r" ]]; then
   ensure_node_path
@@ -3668,6 +3742,14 @@ if [[ "${1:-}" == "--resume" || "${1:-}" == "-r" ]]; then
   ensure_auth
   apply_heimdall_theme 2>/dev/null || true
   print_banner 2>/dev/null || true
+
+  # A conversation running in the background cannot be resumed by `claude --continue` (it refuses): re-attach it instead.
+  # `hmd --resume ID|NAME` picks the session; `hmd --resume --foreground` skips this and resumes in the foreground as before.
+  case "${2:-}" in
+    --foreground) ;;
+    -*) _heimdall_resume_attach_bg "" ;;
+    *) _heimdall_resume_attach_bg "${2:-}" ;;
+  esac
 
   # Check for resumable state
   if [ -f "$WORK_DIR/.planning/STATE.md" ]; then
@@ -3824,7 +3906,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall \"build X\"       Run a task end-to-end in the current directory"
   echo "  heimdall -- <word>       Run a ONE-word task (a lone word alone is read as a command)"
   echo "  heimdall                  Interactive Claude session with heimdall powers"
-  echo "  heimdall --resume         Resume last session (conversation + .planning state)"
+  echo "  heimdall --resume [id]    Resume last session (conversation + .planning state); a background session is re-attached"
+  echo "  heimdall --resume --foreground  Resume the last conversation here even while background sessions run"
   echo "  heimdall --auto           Use auto-mode (safer alternative to skip-permissions)"
   echo "  heimdall --no-goal         Disable goal-driven execution for this run"
   echo "  heimdall --skip-checkpoint Start fresh, ignore last checkpoint/settings"
@@ -3842,6 +3925,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall join <secret>    Join a teammate's team"
   echo "  heimdall connect          Connect a Claude credential for remote jobs"
   echo "  heimdall presence         Control presence (off/on/status/roster)"
+  echo "  heimdall agents           Background Claude sessions of this directory, with the attach command"
   echo "  heimdall tier             Model routing table + tier declaration log"
   echo "  heimdall status           CLI-agnostic statusline HUD (same renderer as the bar)"
   echo "  heimdall weekly-log       Weekly changelog draft generator (drafts only)"
