@@ -48,6 +48,16 @@
 #                                 A running process cannot be hot-swapped onto a new
 #                                 binary, so the only honest remedy is "restart" — we say
 #                                 so once at SessionStart rather than nagging every render.
+#                                 Under a supervising launcher (HMD_SUPERVISED=1, auto
+#                                 restart not off) the line says the restart is automatic.
+#   heimdall-cc-selfheal pending [--pid P]
+#                                 read-only, fast, machine-readable form of the same
+#                                 question (the SAME detection as pin-notice): prints
+#                                 "claude <running> <newest>" and exits 0 when claude process
+#                                 P (default: the nearest claude ancestor) runs an older
+#                                 binary than the newest installed; prints nothing and exits
+#                                 1 otherwise or when anything is unreadable; exit 2 = a
+#                                 malformed call. The seamless-restart machinery asks this.
 #   heimdall-cc-selfheal --force  ignore the throttle; run now.
 #
 # SAFETY CONTRACT.
@@ -72,6 +82,11 @@
 #   HEIMDALL_CC_VERSIONS            claude versions dir. TEST seam.
 #   HEIMDALL_CC_PIN_PID             pid to resolve the running version from. TEST seam.
 #   HEIMDALL_CC_LSOF                `lsof -p <pid>`-style stub. TEST seam.
+#   HEIMDALL_CC_SESSIONS_DIR        claude's per-process sessions dir; <pid>.json there carries the
+#                                   RUNNING binary's version (default ~/.claude/sessions). TEST seam.
+#   HMD_SUPERVISED=1, HMD_AUTO_RESTART=off, ${HMD_HOME}/no-auto-restart
+#                                   choose the pin notice's wording (see pin-notice above). The
+#                                   launcher sets the first; the other two are the operator's opt-outs.
 
 set -uo pipefail
 
@@ -89,6 +104,7 @@ UPDATE_RESULT="${HEIMDALL_CC_UPDATE_RESULT:-$HOME/.claude/.last-update-result.js
 # mistaken for a settled one. Test seam.
 STALE_HOURS="${HEIMDALL_CC_RESULT_STALE_HOURS:-6}"
 CC_VERSIONS="${HEIMDALL_CC_VERSIONS:-$HOME/.local/share/claude/versions}"
+SESSIONS_DIR="${HEIMDALL_CC_SESSIONS_DIR:-$HOME/.claude/sessions}"
 
 log() {  # one-line, secret-free, best-effort
   mkdir -p "$HMD_HOME" 2>/dev/null || return 0
@@ -349,19 +365,86 @@ _running_version() {
 
 _newest_installed() { ls "$CC_VERSIONS" 2>/dev/null | sort -V | tail -1; }
 
-cmd_pin_notice() {
-  opted_out && return 0
-  is_native || return 0
-  [ -d "$CC_VERSIONS" ] || return 0
-  local pid running newest
-  pid="$(_claude_ancestor || true)";        [ -n "$pid" ] || return 0
-  running="$(_running_version "$pid" || true)"; [ -n "$running" ] || return 0
-  newest="$(_newest_installed || true)";    [ -n "$newest" ] || return 0
-  [ "$running" = "$newest" ] && return 0
+# the version claude ITSELF recorded for <pid> in ~/.claude/sessions/<pid>.json (written by Claude Code,
+# undocumented: observed on 2.1.323, docs/analysis/2026-11-13-seamless-restart-spike.md Q4). Cheaper than
+# lsof and exact, so it is asked first. Anything that is not a plain version string recorded for THAT pid
+# (unreadable, oversized, wrong shape, another process's file left behind) is silence: the caller falls
+# back to lsof. <pid> is a validated number, so the path below cannot be steered.
+_session_version() {
+  [ -r "$SESSIONS_DIR/$1.json" ] && command -v python3 >/dev/null 2>&1 || return 1
+  python3 -I -S -c "import json,re,sys
+try:
+    d=json.loads(open(sys.argv[1]).read(65536))
+    v=d['version']
+    ok=d['pid']==int(sys.argv[2]) and isinstance(v,str) and re.fullmatch(r'[0-9][0-9A-Za-z._+-]{0,63}',v)
+except Exception:
+    sys.exit(1)
+if not ok: sys.exit(1)
+print(v)" "$SESSIONS_DIR/$1.json" "$1" 2>/dev/null
+}
+
+# THE ONE DETECTION behind pin-notice and pending: prints "<running> <newest>" and returns 0 iff claude
+# process <pid> (default: the nearest claude ancestor of this process) runs an OLDER binary than the newest
+# installed; otherwise silent, return 1. Fails closed: an unreadable input means "not behind" (a missed
+# restart costs the old behaviour, a notice; a wrong one costs the operator's run). Running version: the
+# sessions file first, lsof second. The same guards as the rest of the tool: not opted out, native install,
+# a versions dir.
+_behind_versions() {
+  opted_out && return 1
+  is_native || return 1
+  [ -d "$CC_VERSIONS" ] || return 1
+  local pid="${1:-}" running newest
+  [ -n "$pid" ] || pid="$(_claude_ancestor || true)"
+  [ -n "$pid" ] || return 1
+  running="$(_session_version "$pid" || true)"
+  [ -n "$running" ] || running="$(_running_version "$pid" || true)"
+  [ -n "$running" ] || return 1
+  newest="$(_newest_installed || true)"; [ -n "$newest" ] || return 1
+  [ "$running" = "$newest" ] && return 1
   # only ever report BEHIND — a session ahead of the newest on-disk build is not a fault.
-  [ "$(printf '%s\n%s\n' "$running" "$newest" | sort -V | head -1)" = "$running" ] || return 0
-  printf '[heimdall] claude %s is pinned by this session; %s is installed — restart to adopt it (auto-update cannot swap a running binary).\n' \
-    "$running" "$newest"
+  [ "$(printf '%s\n%s\n' "$running" "$newest" | sort -V | head -1)" = "$running" ] || return 1
+  printf '%s %s\n' "$running" "$newest"
+}
+
+# Will the launcher restart this session by itself at the next idle moment? The restart gate's G1 opt-outs
+# (HMD_AUTO_RESTART=off, ${HMD_HOME}/no-auto-restart) plus "a launcher is supervising this session"
+# (HMD_SUPERVISED=1, exported only by the interactive launch path). The notice must never promise a
+# restart the gate would refuse, so any entry at the opt-out path counts, a directory included.
+_auto_restart_on() {
+  [ "${HMD_SUPERVISED:-}" = 1 ] || return 1
+  [ "${HMD_AUTO_RESTART:-}" != off ] || return 1
+  [ ! -e "$HMD_HOME/no-auto-restart" ]
+}
+
+cmd_pin_notice() {
+  local vers running newest
+  vers="$(_behind_versions)" || return 0
+  running="${vers% *}"; newest="${vers#* }"
+  if _auto_restart_on; then
+    printf '[heimdall] claude %s is pinned by this session; %s is installed - restarting automatically at the next idle moment (HMD_AUTO_RESTART=off to disable)\n' \
+      "$running" "$newest"
+  else
+    printf '[heimdall] claude %s is pinned by this session; %s is installed — restart to adopt it (auto-update cannot swap a running binary).\n' \
+      "$running" "$newest"
+  fi
+}
+
+# pending [--pid P] — the machine-readable form of the pin notice's question. "claude <running> <newest>"
+# and exit 0 when behind; nothing and exit 1 when not behind or anything is unreadable; exit 2 (message on
+# stderr) for a malformed call, so a caller's bug is never mistaken for either answer.
+cmd_pending() {
+  local pid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pid) [ $# -ge 2 ] && [ -n "$2" ] || { echo "heimdall-cc-selfheal pending: --pid needs a pid" >&2; return 2; }
+             pid="$2"; shift 2 ;;
+      *)     echo "heimdall-cc-selfheal pending: unknown arg '$1' (pending [--pid P])" >&2; return 2 ;;
+    esac
+  done
+  case "$pid" in *[!0-9]*) echo "heimdall-cc-selfheal pending: --pid must be a number" >&2; return 2 ;; esac
+  local vers
+  vers="$(_behind_versions "$pid")" || return 1
+  printf 'claude %s\n' "$vers"
 }
 
 cmd_check() {  # throttled + DETACHED; never blocks the session
@@ -381,6 +464,7 @@ case "${1:-check}" in
   --force)      cmd_check --force ;;
   status)       cmd_status ;;
   pin-notice)   cmd_pin_notice ;;
-  -h|--help)    sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *)            echo "heimdall-cc-selfheal: unknown arg '${1}' (check|status|pin-notice|--force)" >&2; exit 2 ;;
+  pending)      shift; cmd_pending "$@"; exit $? ;;
+  -h|--help)    sed -n '2,70p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)            echo "heimdall-cc-selfheal: unknown arg '${1}' (check|status|pin-notice|pending|--force)" >&2; exit 2 ;;
 esac
