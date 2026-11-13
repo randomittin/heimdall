@@ -879,7 +879,7 @@ def s_q5():
 
 
 def s_q6():
-    for variant, body, test in (("plain", SUP_PLAIN, "keys"), ("fd0", SUP_FD0, "keys"), ("fd0-sigint", SUP_FD0, "sigint")):
+    for variant, body, test in (("plain", SUP_PLAIN, "keys"), ("plain-sigint", SUP_PLAIN, "sigint"), ("fd0", SUP_FD0, "keys")):
         path = os.path.join(ROOT, "sup-%s.sh" % variant.split("-")[0])
         with open(path, "w") as f:
             f.write(body)
@@ -894,8 +894,9 @@ def s_q6():
             if cands:
                 cpid = cands[0][0]
                 res["fds_0_1_2"] = run_out(["/usr/sbin/lsof", "-p", str(cpid), "-a", "-d", "0,1,2"])
-                res["pid_pgid_tpgid_stat_ignored_caught"] = run_out(["/bin/ps", "-o", "pid=,pgid=,tpgid=,stat=,ignored=,caught=", "-p", str(cpid)])
-                res["bash_pid_pgid_tpgid"] = run_out(["/bin/ps", "-o", "pid=,pgid=,tpgid=,stat=,ignored=", "-p", str(r.pid)])
+                res["every_fd_that_is_a_tty_device"] = [ln for ln in run_out(["/usr/sbin/lsof", "-p", str(cpid)]).splitlines() if "/dev/tty" in ln or "ttys" in ln or "COMMAND" in ln]
+                res["claude_pid_pgid_tpgid_stat"] = run_out(["/bin/ps", "-o", "pid=,pgid=,tpgid=,stat=", "-p", str(cpid)])
+                res["bash_pid_pgid_tpgid_stat"] = run_out(["/bin/ps", "-o", "pid=,pgid=,tpgid=,stat=", "-p", str(r.pid)])
             if res["claude_became_interactive_idle"] and test == "keys":
                 m = r.mark()
                 r.write(b"hello")
@@ -913,7 +914,9 @@ def s_q6():
                 r.pump(seconds=2.0)
                 res["resize_redraw_metrics"] = redraw_metrics(bytes(r.buf[m:]))
                 r.write(b"\x03")
-                res["exited_after_second_ctrl_c"] = r.wait_exit(20)
+                r.pump(seconds=0.3)
+                r.write(b"\x03")
+                res["wrapper_exited_after_two_quick_ctrl_c"] = r.wait_exit(20)
             elif res["claude_became_interactive_idle"] and test == "sigint":
                 r.send_to_claude(signal.SIGINT)
                 res["wrapper_exited_within_8s_after_SIGINT_to_claude"] = r.wait_exit(8)
