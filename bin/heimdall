@@ -2507,6 +2507,7 @@ case "${1:-}" in
 hmd agents -- background sessions and subagent transcripts
 
   hmd agents                  list this directory's background Claude Code sessions, with the command that re-attaches one
+  hmd agents finished [list|clear]  finished Agent-tool subagents never closed with TaskStop
   hmd agents prune [OPTIONS]  opt-in disk clean-up: compress or delete the transcripts of old, finished subagents
                               (~/.claude/projects/<project>/<session>/subagents/agent-*). It never runs by itself, and with
                               neither --compress nor --delete it is a dry run that lists the count and the bytes.
@@ -2517,6 +2518,19 @@ EOF
         exit 0
         ;;
     esac
+    # `hmd agents finished [list|clear ...]`: the finished background agents of the Agent tool that were never closed with
+    # TaskStop (bin/heimdall-finished-agents; the hooks that fill the list are in hooks/hooks.json). A verb of this arm, so the
+    # background-session list below stays what `hmd agents` has been, and bin/heimdall-agents (the orphan sweep) stays apart.
+    if [ "${1:-}" = "finished" ]; then
+      shift
+      FINISHED_BIN="$PLUGIN_DIR/bin/heimdall-finished-agents"
+      if [ ! -x "$FINISHED_BIN" ]; then
+        echo "  Error: heimdall-finished-agents not found at $FINISHED_BIN" >&2
+        echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+        exit 1
+      fi
+      exec "$FINISHED_BIN" "$@"
+    fi
     BG_SESSIONS_BIN="$PLUGIN_DIR/bin/heimdall-bg-sessions"
     if [ ! -x "$BG_SESSIONS_BIN" ]; then
       echo "  Error: heimdall-bg-sessions not found at $BG_SESSIONS_BIN" >&2
@@ -3955,6 +3969,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall connect          Connect a Claude credential for remote jobs"
   echo "  heimdall presence         Control presence (off/on/status/roster)"
   echo "  heimdall agents           Background Claude sessions of this directory, with the attach command"
+  echo "  heimdall agents finished  Finished agents not yet closed with TaskStop (list, clear)"
   echo "  heimdall tier             Model routing table + tier declaration log"
   echo "  heimdall status           CLI-agnostic statusline HUD (same renderer as the bar)"
   echo "  heimdall weekly-log       Weekly changelog draft generator (drafts only)"

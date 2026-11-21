@@ -16,6 +16,8 @@
      "why": "delivers companion-app inbox messages at prompt submit"},
     {"id": "phone-control-prompt", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "phone-control-prompt",
      "why": "drops a stale phone stop request at prompt submit so it cannot end the next turn"},
+    {"id": "finished-agents-prompt", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "finished-agents-prompt",
+     "why": "prints one line to the model when finished background agents were never closed, so closing them is asked for by a hook and not left to memory"},
 
     {"id": "bash-gate-chain", "kind": "guard", "tier": "core", "layer": "hook", "hook": "bash-gate-chain",
      "fails": "closed", "operator_env": null, "proof": "test/heimdall-precheck-bash.test.sh",
@@ -131,6 +133,10 @@
      "why": "delivers companion-app inbox messages after a tool ran"},
     {"id": "phone-control-posttool", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "phone-control-posttool",
      "why": "honours the phone's interrupt after a tool ran"},
+    {"id": "finished-agents-close", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "finished-agents-close",
+     "why": "takes an agent off the finished-and-open list when TaskStop stops it or a SendMessage resumes it"},
+    {"id": "finished-agents-close-failed", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "finished-agents-close-failed",
+     "why": "takes an agent off the list when TaskStop answers that no such task exists or it is not running"},
 
     {"id": "session-bootstrap", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "session-bootstrap",
      "why": "session start wiring: autoupdate check, statusline, trackers, state init, presence beat, cleanup advice"},
@@ -172,6 +178,8 @@
      "why": "records a task outcome for the finished subagent"},
     {"id": "subagent-429-detect", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "subagent-429-detect",
      "why": "marks a subagent rate limit for fallback routing"},
+    {"id": "finished-agents-record", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "finished-agents-record",
+     "why": "records each finished background agent (id, time, description) per session"},
 
     {"id": "stop-metric-reminder", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "stop-metric-reminder",
      "why": "metric reminder at main-agent Stop"},
