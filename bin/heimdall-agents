@@ -104,6 +104,18 @@
 #   orphans [--json] OPERATOR VIEW: only the agents that need attention —
 #                    parked mailbox teammates, provably-dead orphans, wedged and
 #                    stale agents. Excludes anything live, working or completed.
+#                    Also lists (see `open`): finished agents nobody stopped and
+#                    background shells whose process is gone, each with the exact
+#                    TaskStop to run (state finished-open / shell-dead in --json).
+#   open [--json|--brief|--resume-hook]
+#                    ONLY those two classes, read from the session transcript
+#                    (bin/lib/agents_open_scan.pl, read-only, fail-open) and lsof:
+#                    an agent whose last event is a "finished" notice with no
+#                    TaskStop or kill after it (a later notice re-opens it, a
+#                    SendMessage resumes it); a shell whose process exited (a
+#                    completed/failed notice, or no process holds its output file).
+#                    --brief: markdown lines for the checkpoint; --resume-hook: the
+#                    SessionStart line, silent unless source=resume.
 #   reap [--json]    record terminal/parked subagents in heimdall's registry
 #                    (idempotent). Never touches harness files.
 #   sweep [--json]   AUTOMATION ENTRY POINT: reap + print an actionable report
@@ -184,6 +196,14 @@
 #                           keyed under (see HMD_AGENT_LIVE_SLUGS_TTL)
 #   HMD_NOW                 override "now" epoch seconds (deterministic tests)
 #   HMD_AGENT_NO_SWEEP      if set to 1, `sweep` is an explicit opt-out no-op
+#   HMD_AGENT_LSOF          lsof used to ask whether a process still holds a background
+#                           shell's output file (default lsof; missing or failing means
+#                           "cannot tell", never "dead")
+#   HMD_AGENT_SHELL_GRACE_SECS  a shell whose output file changed more recently than this
+#                           is never judged dead by lsof (default 60)
+#   HMD_AGENT_OPEN_MAX_AGE_SECS  `open`/`orphans` list nothing older than this (default 604800, 7 days)
+#   CLAUDE_CODE_SESSION_ID  picks the conversation's own transcript for `open`/`orphans`
+#                           (else the newest top-level transcript of the project)
 #
 # Exit: 0 always for list/count/orphans/reap/sweep (fail-closed, degraded, never
 #       crashes); 2 only on usage error.
@@ -1065,16 +1085,174 @@ _orphan_rows() {
   enumerate | awk -F'\t' '$3=="mailbox" || $3=="orphaned" || $3=="hung" || $3=="stale"'
 }
 
+# ── open tasks: finished agents nobody stopped, background shells whose process is gone ───────────────────────────────
+# `enumerate` judges an agent by its transcript's mtime and last event, so a background agent that sent its "finished" notice reads
+# `done`, and a background shell is not an agent at all. Neither is CLOSED: the harness keeps listing both until TaskStop. Measured
+# 2026-11-20 (docs/analysis/2026-11-20-finished-agents-still-listed.md): three finished agents and two finished shells sat in the
+# running list for up to 42 hours while `orphans` printed "no orphaned, parked or wedged subagents". This reads what only the session
+# transcript holds, the notice and the stop (bin/lib/agents_open_scan.pl: read-only, one pass), and asks lsof whether a shell's
+# process is still there. FAIL-OPEN, like the rest of this tool: a transcript, perl or lsof that is missing or fails means "no rows"
+# or "cannot tell", never a claim that something is dead. Nothing here writes anywhere.
+#
+# WHICH TRANSCRIPT: the conversation's own. $CLAUDE_CODE_SESSION_ID is the transcript's file name and stays the same across a resume
+# (the task directory's session id changes with every resume, which is why a resumed conversation's stale shells sit in an OLDER task
+# dir), so it is used when that file exists under this project's slug; otherwise the newest top-level transcript of the slug. A
+# concurrent session's agents are not listed: TaskStop reaches only what its own session spawned.
+_open_transcripts() {
+  local slug dir id f
+  slug="$(_slug_now)"
+  [ -n "$slug" ] || return 0
+  dir="$PROJECTS_DIR/$slug"
+  for id in "${CLAUDE_CODE_SESSION_ID:-}" "${CLAUDE_SESSION_ID:-}"; do
+    case "$id" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+    [ -f "$dir/$id.jsonl" ] && { printf '%s\n' "$dir/$id.jsonl"; return 0; }
+  done
+  f="$(ls -t "$dir"/*.jsonl 2>/dev/null | head -n 1)"
+  [ -n "$f" ] && printf '%s\n' "$f"
+  return 0
+}
+
+# The basenames of those files some process holds open. A live background shell holds its output file open for writing (measured
+# 2026-11-22: the shell and its children, never the harness), so a file nobody holds is a process that is gone. rc 2 = cannot tell.
+_held_names() {
+  local bin="${HMD_AGENT_LSOF:-lsof}" out rc
+  command -v "$bin" >/dev/null 2>&1 || return 2
+  out="$("$bin" -F n -- "$@" 2>/dev/null)"; rc=$?
+  [ "$rc" -le 1 ] || return 2
+  printf '%s\n' "$out" | sed -n 's|^n.*/||p'
+}
+
+# Rows `id<TAB>kind<TAB>age<TAB>description` (description last, "-" when unknown), longest open first. AGE WINDOW: nothing older than
+# HMD_AGENT_OPEN_MAX_AGE_SECS (default 7 days) is listed. A long conversation carries every agent it ever spawned in its transcript (a real
+# 70 MB one: 436 "finished, never stopped" agents up to 68 days old), and a harness that restarted since no longer holds them, so
+# listing them would drown the few that are really open; the evidence of a stale list is hours (18-42 h), not weeks.
+_open_rows() {
+  local T=$'\t' helper scan="" rows="" f id kind state closed at out desc mt age i hn grace maxage known=" " taskdir
+  local -a tfiles=() cids=() couts=() cdescs=()
+  helper="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")" 2>/dev/null && pwd)/lib/agents_open_scan.pl"
+  grace="${HMD_AGENT_SHELL_GRACE_SECS:-}"
+  case "$grace" in ''|*[!0-9]*) grace=60 ;; esac
+  maxage="${HMD_AGENT_OPEN_MAX_AGE_SECS:-}"
+  case "$maxage" in ''|*[!0-9]*) maxage=604800 ;; esac
+  while IFS= read -r f; do
+    [ -n "$f" ] && tfiles+=("$f")
+  done <<< "$(_open_transcripts)"
+  if [ "${#tfiles[@]}" -gt 0 ] && [ -r "$helper" ] && command -v perl >/dev/null 2>&1; then
+    scan="$(perl "$helper" "${tfiles[@]}" 2>/dev/null)" || scan=""
+  fi
+  while IFS=$'\t' read -r kind id state closed at out desc; do
+    [ -n "$id" ] || continue
+    if [ "$kind" = "agent" ]; then
+      case "$at" in ''|*[!0-9]*) at="$(_mtime "${tfiles[0]}")" ;; esac
+      age=$(( NOW - at )); [ "$age" -lt 0 ] && age=0
+      [ "$age" -le "$maxage" ] || continue
+      rows="$rows$id${T}agent${T}$age${T}$desc"$'\n'
+      continue
+    fi
+    known="$known$id "
+    [ "$closed" = "1" ] && continue
+    { [ "$out" != "-" ] && [ -f "$out" ]; } || continue
+    if [ "$state" = "ended" ]; then
+      mt="$(_mtime "$out")"; age=$(( NOW - mt )); [ "$age" -lt 0 ] && age=0
+      [ "$age" -le "$maxage" ] || continue
+      rows="$rows$id${T}shell${T}$age${T}$desc"$'\n'
+    else
+      cids+=("$id"); couts+=("$out"); cdescs+=("$desc")
+    fi
+  done <<< "$scan"
+  # Shells the transcript never mentioned (a plain b+8/9 alnum file in the task dir, the shape _collect_candidates skips as "not an
+  # agent"), judged by their process alone.
+  taskdir="$(resolve_taskdir)"
+  if [ -n "$taskdir" ] && [ -d "$taskdir" ]; then
+    for f in "$taskdir"/b*.output; do
+      { [ -f "$f" ] && [ ! -L "$f" ]; } || continue
+      id="${f##*/}"; id="${id%.output}"
+      case "$id" in
+        b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]|\
+        b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]) ;;
+        *) continue ;;
+      esac
+      case "$known" in *" $id "*) continue ;; esac
+      known="$known$id "
+      cids+=("$id"); couts+=("$f"); cdescs+=("-")
+    done
+  fi
+  if [ "${#cids[@]}" -gt 0 ]; then
+    hn="$(_held_names "${couts[@]}")" && {
+      for i in "${!cids[@]}"; do
+        case $'\n'"$hn"$'\n' in *$'\n'"${couts[$i]##*/}"$'\n'*) continue ;; esac
+        mt="$(_mtime "${couts[$i]}")"; age=$(( NOW - mt )); [ "$age" -lt 0 ] && age=0
+        [ "$age" -ge "$grace" ] || continue
+        [ "$age" -le "$maxage" ] || continue
+        rows="$rows${cids[$i]}${T}shell${T}$age${T}${cdescs[$i]}"$'\n'
+      done
+    }
+  fi
+  printf '%s' "$rows" | sort -t "$T" -k3,3nr
+  return 0
+}
+
+_age_h() { # seconds -> 45s | 12m | 3h | 2d
+  local s="$1"
+  if [ "$s" -ge 86400 ]; then printf '%sd' $(( s / 86400 ))
+  elif [ "$s" -ge 3600 ]; then printf '%sh' $(( s / 3600 ))
+  elif [ "$s" -ge 60 ]; then printf '%sm' $(( s / 60 ))
+  else printf '%ss' "$s"; fi
+}
+
+# <rows> <max> <prefix>: one line per open task, the exact TaskStop last. Backticks are dropped from a description (it lands in markdown).
+_fmt_open() {
+  local rows="$1" max="$2" prefix="$3" n=0 total id kind age desc
+  total="$(printf '%s\n' "$rows" | grep -c .)"
+  while IFS=$'\t' read -r id kind age desc; do
+    [ -n "$id" ] || continue
+    n=$(( n + 1 ))
+    [ "$n" -le "$max" ] || continue
+    desc="$(printf '%s' "$desc" | tr -d '`' | cut -c1-100)"
+    printf '%s`%s` %s — %s (%s ago) → TaskStop task_id=%s\n' "$prefix" "$id" "$kind" "$desc" "$(_age_h "$age")" "$id"
+  done <<< "$rows"
+  [ "$total" -le "$max" ] || printf '%s(+%s more: heimdall-agents orphans)\n' "$prefix" $(( total - max ))
+}
+
+_print_open_table() { # <rows>
+  local rows="$1" id kind age desc
+  printf 'OPEN BUT FINISHED: notified or ended, never stopped (%s)\n' "$(printf '%s\n' "$rows" | grep -c .)"
+  printf '%-20s %-6s %8s  %-36s %s\n' "ID" "KIND" "AGE(s)" "TASKSTOP" "DESCRIPTION"
+  while IFS=$'\t' read -r id kind age desc; do
+    [ -n "$id" ] || continue
+    printf '%-20s %-6s %8s  %-36s %s\n' "$id" "$kind" "$age" "TaskStop task_id=$id" "$desc"
+  done <<< "$rows"
+  echo
+  echo "  A finished agent stays resumable, so the harness keeps listing it until TaskStop; a finished shell stays listed too."
+  echo "  Close each with the TaskStop shown unless it is kept for a follow-up."
+}
+
+_open_rows_json() { # <rows>
+  local rows="$1" id kind age desc
+  [ -n "$rows" ] || { echo '[]'; return 0; }
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r id kind age desc; do
+    [ -n "$id" ] || continue
+    jq -n --arg id "$id" --arg kind "$kind" --argjson age "${age:-0}" --arg desc "$desc" \
+      '{id:$id, age_secs:$age, state:(if $kind=="agent" then "finished-open" else "shell-dead" end), name:"-",
+        kind:$kind, description:(if $desc=="-" then null else $desc end), taskstop:("TaskStop task_id="+$id)}'
+  done | jq -s '.'
+}
+
 cmd_orphans() {
-  local as_json="" rows
+  local as_json="" rows orows
   [ "${1:-}" = "--json" ] && as_json=1
   rows="$(_orphan_rows)"
+  orows="$(_open_rows)"
   if [ -n "$as_json" ]; then
-    _rows_to_json "$rows"
+    { _rows_to_json "$rows"; _open_rows_json "$orows"; } | jq -s 'add'
+    return 0
+  fi
+  if [ -z "$rows" ] && [ -z "$orows" ]; then
+    echo "no orphaned, parked or wedged subagents"
     return 0
   fi
   if [ -z "$rows" ]; then
-    echo "no orphaned, parked or wedged subagents"
+    _print_open_table "$orows"
     return 0
   fi
   printf '%-42s %8s  %-9s %s\n' "SUBAGENT" "AGE(s)" "STATE" "NAME"
@@ -1088,6 +1266,41 @@ cmd_orphans() {
     echo "  CLEAR FROM INSIDE THE HARNESS — this tool cannot: TaskStop <id|name>,"
     echo "  or /tasks → select → Ctrl+X, or restart the owning session."
   fi
+  if [ -n "$orows" ]; then
+    echo
+    _print_open_table "$orows"
+  fi
+}
+
+# open: ONLY the two classes above. --json: the rows; --brief: markdown lines for bin/heimdall-checkpoint; --resume-hook: what the
+# SessionStart hook prints (silent when nothing is open, and unless the hook payload says source=resume or says nothing).
+cmd_open() {
+  local mode="" rows a payload="" src
+  for a in "$@"; do
+    case "$a" in --json) mode=json ;; --brief) mode=brief ;; --resume-hook) mode=hook ;; esac
+  done
+  rows="$(_open_rows)"
+  case "$mode" in
+    json)  _open_rows_json "$rows"; return 0 ;;
+    brief) [ -n "$rows" ] && _fmt_open "$rows" 40 "- "; return 0 ;;
+    hook)
+      [ -n "$rows" ] || return 0
+      # Stdin is read only now that there is something to say, and bounded: a hook whose stdin is a terminal or never closes must
+      # cost nothing the rest of the time.
+      if [ ! -t 0 ] && command -v perl >/dev/null 2>&1; then
+        payload="$(perl -e 'alarm 2; local $/; print scalar <STDIN>' 2>/dev/null)"
+      fi
+      src="$(printf '%s' "$payload" | jq -r '.source // empty' 2>/dev/null)"
+      [ -z "$src" ] || [ "$src" = "resume" ] || return 0
+      printf '[heimdall] %s finished agent(s)/shell(s) of this session were never stopped: "completed" in a summary is not "closed". TaskStop each unless it is kept for a follow-up:\n' "$(printf '%s\n' "$rows" | grep -c .)"
+      _fmt_open "$rows" 12 "  "
+      return 0 ;;
+  esac
+  if [ -z "$rows" ]; then
+    echo "no open finished agents or dead shells"
+    return 0
+  fi
+  _print_open_table "$rows"
 }
 
 # Record one id in heimdall's own registry. jq is the single writer.
@@ -1266,6 +1479,7 @@ main() {
     list)    shift; cmd_list "$@" ;;
     count)   shift; cmd_count "$@" ;;
     orphans) shift; cmd_orphans "$@" ;;
+    open)    shift; cmd_open "$@" ;;
     reap)    shift; cmd_reap "$@" ;;
     sweep)   shift; cmd_sweep "$@" ;;
     # `rescue` is the ENFORCEMENT half of `orphans`. orphans (and

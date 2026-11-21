@@ -298,10 +298,12 @@ else
   bad "DEFECT-3: orphans --json missing parked teammate"
 fi
 # A completion is NOT an orphan — the defect-1 and defect-3 fixes must agree.
-if [ "$(printf '%s' "$ORPH_J" | jq -r --arg i "$A_DONE" '[.[]|select(.id==$i)]|length')" = "0" ]; then
-  ok "DEFECT-3: orphans excludes completed agents"
+# It may be LISTED now (a finished agent nobody stopped is still open, see test/agents-orphans-finished.test.sh), but only as
+# `finished-open`, never under an orphan-class state.
+if [ "$(printf '%s' "$ORPH_J" | jq -r --arg i "$A_DONE" '[.[]|select(.id==$i and .state!="finished-open")]|length')" = "0" ]; then
+  ok "DEFECT-3: a completed agent is never listed as an orphan (only as finished-open)"
 else
-  bad "DEFECT-3: orphans wrongly lists a completed agent"
+  bad "DEFECT-3: orphans wrongly labels a completed agent as an orphan"
 fi
 # Never surface a genuinely live/working agent as an orphan.
 if [ "$(printf '%s' "$ORPH_J" | jq -r --arg i "$A_WORK" '[.[]|select(.id==$i)]|length')" = "0" ]; then
