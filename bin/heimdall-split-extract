@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# heimdall-split-extract -- cut hmd-skills or hmd-statusline out of heimdall's own git history, locally and offline.
+#
+#   heimdall-split-extract skills|statusline [--to DIR] [--source REPO] [--branch NAME] [--dry-run]     (--help prints the contract)
+#
+# Task T1.2 of docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md: section 2 (the history carry-over and its filter-repo calls) and
+# section 7 (what stays the operator's: creating the GitHub repos, the remote, the push). The paths keep their heimdall names (no --path-rename), so
+# a new repo is a path-for-path mirror of what heimdall holds. The lists below are the plan's, with the one correction the wave-0 audit logged:
+# test/heimdall-subagent-statusline.test.sh travels too (the plan's list left it out).
+#
+# Work happens in a directory next to DIR that is renamed to DIR only when every step worked, so DIR exists only if the extract is complete:
+#   1. git clone --no-local --no-tags --single-branch   ONE branch, no tags: heimdall has hundreds of branches and tags, the new repo is public once
+#      the operator pushes it, and its own v1.0.0 must not collide with a heimdall tag
+#   2. git filter-repo --force --path ... --path-glob ...   keep only the plan's paths, history included
+#   3. git filter-repo --force --invert-paths --path ...    skills only: drop skills/designmatch/.heimdall (runtime caches a wip checkpoint committed)
+#   4. the branch is named main; an empty result and a leftover remote are refused (filter-repo itself drops origin)
+#
+# It never adds a remote, pushes, writes into an existing path or changes the source: only the clone is rewritten, and the repository-local
+# variables of the caller's environment (GIT_DIR and its siblings) are dropped first, so no git call here can be pointed at another repository.
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+TOOL_ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
+
+# ── the path lists: plan section 2, one "<filter-repo option> <value>" per line ─────────────────────────────────────────────────────────────────
+SKILLS_KEEP=(
+  "path skills/stacks"
+  "path skills/designmatch"
+  "path skills/self-improve"
+  "path skills/system-health"
+  "path skills/mac-deep-clean"
+)
+# runtime caches committed by a wip checkpoint (1acd792b): dropped from every commit, in a second pass
+SKILLS_DROP=(
+  "path skills/designmatch/.heimdall"
+)
+STATUSLINE_KEEP=(
+  "path hooks/statusline.sh"
+  "path hooks/subagent-statusline.sh"
+  "path bin/heimdall-statusline"
+  "path bin/heimdall-statusline-register"
+  "path bin/heimdall-statusline-register-cursor"
+  "path bin/heimdall-sigil"
+  "path bin/heimdall-sigil-png"
+  "path sentinels/hmd-statusline.py"
+  "path sentinels/hmd_sigil.py"
+  "path sentinels/hmd_gauge.py"
+  "path sentinels/hmd_sigil_png.py"
+  "path sentinels/hmd-sigil.py"
+  "path sentinels/subagent-statusline.py"
+  "path sentinels/hmd-subagent-statusline.sh"
+  "path sentinels/hmd_layout.py"
+  "path sentinels/hmd_termcaps.py"
+  "path sentinels/hmd_ledger.py"
+  "path sentinels/hmd_wall.py"
+  "path conformance/statusline"
+  "path-glob test/heimdall-statusline-*.test.sh"
+  "path-glob test/heimdall-sigil-*.test.sh"
+  "path test/heimdall-subagent-statusline.test.sh"
+)
+
+usage() {
+  cat <<'EOF'
+heimdall-split-extract skills|statusline [--to DIR] [--source REPO] [--branch NAME] [--dry-run]
+
+Builds the hmd-skills or hmd-statusline repository from heimdall's own git history, locally and offline (plan:
+docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md, section 2). The new repository keeps heimdall's relative paths (no rename), so
+it is a path-for-path mirror of what heimdall holds.
+
+  skills        skills/stacks, designmatch, self-improve, system-health, mac-deep-clean (the committed skills/designmatch/.heimdall caches are dropped)
+  statusline    the HUD and sigil renderers, their registrars, conformance/statusline and the renderer-only suites
+  --to DIR      where the repository is written; required unless --dry-run. DIR must not exist (a file, a link or a directory: all refused), its
+                parent must, and DIR may not be inside the source work tree
+  --source REPO the heimdall checkout to cut from (default: the one this tool lives in); a full clone, not a shallow one
+  --branch NAME the source branch to extract (default: the checked-out one; a detached HEAD needs this). The result's branch is named main
+  --dry-run     print the plan (source, destination, every step and path list) and exit; nothing is cloned, rewritten or written
+
+What it does: a git clone --no-local of ONE branch without tags (the new repo is public once pushed; heimdall's other branches and tags are not its
+history), then git filter-repo with the plan's path lists, in a work directory next to DIR that is renamed to DIR only when everything worked: DIR
+exists only if the extract is complete.
+
+What it never does: add a remote, push, change the source repository or write into an existing path. Creating the GitHub repos, the remote and the
+push are the operator's steps (plan section 7). git filter-repo is required (pip install --user git-filter-repo); there is no fallback.
+
+Exit: 0 done (or the dry run printed), 1 a step failed (nothing is left behind), 2 usage or a refusal, 3 git or git filter-repo missing.
+EOF
+}
+
+die() { printf 'heimdall-split-extract: %s\n' "$1" >&2; exit "${2:-2}"; }
+refuse_if_exists() { if [ -e "$1" ] || [ -L "$1" ]; then die "$2" "$3"; fi; }
+
+WORK=""
+cleanup() {
+  case "$WORK" in */.hmd-split-extract.*) rm -rf -- "$WORK" ;; esac
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+KIND=""; TO=""; SOURCE=""; BRANCH=""; DRY_RUN=0; DEST=""
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  skills|statusline) KIND="$1"; shift ;;
+  "") usage >&2; exit 2 ;;
+  *) die "unknown repo '$1': expected skills or statusline (see --help)" ;;
+esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --to|--source|--branch)
+      [ $# -ge 2 ] || die "$1 needs a value"
+      case "$1" in --to) TO="$2" ;; --source) SOURCE="$2" ;; --branch) BRANCH="$2" ;; esac
+      shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option '$1' (see --help)" ;;
+  esac
+done
+case "$KIND" in
+  skills)     REPO_NAME="hmd-skills";     KEEP=("${SKILLS_KEEP[@]}");     DROP=("${SKILLS_DROP[@]}") ;;
+  statusline) REPO_NAME="hmd-statusline"; KEEP=("${STATUSLINE_KEEP[@]}"); DROP=() ;;
+esac
+
+command -v git >/dev/null 2>&1 || die "git is not installed" 3
+for _v in $(git rev-parse --local-env-vars); do unset "$_v"; done
+
+# ── the source: a full clone, and the branch to cut ─────────────────────────────────────────────────────────────────────────────────────────────
+SOURCE="${SOURCE:-$TOOL_ROOT}"
+[ -d "$SOURCE" ] || die "--source $SOURCE is not a directory"
+SRC_TOP="$(git -C "$SOURCE" rev-parse --show-toplevel 2>/dev/null)" || die "--source $SOURCE is not inside a git work tree"
+SRC_TOP="$(cd "$SRC_TOP" && pwd -P)"
+[ "$(git -C "$SRC_TOP" rev-parse --is-shallow-repository)" = false ] \
+  || die "the source $SRC_TOP is a shallow clone: its history is cut short, so the extract would be too; use a full clone"
+if [ -z "$BRANCH" ]; then
+  BRANCH="$(git -C "$SRC_TOP" symbolic-ref --short -q HEAD)" || die "the source HEAD is detached: name the branch to extract with --branch NAME"
+fi
+SRC_SHA="$(git -C "$SRC_TOP" rev-parse -q --verify "refs/heads/$BRANCH^{commit}")" || die "the source has no branch '$BRANCH'"
+
+# ── the destination: new, next to an existing parent, outside the source ───────────────────────────────────────────────────────────────────────
+if [ -n "$TO" ]; then
+  refuse_if_exists "$TO" "destination $TO already exists: this tool never writes into an existing path" 2
+  [ -d "$(dirname -- "$TO")" ] || die "the parent directory of $TO does not exist"
+  DEST="$(cd "$(dirname -- "$TO")" && pwd -P)/$(basename -- "$TO")"
+  [ -w "$(dirname -- "$DEST")" ] || die "the parent directory of $DEST is not writable"
+  case "$DEST/" in "$SRC_TOP"/*) die "destination $DEST is inside the source work tree $SRC_TOP" ;; esac
+elif [ "$DRY_RUN" = 0 ]; then
+  die "--to DIR is required (only --dry-run runs without it)"
+fi
+
+FR_VERSION="$(git filter-repo --version 2>/dev/null)" && FR_OK=1 || FR_OK=0
+
+print_plan() {
+  local n=1 e
+  printf 'repo         %s (%s)\n' "$REPO_NAME" "$KIND"
+  printf 'source       %s, branch %s @ %s\n' "$SRC_TOP" "$BRANCH" "${SRC_SHA:0:12}"
+  printf 'destination  %s\n' "${DEST:-(none: a real run needs --to DIR)}"
+  if [ "$FR_OK" = 1 ]; then printf 'filter-repo  available (%s)\n' "$FR_VERSION"
+  else printf 'filter-repo  NOT FOUND: a real run stops here; install it for your own user with: pip install --user git-filter-repo\n'; fi
+  printf 'step %d  git clone --no-local --no-tags --single-branch --branch %s <source> <work directory next to the destination>\n' "$n" "$BRANCH"; n=$((n+1))
+  printf 'step %d  git filter-repo --force: keep only these paths, history included\n' "$n"; n=$((n+1))
+  for e in "${KEEP[@]}"; do printf '  %s\n' "$e"; done
+  if [ "${#DROP[@]}" -gt 0 ]; then
+    printf 'step %d  git filter-repo --force --invert-paths: then drop these paths from every commit\n' "$n"; n=$((n+1))
+    for e in "${DROP[@]}"; do printf '  %s\n' "$e"; done
+  fi
+  printf 'step %d  the branch is named main; no remote may remain; the work directory is renamed to the destination\n' "$n"
+}
+
+if [ "$DRY_RUN" = 1 ]; then
+  echo "DRY RUN: nothing is cloned, rewritten or written."
+  print_plan
+  exit 0
+fi
+[ "$FR_OK" = 1 ] || die "git filter-repo is not available ('git filter-repo --version' fails): install it for your own user with: pip install --user git-filter-repo (--dry-run still prints the plan)" 3
+print_plan
+
+# filter_repo <0|1 = --invert-paths> <"<option> <value>" entries...>: one git filter-repo call, on the clone only
+filter_repo() {
+  local invert="$1" e; shift
+  local -a argv=(git -C "$WORK" filter-repo --force)
+  [ "$invert" = 1 ] && argv+=(--invert-paths)
+  for e in "$@"; do argv+=("--${e%% *}" "${e#* }"); done
+  "${argv[@]}" >&2
+}
+
+refuse_if_exists "$(dirname -- "$DEST")/.hmd-split-extract.$$" "work directory $(dirname -- "$DEST")/.hmd-split-extract.$$ already exists" 1
+WORK="$(dirname -- "$DEST")/.hmd-split-extract.$$"
+if ! git -c core.hooksPath=/dev/null clone --quiet --no-local --no-tags --single-branch --origin origin --branch "$BRANCH" -- "$SRC_TOP" "$WORK"; then
+  die "git clone of $SRC_TOP failed" 1
+fi
+# filter-repo runs with --force, so make sure it is aimed at the clone just made and at nothing else
+[ "$(git -C "$WORK" rev-parse --show-toplevel)" = "$(cd "$WORK" && pwd -P)" ] || die "$WORK is not the root of its own repository; nothing was rewritten" 1
+
+filter_repo 0 "${KEEP[@]}" || die "git filter-repo failed on the keep pass" 1
+if [ "${#DROP[@]}" -gt 0 ]; then
+  filter_repo 1 "${DROP[@]}" || die "git filter-repo failed on the drop pass" 1
+fi
+
+git -C "$WORK" rev-parse -q --verify HEAD >/dev/null || die "nothing is left after filtering: branch '$BRANCH' of $SRC_TOP has none of the paths" 1
+if [ -n "$(git -C "$WORK" remote)" ]; then die "the result still has a remote ($(git -C "$WORK" remote | tr '\n' ' ')); it is not handed over" 1; fi
+if [ "$BRANCH" != main ]; then git -C "$WORK" branch -m "$BRANCH" main || die "could not name the branch main" 1; fi
+
+refuse_if_exists "$DEST" "destination $DEST appeared while the extract ran; it was not touched and the finished extract is discarded, run again" 1
+mv -- "$WORK" "$DEST" || die "could not move the result into place ($WORK -> $DEST)" 1
+WORK=""
+
+printf 'heimdall-split-extract: wrote %s\n' "$DEST"
+printf '  repo    %s (%s)\n' "$REPO_NAME" "$KIND"
+printf '  from    %s, branch %s @ %s\n' "$SRC_TOP" "$BRANCH" "$SRC_SHA"
+printf '  result  branch main, %s commits, %s files at HEAD, no remote, no tag\n' \
+  "$(git -C "$DEST" rev-list --count HEAD)" "$(git -C "$DEST" ls-tree -r --name-only HEAD | wc -l | tr -d ' ')"
+printf '  not pushed: the GitHub repo, the remote and the push are operator steps (plan section 7)\n'
