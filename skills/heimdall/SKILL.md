@@ -37,7 +37,7 @@ AGENTS: If 2+ tasks are independent → spawn parallel agents (`run_in_backgroun
 
 AGENT NAMING: Spawn UNNAMED. Passing `name:` puts the harness in persistent MAILBOX mode ("The agent is now running and will receive instructions via mailbox") — that agent never self-terminates and never emits a `task-notification`, so awaiting the spawn call waits forever for a result that cannot arrive. Measured over one session: 0/43 named spawns completed vs 59/66 unnamed. `name:` is opt-in ONLY for a genuinely long-lived conversational agent you will `SendMessage` and accept as session-resident; every other named spawn is a leak. Identify a spawn's work via `description:`, never `name:`. (conventions R13)
 
-A named agent is NOT unkillable: `TaskStop` closes it by name or agent ID and `SendMessage` resumes it. What you lose with `name:` is the RESULT on the spawn call, not control of the agent. Close what you open → "Closing Idle Agents" below.
+A named agent is NOT unkillable: `TaskStop` closes it by name or agent ID and `SendMessage` resumes it. What you lose with `name:` is the RESULT on the spawn call, not control of the agent. Close what you open → "Closing Finished Agents" below.
 
 R13 WARNS; IT DOES NOT BLOCK. The `PreToolUse` `Agent` hook lets every spawn through (exit 0) and prints a notice on stderr when one carries `name:`. It used to deny (exit 2). That deny rested on the orchestrator having no way to close a named agent — `TaskStop` made that false — and the matcher fires on EVERY Agent spawn in EVERY project (heimdall loads via `--plugin-dir`), so it hard-failed legitimate named teammates in unrelated repos. What stays true is the measurement (0/43 named completed vs 59/66 unnamed), so unnamed remains the default. The notice carries the part you must act on: **no result arrives via the spawn call, and THE SPAWNER OWNS THE CLEANUP** — `TaskStop` it when its work is done, and find leaks with `bin/heimdall-agents orphans`. `HEIMDALL_ALLOW_NAMED_AGENT=1` now silences the notice rather than unlocking the spawn. Fail-SAFE, not fail-closed: a payload the hook cannot parse still warns and still proceeds — a malformed payload must never cost a spawn. Proof: `bash test/agent-name-gate.test.sh`.
 
@@ -55,23 +55,13 @@ The hook `bin/parallelism-tracker` is invoked on every Read/Bash/Edit/Write to n
 
 TIMELINES: NEVER estimate work in weeks or months. AI agents run in parallel — human work-week cadence is meaningless. Phases that have no dependency run simultaneously, not sequentially. "Wave 0: ~90 min (4 parallel agents)" is RIGHT. "Phase 0: Weeks 1-2" is WRONG.
 
-## Closing Idle Agents — automatic, no human input
+## Closing Finished Agents — automatic, no human input
 
 You spawn agents. You close them. Nobody asks you to.
 
-**The signal already arrives.** When a spawned agent parks, the harness delivers an `idle_notification` to the parent: `{"type":"idle_notification","from":"<agent name>","idleReason":"available"}`.
+**THE RULE: when a background agent's completion notice reads `Agent "<desc>" finished`, `TaskStop` its id in the same turn**, unless you are keeping it for a follow-up (say why). A notice reading `is waiting on its own background work` is not finished: leave it. Never `TaskStop` an agent that is still working. `idle_notification` only comes from named agents (`name:`), so it does not drive closing the unnamed agents you spawn.
 
-**THE RULE: on an `idle_notification` from an agent whose work is complete, call `TaskStop` on it.** Same turn, no confirmation prompt. `TaskStop` takes a background task ID, or a teammate / named background agent by agent ID or name — so the notification's `from` is a valid argument.
-
-Judgement, not reflex:
-
-- **Delivered its result and parked** → stop it.
-- **Deliberately resident** for a multi-turn conversation you intend to continue via `SendMessage` → keep it, and say so explicitly ("keeping <name>: still driving it for X"). A keep you cannot justify in one sentence is a leak.
-- **Still working** → NEVER stop it. Killing live work is far worse than a lingering idle row. `idleReason: "available"` means parked-and-available — confirm the notification says that; never stop on an inference that an agent "looks done".
-
-Agents parked BEFORE this rule applied send no fresh notification. Sweep with `bin/heimdall-agents orphans` (lists parked mailbox teammates by name), then `TaskStop` each completed one. Run the sweep at session start and after any multi-wave task.
-
-**`TaskStop` is CONFIRMED PRESENT and functional.** It ships in Claude Code 2.1.198+ and was declared on the agent definitions in `b214eb1`; a later session exercised it and it correctly enumerated the running agent set. **Verified scoping limit:** `TaskStop` only reaches agents the CALLING SESSION spawned — a cross-session stop returns `No task found with ID`. So an orchestrator can close its own named agents but never another session's, which is exactly why `bin/heimdall-agents orphans` still matters for agents stranded by a dead session. Full guidance: [agent-templates.md](references/agent-templates.md).
+`TaskStop` reaches only agents this session spawned (a cross-session stop returns `No task found with ID`). Agents stranded by a dead session or parked before this rule: `bin/heimdall-agents orphans`. The full rule, the notice table, and the `UserPromptSubmit` backstop that lists finished-but-open agents (`hmd agents finished list`) are in `agents/heimdall.md` §4d.
 
 ## Available Commands
 
