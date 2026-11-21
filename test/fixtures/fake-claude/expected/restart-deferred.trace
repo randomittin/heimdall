@@ -1,0 +1,47 @@
+# scenario: restart-deferred (plan section 3: G4 turn ended, G5 no live work, G6 user quiet; section 2 step 4 session id read at TERM time)
+# given: as restart-happy, but only claude has an update (hmd is current) and HMD_RESTART_QUIET_S is between 7 and 10 s (longer than the 6 s key gap)
+# when:  Stop #1 fires while the turn is still busy (G4); the turn ends but live work the status does not show runs: a DIRECT child of claude
+#        that is not on the allowlist (G5, memo finding 4); it ends; the user types twice, 6 s apart (G6); /clear then changes the session id
+#        AFTER the last Stop, so the sessions file and the request's session_id disagree at TERM time
+# then:  NO TERM while busy, none while the child lives, none inside the quiet window; the single TERM comes after the last KEY plus the quiet
+#        window; the relaunch resumes sid-2, the id in effect at TERM time (the sessions file), never sid-1 from the Stop request
+# seams: HMD_RESTART_SETTLE_S below 5 s; the busy (10 s) and child (15 s) windows outlast the two gate evaluations 3 s apart plus one 5 s poll
+#env FAKE_CLAUDE_TERM=graceful
+#script @0 set status=idle sessionId=sid-1 version=2.1.322
+#script @0 sleep 1
+#script @0 set status=busy
+#script @0 stop-hook
+#script @0 sleep 10
+#script @0 set status=idle
+#script @0 child on
+#script @0 sleep 15
+#script @0 child off
+#script @0 key
+#script @0 sleep 6
+#script @0 key
+#script @0 sleep 6
+#script @0 set sessionId=sid-2
+#script @1 set status=idle sessionId=sid-2 version=2.1.323
+#script @1 sleep 4
+#script @1 exit 0
+START argv=--agent heimdall resume=none count=0
+STATUS idle
+SESSION sid-1
+VERSION 2.1.322
+STATUS busy
+STOP_HOOK
+STATUS idle
+CHILD on
+CHILD off
+KEY
+KEY
+SESSION sid-2
+SIGNAL TERM
+EXIT rc=143
+PRINT [heimdall] updated claude 2.1.322->2.1.323 - resumed
+START argv=--agent heimdall --resume sid-2 resume=sid-2 count=1
+STATUS idle
+SESSION sid-2
+VERSION 2.1.323
+EXIT rc=0
+?tty TTY restored=yes

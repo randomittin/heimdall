@@ -1,0 +1,42 @@
+# scenario: restart-loop-guard (plan section 3 G7 at most 1 restart per target version; section 2 step 5 only a marker match relaunches)
+# given: as restart-happy, with the 600 s spacing guard of G7 lowered to 0 so ONLY the per-version cap can block a second restart; the update does
+#        NOT take: after the relaunch claude still reports 2.1.322 and 2.1.323 is still the pending target
+# when:  restart #1 happens as in restart-happy; in the relaunched session a turn ends (Stop, settled, quiet) with the same target still pending;
+#        15 s later the user types /exit
+# then:  NO second TERM (one restart per target version); the user's own exit (rc 0, no restarting.json for this child) ends the launcher
+#        and nothing is relaunched; no START after the last EXIT
+# seams: HMD_RESTART_SETTLE_S and HMD_RESTART_QUIET_S below 5 s so a second restart WOULD fit inside the 15 s window if the guard were missing
+#env FAKE_CLAUDE_TERM=graceful
+#script @0 set status=idle sessionId=sid-1 version=2.1.322
+#script @0 sleep 1
+#script @0 set status=busy
+#script @0 sleep 1
+#script @0 stop-hook
+#script @0 set status=idle
+#script @1 set status=idle sessionId=sid-1 version=2.1.322
+#script @1 sleep 1
+#script @1 set status=busy
+#script @1 sleep 1
+#script @1 stop-hook
+#script @1 set status=idle
+#script @1 sleep 15
+#script @1 exit 0
+START argv=--agent heimdall resume=none count=0
+STATUS idle
+SESSION sid-1
+VERSION 2.1.322
+STATUS busy
+STOP_HOOK
+STATUS idle
+SIGNAL TERM
+EXIT rc=143
+PRINT [heimdall] updated claude 2.1.322->2.1.323 - resumed
+START argv=--agent heimdall --resume sid-1 resume=sid-1 count=1
+STATUS idle
+SESSION sid-1
+VERSION 2.1.322
+STATUS busy
+STOP_HOOK
+STATUS idle
+EXIT rc=0
+?tty TTY restored=yes
