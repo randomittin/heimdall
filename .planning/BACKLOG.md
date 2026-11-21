@@ -52,3 +52,7 @@
 - [2026-11-12] suite cache served 0 of 568 on three consecutive --failed runs ("568 changed or new") although only a few files changed between them; find what moves every closure hash (likely a hook-committed tracked file such as .planning/settings.json inside many closures) — the cache is not saving anything right now.
 - [2026-11-23] bin/lib/agents_notif_index.pl parses task-notifications from any row (same loose pattern fixed in agents_open_scan.pl, 08515dda); only feeds the statusline count, but should trust harness rows only.
 - [2026-11-23] companion_push.scrub leaves `PASSWORD=...` assignments unredacted; align with the redaction rules in agents_open_scan.pl.
+
+## Deferred findings (2026-11-22)
+
+- [ ] MEDIUM: req TTL restarts on every Stop (_HMD_SV_SINCE reset on USR1), so an active user who never idles 300s keeps the launcher running the gate (python+git+cc-selfheal) every 5s for the whole session; fix: anchor TTL at first request, not each poke (bin/lib/hmd_supervise.sh:286; review; release after v2.4.10)
