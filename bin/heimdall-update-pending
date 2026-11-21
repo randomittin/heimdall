@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# heimdall-update-pending -- is a newer claude, or a newer hmd, installed than the one this session started with? (seamless restart, W1-hmd-pending)
+#
+# This file is only the launcher. The behaviour, the usage and the contract (`heimdall-update-pending --help` prints the usage) are in
+# bin/lib/hmd_update_pending.py. Python runs isolated (-I -S), like the other hook helpers, so nothing from the cwd or the environment is imported.
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+exec python3 -I -S "$(cd "$(dirname "$SELF")" && pwd)/lib/hmd_update_pending.py" "$@"
