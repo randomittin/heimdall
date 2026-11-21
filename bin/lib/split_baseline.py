@@ -16,8 +16,8 @@ whatever --root is, so a doctored copy of the files can be checked against the r
 WHAT IS RECORDED
   paths       sha256, byte count and exec bit of every moved file: skills (21: stacks, designmatch, self-improve, system-health, mac-deep-clean),
               statusline runtime (18: hooks, bin, sentinels), conformance/statusline (26: invariants, 21 goldens, 4 fixtures) and the statusline,
-              sigil, status-json and cursor-statusline suites (35). A link or a directory where a file belongs is a difference, not a file.
-  host-calls  per suite of the 35: which HOST files (the plan's "stays core" list and the reverse-dependency list) the suite names. Read from the
+              sigil, status-json, cursor-statusline and subagent-statusline suites (36). A link or a directory where a file belongs is a difference, not a file.
+  host-calls  per suite of the 36: which HOST files (the plan's "stays core" list and the reverse-dependency list) the suite names. Read from the
               suite's text without its full-line comments, so it is what the suite can call, not what it talks about. A one-word name (heimdall,
               falsify) is also prose, so it counts only with its directory (bin/heimdall); a name followed by `.ext` is another file (agent-pool.json
               is a data file, not bin/agent-pool).
@@ -99,6 +99,7 @@ TESTS = (
     ["test/heimdall-statusline-%s.test.sh" % name for name in STATUSLINE_SUITES]
     + ["test/heimdall-sigil-%s.test.sh" % name for name in SIGIL_SUITES]
     + ["test/heimdall-status-json.test.sh", "test/heimdall-init-cursor-statusline.test.sh"]
+    + ["test/heimdall-subagent-statusline.test.sh"]
 )
 
 GROUPS = (("skills", SKILLS), ("statusline-runtime", RUNTIME), ("statusline-conformance", CONFORMANCE), ("statusline-tests", TESTS))
