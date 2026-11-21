@@ -67,6 +67,10 @@
 #     untracked .heimdall/ (`note` keeps recording), so the first `write` after the sweep saves what a deferred one would have.
 #     Checked twice — before anything is measured, and again right before the first tracked write, because measuring takes
 #     seconds and a sweep can start in them. Fails open: a lock it cannot read as a live sweep of this checkout is no sweep.
+#   - Open-agents-aware: `write` lists what the session transcript says is still OPEN (bin/heimdall-agents open: a background agent
+#     that sent its "finished" notice and was never TaskStop'd, a background shell whose process is gone) under "### Open agents",
+#     so a resume does not read "completed" in a summary as "closed" (docs/analysis/2026-11-20-finished-agents-still-listed.md).
+#     Omitted when there are none and when the reader cannot answer (bounded at 4 s, fail-open): it is not a resume-contract field.
 #
 # USAGE
 #   heimdall-checkpoint write [project_dir]   # write/update .planning/CHECKPOINT.md
@@ -287,6 +291,29 @@ _session_edits() {
 
   printf '### This session'"'"'s edited files (edit-tracker — git log cannot attribute these)\n'
   printf '```\n%s\n```\n\n' "$summary"
+}
+
+# Open agents (mechanical, no LLM): the finished agents and dead shells `heimdall-agents open` reads from the session transcript.
+# A summary says "completed"; the harness keeps listing the agent as running until TaskStop, and after a compaction or a resume
+# nobody remembers to stop it. Not a resume-contract field: absent when there are none and when the reader cannot answer.
+OA_COUNT=0; OA_LINES=""
+
+_scan_open_agents() {
+  local project_dir="$1" tool out
+  OA_COUNT=0; OA_LINES=""
+  tool="$(_sibling_tool heimdall-agents)"
+  [ -n "$tool" ] || return 0
+  out="$(cd "$project_dir" 2>/dev/null && HMD_AGENT_CWD="$project_dir" _bounded 4 "$tool" open --brief 2>/dev/null)" || return 0
+  [ -n "$out" ] || return 0
+  OA_LINES="$out"
+  OA_COUNT="$(printf '%s\n' "$out" | grep -c '^- `')"
+}
+
+_open_agents_section() {
+  [ "${OA_COUNT:-0}" -gt 0 ] 2>/dev/null || return 0
+  printf '### Open agents (%s) — "completed" in a summary is not "closed"\n' "$OA_COUNT"
+  printf '> Finished (agents) or ended (shells) and never stopped. Close each with TaskStop unless it is kept for a follow-up; `heimdall-agents orphans` re-reads this live.\n\n'
+  printf '%s\n\n' "$OA_LINES"
 }
 
 # Gate state (mechanical, no LLM): a resuming session must know a gate is RED BEFORE
@@ -561,6 +588,7 @@ _build_block() {
   _contract_block
 
   _worktree_ledger "$project_dir"
+  _open_agents_section
   _session_edits
   _gate_state "$project_dir"
 
@@ -945,6 +973,7 @@ cmd_write() {
   _scan_facts "$project_dir"
   _scan_worktrees "$project_dir"
   _scan_gate "$project_dir"
+  _scan_open_agents "$project_dir"
   _notes_notice "$project_dir"
   _derive_contract "$project_dir"
 

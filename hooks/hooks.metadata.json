@@ -235,9 +235,9 @@
       "event": "SessionStart",
       "index": 1,
       "id": "resume-probe",
-      "description": "Runs heimdall-resume-probe (10s alarm) when a CHECKPOINT.md exists and prints its head.",
+      "description": "Runs heimdall-resume-probe (10s alarm) when a CHECKPOINT.md exists and prints its head, then (source=resume, 8s alarm) lists the finished agents and dead shells this session never stopped (heimdall-agents open --resume-hook).",
       "matcher": "",
-      "fingerprint": "9624c0228ff477d723ddb8c6e31ed3a7cc30c18be58458bbf21713b20b7a7ecc",
+      "fingerprint": "989b0d41a52cf135f6e513b319a5b020e67933e5aee0e0023c0836680543d28f",
       "locked": false,
       "remote_toggle": true
     },
