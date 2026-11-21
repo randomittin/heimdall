@@ -12,7 +12,9 @@
 #   * the order: the FIRST failing condition names the verdict, and an unreadable signal never hides an earlier failing one
 #   * fail closed: a missing sessions file, an unknown or absent status, a hung or crashing helper, garbage output, an unset or missing tty
 #   * --now skips G6 only; --json; the default request path; a bad option is exit 2 and never a verdict
-#   * falsifiability: three one-line breaks of the gate (M1 skip G4, M2 skip G5, M3 ignore the keystroke window) each flip a verdict pinned here
+#   * the operator's switches in G6: a fresh $HEIMDALL_HOME/restart/now (`hmd restart now`) ends the wait for a typing user, a future defer-until (`hmd restart defer`) holds it
+#   * the three numbers with a seam (STOP_BEFORE_IDLE_S 30, SESSION_MIN_AGE_S 60, RESTART_GAP_S 600): the default, the seam moving it, a typo being the default and never 0
+#   * falsifiability: five one-line breaks of the gate (M1 skip G4, M2 skip G5, M3 ignore the keystroke window, M4 ignore a deferral, M5 ignore `now`) each flip a verdict pinned here
 #   * the sessions-file canary: the schema check goes red on a record that lost a field; with HMD_RESTART_LIVE_CANARY=1 it also reads the LIVE files
 # Every input is a seam under a temp dir (a fixed clock HMD_RESTART_NOW, a fake tty file, fake `ps` / agents / pending commands): no real session, tty
 # or process is read or touched, and the gate is called directly, not through the bin/heimdall dispatcher. bash 3.2 compatible.
@@ -31,7 +33,7 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf
 # nothing the operator exports changes a case
 unset HMD_AUTO_RESTART HMD_SUPERVISED HMD_RESTART_DIR HMD_RESTART_SESSIONS_DIR HMD_RESTART_TTY HMD_RESTART_AGENTS_CMD HMD_RESTART_PENDING_CMD \
       HMD_RESTART_PS_CMD HMD_RESTART_QUIET_S HMD_RESTART_SETTLE_S HMD_RESTART_NOW HMD_RESTART_CMD_TIMEOUT_S HEIMDALL_CC_VERSIONS HMD_AGENT_TASKDIR \
-      HMD_AGENT_CWD HEIMDALL_HOME
+      HMD_AGENT_CWD HEIMDALL_HOME HMD_RESTART_STOP_BEFORE_IDLE_S HMD_RESTART_SESSION_MIN_AGE_S HMD_RESTART_GAP_S
 
 echo "restart-gate"
 command -v python3 >/dev/null 2>&1 || { bad "0. python3 is required"; exit 1; }
@@ -128,6 +130,12 @@ if knob("TTY", "ok") != "missing":
 os.makedirs(os.path.join(FX, "home", "restart"))
 if knob("OPTOUT_FILE", "0") == "1":
     put("home/no-auto-restart")
+if knob("DEFER", ""):  # the operator's `hmd restart defer`: seconds from NOW until the deferral ends (negative once it ended)
+    put("home/restart/defer-until", "%d\n" % (NOW + int(knob("DEFER", ""))))
+if knob("NOWREQ", ""):  # the operator's `hmd restart now`: how many seconds ago it was asked (negative: a time that has not come)
+    put("home/restart/now", "%d\n" % (NOW - int(knob("NOWREQ", ""))))
+if knob("MARKER_GARBAGE", ""):  # one of those two files, holding something that is not a number
+    put("home/restart/" + knob("MARKER_GARBAGE", ""), "soon\n")
 targets_now = {"claude": "2.1.322", "hmd": "2.4.2"}
 targets_old = {"claude": "2.1.300", "hmd": "2.3.0"}
 last = knob("LAST", "none")
@@ -255,6 +263,11 @@ C "G4 settling boundary: idle for 15 s is settled" SAFE FX_STATUS_AGE=15 FX_TTY_
 C "G4 settling honours HMD_RESTART_SETTLE_S" "UNSAFE settling" FX_STATUS_AGE=20 -- HMD_RESTART_SETTLE_S=30
 C "G4 not-idle: the idle began 100 s after the recorded Stop (a later turn the request does not know)" "UNSAFE not-idle" FX_STOP_GAP=100
 C "G4 not-idle: the recorded Stop is 30 s newer than the idle (the request is ahead of the session)" "UNSAFE not-idle" FX_STOP_GAP=-30
+C "G4 the idle may begin up to 30 s after the recorded Stop (25 s)" SAFE FX_STOP_GAP=25
+C "G4 not-idle: 35 s after the recorded Stop is outside the default window" "UNSAFE not-idle" FX_STOP_GAP=35
+C "G4 HMD_RESTART_STOP_BEFORE_IDLE_S narrows the window (25 s > 10 s)" "UNSAFE not-idle" FX_STOP_GAP=25 -- HMD_RESTART_STOP_BEFORE_IDLE_S=10
+C "G4 HMD_RESTART_STOP_BEFORE_IDLE_S widens it (35 s <= 60 s)" SAFE FX_STOP_GAP=35 -- HMD_RESTART_STOP_BEFORE_IDLE_S=60
+C "G4 a typo in HMD_RESTART_STOP_BEFORE_IDLE_S is the default, never 0" SAFE FX_STOP_GAP=25 -- HMD_RESTART_STOP_BEFORE_IDLE_S=abc
 
 echo "-- G5 no live background work"
 C "G5 agents-live: heimdall-agents count > 0" "UNSAFE agents-live" FX_AGENTS=2
@@ -275,6 +288,13 @@ C "G6 HMD_RESTART_QUIET_S moves the window (100 s >= 60 s)" SAFE FX_TTY_AGE=100 
 C "G6 a typo in HMD_RESTART_QUIET_S is the default, never 0" "UNSAFE user-active" FX_TTY_AGE=100 -- HMD_RESTART_QUIET_S=abc
 C "--now skips G6 only: a typing user does not stop it" SAFE FX_TTY_AGE=10 -- -- --now
 C "--now skips G6 only: a busy session still does" "UNSAFE not-idle" FX_TTY_AGE=10 FX_STATUS=busy -- -- --now
+C "G6 defer: the operator deferred for another 600 s (the tty alone would allow it)" "UNSAFE user-active" FX_DEFER=600
+C "G6 defer: a deferral that ended 30 s ago no longer holds" SAFE FX_DEFER=-30
+C "G6 now: 'hmd restart now' asked 20 s ago ends the wait for a typing user" SAFE FX_TTY_AGE=10 FX_NOWREQ=20
+C "G6 now: ... and the wait for a deferral" SAFE FX_DEFER=600 FX_NOWREQ=20
+C "G6 now: asked 200 s ago has lapsed (the typing user holds again)" "UNSAFE user-active" FX_TTY_AGE=10 FX_NOWREQ=200
+C "G6 now: a time that has not come is not an ask (the typing user holds)" "UNSAFE user-active" FX_TTY_AGE=10 FX_NOWREQ=-60
+C "G6 now skips G6 only: a busy session still holds" "UNSAFE not-idle" FX_STATUS=busy FX_NOWREQ=20
 
 echo "-- G7 loop guards"
 C "G7 loop-guard: the session is 30 s old" "UNSAFE loop-guard" FX_STARTED_AGE=30
@@ -282,6 +302,11 @@ C "G7 loop-guard: the previous restart was 100 s ago (a different target)" "UNSA
 C "G7 loop-guard: one restart per target version (2.1.322 and 2.4.2 were restarted to already)" "UNSAFE loop-guard" FX_LAST=same
 C "G7 an old restart to other targets does not block" SAFE FX_LAST=old
 C "G7 one new target (hmd 2.4.2) among old ones is enough to restart" SAFE FX_LAST=partial
+C "G7 HMD_RESTART_SESSION_MIN_AGE_S lowers the session age (30 s >= 10 s)" SAFE FX_STARTED_AGE=30 -- HMD_RESTART_SESSION_MIN_AGE_S=10
+C "G7 HMD_RESTART_SESSION_MIN_AGE_S raises it (an hour-old session is younger than 2 h)" "UNSAFE loop-guard" FX_STARTED_AGE=3600 -- HMD_RESTART_SESSION_MIN_AGE_S=7200
+C "G7 HMD_RESTART_GAP_S lowers the spacing (the previous restart was 100 s ago, 50 s is enough)" SAFE FX_LAST=recent -- HMD_RESTART_GAP_S=50
+C "G7 HMD_RESTART_GAP_S=0 allows a restart right after another one, for a new target" SAFE FX_LAST=recent -- HMD_RESTART_GAP_S=0
+C "G7 a typo in HMD_RESTART_GAP_S is the default, never 0" "UNSAFE loop-guard" FX_LAST=recent -- HMD_RESTART_GAP_S=abc
 
 echo "-- G8 git mid-operation"
 C "G8 git-midop: .git/rebase-merge" "UNSAFE git-midop" FX_GIT=rebase-merge
@@ -309,6 +334,8 @@ C "unreadable: the pending command is not configured" "UNSAFE signal-unreadable"
 C "unreadable: the process table cannot be read" "UNSAFE signal-unreadable" FX_PS_RC=1
 C "unreadable: the record of the last restart is garbage" "UNSAFE signal-unreadable" FX_LAST=garbage
 C "unreadable: claude is pending but the versions directory is missing" "UNSAFE signal-unreadable" FX_VERSIONS=missing
+C "unreadable: the deferral file holds no number" "UNSAFE signal-unreadable" FX_MARKER_GARBAGE=defer-until
+C "unreadable: the now file holds no number" "UNSAFE signal-unreadable" FX_MARKER_GARBAGE=now
 
 echo "-- order: the first failing condition names the verdict"
 C "order: opt-out beats a busy session" "UNSAFE opt-out" FX_STATUS=busy -- HMD_AUTO_RESTART=off
@@ -343,6 +370,8 @@ mutant() {  # mutant <name> <sed expression> <expected output of the intact gate
 mutant "M1 skip G4 (end a busy session)" 's/if session\["status"\] != "idle":/if False:/' "UNSAFE not-idle" FX_STATUS=busy
 mutant "M2 skip G5 (end a session with a live agent)" 's/if int(count) > 0:/if False:/' "UNSAFE agents-live" FX_AGENTS=2
 mutant "M3 ignore the keystroke window" 's/if ctx.now - atime < ctx.quiet:/if False:/' "UNSAFE user-active" FX_TTY_AGE=10
+mutant "M4 ignore a deferral" 's/if until is not None and ctx.now < until:/if False:/' "UNSAFE user-active" FX_DEFER=600
+mutant "M5 ignore \`hmd restart now\`" 's/if asked is not None and 0 <= ctx.now - asked <= NOW_VALID_S:/if False:/' SAFE FX_TTY_AGE=10 FX_NOWREQ=20
 
 echo "-- the sessions-file canary (schema drift of ~/.claude/sessions/<pid>.json)"
 canary() {  # canary <file>: exit 0 when the record carries everything the gate reads

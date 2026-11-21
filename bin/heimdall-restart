@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# heimdall-restart -- the operator's switches for the automatic restart after an update (docs/superpowers/plans/2026-11-13-seamless-update-restart.md, Task W3-launcher).
+#
+#   hmd restart [status]         is it on, any deferral, the last restart, the sessions waiting for one, and what a resume does not bring back
+#   hmd restart on | off         off writes $HEIMDALL_HOME/no-auto-restart, which the gate reads as its opt-out (G1); on removes it
+#   hmd restart defer [MINUTES]  do not restart for MINUTES (default 60, at most 10080); 0 ends a deferral. Writes $HEIMDALL_HOME/restart/defer-until
+#   hmd restart now              restart the waiting session(s) at their next safe moment even while you type. Writes $HEIMDALL_HOME/restart/now
+#
+# It writes those three files, each atomically, and nothing else. It signals no process: the launcher that supervises a session is the only thing that ever ends it,
+# and it asks the gate (bin/lib/hmd_restart_gate.py: G1 and G6 read these files) every few seconds while a restart request waits, so a change here is seen within
+# that poll. A busy session, a live agent or a running sweep is never ended, whatever is written here. HMD_AUTO_RESTART=off in an environment still wins over `on`.
+set -u
+
+HOME_DIR="${HEIMDALL_HOME:-${HOME:-}/.heimdall}"
+RDIR="$HOME_DIR/restart"
+OPTOUT="$HOME_DIR/no-auto-restart"
+MAX_DEFER_MIN=10080
+
+usage() {
+  cat >&2 <<'EOF'
+usage: hmd restart [status] | on | off | defer [MINUTES] | now
+  status           is the automatic restart on, any deferral, the last restart, who is waiting
+  on | off         switch it for every session of this user (off writes the no-auto-restart file)
+  defer [MINUTES]  do not restart for MINUTES (default 60, at most 10080); 0 ends a deferral
+  now              restart a waiting session at its next safe moment, even while you type
+EOF
+}
+
+# a time for people: macOS `date -r EPOCH`, GNU `date -d @EPOCH`, the bare number when neither works
+fmt_ts() { date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$1"; }
+
+# write_file PATH TEXT: the text and a newline, atomically (a temp file in the same directory, then a rename), in a 0700 directory
+write_file() {
+  local dest="$1" dir tmp
+  dir="$(dirname "$dest")"
+  if ! ( umask 077; mkdir -p "$dir" ) 2>/dev/null; then
+    echo "heimdall-restart: cannot create $dir" >&2
+    return 1
+  fi
+  tmp="$(mktemp "$dir/.tmp.XXXXXX" 2>/dev/null)" || { echo "heimdall-restart: cannot write in $dir" >&2; return 1; }
+  if printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$dest"; then return 0; fi
+  rm -f "$tmp"
+  echo "heimdall-restart: cannot write $dest" >&2
+  return 1
+}
+
+# the epoch in a file the gate also reads (digits only), or nothing
+read_epoch() {
+  local v
+  v="$(head -c 20 "$1" 2>/dev/null | tr -d ' \n')"
+  case "$v" in ''|*[!0-9]*) return 0 ;; esac
+  [ "${#v}" -le 12 ] || return 0
+  printf '%s' "$v"
+}
+
+# the launchers that have a restart request waiting: one pid per line. A directory $HEIMDALL_HOME/restart/<pid> with a req.json is one, while that pid is alive
+waiting_pids() {
+  local d pid
+  for d in "$RDIR"/[0-9]*/; do
+    [ -f "${d}req.json" ] || continue
+    pid="$(basename "$d")"
+    case "$pid" in *[!0-9]*) continue ;; esac
+    ps -p "$pid" >/dev/null 2>&1 || continue
+    printf '%s\n' "$pid"
+  done
+}
+
+cmd_on() {
+  if ! rm -f "$OPTOUT"; then
+    echo "heimdall-restart: cannot remove $OPTOUT" >&2
+    return 1
+  fi
+  echo "auto restart: on (HMD_AUTO_RESTART=off in an environment still turns it off there)"
+}
+
+cmd_off() {
+  write_file "$OPTOUT" "off: hmd restart on removes this file" || return 1
+  echo "auto restart: off for every session (hmd restart on turns it back on)"
+}
+
+cmd_defer() {
+  local minutes="${1:-60}" now until
+  case "$minutes" in ''|*[!0-9]*) echo "heimdall-restart: defer takes a number of minutes (0 to $MAX_DEFER_MIN), not '$minutes'" >&2; return 2 ;; esac
+  if [ "${#minutes}" -gt 5 ] || [ "$((10#$minutes))" -gt "$MAX_DEFER_MIN" ]; then
+    echo "heimdall-restart: defer takes at most $MAX_DEFER_MIN minutes (a week), not $minutes" >&2
+    return 2
+  fi
+  minutes=$((10#$minutes))
+  if [ "$minutes" -eq 0 ]; then
+    rm -f "$RDIR/defer-until"
+    echo "defer: none"
+    return 0
+  fi
+  now="$(date +%s)"
+  until=$((now + minutes * 60))
+  write_file "$RDIR/defer-until" "$until" || return 1
+  echo "deferred until $(fmt_ts "$until") (hmd restart defer 0 ends it)"
+}
+
+cmd_now() {
+  local pids n
+  pids="$(waiting_pids)"
+  if [ -z "$pids" ]; then
+    echo "no restart request is waiting: a session asks at the end of a turn once an update is installed (hmd restart status)" >&2
+    return 1
+  fi
+  write_file "$RDIR/now" "$(date +%s)" || return 1
+  n="$(printf '%s\n' "$pids" | wc -l | tr -d ' ')"
+  echo "restart now: $n waiting session(s) restart at their next safe moment, typing or not (a busy session or a live agent still waits)"
+}
+
+cmd_status() {
+  local state why now until text ts claude_v hmd_v p line
+  local re_ts='"ts"[[:space:]]*:[[:space:]]*([0-9]+)'
+  local re_claude='"claude"[[:space:]]*:[[:space:]]*"([0-9A-Za-z._+-]{1,64})"'
+  local re_hmd='"hmd"[[:space:]]*:[[:space:]]*"([0-9A-Za-z._+-]{1,64})"'
+  now="$(date +%s)"
+  case "$(printf '%s' "${HMD_AUTO_RESTART:-}" | tr '[:upper:]' '[:lower:]')" in
+    off) state=off; why="HMD_AUTO_RESTART=off in this environment" ;;
+    *)
+      if [ -e "$OPTOUT" ]; then
+        state=off; why="the no-auto-restart file; hmd restart on removes it"
+      else
+        state=on; why="HMD_AUTO_RESTART is not off and there is no no-auto-restart file"
+      fi ;;
+  esac
+  echo "auto restart: $state ($why)"
+  until="$(read_epoch "$RDIR/defer-until")"
+  if [ -n "$until" ] && [ "$until" -gt "$now" ]; then
+    echo "defer: deferred until $(fmt_ts "$until") (hmd restart defer 0 ends it)"
+  else
+    echo "defer: none"
+  fi
+  ts=""; claude_v=""; hmd_v=""
+  if [ -f "$RDIR/last.json" ]; then
+    text="$(head -c 4096 "$RDIR/last.json" 2>/dev/null)"
+    if [[ $text =~ $re_ts ]]; then ts="${BASH_REMATCH[1]}"; fi
+    if [[ $text =~ $re_claude ]]; then claude_v="${BASH_REMATCH[1]}"; fi
+    if [[ $text =~ $re_hmd ]]; then hmd_v="${BASH_REMATCH[1]}"; fi
+  fi
+  if [ -n "$ts" ]; then
+    line="last restart: $(fmt_ts "$ts") to"
+    [ -z "$claude_v" ] || line="$line claude $claude_v"
+    [ -z "$hmd_v" ] || line="$line$([ -z "$claude_v" ] || printf ',') hmd $hmd_v"
+    echo "$line"
+  else
+    echo "last restart: none yet"
+  fi
+  line=""
+  for p in $(waiting_pids); do
+    echo "waiting: launcher pid $p has asked for a restart (it happens at the next safe moment: idle, no agent or sweep running, you not typing)"
+    line=1
+  done
+  [ -n "$line" ] || echo "waiting: nothing"
+  echo "a restart resumes the same conversation (history, the model a turn last used, permission mode, hmd's own prompt). It does NOT bring back the effort level (back to the default), an unsubmitted prompt draft, or a /model switch no turn has used yet. \"Allow for this session\" grants were not measured."
+}
+
+case "${1:-}" in
+  ''|status) cmd_status ;;
+  on) cmd_on ;;
+  off) cmd_off ;;
+  defer)
+    if [ $# -gt 2 ]; then usage; exit 2; fi
+    cmd_defer "${2:-60}" ;;
+  now) cmd_now ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac
