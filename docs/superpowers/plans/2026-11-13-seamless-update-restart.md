@@ -88,6 +88,8 @@ Launcher saves `stty -g` at supervisor start. After ANY child exit that is follo
 
 ## 7. Open questions for the operator (closed options)
 
+**DECIDED 2026-11-22** (operator: "your call on auto restart"): Q1 = (a) ON by default for every interactive `hmd` session, opt out `HMD_AUTO_RESTART=off`; Q2 = (b) 300 s; Q3 = (a) parked mailbox teammates do not block, they are listed in the printed line; Q4 = moot, W0 measured SIGTERM graceful (proceed); Q5 = (a) out of scope for this plan, supervised foreground sessions only, revisit after `hmd --resume` attach (58447ffc) has run in practice. Note from W1: the launcher records `--launcher-start-hmd` from `.claude-plugin/plugin.json` (not describe-first), matching `bin/lib/hmd_update_pending.py`.
+
 - **Q1 default**: (a) ON by default for every interactive `hmd` session, opt out with `HMD_AUTO_RESTART=off` [recommended: you asked for automatic]; (b) OFF until a one-time `hmd restart enable`; (c) ON only for claude-binary updates, hmd-only updates still wait for a manual restart.
 - **Q2 quiet window before restart**: (a) 90 s; (b) 300 s = prompt-cache TTL, restart costs no extra tokens [recommended]; (c) 3600 s.
 - **Q3 parked mailbox teammates** (named agents that never finish): (a) do not block a restart, list them in the printed line [recommended]; (b) block while any exist (then restarts would effectively never happen in heimdall sessions).
