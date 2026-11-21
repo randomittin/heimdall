@@ -2,7 +2,7 @@
 """hmd_update_pending -- is a newer claude, or a newer hmd, installed than the one this session started with?
 
 The seamless-restart feature (docs/superpowers/plans/2026-11-13-seamless-update-restart.md, sections 2 and 3, Task W1-hmd-pending) asks this before it does
-anything else: is there anything to restart FOR? The Stop hook asks it after every turn and the restart gate reads it as G3, so it stays cheap (two git calls
+anything else: is there anything to restart FOR? The Stop hook asks it after every turn and the restart gate reads it as G3, so it stays cheap (one git call
 and one command) and it only says "yes" about what it could read in full, because a wrong "yes" ends a running session.
 
   heimdall-update-pending --launcher-start-hmd X.Y.Z [--pid P] [--json]
@@ -19,12 +19,15 @@ claude than the newest installed, and prints nothing and exits 1 otherwise. HMD_
 Anything else it does (another exit status, a line that is not exactly `claude <version> <version>`, a hang past HMD_UPDATE_CMD_TIMEOUT_S, a command that
 cannot start) is an unreadable input. The line is checked token by token, because the launcher prints it into a terminal.
 
-The hmd half compares the version the launcher recorded at its start (--launcher-start-hmd, from the same source as bin/heimdall-autoupdate's
-installed_version) with the version on disk now, and is pending only when the one on disk is strictly newer (a downgrade is not pending). The version on disk
-is read exactly as installed_version reads it: `git describe --tags --abbrev=0 --match 'v[0-9]*'` first, then .claude-plugin/plugin.json when git has no
-answer, normalised by the same pattern as its norm_semver. Where installed_version quietly lets git win, this treats two answers that differ as an error and
-reports nothing: while `git checkout` is still writing, plugin.json is already new and HEAD is still old, and nothing may be restarted from that.
-test/hmd-update-pending.test.sh holds both files to the same flags, pattern and order.
+The hmd half compares the version the launcher recorded at its start (--launcher-start-hmd) with the version on disk now, and is pending only when the one on
+disk is strictly newer (a downgrade is not pending). The version on disk is .claude-plugin/plugin.json's `version`, read first, the way bin/heimdall's
+banner_version() reads it: the manifest ships bundled with the release code, so it names the code that is on disk. `git describe --tags --abbrev=0 --match
+'v[0-9]*'` is only the fallback, used when the manifest carries no version at all: a hint, never a second opinion that has to agree. It cannot be one, because
+install.sh upgrades an installed clone with `git fetch origin <tag>` + `git checkout FETCH_HEAD`, which creates no local tag: after a real upgrade `git describe`
+keeps naming the OLD tag for good while plugin.json names the new version (measured on install.sh's own sequence; test/hmd-update-pending.test.sh replays it).
+bin/heimdall-autoupdate's installed_version() and bin/heimdall's heimdall_version() read describe first and are stale on such a tree, so the launcher must record
+--launcher-start-hmd from plugin.json the way this helper reads it (banner_version()), or a launcher started on an upgraded tree would see an update that is
+already installed. test/hmd-update-pending.test.sh holds this helper to banner_version's order and to the updater's describe flags and version pattern.
 
 "Fully installed" means the update FINISHED, not that its files are on disk. Two markers say it has not:
   * bin/heimdall-autoupdate runs its verified installer inside ${TMPDIR:-/tmp}/heimdall-apply.<random> and removes that directory only after the installer has
@@ -35,11 +38,6 @@ test/hmd-update-pending.test.sh holds both files to the same flags, pattern and 
     checkout that died half way, which is no tree to restart from either.
 Either marker, or any half that cannot be read, makes the whole answer "nothing" (the plan's rule: failing to restart costs the old behaviour, a pin notice;
 failing to be safe costs the operator's run). The hmd half vetoes the claude half and the other way round: a claude restart would re-exec the new launcher.
-
-KNOWN LIMIT, measured on install.sh's own upgrade sequence in a throwaway repository: `git fetch origin <tag>` + `git checkout FETCH_HEAD` creates no local
-tag, so after an upgrade `git describe` keeps naming the OLD tag while plugin.json names the new version. On such an install the two sources then differ for
-good and, by the rule above, the hmd half stays silent (fail closed; the claude half still works). The cure belongs in install.sh (keep the fetched tag),
-not here.
 
 Environment: HMD_UPDATE_PLUGIN_DIR (the plugin tree whose version is read; default the tree this file is in), HMD_UPDATE_CC_PENDING_CMD (above),
 HMD_UPDATE_CMD_TIMEOUT_S (default 5: how long git or the cc command may take; a child that outlives it is killed with its process group),
@@ -127,13 +125,13 @@ def git_layout(plugin_dir):
 
 
 def describe_version(plugin_dir):
-    """installed_version's git half: the nearest vX.Y.Z tag, or None when the repository has none."""
+    """The fallback source: the nearest vX.Y.Z tag (installed_version's git call, flag for flag), None when the repository has none. A hint, never a check on plugin.json: after install.sh's tag-less upgrade it still names the OLD release."""
     status, out = git(plugin_dir, *DESCRIBE)
     return norm_semver(out.strip()) if status == 0 else None
 
 
 def manifest_version(plugin_dir):
-    """installed_version's fallback half: .claude-plugin/plugin.json's version, None when the file or the field is absent."""
+    """The source that decides: .claude-plugin/plugin.json's version, None when the file or the field is absent (Unreadable when the file is not JSON)."""
     path = os.path.join(plugin_dir, ".claude-plugin", "plugin.json")
     try:
         with open(path, encoding="utf-8") as handle:
@@ -173,19 +171,17 @@ def apply_in_flight():
 
 
 def resolve_hmd_version(plugin_dir):
-    """The hmd version on disk now, or Unreadable: the update is still landing, a source cannot be read, or the sources disagree."""
+    """The hmd version on disk now, or Unreadable: the update is still landing or no source can be read. plugin.json decides; git describe is only the fallback."""
     if apply_in_flight():
         raise Unreadable("the installer is still running (a %s* workdir is in %s)" % (APPLY_DIR_PREFIX, os.environ.get("TMPDIR") or "/tmp"))
     is_repo, lock = git_layout(plugin_dir)
     if lock and os.path.lexists(lock):
         raise Unreadable("git is rewriting the plugin tree (%s exists)" % lock)
-    from_git = describe_version(plugin_dir) if is_repo else None
-    from_manifest = manifest_version(plugin_dir)
-    if from_git and from_manifest and from_git != from_manifest:
-        raise Unreadable("git describe says %s, plugin.json says %s" % (from_git, from_manifest))
-    version = from_git or from_manifest
+    version = manifest_version(plugin_dir)
+    if not version and is_repo:
+        version = describe_version(plugin_dir)
     if not version:
-        raise Unreadable("no version source: the plugin tree has neither a vX.Y.Z tag nor a plugin.json version")
+        raise Unreadable("no version source: the plugin tree has neither a plugin.json version nor a vX.Y.Z tag")
     return version
 
 

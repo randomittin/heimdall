@@ -7,22 +7,25 @@
 #
 # This drives the REAL launcher and the REAL helper (bin/lib/hmd_update_pending.py) against throwaway plugin trees (a real git repo, a real tag, a real
 # .claude-plugin/plugin.json) and fake `heimdall-cc-selfheal pending` commands, and pins:
-#   * the hmd half: newer, same, downgraded (not pending); each canonical version source on its own (git describe, plugin.json); no source; the two sources
-#     disagreeing; a garbled manifest
+#   * the hmd half: newer, same, downgraded (not pending); plugin.json is the version on disk and git describe only the fallback for a tree whose manifest has no
+#     version (the two never have to agree); install.sh's REAL upgrade replayed (`git fetch origin <tag>` + `git checkout FETCH_HEAD` creates no local tag, so
+#     describe keeps naming the OLD tag for good, and the upgrade must still be reported); no source; a garbled manifest
 #   * the claude half: passed through from the cc command, --pid forwarded; a command that crashes, prints garbage, prints something a hook must not echo
 #     (metacharacters), is missing, or hangs is "unreadable" -- and an unreadable half vetoes the whole answer, hmd half included
 #   * "fully installed" means the update FINISHED, not that its files are on disk: bin/heimdall-autoupdate runs the verified installer inside a
 #     ${TMPDIR:-/tmp}/heimdall-apply.* workdir and removes it only after the installer exits (the one completion marker that updater has), and install.sh
 #     updates with `git checkout`, which holds .git/index.lock while the manifest is already new and HEAD still old (measured)
-#   * the same precedence and the same flags as bin/heimdall-autoupdate's installed_version (a tripwire: the two files cannot drift apart unnoticed)
+#   * the same source order as bin/heimdall's banner_version (the manifest first), and the same describe flags and version pattern as bin/heimdall-autoupdate
+#     (a tripwire: the files cannot drift apart unnoticed)
 #   * the usage: --json, argument errors, a GIT_DIR inherited from a parent process never redirects the answer
-#   * the suite can go RED: four one-line breaks of the helper each make a case give the wrong answer
+#   * the suite can go RED: five one-line breaks of the helper each make a case give the wrong answer
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$REPO/bin/heimdall-update-pending"
 LIB="$REPO/bin/lib/hmd_update_pending.py"
 AUTOUPDATE="$REPO/bin/heimdall-autoupdate"
+HEIMDALL_BIN="$REPO/bin/heimdall"
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
@@ -54,7 +57,7 @@ if [ -n "$PYREAL" ] && [ -x "$PYREAL" ]; then ln -s "$PYREAL" "$TMPROOT/pybin/py
 export PATH="$TMPROOT/pybin:$PATH"
 
 # ---- fixtures -------------------------------------------------------------------------------------------------------------------------------------
-g() { git -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"; }
+g() { git -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false -c core.hooksPath=/dev/null -c protocol.file.allow=always "$@"; }
 mkplug() {  # mkplug <dir> <manifest version | -> <git tag version | ->: a plugin tree whose two canonical version sources are the given ones
   local d="$1" mv="$2" tv="$3"
   mkdir -p "$d"
@@ -68,10 +71,33 @@ P_NEW="$TMPROOT/p-new";           mkplug "$P_NEW" 2.4.2 2.4.2         # on disk 
 P_MANIFEST="$TMPROOT/p-manifest"; mkplug "$P_MANIFEST" 2.4.2 -        # no repository (a tarball install): plugin.json alone
 P_GIT="$TMPROOT/p-git";           mkplug "$P_GIT" - 2.4.2             # no manifest: the tag alone
 P_NONE="$TMPROOT/p-none";         mkplug "$P_NONE" - -                # neither source
-P_DISAGREE="$TMPROOT/p-disagree"; mkplug "$P_DISAGREE" 2.4.5 2.4.2    # manifest new, HEAD's tag old: what git checkout leaves while it is still writing
+P_STALETAG="$TMPROOT/p-staletag"; mkplug "$P_STALETAG" 2.4.5 2.4.2    # manifest new, the nearest tag old: what install.sh's tag-less upgrade leaves behind for good
 P_GARBLED="$TMPROOT/p-garbled";   mkplug "$P_GARBLED" - 2.4.2; mkdir -p "$P_GARBLED/.claude-plugin"; printf '{' >"$P_GARBLED/.claude-plugin/plugin.json"
 P_OTHER="$TMPROOT/p-other";       mkplug "$P_OTHER" - 2.4.9           # some OTHER repository, for the inherited-GIT_DIR case
 if [ "$(g -C "$P_NEW" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null)" = "v2.4.2" ]; then ok "0. fixture: the throwaway plugin tree is a repository tagged v2.4.2"; else bad "0. fixture: git could not tag the throwaway plugin tree"; exit 1; fi
+
+# the REAL upgrade shape. install.sh installs with `git clone --depth 1 --branch <tag>` and upgrades an installed clone with `git fetch origin <tag>` +
+# `git checkout FETCH_HEAD`; that fetch names no destination ref, so it creates NO local tag and `git describe` keeps naming the first release while plugin.json
+# names the new one (measured). Replayed here: an origin with two releases, a depth-1 clone at the first, upgraded to the second the way install.sh does it.
+ORIGIN="$TMPROOT/origin"; P_UPGRADED="$TMPROOT/p-upgraded"
+mkdir -p "$ORIGIN/.claude-plugin"
+(
+  cd "$ORIGIN" && g init -q . \
+    && printf '{"name":"hmd","version":"2.4.1"}\n' >.claude-plugin/plugin.json && printf 'one\n' >README && g add -A && g commit -q -m release-2.4.1 && g tag v2.4.1 \
+    && printf '{"name":"hmd","version":"2.4.2"}\n' >.claude-plugin/plugin.json && printf 'two\n' >README && g add -A && g commit -q -m release-2.4.2 && g tag v2.4.2
+) >/dev/null 2>&1
+{ g clone --quiet --depth 1 --branch v2.4.1 "file://$ORIGIN" "$P_UPGRADED" \
+    && g -C "$P_UPGRADED" remote set-url origin "file://$ORIGIN" \
+    && g -C "$P_UPGRADED" fetch --quiet origin v2.4.2 \
+    && g -C "$P_UPGRADED" checkout --quiet FETCH_HEAD; } >/dev/null 2>&1
+UP_TAGS="$(g -C "$P_UPGRADED" tag --list 2>/dev/null | tr '\n' ' ')"
+UP_DESCRIBE="$(g -C "$P_UPGRADED" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null)"
+UP_HEAD="$(g -C "$P_UPGRADED" rev-parse HEAD 2>/dev/null)"
+if [ "$UP_TAGS" = "v2.4.1 " ] && [ "$UP_DESCRIBE" = "v2.4.1" ] && [ "$UP_HEAD" = "$(g -C "$ORIGIN" rev-parse 'v2.4.2^{commit}' 2>/dev/null)" ] && grep -q '"version":"2.4.2"' "$P_UPGRADED/.claude-plugin/plugin.json"; then
+  ok "0. fixture: install.sh's upgrade replayed: HEAD is the 2.4.2 release, plugin.json says 2.4.2, no local v2.4.2 tag, git describe still names v2.4.1"
+else
+  bad "0. fixture: the upgraded tree is not the tag-less upgrade shape" "tags=[$UP_TAGS] describe=[$UP_DESCRIBE] head=[$UP_HEAD]"; exit 1
+fi
 
 # fake `heimdall-cc-selfheal pending`: what each prints and exits with
 mkdir -p "$TMPROOT/cc"
@@ -131,15 +157,20 @@ CC="$CC_CURRENT"
 runp -- --launcher-start-hmd 2.4.1 --json;  expect "2. --json hmd only: the other half is absent" 0 '{"hmd":["2.4.1","2.4.2"]}'
 runp -- --launcher-start-hmd 2.4.2 --json;  expect "2. --json nothing pending: no output, exit 1" 1 ''
 
-# ---- 3. each canonical version source, and what an unreadable one does -----------------------------------------------------------------------------
+# ---- 3. the version on disk: plugin.json decides, git describe is only the fallback ----------------------------------------------------------------
 CC="$CC_PENDING"
-PLUG="$P_MANIFEST"; runp -- --launcher-start-hmd 2.4.1; expect "3. plugin.json alone (no repository) is the fallback source" 0 "$PEND_C"$'\n''hmd 2.4.1 2.4.2'
-PLUG="$P_GIT";      runp -- --launcher-start-hmd 2.4.1; expect "3. git describe alone (no manifest) is read" 0 "$PEND_C"$'\n''hmd 2.4.1 2.4.2'
+PLUG="$P_MANIFEST"; runp -- --launcher-start-hmd 2.4.1; expect "3. plugin.json alone (no repository) is read" 0 "$PEND_C"$'\n''hmd 2.4.1 2.4.2'
+PLUG="$P_GIT";      runp -- --launcher-start-hmd 2.4.1; expect "3. git describe alone (a manifest-less tree) is the fallback" 0 "$PEND_C"$'\n''hmd 2.4.1 2.4.2'
 PLUG="$P_NONE";     runp "$DBG" -- --launcher-start-hmd 2.4.1; expect "3. no version source at all: nothing, even though claude is pending (fail closed)" 1 '' "no version source"
-PLUG="$P_DISAGREE"; runp "$DBG" -- --launcher-start-hmd 2.4.1; expect "3. git describe 2.4.2 vs plugin.json 2.4.5: an error, nothing, even though claude is pending" 1 '' "plugin.json says 2.4.5"
-PLUG="$P_GARBLED";  runp "$DBG" -- --launcher-start-hmd 2.4.1; expect "3. a manifest that is not JSON: nothing, even though claude is pending" 1 '' "plugin.json"
-PLUG="$P_DISAGREE"; runp -- --launcher-start-hmd 2.4.1;        expect "3. without HMD_UPDATE_PENDING_DEBUG a refusal is silent on stderr too" 1 ''
+PLUG="$P_STALETAG"; runp -- --launcher-start-hmd 2.4.1; expect "3. a stale tag (v2.4.2) beside a newer plugin.json (2.4.5): plugin.json decides, the two never have to agree" 0 "$PEND_C"$'\n''hmd 2.4.1 2.4.5'
+PLUG="$P_GARBLED";  runp "$DBG" -- --launcher-start-hmd 2.4.1; expect "3. a manifest that is not JSON: nothing, even though claude is pending (a tag does not paper over it)" 1 '' "plugin.json"
+PLUG="$P_NONE";     runp -- --launcher-start-hmd 2.4.1;        expect "3. without HMD_UPDATE_PENDING_DEBUG a refusal is silent on stderr too" 1 ''
 if [ -z "$ERR" ]; then ok "3. ... and stderr is empty"; else bad "3. stderr is empty without the debug seam" "got [$ERR]"; fi
+PLUG="$P_UPGRADED"; CC="$CC_CURRENT"   # install.sh's real upgrade: plugin.json 2.4.2, no local v2.4.2 tag, git describe still v2.4.1 (fixture check 0.)
+runp -- --launcher-start-hmd 2.4.1; expect "3. the real upgrade (fetch tag + checkout FETCH_HEAD, no local tag): the hmd update is pending" 0 'hmd 2.4.1 2.4.2'
+runp -- --launcher-start-hmd 2.4.2; expect "3. ... and the launcher that started on it (2.4.2) sees nothing pending: no restart loop on a tag-less tree" 1 ''
+CC="$CC_PENDING"
+runp -- --launcher-start-hmd 2.4.1; expect "3. ... with claude pending as well: both lines" 0 "$PEND_C"$'\n''hmd 2.4.1 2.4.2'
 
 # ---- 4. fully installed: the update finished -------------------------------------------------------------------------------------------------------
 PLUG="$P_NEW"; CC="$CC_PENDING"
@@ -159,6 +190,15 @@ rm -rf "$APPLY_TMP/heimdall-apply-other" "$APPLY_TMP/heimdall-apply.file"
 runp "$DBG" -- --launcher-start-hmd 2.4.1; expect "4. .git/index.lock (git checkout mid-flight: manifest already new, HEAD still old): nothing" 1 '' "index.lock"
 rm -f "$P_NEW/.git/index.lock"
 runp -- --launcher-start-hmd 2.4.1;        expect "4. the checkout finished and the lock is gone: pending" 0 "$PEND_C"$'\n''hmd 2.4.1 2.4.2'
+# the same two markers hold on the tag-less upgraded tree: describe no longer has to agree, so they are what keeps a half-landed update unreported
+PLUG="$P_UPGRADED"
+mkdir -p "$AD"
+runp "$DBG" -- --launcher-start-hmd 2.4.1; expect "4. the real upgrade's tree while its installer still runs (fresh heimdall-apply.* workdir): nothing" 1 '' "installer is still running"
+rm -rf "$AD"
+: >"$P_UPGRADED/.git/index.lock"
+runp "$DBG" -- --launcher-start-hmd 2.4.1; expect "4. the real upgrade's tree while git holds .git/index.lock: nothing" 1 '' "index.lock"
+rm -f "$P_UPGRADED/.git/index.lock"
+runp -- --launcher-start-hmd 2.4.1;        expect "4. the real upgrade's tree once both are gone: pending" 0 "$PEND_C"$'\n''hmd 2.4.1 2.4.2'
 
 # ---- 5. a claude half that cannot be read vetoes everything ----------------------------------------------------------------------------------------
 PLUG="$P_NEW"
@@ -183,17 +223,21 @@ runp "$DBG" -- --launcher-start-hmd abc;           expect "6. a launcher version
 runp "$DBG" -- --launcher-start-hmd '';            expect "6. an EMPTY launcher version (unset variable): nothing, fail closed" 1 '' "launcher-start-hmd"
 runp "$DBG" -- --launcher-start-hmd 2.4.1 --pid abc; expect "6. a --pid that is no number: nothing" 1 '' "--pid"
 CC="$CC_CURRENT"
+PLUG="$P_GIT"   # a manifest-less tree: git describe is what names its version, so a redirected git would name another repository's tag
 runp "GIT_DIR=$P_OTHER/.git" -- --launcher-start-hmd 2.4.1; expect "6. a GIT_DIR inherited from a parent process (another repo, tag v2.4.9) does not redirect git" 0 'hmd 2.4.1 2.4.2'
+PLUG="$P_NEW"
 runp "PATH=$TMPROOT/fakegit:$PATH" "$DBG" HMD_UPDATE_CMD_TIMEOUT_S=1 -- --launcher-start-hmd 2.4.1; expect "6. a git that hangs is killed at the timeout: nothing" 1 '' "did not answer within 1s"
 
-# ---- 7. the same sources and the same precedence as bin/heimdall-autoupdate's installed_version ----------------------------------------------------
-SH_BODY="$(awk '/^installed_version\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUTOUPDATE")"
+# ---- 7. the same source order as the repo's own "what code is on disk" resolver, the same describe flags and pattern as the updater ----------------
+# bin/heimdall's banner_version() reads the manifest FIRST and git describe only when the manifest gives nothing; installed_version() and heimdall_version() read
+# describe first, which is what install.sh's tag-less upgrade leaves stale: this helper follows the first, not those two
+BV_BODY="$(awk '/^banner_version\(\)/{f=1} f{print} f&&/^}/{exit}' "$HEIMDALL_BIN")"
 PY_BODY="$(awk '/^def resolve_hmd_version\(/{f=1;print;next} f&&/^def /{exit} f{print}' "$LIB")"
 line_of() { printf '%s\n' "$2" | grep -n -F -- "$1" | head -1 | cut -d: -f1; }
-SH_G="$(line_of 'describe' "$SH_BODY")"; SH_M="$(line_of 'plugin.json' "$SH_BODY")"
-PY_G="$(line_of 'describe_version(' "$PY_BODY")"; PY_M="$(line_of 'manifest_version(' "$PY_BODY")"
-if [ -n "$SH_G" ] && [ -n "$SH_M" ] && [ "$SH_G" -lt "$SH_M" ]; then ok "7. installed_version reads git describe before plugin.json"; else bad "7. could not read installed_version's source order" "describe line [$SH_G] plugin.json line [$SH_M]"; fi
-if [ -n "$PY_G" ] && [ -n "$PY_M" ] && [ "$PY_G" -lt "$PY_M" ]; then ok "7. the helper reads git describe before plugin.json, in the same order"; else bad "7. the helper's source order differs from installed_version" "describe line [$PY_G] manifest line [$PY_M]"; fi
+BV_M="$(line_of 'plugin.json' "$BV_BODY")"; BV_G="$(line_of 'heimdall_version' "$BV_BODY")"
+PY_M="$(line_of 'manifest_version(' "$PY_BODY")"; PY_G="$(line_of 'describe_version(' "$PY_BODY")"
+if [ -n "$BV_M" ] && [ -n "$BV_G" ] && [ "$BV_M" -lt "$BV_G" ]; then ok "7. banner_version reads plugin.json before it falls back to the git tag"; else bad "7. could not read banner_version's source order" "plugin.json line [$BV_M] heimdall_version line [$BV_G]"; fi
+if [ -n "$PY_M" ] && [ -n "$PY_G" ] && [ "$PY_M" -lt "$PY_G" ]; then ok "7. the helper reads plugin.json before git describe, in the same order"; else bad "7. the helper's source order differs from banner_version" "manifest line [$PY_M] describe line [$PY_G]"; fi
 if grep -qF "describe --tags --abbrev=0 --match 'v[0-9]*'" "$AUTOUPDATE" && grep -qF 'DESCRIBE = ("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*")' "$LIB"; then ok "7. git describe is called with the same flags in both"; else bad "7. the git describe flags differ between installed_version and the helper"; fi
 if grep -qF 'v?([0-9]+\.[0-9]+\.[0-9]+)' "$AUTOUPDATE" && grep -qF 'v?([0-9]+\.[0-9]+\.[0-9]+)' "$LIB"; then ok "7. a version is normalised with the same pattern in both (norm_semver)"; else bad "7. the version pattern differs between norm_semver and the helper"; fi
 if grep -qF 'heimdall-apply.' "$AUTOUPDATE" && grep -qF 'APPLY_DIR_PREFIX = "heimdall-apply."' "$LIB" && grep -qF "rm -rf '\$workdir'" "$AUTOUPDATE"; then
@@ -209,23 +253,30 @@ mutate() {  # mutate <sed expression>: the helper with one line broken, at $MUT;
   sed -e "$1" "$LIB" >"$MUT/bin/lib/hmd_update_pending.py"
   ! cmp -s "$LIB" "$MUT/bin/lib/hmd_update_pending.py"
 }
-caught() {  # caught <name> <sed expression>: the case just set up (PLUG, CC, an optional fixture state, start 2.4.1 unless START) must now answer differently
-  local name="$1"
-  if ! mutate "$2"; then bad "8. $name: the break did not apply (the helper's line changed)"; return; fi
+run_broken() {  # run_broken <name> <sed expression>: the case just set up (PLUG, CC, an optional fixture state, start 2.4.1 unless START) run through the helper with one line broken; false when the break did not apply
+  if ! mutate "$2"; then bad "8. $1: the break did not apply (the helper's line changed)"; return 1; fi
   BIN_UNDER_TEST="$MUT/bin/heimdall-update-pending"
   runp -- --launcher-start-hmd "${START:-2.4.1}"
   BIN_UNDER_TEST="$BIN"
-  if [ "$RC" = 1 ] && [ -z "$OUT" ]; then bad "8. $name: the broken helper still gave the right answer"; else ok "8. $name: caught (the broken helper answered rc=$RC out=[$OUT])"; fi
+}
+caught() {  # caught <name> <sed expression>: a case that reports NOTHING while the helper is whole must report something with the line broken
+  run_broken "$1" "$2" || return
+  if [ "$RC" = 1 ] && [ -z "$OUT" ]; then bad "8. $1: the broken helper still gave the right answer"; else ok "8. $1: caught (the broken helper answered rc=$RC out=[$OUT])"; fi
+}
+caught_lost() {  # caught_lost <name> <sed expression>: a case that REPORTS a pending update while the helper is whole must report nothing with the line broken
+  run_broken "$1" "$2" || return
+  if [ "$RC" = 1 ] && [ -z "$OUT" ]; then ok "8. $1: caught (the broken helper reported nothing)"; else bad "8. $1: the broken helper still reported rc=$RC out=[$OUT]"; fi
 }
 CC="$CC_CURRENT"
 PLUG="$P_NEW";      START=2.4.2 caught "'newer' compared with >= instead of >" 's/if version_tuple(now) > version_tuple(start):/if version_tuple(now) >= version_tuple(start):/'
-PLUG="$P_DISAGREE"; caught "the two-source disagreement no longer vetoes" 's/from_git != from_manifest/False/'
 mkdir -p "$AD"
 PLUG="$P_NEW";      caught "a running installer is no longer noticed" 's/if apply_in_flight():/if False:/'
 rm -rf "$AD"
 : >"$P_NEW/.git/index.lock"
 caught "git's index.lock is no longer noticed" 's/if lock and os.path.lexists(lock):/if False:/'
 rm -f "$P_NEW/.git/index.lock"
+PLUG="$P_UPGRADED"; caught_lost "plugin.json no longer decides, git describe does (the tag-less upgrade goes unreported)" 's/^    version = manifest_version(plugin_dir)$/    version = None/'
+PLUG="$P_GIT";      caught_lost "the git describe fallback is gone (a manifest-less tree reports nothing)" 's/^    if not version and is_repo:$/    if False:/'
 
 echo
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
