@@ -50,3 +50,5 @@
 - [2026-11-12] skills consent tty menu header shows the manifest repo for a name even when a foreign repo was requested (stderr line names the real repo just before); build the header from the requested repo.
 - [2026-11-12] (security review, MEDIUM) consent for a foreign repo under a manifest name: lock row ref/source also name the manifest repo; pass the requested repo to the gate (HMD_SKILLS_CONSENT_REPO) and use it in header + lock row.
 - [2026-11-12] suite cache served 0 of 568 on three consecutive --failed runs ("568 changed or new") although only a few files changed between them; find what moves every closure hash (likely a hook-committed tracked file such as .planning/settings.json inside many closures) — the cache is not saving anything right now.
+- [2026-11-23] bin/lib/agents_notif_index.pl parses task-notifications from any row (same loose pattern fixed in agents_open_scan.pl, 08515dda); only feeds the statusline count, but should trust harness rows only.
+- [2026-11-23] companion_push.scrub leaves `PASSWORD=...` assignments unredacted; align with the redaction rules in agents_open_scan.pl.
