@@ -71,11 +71,14 @@ fi
 
 # The supervised claude launch of the seamless restart (bin/lib/hmd_supervise.sh): ONE function in place of the bare `claude ...` of both interactive launches. It
 # defines functions only and is read completely here, before any child starts, so an update that rewrites it while a session runs cannot change what this launcher
-# executes. Same convention as the receipted-install helpers below: it ships in this tree, and a checkout without it fails at the call with "command not found".
-if [ -f "$PLUGIN_DIR/bin/lib/hmd_supervise.sh" ]; then
+# executes. Fail open, unlike the receipted-install helpers below: a tree without the library (a partial install, a copy of this file alone) or one whose copy cannot be
+# read leaves the function undefined, and the one-line fallback then launches the bare `claude ...` both launches ran before the supervisor existed, the very line the
+# library runs itself when it is not supervising. The test is on the function, not on the file, so every way of not getting it ends in that line, never in "command not found".
+if [ -r "$PLUGIN_DIR/bin/lib/hmd_supervise.sh" ]; then
   # shellcheck disable=SC1091
   . "$PLUGIN_DIR/bin/lib/hmd_supervise.sh" 2>/dev/null || true
 fi
+declare -F hmd_supervised_claude >/dev/null 2>&1 || hmd_supervised_claude() { claude "$@"; }
 
 # Real-user detection (bin/lib/real-home.sh) — the fail-safe gate for the side effects
 # $HOME cannot isolate (launchctl targets the GUI session domain, not a $HOME path).
