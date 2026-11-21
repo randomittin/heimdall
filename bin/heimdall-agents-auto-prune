@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""heimdall-agents-auto-prune -- once a day, compress (never delete) the transcripts of old, finished subagents.
+
+    heimdall-agents-auto-prune        what the agents-auto-prune SessionStart hook launches, detached; it prints nothing
+
+WHY. A long session leaves gigabytes of subagent transcripts that nothing removes (recommendation 7 of
+docs/analysis/2026-11-20-finished-agents-still-listed.md). `hmd agents prune` reclaims them, but a person has to remember to run it.
+This runs the SAFE half of it for them and nothing else: `heimdall-agents-prune --compress --older-than <DAYS>d`. Never --delete:
+compressing keeps every byte (read one back with `gzip -dc FILE.gz`), deleting does not, so deleting stays a person's decision.
+Every protection of the prune tool still holds (a session with a live process, anything written in the last 10 minutes, a main
+transcript, a symlink, anything outside <config>/projects): this wraps the tool and never reimplements one of its rules.
+
+WHEN. At most once in 24 hours. $HEIMDALL_HOME/agents-prune.stamp holds the epoch seconds of the last run, written BEFORE the run so a
+run that fails or hangs is not retried by every session of that day (the next day continues: each file is replaced atomically, so a
+cut-off run loses nothing). A stamp that cannot be read, is not a number or is from the future (a clock set back) counts as due.
+$HEIMDALL_HOME/agents-prune.lock is an flock(2) lock taken without waiting: two sessions that start together run it once, and a
+session that dies holding it leaves nothing behind (the kernel drops the lock with the process). There is one stamp per HEIMDALL_HOME,
+so with several CLAUDE_CONFIG_DIRs the first session of the day decides which of them is compressed. The prune tool is the one beside
+this file. The hook starts it for a top-level session only: a subagent's own session start (CLAUDE_CODE_CHILD_SESSION set) fires
+SessionStart too, thousands of times in a long session, and costs the hook one shell test, not this process.
+
+OUTPUT. Nothing on stdout or stderr: a SessionStart hook's stdout is read by the model. ONE line per run goes to
+$HEIMDALL_HOME/logs/agents-prune.log, <UTC time> older-than=<N>d <the tool's own summary: agents, files, bytes reclaimed>, or why it
+failed or timed out. A run that fails before it can write that line has nowhere to say so. Always exits 0: housekeeping never fails a
+session. An error of its own (a home it cannot write, a lock the file system refuses) is one log line too, never a crash.
+
+SWITCHES, read from the environment Claude Code runs in
+  HMD_AUTO_PRUNE=off|0|false|no   no run at all, nothing created. On by default. `hmd guardrails off agents-auto-prune` (or
+                                  `hmd hooks disable agents-auto-prune`) switches the hook itself off.
+  HMD_AUTO_PRUNE_DAYS=N           compress agents older than N days: default 14, never fewer than 3 (a smaller number is 3, a value
+                                  that is not a whole number of days is 14).
+  HMD_AUTO_PRUNE_TIMEOUT_S=N      stop the tool after N seconds (default 600; anything but a positive whole number is 600). What it
+                                  finished stays compressed and the next day continues.
+A relative HEIMDALL_HOME is the cwd, which a repository controls, so it counts for nothing: no run. The tool runs at the lowest CPU
+priority.
+"""
+import contextlib
+import fcntl
+import os
+import re
+import subprocess
+import sys
+import time
+
+DEFAULT_DAYS = 14
+MIN_DAYS = 3
+DEFAULT_TIMEOUT_S = 600
+PERIOD_S = 86400
+LOWEST_PRIORITY = 19
+OFF_VALUES = ("off", "0", "false", "no")
+STAMP = "agents-prune.stamp"
+LOCK = "agents-prune.lock"
+LOG_DIR = "logs"
+LOG = "agents-prune.log"
+TOOL = "heimdall-agents-prune"
+SUMMARY_RE = re.compile(r"^hmd agents prune: ((?:compressed|nothing) .*)$", re.M)
+CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]")
+LINE_CAP = 400
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def heimdall_home():
+    """$HEIMDALL_HOME, else $HOME/.heimdall; None unless that is an absolute path."""
+    home = os.environ.get("HEIMDALL_HOME")
+    if not home and os.environ.get("HOME"):
+        home = os.path.join(os.environ["HOME"], ".heimdall")
+    return home if home and os.path.isabs(home) else None
+
+
+def number(text, digits):
+    """The integer in TEXT when it is 1 to DIGITS plain digits, else None."""
+    text = (text or "").strip()
+    return int(text) if re.fullmatch("[0-9]{1,%d}" % digits, text) else None
+
+
+def threshold_days():
+    days = number(os.environ.get("HMD_AUTO_PRUNE_DAYS"), 5)
+    return DEFAULT_DAYS if days is None else max(days, MIN_DAYS)
+
+
+def timeout_s():
+    return number(os.environ.get("HMD_AUTO_PRUNE_TIMEOUT_S"), 6) or DEFAULT_TIMEOUT_S
+
+
+def is_due(stamp, now):
+    """True unless the last run was less than a day ago; a stamp that says anything else counts as due."""
+    try:
+        with open(stamp, "r") as handle:
+            last = int(handle.read(32).strip())
+    except (OSError, ValueError):
+        return True
+    return not 0 <= now - last < PERIOD_S
+
+
+def write_stamp(stamp, now):
+    """Atomically: the whole new stamp or the old one, never half of one."""
+    temp = "%s.%d.tmp" % (stamp, os.getpid())
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write("%d\n" % now)
+        os.replace(temp, stamp)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp)
+
+
+def log(home, message):
+    """ONE line in $HEIMDALL_HOME/logs/agents-prune.log (0600; the directory 0700 when this creates it). Best effort: a log that cannot
+    be written has nowhere to report it, a detached hook having no output."""
+    line = "%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), CONTROL_RE.sub("?", message))
+    with contextlib.suppress(OSError):
+        directory = os.path.join(home, LOG_DIR)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd = os.open(os.path.join(directory, LOG), os.O_WRONLY | os.O_APPEND | os.O_CREAT | NOFOLLOW, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8", errors="replace") as handle:
+            handle.write(line[:LINE_CAP] + "\n")
+
+
+def first_line(text):
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return "no message"
+
+
+def compress(tool, days, seconds):
+    """Ask the prune tool for --compress and nothing else; -> the words for the log line."""
+    command = [tool, "--compress", "--older-than", "%dd" % days]
+    try:
+        done = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=seconds)
+    except subprocess.TimeoutExpired:
+        return "timed out after %ds (what it compressed stays compressed; the next run continues)" % seconds
+    except OSError as err:
+        return "failed to start %s: %s" % (tool, err.strerror or err)
+    summary = SUMMARY_RE.findall(done.stdout.decode("utf-8", "replace"))
+    words = summary[-1] if summary else "failed"
+    if done.returncode != 0:
+        words += ", exit %d: %s" % (done.returncode, first_line(done.stderr.decode("utf-8", "replace")))
+    return words
+
+
+def run():
+    if os.environ.get("HMD_AUTO_PRUNE", "").strip().lower() in OFF_VALUES:
+        return
+    home = heimdall_home()
+    if home is None:
+        return
+    days = threshold_days()
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    lock = os.open(os.path.join(home, LOCK), os.O_RDWR | os.O_CREAT | NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return  # another session is running it right now; the lock is dropped with this process, whatever it is doing
+    stamp = os.path.join(home, STAMP)
+    now = int(time.time())
+    if not is_due(stamp, now):
+        return
+    write_stamp(stamp, now)
+    with contextlib.suppress(OSError):
+        os.nice(LOWEST_PRIORITY)
+    tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), TOOL)
+    if os.path.isfile(tool) and os.access(tool, os.X_OK):
+        outcome = compress(tool, days, timeout_s())
+    else:
+        outcome = "failed, %s not found at %s" % (TOOL, tool)
+    log(home, "older-than=%dd %s" % (days, outcome))
+
+
+def main():
+    try:
+        run()
+    except Exception as err:  # housekeeping never fails a session; the log says what went wrong
+        home = heimdall_home()
+        if home is not None:
+            log(home, "failed: %s: %s" % (type(err).__name__, err))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

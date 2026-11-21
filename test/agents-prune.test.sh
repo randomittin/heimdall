@@ -219,7 +219,8 @@ eq "--help exits 0" 0 "$RC"
 for flag in --older-than --compress --delete --dry-run --project --yes; do
   check "--help names $flag" grep -q -- "$flag" "$OUT"
 done
-check "--help says it is opt-in and never runs by itself" grep -qi 'never runs by itself' "$OUT"
+check "--help says --delete never runs by itself" grep -qi -- '--delete never runs by itself' "$OUT"
+check "--help names the one automatic caller, what it asks for and its off switch" grep -q 'HMD_AUTO_PRUNE=off' "$OUT"
 check "--help tells how to read a compressed transcript back" grep -q 'gzip -dc' "$OUT"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -452,7 +453,8 @@ dispatch "$H" agents --help
 eq "hmd agents --help: exits 0" 0 "$RC"
 check "hmd agents --help: mentions the prune verb" grep -q 'hmd agents prune' "$OUT"
 check "hmd agents --help: mentions its options" grep -q -- '--older-than' "$OUT"
-check "hmd agents --help: says it never runs by itself" grep -qi 'never runs by itself' "$OUT"
+check "hmd agents --help: says --delete never runs by itself" grep -qi -- '--delete never runs by itself' "$OUT"
+check "hmd agents --help: names the off switch of the daily compress" grep -q 'HMD_AUTO_PRUNE=off' "$OUT"
 check "hmd agents --help: does not go ask for background sessions" test ! -s "$STUB_OUT"
 
 rm -f "$PLUG/bin/heimdall-agents-prune"
