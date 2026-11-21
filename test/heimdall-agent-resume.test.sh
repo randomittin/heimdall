@@ -21,6 +21,11 @@
 #   4. resume-hint STAYS SILENT WHEN THERE IS NOTHING TO DO, and speaks up
 #      the moment there is — this is the SessionStart hot path, wired via
 #      bin/heimdall-quota-resume's own resume-hint (see its cmd_resume_hint).
+#   5. THE HUNG LABEL COUNTS FROM THE LAST TOOL CALL. An agent awaiting a tool
+#      result is `hung` only when the transcript's mtime AND the stamp on its last
+#      record (its last tool call) are both older than HMD_AGENT_HUNG_SECS.
+#      SessionStart once printed "[hung]" for an agent that was making tool calls
+#      (docs/analysis/2026-11-20-finished-agents-still-listed.md, item 6).
 #
 # Hermetic: mirrors test/heimdall-agents.test.sh's fixture shapes exactly
 # (this tool shells out to bin/heimdall-agents and must see the real thing),
@@ -176,6 +181,67 @@ mk_notif2 "$R_DONE" completed "Agent \"fixture\" finished cleanly"
 
 R_MBOX="armbox-0000000000003"
 mk_agent "$R_MBOX" 5000 end in_process_teammate mboxfixture
+
+# ═════════════════════════════════════════════════════════════════════════════
+# (0) THE HUNG LABEL COUNTS FROM THE LAST TOOL CALL — the SessionStart false flag.
+# A world of its own (task dir, projects dir and registry) so the exact counts below stay exact. Every agent here is awaiting a tool result and its transcript's mtime is
+# 99999 s old unless said otherwise (the one clock HMD_AGENT_HUNG_SECS=3600 used to be read from); what differs is the stamp on its last record, which is its last tool call.
+# ═════════════════════════════════════════════════════════════════════════════
+iso_of() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%S.000Z; }
+
+# mk_agent_stamped <id> <mtime_age_secs> <stamp: seconds before NOW (negative = the future) or "bad" = not a date> — mk_agent's awaiting-a-tool-result fixture whose
+# last record (the tool_use) carries a timestamp, as every record of a real transcript does.
+mk_agent_stamped() {
+  local id="$1" mage="$2" stamp="$3" j="$SUBDIR/agent-$1.jsonl" ts
+  mk_agent "$id" "$mage" tool
+  if [ "$stamp" = bad ]; then ts="not-a-date"; else ts="$(iso_of $(( NOW - stamp )))"; fi
+  {
+    printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"go"}]}}'
+    jq -nc --arg t "$ts" '{type:"assistant", timestamp:$t, message:{role:"assistant", stop_reason:"tool_use", content:[{type:"tool_use", name:"Bash", id:"tu_1"}]}}'
+  } > "$j"
+  set_mtime "$j" $(( NOW - mage ))
+}
+
+CLK="$WORK/clock"
+CLK_TASKDIR="$CLK/claude-501/$SLUG/$TSESS/tasks"
+mkdir -p "$CLK_TASKDIR" "$CLK/projects/$SLUG/$ASESS/subagents"
+: > "$CLK/projects/$SLUG/$ASESS.jsonl"
+C_FRESH="aclkfresh0000000010"; C_OLD="aclkold000000000011"; C_FUTURE="aclkfuture00000000012"; C_BAD="aclkbad000000000013"; C_TOUCHED="aclktouched00000000014"
+(
+  SUBDIR="$CLK/projects/$SLUG/$ASESS/subagents"; TASKDIR="$CLK_TASKDIR"
+  mk_agent_stamped "$C_FRESH" 99999 30        # last tool call 30 s ago, transcript mtime stale: the false flag
+  mk_agent_stamped "$C_OLD" 99999 99999       # both clocks old: a real wedge
+  mk_agent_stamped "$C_FUTURE" 99999 -100000  # a stamp from the future proves nothing: the mtime's verdict stands
+  mk_agent_stamped "$C_BAD" 99999 bad         # an unreadable stamp proves nothing either
+  mk_agent_stamped "$C_TOUCHED" 10 99999      # old stamp, transcript written to 10 s ago: not hung (the mtime still counts)
+)
+clk_env() { env HMD_AGENT_TASKDIR="$CLK_TASKDIR" HMD_AGENT_PROJECTS_DIR="$CLK/projects" HMD_AGENT_REAPED_FILE="$CLK/reaped.json" "$@"; }
+CLK_LIST="$(clk_env "$AGENTS" list --json)"
+clk_state() { printf '%s' "$CLK_LIST" | jq -r --arg i "$1" '.[]|select(.id==$i)|.state'; }
+[ "$(clk_state "$C_FRESH")" = "working" ] \
+  && ok "last tool call 30 s ago on a 99999 s old transcript -> working, not hung" \
+  || bad "FALSE FLAG: a last tool call 30 s ago got '$(clk_state "$C_FRESH")', want working"
+[ "$(clk_state "$C_OLD")" = "hung" ] \
+  && ok "last tool call and transcript both 99999 s old -> hung" \
+  || bad "a real wedge got '$(clk_state "$C_OLD")', want hung"
+[ "$(clk_state "$C_FUTURE")" = "hung" ] \
+  && ok "a last-record stamp from the future does not keep an old agent alive -> hung" \
+  || bad "a future stamp got '$(clk_state "$C_FUTURE")', want hung"
+[ "$(clk_state "$C_BAD")" = "hung" ] \
+  && ok "an unreadable last-record stamp falls back to the mtime -> hung" \
+  || bad "an unreadable stamp got '$(clk_state "$C_BAD")', want hung"
+[ "$(clk_state "$C_TOUCHED")" = "working" ] \
+  && ok "a transcript written to 10 s ago is not hung even with an old stamp (the mtime still counts)" \
+  || bad "a fresh mtime got '$(clk_state "$C_TOUCHED")', want working"
+CLK_HINT="$(clk_env "$AR" resume-hint --repo "$REPO" 2>/dev/null)"
+case "$CLK_HINT" in
+  *"$C_OLD  [hung]"*) ok "SessionStart resume-hint still names the real wedge as [hung]" ;;
+  *) bad "resume-hint lost the real wedge: $CLK_HINT" ;;
+esac
+case "$CLK_HINT" in
+  *"$C_FRESH"*|*"$C_TOUCHED"*) bad "resume-hint printed an agent that made a tool call seconds ago: $CLK_HINT" ;;
+  *) ok "SessionStart resume-hint does not call an agent with a recent tool call hung" ;;
+esac
 
 # ═════════════════════════════════════════════════════════════════════════════
 # (1) BEFORE any interrupted agent exists: list/report empty, resume-hint SILENT

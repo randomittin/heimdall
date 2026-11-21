@@ -15,8 +15,8 @@
 # its changes to the orchestrator: review finding F2); it composes with the brief-adoption gate (the block is NOT counted against the brief word
 # threshold, and a prompt that gate DOES replace carries the block too, in the same updatedInput); every shape it cannot rewrite, a malformed or
 # empty payload and a jq that fails on the rewrite leave the spawn untouched (exit 0, nothing on stdout); the section has no `exit`, so it cannot
-# deny; the shipped hooks.json Agent command delivers the rewrite; and five mutants of the hook (opt-out ignored, idempotence gone, every type
-# matched, isolation ignored, isolation never recognised) each go wrong in the way an assertion above catches.
+# deny; the shipped hooks.json Agent command delivers the rewrite; and six mutants of the hook (opt-out ignored, idempotence gone, every type
+# matched, isolation ignored, isolation never recognised, the 30-minute wait limit dropped) each go wrong in the way an assertion above catches.
 #
 # Hermetic: every invocation runs the REAL hook under `env -i` from a scratch cwd with its own HOME/HEIMDALL_HOME/planning dir, with
 # HMD_MIN_FREE_PCT=0 (the disk-floor fence would otherwise read THIS machine's free space) and HMD_CTX_GATE_OFF=1 (the context fence would
@@ -111,10 +111,10 @@ check "general-purpose: the original prompt is kept verbatim, at the start" \
 check "general-purpose: the marker line is there exactly once" test "$(marker_lines "$NEWP")" = 1
 BLOCK="$(block_of "$NEWP")"
 MISSING=""
-for tok in 'until' 'tail -f' 'pgrep' 'run_in_background' 'Monitor' 'timeout' 'commit' 'once' 'concise'; do
+for tok in 'until' 'tail -f' 'pgrep' 'run_in_background' 'Monitor' 'timeout' '30 minutes' 'waiting for' 'commit' 'once' 'concise'; do
   grep -qiF -- "$tok" <<<"$BLOCK" || MISSING="$MISSING [$tok]"
 done
-[ -z "$MISSING" ] && ok "general-purpose: the block carries every rule (no foreground polling, run_in_background + Monitor, explicit timeout, a commit rule, tests once, concise report)" \
+[ -z "$MISSING" ] && ok "general-purpose: the block carries every rule (no foreground polling, run_in_background + Monitor, explicit timeout, give up waiting after 30 minutes and report what it waited for, a commit rule, tests once, concise report)" \
   || bad "general-purpose: the block is missing:$MISSING"
 BLOCK_LINES="$(printf '%s\n' "$BLOCK" | wc -l | tr -d ' ')"
 [ "$BLOCK_LINES" -ge 5 ] && [ "$BLOCK_LINES" -le 10 ] && ok "general-purpose: the block is terse (5 to 10 lines, it is $BLOCK_LINES)" || bad "general-purpose: the block is $BLOCK_LINES lines, want 5 to 10"
@@ -172,8 +172,10 @@ WT_BLOCK="$(block_of "$(newprompt)")"
 check "isolation worktree: the block tells the agent to commit early and often in its worktree" has_text 'Commit early and often in your worktree' "$WT_BLOCK"
 check "isolation worktree: the block does not tell the agent to refrain from committing" lacks_text 'do not commit' "$WT_BLOCK"
 check "isolation worktree: the report line still asks for the commit sha" has_text 'commit sha' "$WT_BLOCK"
-check "the two variants differ only in rules 4 and 6: the marker and every other rule are the same line for line" \
-  test "$(printf '%s\n' "$WT_BLOCK" | grep -v '^[46]\. ')" = "$(printf '%s\n' "$SHARED_BLOCK" | grep -v '^[46]\. ')"
+check "isolation worktree: the block carries the wait limit too (give up after 30 minutes, report what it waited for)" has_text 'give up after 30 minutes and report what you were waiting for' "$WT_BLOCK"
+check "no isolation: the block carries the wait limit (give up after 30 minutes, report what it waited for)" has_text 'give up after 30 minutes and report what you were waiting for' "$SHARED_BLOCK"
+check "the two variants differ only in rules 5 and 7: the marker and every other rule are the same line for line" \
+  test "$(printf '%s\n' "$WT_BLOCK" | grep -v '^[57]\. ')" = "$(printf '%s\n' "$SHARED_BLOCK" | grep -v '^[57]\. ')"
 
 payload "$SANDBOX/remote.json" general-purpose "$P1" '{"isolation":"remote"}'
 fire "$SANDBOX/remote.json"
@@ -255,7 +257,7 @@ check "hooks.json wires the Agent hook to bin/heimdall-precheck-agent" grep -q '
 RC=$?
 check "the shipped hooks.json Agent command rewrites a general-purpose spawn" rewrote
 
-# ── 9. the assertions bite: five mutants of the hook each go wrong ────────────────────────────
+# ── 9. the assertions bite: six mutants of the hook each go wrong ────────────────────────────
 # Each mutant is a lone copy of the hook (no sibling libs or binaries, so every other fence is inert and only the section under test runs).
 mutant() { # mutant <name> <sed expression>   writes $SANDBOX/mut/<name>; false when the expression changed nothing
   sed "$2" "$REAL_HOOK" >"$SANDBOX/mut/$1"
@@ -285,6 +287,11 @@ if mutant never-isolated 's/\.isolation == "worktree"/false/'; then
   fire_hook "$SANDBOX/mut/never-isolated" "$SANDBOX/wt.json"
   check "RED-PROOF: a hook that never recognises isolation worktree tells that spawn NOT to commit (so the isolation worktree assertions above bite)" \
     has_text 'Do not commit' "$(block_of "$(newprompt)")"
+fi
+if mutant no-wait-limit 's/give up after 30 minutes/wait as long as it takes/'; then
+  fire_hook "$SANDBOX/mut/no-wait-limit" "$SANDBOX/gp.json"
+  check "RED-PROOF: a hook whose rule 4 drops the 30-minute limit sends a block without it (so the wait-limit assertions above bite)" \
+    lacks_text '30 minutes' "$(block_of "$(newprompt)")"
 fi
 
 echo "--------------------------------------------------------------------"
