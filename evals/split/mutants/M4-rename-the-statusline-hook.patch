@@ -1,0 +1,11 @@
+# Mutant M4 of test/split-falsify.test.sh (docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md, section 4 'Oracle gate', task T4.1).
+# CHANGE: hooks/statusline.sh is renamed to hooks/statusline-renamed.sh, bytes and exec bit as they were.
+# The suite applies this patch to a COPY of the tracked tree, never to the real one, and runs the split's gates on the copy.
+# MUST TURN RED: bin/heimdall-vendor verify --all, test/vendor-parity.test.sh, test/split-baseline.test.sh.
+# The path is what users' ~/.claude/settings.json statusLine and install.sh match (INV-S2): nothing may move it.
+# It applies to the pinned bytes only: when a pin moves, make the same edit in a copy of the tree and keep `git diff` (a patch that no longer applies fails the suite, it never counts as a kill).
+
+diff --git a/hooks/statusline.sh b/hooks/statusline-renamed.sh
+similarity index 100%
+rename from hooks/statusline.sh
+rename to hooks/statusline-renamed.sh

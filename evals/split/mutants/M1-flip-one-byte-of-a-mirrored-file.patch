@@ -1,0 +1,20 @@
+# Mutant M1 of test/split-falsify.test.sh (docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md, section 4 'Oracle gate', task T4.1).
+# CHANGE: one byte of a mirrored file changes and the size does not: `du -sh` becomes `du -sk` in skills/mac-deep-clean/SKILL.md.
+# The suite applies this patch to a COPY of the tracked tree, never to the real one, and runs the split's gates on the copy.
+# MUST TURN RED: bin/heimdall-vendor verify --all, test/vendor-parity.test.sh, test/split-baseline.test.sh.
+# Only a hash can see this one: nothing renders or runs that file, so it is the gate on the bytes (INV-S1) that is tested.
+# It applies to the pinned bytes only: when a pin moves, make the same edit in a copy of the tree and keep `git diff` (a patch that no longer applies fails the suite, it never counts as a kill).
+
+diff --git a/skills/mac-deep-clean/SKILL.md b/skills/mac-deep-clean/SKILL.md
+index 07f3d6f..30a00f5 100644
+--- a/skills/mac-deep-clean/SKILL.md
++++ b/skills/mac-deep-clean/SKILL.md
+@@ -10,7 +10,7 @@ Autonomous macOS storage + memory cleanup. Investigate first (read-only), presen
+ Ships with Heimdall: invoke it as `hmd:mac-deep-clean` (a copy you installed by hand under `~/.claude/skills/mac-deep-clean/` is plain `mac-deep-clean`). `hmd:system-health` and `heimdall-cleanup --deep` notice the need and hand off here — they never delete anything outside Heimdall's own garbage; this skill is the confirm-gated executor.
+ 
+ ## Golden rules
+-- **Measure before deleting.** Always `du -sh` / `df -h` before and after. Report reclaimed bytes.
++- **Measure before deleting.** Always `du -sk` / `df -h` before and after. Report reclaimed bytes.
+ - **Irreversible = confirm.** Deleting repos/files with uncommitted work needs explicit user naming. Never infer consent from background-task notifications.
+ - **Scope precisely.** `rm -rf` explicit paths only. Never `rm -rf` a parent when you mean a child. Verify exact version-dir names (Android SDK, NDK) before deleting "old" versions.
+ - **Caches regenerate; user data does not.** Keep: iMessage db, browser profiles, Notes, VSCode, source `.git`, loose documents. Delete: caches, build output, node_modules, old SDK versions, dead worktrees.
