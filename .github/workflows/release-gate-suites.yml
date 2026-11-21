@@ -121,6 +121,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # The vendor lock. heimdall keeps a copy of every file of the split-out hmd-skills and
+      # hmd-statusline repositories at the same path, and vendor/vendor.lock.json pins the tagged
+      # commit and the hash of those files: a hand edit of a mirrored file, or a lock bumped
+      # without its files, fails here (docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md,
+      # INV-S1). It is offline: it hashes the checked-out files and fetches nothing.
+      - name: Verify the vendored mirror against vendor/vendor.lock.json
+        run: bin/heimdall-vendor verify --all
+
       # The filter is a single anchored alternation. It was verified before this file was
       # written to select exactly these 14 files out of the full test/*.test.sh glob and
       # nothing else — in particular it does NOT also pull in
