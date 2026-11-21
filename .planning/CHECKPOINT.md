@@ -1,33 +1,38 @@
 <!-- heimdall-auto-checkpoint:begin -->
-## Auto-checkpoint — 2026-11-12T11:31:11Z
+## Auto-checkpoint — 2026-11-21T19:31:54Z
 
 > Written automatically at session end (mechanical, no LLM). Run `/hmd:save`
 > for a richer human/LLM-authored handoff — it enriches this same file.
 
 - **Branch:** main
-- **HEAD:** 82e282ca
+- **HEAD:** 416f8dc8
 - **Phase:** unknown
 - **Active goal:** none
-- **Uncommitted files:** 4
+- **Uncommitted files:** 0
 
 ### What must never be lost (the resume contract)
 > Graded on the next restart by `heimdall-resume-probe` against the digests in
 > `.planning/RESUME-KEY.json`, written at save time — while the knowledge is
 > still present. A field that does not survive this write FAILS the save.
 
-- **In progress:** phase=unknown · goal=none · in flight: 4 uncommitted file(s) — .planning/CHECKPOINT.md.planning/settings.json.planning/ledger/checkpoints/haid_unknown.rishabhs-macbook-air-a013.json.planning/ledger/checkpoints/haid_unknown.rishabhs-macbook-air-d6b2.json
-- **Gated decisions:** push gate FAILING — nothing may be pushed until it clears
-- **Held branches:** worktree-agent-a21537b121081222d (5 commit(s) not on main, at /Users/rj/Downloads/heimdall/.claude/worktrees/agent-a21537b121081222d)perf-app-pair (4 commit(s) not on main)perf-attach (1 commit(s) not on main)perf-mutants (4 commit(s) not on main)perf-shell-heavy (1 commit(s) not on main)perf-view (1 commit(s) not on main)readme-launch (2 commit(s) not on main)worktree-agent-a01812998a16c79bf (2 commit(s) not on main)worktree-agent-a0b3b29e1ead39351 (5 commit(s) not on main)worktree-agent-a3236595ab3b3adbd (1 commit(s) not on main)worktree-agent-a4ddcfc5c10a426d1 (4 commit(s) not on main)worktree-agent-a540397c1f134aa66 (1 commit(s) not on main)worktree-agent-a58aa859c281c70a8 (13 commit(s) not on main)worktree-agent-a5e40bbcd8616400e (6 commit(s) not on main)worktree-agent-a748f2d5d2d8b8d87 (1 commit(s) not on main)worktree-agent-a757edcc7298ab070 (3 commit(s) not on main)worktree-agent-ab644b92c05a00b17 (1 commit(s) not on main)
-- **Unpushed:** 184 commit(s) unpushed on main (HEAD 82e282ca, upstream origin/main)
-- **Open warnings:** ⚠ push gate is RED⚠ 2 worktree(s) flagged dirty or unmerged
-- **Refuted claims:** none recorded this session — record one with: heimdall-checkpoint note refuted "<claim> → what was actually true"
+- **In progress:** phase=unknown · goal=none · compaction (auto) at 2026-10-08T15:46:42Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-10-13T10:19:12Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-10-13T12:16:58Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-10-14T16:50:08Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-10-20T01:35:33Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-11-10T12:36:23Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail went · in flight: 0 uncommitted files
+- **Gated decisions:** push gate FAILING — nothing may be pushed until it clearsOperator-only (item 15): push local commits to origin; runhmd.dev DNS; GitHub App registration; npm publish runhmd only after hmd attack is released; hmd receipt keygen + commit release/runhmd-receipt.pub; relay deploy (canary URL assumes hmd-relay-canary.therishabh16.workers.dev, else set RELAY_URL).
+- **Held branches:** worktree-agent-a21537b121081222d (5 commit(s) not on main, at /Users/rj/Downloads/heimdall/.claude/worktrees/agent-a21537b121081222d)worktree-agent-a3bba857179f782c2 (1 commit(s) not on main, at /Users/rj/Downloads/heimdall/.claude/worktrees/agent-a3bba857179f782c2)worktree-agent-a5aedf760cbd2c5e2 (4 commit(s) not on main, at /Users/rj/Downloads/heimdall/.claude/worktrees/agent-a5aedf760cbd2c5e2)worktree-agent-a6a251a67e5adf6b2 (3 commit(s) not on main, at /Users/rj/Downloads/heimdall/.claude/worktrees/agent-a6a251a67e5adf6b2)worktree-agent-af605613f34edf83f (1 commit(s) not on main, at /Users/rj/Downloads/heimdall/.claude/worktrees/agent-af605613f34edf83f)perf-app-pair (4 commit(s) not on main)perf-attach (1 commit(s) not on main)perf-mutants (4 commit(s) not on main)perf-shell-heavy (1 commit(s) not on main)perf-view (1 commit(s) not on main)readme-launch (2 commit(s) not on main)worktree-agent-a01812998a16c79bf (2 commit(s) not on main)worktree-agent-a0b3b29e1ead39351 (5 commit(s) not on main)worktree-agent-a3236595ab3b3adbd (1 commit(s) not on main)worktree-agent-a4ddcfc5c10a426d1 (4 commit(s) not on main)worktree-agent-a540397c1f134aa66 (1 commit(s) not on main)worktree-agent-a58aa859c281c70a8 (13 commit(s) not on main)worktree-agent-a5e40bbcd8616400e (6 commit(s) not on main)worktree-agent-a748f2d5d2d8b8d87 (1 commit(s) not on main)worktree-agent-a757edcc7298ab070 (3 commit(s) not on main)worktree-agent-ab644b92c05a00b17 (1 commit(s) not on main)
+- **Unpushed:** 224 commit(s) unpushed on main (HEAD 416f8dc8, upstream origin/main)
+- **Open warnings:** hmdapp app-side needed: refusal ack must parse detail=='non-increasing-seq' + numeric last; phone register_push loop = 99% of 5,200 acks/day; restart hmd app connect for push-test + WebSocket hmd leg; launch-brief handbacks not yet written to hmdapp/docs.⚠ push gate is RED⚠ 6 worktree(s) flagged dirty or unmerged
+- **Refuted claims:** module-consent-waiver's 7 failures were real defects → they were starvation artifacts from my own stray load generators; solo run is 65/0the OmniRoute gateway is wedged at the HTTP layer → it is a webpack DEV server recompiling per request; it answered / with 307 after 141.78sthe 6 sweep reds on f166096a were code regressions → 5 were timing budgets under external load 18-45 (A/B: main faster than fd256c80), 1 was a 30-day reachability exemption that expired on 2026-09-21
 
-### Worktree ledger — nothing-lost proof (12 of 12 worktree(s) scanned)
+### Worktree ledger — nothing-lost proof (25 of 25 worktree(s) scanned)
 > Base ref: `main`. Clean = zero uncommitted files AND HEAD merged into base.
 
-- 10/12 clean, 2 flagged — rescue these before restarting:
-- DIRTY `/Users/rj/Downloads/heimdall` — 4 uncommitted file(s)
+- 19/25 clean, 6 flagged — rescue these before restarting:
 - UNMERGED `/Users/rj/Downloads/heimdall/.claude/worktrees/agent-a21537b121081222d` — HEAD has commits not on `main`
+- UNMERGED `/Users/rj/Downloads/heimdall/.claude/worktrees/agent-a3bba857179f782c2` — HEAD has commits not on `main`
+- DIRTY `/Users/rj/Downloads/heimdall/.claude/worktrees/agent-a3bee6482d97ae507` — 1 uncommitted file(s)
+- DIRTY `/Users/rj/Downloads/heimdall/.claude/worktrees/agent-a5aedf760cbd2c5e2` — 1 uncommitted file(s)
+- UNMERGED `/Users/rj/Downloads/heimdall/.claude/worktrees/agent-a5aedf760cbd2c5e2` — HEAD has commits not on `main`
+- UNMERGED `/Users/rj/Downloads/heimdall/.claude/worktrees/agent-a6a251a67e5adf6b2` — HEAD has commits not on `main`
+- UNMERGED `/Users/rj/Downloads/heimdall/.claude/worktrees/agent-af605613f34edf83f` — HEAD has commits not on `main`
 
 ### This session's edited files (edit-tracker — git log cannot attribute these)
 ```
@@ -40,29 +45,21 @@
 GATE FAILED: Tests not passing
 LINT WAIVED: 2.4.8: 21 shellcheck warnings (15 SC2034 unused vars, SC2163 intentional export of kv string, SC2010, SC2120, SC2154, SC1090), 0 errors, 19 in test files; fixing them stales the green full receipt 3a0f2c0b; fixes ride the 2.4.9 batch (waived 2026-10-19T20:50:33Z) -- the lint evidence is NOT passing (findings: 24 lint finding(s) in the last run)
 GATE FAILED: Changes pending re-test
-GATE FAILED: no sweep receipt at /var/folders/t3/17x0hkw12n3g0qy3sjkggbsr0000gn/T/hr.iVvn/s8/install-stranger.eX6z1t/tmp.AyxVckAR/.heimdall/.heimdall/receipts/last-sweep.json — a full sweep has never recorded a result in this checkout. Run: bash test/run-all.sh
+GATE FAILED: sweep receipt is STALE — receipt HEAD 272cab68cd157c8c882fc659a027d278d97fb0ff != current HEAD 416f8dc8f8958779d46e3f71d0c5eb91ebd7f073 (commits landed since the sweep ran, including non-hook-owned paths: .github/workflows/release-gate-suites.yml,AGENTS.md,CHANGELOG.md). Run: bash test/run-all.sh --since-green
 Quality gates not met. Push blocked.
 ```
 
 ### Recent commits
-- 82e282ca journal: [COMMUNICATION] test: find heimdall-autoupdate source sites by content, not pinned lines Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>
-- 53522ac3 test: find heimdall-autoupdate source sites by content, not pinned lines Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>
-- dd05e91c wip: 6 edit-op checkpoint (heimdall-wip)
-- 89a21f74 journal: [COMMUNICATION] Merge branch 'worktree-agent-a8671a9dc3fe9741d'
-- 13f680bd Merge branch 'worktree-agent-a8671a9dc3fe9741d'
-- 0cff5684 Merge branch 'worktree-agent-ab4431279e72d3186'
-- 865dce9e Merge branch 'worktree-agent-a6f97e230d9803d50'
-- a4cf45a7 journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] Merge branch 'worktree-agent-a67b728243413089f'
-- 9aca3299 test: give suite sandboxes the consent gate
-- 63751ee9 journal: [COMMUNICATION] journal: [COMMUNICATION] Merge branch 'worktree-agent-a67b728243413089f'
-
-### Uncommitted changes (git status --porcelain)
-```
- M .planning/CHECKPOINT.md
- M .planning/settings.json
-?? .planning/ledger/checkpoints/haid_unknown.rishabhs-macbook-air-a013.json
-?? .planning/ledger/checkpoints/haid_unknown.rishabhs-macbook-air-d6b2.json
-```
+- 416f8dc8 journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] Merge branch 'worktree-agent-a09a4f60aee01f8c9'
+- 4dfded79 journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] Merge branch 'worktree-agent-a09a4f60aee01f8c9'
+- 94c0750c journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] Merge branch 'worktree-agent-a09a4f60aee01f8c9'
+- c523f533 journal: [COMMUNICATION] journal: [COMMUNICATION] Merge branch 'worktree-agent-a09a4f60aee01f8c9'
+- 662aed85 journal: [COMMUNICATION] Merge branch 'worktree-agent-a09a4f60aee01f8c9'
+- 5de56e64 Merge branch 'worktree-agent-a09a4f60aee01f8c9'
+- b713a786 journal: [COMMUNICATION] Merge branch 'worktree-agent-a0b99014444e7fa12'
+- 8ee520c8 docs(spike): seamless restart W0 measurements
+- f69a02be wip: 6 edit-op checkpoint (heimdall-wip)
+- 8eff2e3a wip: forced checkpoint (heimdall-wip)
 
 ### Resume
 Runnable, in order:
