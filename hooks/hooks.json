@@ -449,6 +449,14 @@
             "asyncRewake": true
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"${HMD_LAUNCHER_PID:-}\" ] || exit 0; HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled seamless-restart && exit 0; HOOK=\"$HMDP/bin/heimdall-restart-request\"; if [ -x \"$HOOK\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 5; exec @ARGV' \"$HOOK\" --claude-pid \"$PPID\" >/dev/null 2>&1; else \"$HOOK\" --claude-pid \"$PPID\" >/dev/null 2>&1; fi; fi; exit 0"
+          }
+        ]
       }
     ],
     "SessionEnd": [

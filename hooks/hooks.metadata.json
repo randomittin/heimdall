@@ -502,6 +502,16 @@
       "remote_toggle": false
     },
     {
+      "event": "Stop",
+      "index": 6,
+      "id": "seamless-restart",
+      "description": "Seamless restart after an update, request half: at the end of a turn of a session an hmd launcher supervises (HMD_LAUNCHER_PID set), when heimdall-update-pending reports a newer claude or hmd than the session started with, bin/heimdall-restart-request writes $HMD_RESTART_DIR/req.json (atomically, 0600) and sends the launcher one SIGUSR1. It only asks: the launcher's restart gate decides whether and when ending claude is safe, and this hook never ends a process, never blocks the turn, prints nothing and always exits 0. A session without a launcher, HMD_AUTO_RESTART=off, a Stop that continues an earlier one, or nothing pending make it a no-op that forks nothing before its first exit.",
+      "matcher": "",
+      "fingerprint": "ad37016b62a3fc5970b50772ce3b6bb6685bf89becd645e1e5dd5a460875f73a",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "SessionEnd",
       "index": 0,
       "id": "presence-keeper-stop",

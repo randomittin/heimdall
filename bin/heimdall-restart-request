@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# heimdall-restart-request -- the Stop hook of the seamless restart: a newer claude or hmd is installed than this session started with, so ask the
+# launcher that supervises claude to restart it at the next safe point (docs/superpowers/plans/2026-11-13-seamless-update-restart.md, section 2
+# step 2, Task W2-hook).
+#
+# It ASKS and nothing else. It writes $HMD_RESTART_DIR/req.json and sends the launcher one SIGUSR1; the launcher runs heimdall-restart-gate and
+# decides whether, and when, it is safe to end claude. This hook never ends a process, never blocks the turn, prints nothing on stdout and always
+# exits 0, so a failure here costs the old behaviour (the pin notice), never the operator's run.
+#
+#   heimdall-restart-request [--claude-pid P]      the Stop payload ({"session_id", "stop_hook_active", ...}) on stdin
+#
+#   --claude-pid  the claude process this hook belongs to; the hook entry of hooks/hooks.json passes its own parent. Default: this script's parent.
+#
+# Environment (the launcher exports the first three, only for an interactive claude it supervises; a session without HMD_LAUNCHER_PID is never touched):
+#   HMD_LAUNCHER_PID         the launcher's pid: the one process this hook ever signals, with USR1
+#   HMD_RESTART_DIR          an absolute path, the launcher's private directory for this run: req.json goes there (0700, created here when missing)
+#   HMD_LAUNCHER_START_HMD   the hmd version the launcher recorded when it started (X.Y.Z), handed to heimdall-update-pending
+#   HMD_AUTO_RESTART=off     the operator's opt-out, in any case: the hook does nothing
+#   HMD_UPDATE_PENDING_CMD   replaces heimdall-update-pending (a command line, split on blanks; a test seam)
+#   HMD_RESTART_REQUEST_DEBUG=1   one line on stderr says why nothing was requested
+#
+# It requests only when ALL hold, checked cheapest first: HMD_LAUNCHER_PID is a live process id and is the parent of claude (a launcher that died
+# leaves claude's env behind, and its pid may belong to another process by now: USR1 would end it); HMD_AUTO_RESTART is not off; HMD_RESTART_DIR is
+# absolute and a directory of this user (not a link); the payload names a usable session_id and is not itself a continuation (stop_hook_active);
+# heimdall-update-pending reports a pending update. The request {session_id, claude_pid, stop_ts, pending} is written to a temp file and renamed,
+# so the launcher never reads half of it; pending is update-pending's own --json object.
+#
+# The first statements of main() are shell builtins: every Stop of a session that is not supervised ends before anything forks.
+
+# is_pid VALUE: a process id a `kill` can be handed safely: digits only, no leading zero, 2 .. 2^31-1. Not 0 or a negative (those name process
+# groups, -1 everything the user owns), not 1 (init: the parent of an orphaned claude), nothing a 32-bit pid_t would wrap onto 1.
+is_pid() {
+  case "$1" in [1-9]*) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 10 ] && [ "$1" -gt 1 ] && [ "$1" -lt 2147483648 ]
+}
+
+skip() {
+  [ "${HMD_RESTART_REQUEST_DEBUG:-}" = 1 ] && echo "heimdall-restart-request: nothing requested: $1" >&2
+  exit 0
+}
+
+main() {
+  [ -n "${HMD_LAUNCHER_PID:-}" ] || exit 0
+  case "${HMD_AUTO_RESTART:-}" in [Oo][Ff][Ff]) exit 0 ;; esac
+  exec >/dev/null
+  [ "${HMD_RESTART_REQUEST_DEBUG:-}" = 1 ] || exec 2>/dev/null
+  umask 077
+  local launcher="$HMD_LAUNCHER_PID" dir="${HMD_RESTART_DIR:-}" claude_pid="$PPID" payload fields sid active parent pending tmp self here
+  local -a up
+  [ "${1:-}" = --claude-pid ] && claude_pid="${2:-}"
+
+  is_pid "$launcher" || skip "HMD_LAUNCHER_PID is not a process id"
+  kill -0 "$launcher" 2>/dev/null || skip "the launcher (pid $launcher) is gone"
+  case "$dir" in /?*) ;; *) skip "HMD_RESTART_DIR is not an absolute path" ;; esac
+  is_pid "$claude_pid" || skip "the claude pid is not a process id"
+  [ -t 0 ] && skip "stdin is a terminal, the Stop payload is expected on it"
+  command -v jq >/dev/null 2>&1 || skip "jq is not installed"
+
+  IFS= read -r -d '' payload
+  fields="$(printf '%s' "$payload" | jq -r 'select((.session_id | type) == "string" and (.session_id | test("\\A[0-9A-Za-z][0-9A-Za-z._-]{0,127}\\z"))) | "\(.session_id) \(.stop_hook_active == true)"' 2>/dev/null)" \
+    || skip "the Stop payload is not a JSON object"
+  [ -n "$fields" ] || skip "the Stop payload has no usable session_id"
+  sid="${fields% *}"
+  active="${fields##* }"
+  [ "$active" = true ] && skip "stop_hook_active: this Stop continues an earlier one"
+
+  parent="$(ps -o ppid= -p "$claude_pid" 2>/dev/null)"
+  parent="${parent//[[:space:]]/}"
+  [ "$parent" = "$launcher" ] || skip "claude (pid $claude_pid) is not a child of the launcher (pid $launcher)"
+
+  self="${BASH_SOURCE[0]}"
+  while [ -h "$self" ]; do
+    here="$(cd "$(dirname "$self")" && pwd)"
+    self="$(readlink "$self")"
+    case "$self" in /*) ;; *) self="$here/$self" ;; esac
+  done
+  case "$self" in */*) here="${self%/*}" ;; *) here=. ;; esac
+  if [ -n "${HMD_UPDATE_PENDING_CMD:-}" ]; then
+    read -r -a up <<<"$HMD_UPDATE_PENDING_CMD"
+  else
+    up=("$here/heimdall-update-pending")
+  fi
+  pending="$("${up[@]}" --launcher-start-hmd "${HMD_LAUNCHER_START_HMD:-}" --pid "$claude_pid" --json 2>/dev/null)" \
+    || skip "no update is pending, or it could not be read"
+
+  [ -L "$dir" ] && skip "HMD_RESTART_DIR is a symlink"
+  [ -d "$dir" ] || mkdir -p -m 700 "$dir" 2>/dev/null
+  { [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || skip "HMD_RESTART_DIR is not a directory of this user"
+  tmp="$(mktemp "$dir/.req.XXXXXX" 2>/dev/null)" || skip "cannot create a file in HMD_RESTART_DIR"
+  jq -n --arg sid "$sid" --argjson pid "$claude_pid" --argjson pending "$pending" \
+    'if ($pending | type) == "object" then {session_id: $sid, claude_pid: $pid, stop_ts: now, pending: $pending} else error("pending is not an object") end' \
+    >"$tmp" 2>/dev/null && mv -f "$tmp" "$dir/req.json" 2>/dev/null \
+    || { rm -f "$tmp"; skip "cannot write req.json"; }
+  kill -USR1 "$launcher" 2>/dev/null || skip "cannot signal the launcher"
+  exit 0
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
