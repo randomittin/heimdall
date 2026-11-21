@@ -9,6 +9,8 @@
 #   * print-mode: unsupervised, non-tty: unsupervised, opt-out   -p, a pipe (even with HMD_SUPERVISED=1 inherited from an outer session) and HMD_AUTO_RESTART=off: plain
 #     claude, no supervisor in its environment, no restart directory
 #   * team-pane-noop, non-claude-noop   --team panes still TYPE a bare `claude ...` line; nothing but bin/heimdall (and the library) knows the supervisor
+#   * lib-missing: bare claude   a tree without bin/lib/hmd_supervise.sh (a partial install, a sandbox copy of bin/heimdall alone) falls open on both launches: claude runs
+#     bare with the argv the library's own plain path gives it, and its status is the launcher's, instead of "command not found"
 #   * exit-status: claude's rc preserved   the launcher exits with claude's status on every path
 #   * no code after supervised call   the call ends in `exit` inside the same compound command: a launcher rewritten IN PLACE while it runs never reads the new text
 #   * a restart's re-entry   HMD_LAUNCHER_PID == the launcher's own pid (an exec keeps the pid) and HMD_RESUME_SESSION_ID set: `--resume <sid>`; the same variables
@@ -16,7 +18,8 @@
 #   * the exec gap: a USR1 that arrives before the supervisor's own trap is survived
 #   * `hmd restart` (bin/heimdall-restart): on, off, defer, now, status; it writes only its own files and signals nothing
 # Falsifiability: every case was seen RED against the launcher before the change (the supervised ones for lack of a supervisor, the gap and the in-place ones for lack of
-# a trap and of an `exit`); the unsupervised cases are the controls that must hold before AND after. Nothing outside the temp tree is read, written or signalled.
+# a trap and of an `exit`, the lib-missing ones for lack of the launcher's fallback); the unsupervised cases are the controls that must hold before AND after. Nothing
+# outside the temp tree is read, written or signalled.
 #
 # budget: 40 -- ~15 s solo: about fifteen launcher runs, half of them under a real pty (python3 pty), each a few hundred ms of launcher setup before the stub claude
 # Usage:  bash test/launcher-supervised.test.sh
@@ -151,6 +154,7 @@ launch_line() { grep -F 'LAUNCH:' "$LOG" | head -n 1; }
 field() { launch_line | tr ' ' '\n' | sed -n "s/^$1=//p"; }
 launch_argv() { grep -F '[--agent] [heimdall]' "$LOG" | head -n 1; }
 snip() { head -c 300 "$1" 2>/dev/null | LC_ALL=C tr '\n' ' '; }
+tail_snip() { tail -c 300 "$1" 2>/dev/null | LC_ALL=C tr '\n' ' '; }      # where a launcher that died ("command not found") says so: after its banner
 restart_dir_exists() { [ -e "$HOME_DIR/.heimdall/restart" ]; }
 
 # supervised_ok LABEL: the last run launched claude as a DIRECT child of a supervising launcher, with what the Stop hook and the gate read
@@ -177,8 +181,9 @@ unsupervised_ok() {
 }
 
 echo "-- structure"
-n="$(grep -c 'hmd_supervised_claude' "$HEIMDALL")"
-if [ "$n" = 2 ]; then ok "structure: bin/heimdall names the supervised call exactly twice (the two call sites)"; else bad "structure: the supervised call is named $n times in bin/heimdall, want 2"; fi
+# a CALL is a line that starts with the function's name: the one-line fail-open definition (it starts with `declare`) names it too and is not a call site
+n="$(grep -cE '^[[:space:]]*hmd_supervised_claude([[:space:]]|$)' "$HEIMDALL")"
+if [ "$n" = 2 ]; then ok "structure: bin/heimdall calls the supervised function exactly twice (the two call sites; its fail-open definition is not a call)"; else bad "structure: the supervised function is called $n times in bin/heimdall, want 2"; fi
 if sed -n '/^# --team N/,/^# --help/p' "$HEIMDALL" | grep -q 'hmd_supervised_claude\|HMD_SUPERVISED'; then bad "structure: the --team path must not touch the supervisor"; else ok "structure: the --team path is untouched"; fi
 if head -n 40 "$HEIMDALL" | grep -qF 'trap : USR1'; then ok "structure: trap : USR1 is among the first statements of bin/heimdall"; else bad "structure: no trap : USR1 near the top of bin/heimdall"; fi
 if grep -q '_heimdall_launch_cleanup' "$HEIMDALL"; then ok "structure: the cleanup trap body is kept"; else bad "structure: _heimdall_launch_cleanup is gone"; fi
@@ -201,6 +206,29 @@ launch plain HMD_SUPERVISED=1 -- "$FAKE/bin/heimdall"
 unsupervised_ok "non-tty: unsupervised even when HMD_SUPERVISED=1 is inherited from an outer session"
 launch tty HMD_AUTO_RESTART=OFF -- "$FAKE/bin/heimdall"
 unsupervised_ok "opt-out: HMD_AUTO_RESTART=off (any case) launches claude plainly"
+
+echo "-- the supervisor library missing"
+# A tree without bin/lib/hmd_supervise.sh (a partial install, a sandbox copy of bin/heimdall alone) leaves the supervised function undefined, and both launches used to die
+# with "command not found" before claude started. The launcher falls open to the bare `claude ...` it ran before the supervisor existed. The control is the library's own
+# plain path (HMD_AUTO_RESTART=off is exactly `claude "$@"`): the same launch, so the same argv once what the two sandboxes do not share (their plugin dir, the preamble
+# file's random name) is taken out.
+NOLIB="$T/plugin-nolib"
+mkdir -p "$NOLIB/bin" "$NOLIB/.claude-plugin"
+cp "$HEIMDALL" "$NOLIB/bin/heimdall"
+cp "$FAKE/.claude-plugin/plugin.json" "$NOLIB/.claude-plugin/plugin.json"
+chmod +x "$NOLIB/bin/heimdall"
+norm_argv() { launch_argv | sed -E -e "s|$1|<plugin>|g" -e 's/(\[--append-system-prompt-file\] )\[[^]]*\]/\1[<file>]/'; }
+for site in interactive resume; do
+  site_args=()
+  if [ "$site" = resume ]; then site_args=(--resume); fi
+  launch tty HMD_AUTO_RESTART=off -- "$FAKE/bin/heimdall" ${site_args[@]+"${site_args[@]}"}
+  want="$(norm_argv "$FAKE")"
+  launch tty STUB_RC=3 -- "$NOLIB/bin/heimdall" ${site_args[@]+"${site_args[@]}"}
+  got="$(norm_argv "$NOLIB")"
+  unsupervised_ok "lib missing, $site: claude launches bare (nothing of the supervisor in its environment, no restart directory)"
+  if [ -n "$want" ] && [ "$got" = "$want" ]; then ok "lib missing, $site: the argv is identical to the library's own plain launch"; else bad "lib missing, $site: the argv differs from the library's plain launch" "got [$got] want [$want] end-of-output=[$(tail_snip "$OUT")]"; fi
+  if [ "$RC" = 3 ]; then ok "lib missing, $site: claude's status (3) is the launcher's"; else bad "lib missing, $site: claude's status was not preserved" "rc=$RC end-of-output=[$(tail_snip "$OUT")]"; fi
+done
 
 echo "-- panes and other tools"
 launch plain -- "$FAKE/bin/heimdall" --team 2 do the thing
