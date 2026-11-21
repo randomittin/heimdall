@@ -24,8 +24,9 @@
 # and would pass for a wrong implementation only if lsof were ignored.
 #
 # R6 (checks must be able to fail): every case asserts a behaviour a regression would flip.
-# All fixtures are stubs + temp dirs — the real ~/.local/share/claude is never touched and
-# no real `claude update` is ever invoked.
+# All fixtures are stubs + temp dirs — the real ~/.local/share/claude is never touched, the
+# real ~/.claude/sessions is never read (cases 11-13 pin it, below), and no real
+# `claude update` is ever invoked.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +41,14 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cc-update-test.XXXXXX")"
 cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
 trap cleanup EXIT
+
+# `pin-notice` asks claude's own ~/.claude/sessions/<pid>.json for the running version BEFORE it asks
+# lsof (seam HEIMDALL_CC_SESSIONS_DIR). Cases 11-13 hand it fixture pids (8029, 92315) plus an lsof stub,
+# so a real sessions file for one of those pids would answer in the stub's place and flip the verdict.
+# Every selfheal call below therefore reads this EMPTY per-run dir (set unconditionally: an ambient value
+# is overridden too), never ~/.claude/sessions. The suite never writes into it, so the stub stays the
+# only source of the version.
+export HEIMDALL_CC_SESSIONS_DIR="$WORK/sessions"; mkdir -p "$HEIMDALL_CC_SESSIONS_DIR"
 
 # ── fixture: a native-shaped claude install ─────────────────────────────────────
 # versions/{2.1.208,2.1.209,2.1.210,2.1.211}, launcher symlink -> 2.1.211, lock dir.
