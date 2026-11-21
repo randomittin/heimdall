@@ -4,12 +4,13 @@
   "parity_source": "PARITY.md",
   "baseline_tag": "v1.1.0 (superx)",
   "totals": {
-    "fixtures": 23,
-    "fixture_asserts": 172,
+    "fixtures": 22,
+    "fixture_asserts": 167,
     "no_fixture_rows": 14,
+    "moved_fixtures": 1,
     "findings": 2,
     "skips": 2,
-    "note": "fixtures[] each map to a PARITY.md kept/renamed/improved row with observable behavior; no_fixture[] accounts for the remaining rows (model-gated, prose-only, net-new-without-baseline, or intentionally-dropped) so coverage is 100%."
+    "note": "fixtures[] each map to a PARITY.md kept/renamed/improved row with observable behavior; no_fixture[] accounts for the remaining rows (model-gated, prose-only, net-new-without-baseline, or intentionally-dropped) so coverage is 100%. moved[] accounts for the rows whose fixture left for a split-out repository (hmd-statusline), so coverage stays 100%."
   },
   "fixtures": [
     {
@@ -137,13 +138,6 @@
       "note": "Static check of hooks/hooks.json; executing them would commit to the repo. Hooks NOT modified."
     },
     {
-      "row": "Statusline [SUPERX] prefix (renamed->[HEIMDALL]) + phase (kept) + improved token-bar/glyphs/goal/face + Config statusline.command (kept)",
-      "class": "statusline",
-      "fixture_path": "conformance/statusline/prefix-and-elements.fixture.sh",
-      "asserts": 5,
-      "observable": true
-    },
-    {
       "row": "Config settings.json agent (renamed superx->heimdall) + env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS (kept) + statusline.command (kept)",
       "class": "config",
       "fixture_path": "conformance/config/settings.fixture.sh",
@@ -265,6 +259,18 @@
       "class": "dropped",
       "observable": false,
       "rationale": "out of scope: these are `intentionally dropped` or `findings`, not kept/renamed/improved rows. P2 targets kept/renamed/improved-with-observable rows; drops are listed here for 100% accounting only."
+    }
+  ],
+  "moved": [
+    {
+      "row": "Statusline [SUPERX] prefix (renamed->[HEIMDALL]) + phase (kept) + improved token-bar/glyphs/goal/face + Config statusline.command (kept)",
+      "class": "statusline",
+      "observable": true,
+      "moved_to": "hmd-statusline",
+      "tag": "v1.0.0",
+      "fixture_path_in_repo": "conformance/statusline/prefix-and-elements.fixture.sh",
+      "asserts": 5,
+      "note": "T3.2 of docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md: the fixture lives in the hmd-statusline repository (tag v1.0.0), not here. Heimdall keeps the renderer it drives (sentinels/hmd-statusline.py, hooks/statusline.sh), pinned in vendor/vendor.lock.json."
     }
   ]
 }

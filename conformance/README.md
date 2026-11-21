@@ -83,7 +83,9 @@ will iterate. Shape:
 
 - `fixtures[]` — `{ row, class, fixture_path, asserts, observable: true, [note|finding] }`
 - `no_fixture[]` — `{ row, class, observable: false, rationale }`
-- `totals` — counts (fixtures, asserts, no_fixture rows, findings, skips).
+- `moved[]` — `{ row, class, observable: true, moved_to, tag, fixture_path_in_repo, asserts, note }`: a row whose fixture left for a split-out repository
+  (T3.2 of `docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md`). It is accounted for there, and a CI step iterating `fixtures[]` skips it.
+- `totals` — counts (fixtures, asserts, no_fixture rows, moved fixtures, findings, skips).
 
 ## Future CI wiring (NOT done here)
 

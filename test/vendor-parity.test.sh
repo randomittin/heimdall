@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 #
-# vendor-parity.test.sh -- T3.1 of docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md: heimdall pins the split-out skills and statusline
-# repositories in vendor/vendor.lock.json, and its in-tree copies equal BOTH the pin and the recording of the tree before the split
+# vendor-parity.test.sh -- T3.1 and T3.2 of docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md: heimdall pins the split-out skills and
+# statusline repositories in vendor/vendor.lock.json, and its in-tree copies equal BOTH the pin and the recording of the tree before the split
 # (evals/split/baseline.json, written in W0 by another tool, bin/lib/split_baseline.py). INV-S1 and INV-S2 of .planning/split/INVARIANTS.md.
+#
+# T3.2 moved 41 recorded files out of heimdall: the 24 suites that call only the renderer, and the 17 files of conformance/statusline/ that are not a sigil
+# golden (test/heimdall-sigil-render.test.sh, an integration suite that stays, compares against those 9). They live in hmd-statusline at v1.0.0, history
+# included, and are neither in this tree nor in the lock; the recording keeps them, as the tree was before the split. So the recording is the whole of the
+# lock, the two core-only suites and the 41 moved paths, and each moved path must be GONE here and PRESENT in the tag.
 #
 # `heimdall-vendor verify` alone says the mirror hashes to the lock: a lock and a mirror edited together would still pass it. So the claim is checked
 # three ways, each a GREEN control on the real tree next to RED mutations of one thing on a throwaway copy:
@@ -10,13 +15,16 @@
 #      tree; it is exit 1 for a flipped byte (same size), a dropped exec bit on hooks/statusline.sh, a deleted file, a flipped tree_sha256 and a path
 #      dropped from the lock.
 #   B. the mirror equals the recording byte for byte: every pinned path has the sha256 and exec bit the recording has (hashed here by shasum, not by the
-#      tool); nothing is pinned that the recording does not list; nothing the recording lists is left unpinned except the two suites that stay core-only.
-#      RED for the same mutations, a doctored recording, a core-only suite pinned and a path the recording does not know pinned.
+#      tool); nothing is pinned that the recording does not list; nothing the recording lists is left unpinned except the two suites that stay core-only
+#      and the 41 that moved, which must be absent from the tree. RED for the same mutations, a doctored recording, a core-only suite pinned, a moved path
+#      pinned again or restored in the tree, a recording that lost a moved path, a sigil golden dropped from the lock and a path the recording does not
+#      know pinned.
 #   C. the pin is the tag: when the local clones sit next to the heimdall checkout (HMD_SPLIT_REPOS_DIR overrides the directory), `verify --upstream
-#      --source` fetches v1.0.0 from each and wants the locked commit and tree_sha256; RED for a lock with another commit. A clone that is not there
-#      is a printed skip (CI has none): the pin is then checked offline by A and B only.
+#      --source` fetches v1.0.0 from each and wants the locked commit and tree_sha256, and the 41 moved paths are in the hmd-statusline tag at the
+#      recorded sha256 and exec bit (the deletion lost nothing); RED for a lock with another commit and for a recording hash that is not the tag's. A
+#      clone that is not there is a printed skip (CI has none): the pin is then checked offline by A and B only.
 # No network: every source is a local path and ssh is switched off.
-# cost: about 20 runs of the tool (python3), as many of jq, ~10 batch shasum calls and up to three local fetches of a tag: seconds solo.
+# cost: about 25 runs of the tool (python3), as many of jq, ~12 batch shasum calls and up to three local fetches of a tag: seconds solo.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -26,6 +34,12 @@ LOCK="$ROOT/vendor/vendor.lock.json"
 BASE="$ROOT/evals/split/baseline.json"
 # The two statusline suites the recording lists that stay in heimdall and are not in the new repo: they test host code (plan section 4).
 CORE_ONLY="test/heimdall-init-cursor-statusline.test.sh test/heimdall-status-json.test.sh"
+# The 24 suites T3.2 deleted: they call only the renderer (plan section 4), so they live in hmd-statusline alone. Written out here, not read from the
+# recording or the tool. The 17 conformance files that went with them are derived from the recording below.
+MOVED_SUITES="sigil-cache sigil-custom sigil-detailed sigil-eyestrip-mini sigil-micro sigil-png sigil-sprites sigil-team-mini
+  statusline-agents-cache statusline-cc-columns statusline-cc-region-reserve statusline-cols-detect statusline-crossbranch statusline-density
+  statusline-eyestrip statusline-fullbleed statusline-gauge statusline-host-boundary statusline-identity-flip statusline-panel-floor
+  statusline-perf-budget statusline-register-cursor statusline-terminals statusline-width"
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
@@ -40,6 +54,9 @@ for need in "$TOOL" "$LOCK" "$BASE"; do
   [ -f "$need" ] || { echo "FATAL: $need is missing"; echo "vendor-parity: 0 passed, 1 failed"; exit 1; }
 done
 [ -x "$TOOL" ] || { echo "FATAL: $TOOL is not executable"; echo "vendor-parity: 0 passed, 1 failed"; exit 1; }
+# MOVED: the paths that left heimdall, sorted (the suites above, and every recorded file under conformance/statusline/ that is not a sigil golden).
+MOVED="$({ for s in $MOVED_SUITES; do echo "test/heimdall-$s.test.sh"; done
+           jq -r '.paths[].path | select(startswith("conformance/statusline/") and (startswith("conformance/statusline/goldens/sigil/") | not))' "$BASE"; } | LC_ALL=C sort)"
 
 WORK="$(mktemp -d)" || { echo "FATAL: cannot make a temp dir"; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
@@ -91,22 +108,39 @@ tree_lines() {
     printf '%s %s %s\n' "$h" "$([ -x "$dir/$p" ] && echo x || echo -)" "$p"
   done | LC_ALL=C sort -k3,3
 }
-# base_lines <lock> <baseline>: the recording's "<sha256> <x|-> <path>" for the paths the lock pins
+# base_lines <path list file> <baseline>: the recording's "<sha256> <x|-> <path>" for the listed paths
 base_lines() {
-  jq -r --slurpfile lock "$1" '($lock[0].repos | map(.paths) | add) as $pinned
-    | .paths[] | select(.path as $p | $pinned | any(. == $p))
+  jq -r --rawfile list "$1" '($list | split("\n")) as $want
+    | .paths[] | select(.path as $p | $want | any(. == $p))
     | "\(.sha256) \(if .exec then "x" else "-" end) \(.path)"' "$2" | LC_ALL=C sort -k3,3
 }
 # parity_problems <tree> <lock> <baseline>: one line for each way the tree, the lock and the recording disagree; nothing when they agree
 parity_problems() {
-  local tree="$1" lock="$2" base="$3"
+  local tree="$1" lock="$2" base="$3" p
   jq -r '.repos[].paths[]' "$lock" | LC_ALL=C sort > "$WORK/pp.lock"
   jq -r '.paths[].path' "$base" | LC_ALL=C sort > "$WORK/pp.base"
   printf '%s\n' $CORE_ONLY | LC_ALL=C sort > "$WORK/pp.core"
-  comm -23 "$WORK/pp.lock" "$WORK/pp.base" | sed 's/^/pinned, not in the recording: /'
-  comm -13 "$WORK/pp.lock" "$WORK/pp.base" | comm -23 - "$WORK/pp.core" | sed 's/^/in the recording, not pinned: /'
-  comm -12 "$WORK/pp.lock" "$WORK/pp.core" | sed 's/^/pinned, but stays core-only: /'
-  diff <(base_lines "$lock" "$base") <(tree_lines "$tree" "$WORK/pp.lock") | grep '^[<>]' | sed 's/^/differs (< recording, > tree): /'
+  printf '%s\n' "$MOVED" > "$WORK/pp.moved"
+  LC_ALL=C comm -23 "$WORK/pp.lock" "$WORK/pp.base" | sed 's/^/pinned, not in the recording: /'
+  LC_ALL=C comm -13 "$WORK/pp.lock" "$WORK/pp.base" | LC_ALL=C comm -23 - "$WORK/pp.core" | LC_ALL=C comm -23 - "$WORK/pp.moved" | sed 's/^/in the recording, not pinned: /'
+  LC_ALL=C comm -12 "$WORK/pp.lock" "$WORK/pp.core" | sed 's/^/pinned, but stays core-only: /'
+  LC_ALL=C comm -12 "$WORK/pp.lock" "$WORK/pp.moved" | sed 's/^/pinned, but moved to hmd-statusline: /'
+  LC_ALL=C comm -23 "$WORK/pp.moved" "$WORK/pp.base" | sed 's/^/moved, but not in the recording: /'
+  for p in $MOVED; do
+    if [ -e "$tree/$p" ] || [ -L "$tree/$p" ]; then echo "moved to hmd-statusline, but still in the tree: $p"; fi
+  done
+  diff <(base_lines "$WORK/pp.lock" "$base") <(tree_lines "$tree" "$WORK/pp.lock") | grep '^[<>]' | sed 's/^/differs (< recording, > tree): /'
+}
+# moved_problems <clone> <baseline>: one line for each moved path that tag v1.0.0 of the clone does not carry at the recorded sha256 and exec bit
+moved_problems() {
+  local clone="$1" base="$2" err
+  printf '%s\n' "$MOVED" > "$WORK/mv.list"
+  rm -rf "$WORK/tag" "$WORK/tag.tar"; mkdir -p "$WORK/tag"
+  if ! err="$(git -C "$clone" archive --format=tar -o "$WORK/tag.tar" v1.0.0 -- $MOVED 2>&1)"; then
+    echo "tag v1.0.0 of $clone does not carry every moved path: $(head -2 <<<"$err")"; return
+  fi
+  tar -xf "$WORK/tag.tar" -C "$WORK/tag"
+  diff <(base_lines "$WORK/mv.list" "$base") <(tree_lines "$WORK/tag" "$WORK/mv.list") | grep '^[<>]' | sed 's/^/differs (< recording, > tag): /'
 }
 
 jq -r '.repos[].paths[]' "$LOCK" | LC_ALL=C sort > "$WORK/paths.lock"
@@ -144,9 +178,15 @@ jq 'del(.repos[1].paths[] | select(. == "hooks/statusline.sh"))' "$LOCK" > "$WOR
 red "RED: a moved path (hooks/statusline.sh) dropped from the lock" "FAIL hmd-statusline: tree_sha256 differs" verify --all --lock "$WORK/lock.drop"
 
 echo "== B) the mirror equals the recording (evals/split/baseline.json), byte for byte =="
+NMOVED="$(printf '%s\n' "$MOVED" | grep -c .)"
+if [ "$NMOVED" = 41 ] && ! contains "$MOVED" "goldens/sigil/"; then ok "$NMOVED recorded paths moved out to hmd-statusline: 24 renderer-only suites and 17 conformance files, no sigil golden among them"
+else bad "the moved set has $NMOVED paths (want 41: 24 suites and 17 conformance files, no sigil golden)"; fi
 PROBLEMS="$(parity_problems "$ROOT" "$LOCK" "$BASE")"
-if [ -z "$PROBLEMS" ]; then ok "every one of the $NPATHS pinned paths has the recorded sha256 and exec bit; lock plus the two core-only suites is the whole recording"
+if [ -z "$PROBLEMS" ]; then ok "every one of the $NPATHS pinned paths has the recorded sha256 and exec bit; lock + the two core-only suites + the $NMOVED moved paths (gone from the tree) are the whole recording"
 else bad "the tree, the lock and the recording disagree: $(head -5 <<<"$PROBLEMS")"; fi
+GONE_CORE=""
+for p in $CORE_ONLY; do [ -f "$ROOT/$p" ] || GONE_CORE="$GONE_CORE $p"; done
+if [ -z "$GONE_CORE" ]; then ok "the two core-only suites are still in the tree"; else bad "a core-only suite is gone from the tree:$GONE_CORE"; fi
 fresh; flip_byte "$M/sentinels/hmd_sigil.py"
 names "RED: a changed byte in a copy is named" "$(parity_problems "$M" "$LOCK" "$BASE")" "differs (< recording, > tree): "
 names "RED: ... and the path it is in" "$(parity_problems "$M" "$LOCK" "$BASE")" "sentinels/hmd_sigil.py"
@@ -161,18 +201,30 @@ jq '.repos[1].paths += ["test/heimdall-status-json.test.sh"]' "$LOCK" > "$WORK/l
 names "RED: a core-only suite pinned is reported" "$(parity_problems "$ROOT" "$WORK/lock.core" "$BASE")" "pinned, but stays core-only: test/heimdall-status-json.test.sh"
 jq '.repos[1].paths += ["hooks/hooks.json"]' "$LOCK" > "$WORK/lock.extra"
 names "RED: a pinned path the recording does not list is reported" "$(parity_problems "$ROOT" "$WORK/lock.extra" "$BASE")" "pinned, not in the recording: hooks/hooks.json"
+jq '.repos[1].paths += ["test/heimdall-statusline-gauge.test.sh"]' "$LOCK" > "$WORK/lock.moved"
+names "RED: a moved suite pinned again is reported" "$(parity_problems "$ROOT" "$WORK/lock.moved" "$BASE")" "pinned, but moved to hmd-statusline: test/heimdall-statusline-gauge.test.sh"
+fresh; mkdir -p "$M/test" "$M/conformance/statusline"; : > "$M/test/heimdall-statusline-width.test.sh"; : > "$M/conformance/statusline/INVARIANTS.md"
+RESTORED="$(parity_problems "$M" "$LOCK" "$BASE")"
+names "RED: a moved suite restored in the tree is named" "$RESTORED" "moved to hmd-statusline, but still in the tree: test/heimdall-statusline-width.test.sh"
+names "RED: ... and so is a restored conformance file" "$RESTORED" "moved to hmd-statusline, but still in the tree: conformance/statusline/INVARIANTS.md"
+jq 'del(.paths[] | select(.path == "test/heimdall-statusline-width.test.sh"))' "$BASE" > "$WORK/base.nomoved"
+names "RED: a recording that lost a moved path is reported" "$(parity_problems "$ROOT" "$LOCK" "$WORK/base.nomoved")" "moved, but not in the recording: test/heimdall-statusline-width.test.sh"
+jq 'del(.repos[1].paths[] | select(. == "conformance/statusline/goldens/sigil/rj_M_256.txt"))' "$LOCK" > "$WORK/lock.golden"
+names "RED: a sigil golden dropped from the lock is unpinned, not mistaken for moved (test/heimdall-sigil-render.test.sh compares against it)" \
+  "$(parity_problems "$ROOT" "$WORK/lock.golden" "$BASE")" "in the recording, not pinned: conformance/statusline/goldens/sigil/rj_M_256.txt"
 
 echo "== C) the pin is the tag (local clones) =="
 REPOS_DIR="${HMD_SPLIT_REPOS_DIR:-}"
 if [ -z "$REPOS_DIR" ] && command -v git >/dev/null 2>&1; then
   COMMON="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" && REPOS_DIR="$(dirname "$(dirname "$COMMON")")"
 fi
-first_clone=""
+first_clone=""; statusline_clone=""
 for name in hmd-skills hmd-statusline; do
   src="$REPOS_DIR/$name"
   if [ -n "$REPOS_DIR" ] && git -C "$src" rev-parse -q --verify "refs/tags/v1.0.0" >/dev/null 2>&1; then
     green "verify --upstream: tag v1.0.0 of $src is the locked commit and tree_sha256" "tag checked upstream" verify "$name" --upstream --source "$src" --lock "$LOCK"
     [ "$name" = hmd-skills ] && first_clone="$src"
+    [ "$name" = hmd-statusline ] && statusline_clone="$src"
   else
     echo "  skip $name: no clone with tag v1.0.0 at '$src' (HMD_SPLIT_REPOS_DIR names the directory that holds it)"
   fi
@@ -180,6 +232,13 @@ done
 if [ -n "$first_clone" ]; then
   jq ".repos[0].commit |= $FLIP" "$LOCK" > "$WORK/lock.commit"
   red "RED: a lock pinning another commit than the tag has" "the tag moved, or the lock is stale" verify hmd-skills --upstream --source "$first_clone" --lock "$WORK/lock.commit"
+fi
+if [ -n "$statusline_clone" ]; then
+  MP="$(moved_problems "$statusline_clone" "$BASE")"
+  if [ -z "$MP" ]; then ok "all $NMOVED moved paths are in tag v1.0.0 of $statusline_clone at the recorded sha256 and exec bit: the deletion lost nothing"
+  else bad "a moved path is not in the tag as recorded: $(head -3 <<<"$MP")"; fi
+  jq '(.paths[] | select(.path == "test/heimdall-statusline-width.test.sh") | .sha256) |= '"$FLIP" "$BASE" > "$WORK/base.flipmoved"
+  names "RED: a recorded hash of a moved suite that is not the tag's is named" "$(moved_problems "$statusline_clone" "$WORK/base.flipmoved")" "test/heimdall-statusline-width.test.sh"
 fi
 
 echo
