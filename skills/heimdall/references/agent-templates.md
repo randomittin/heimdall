@@ -287,7 +287,7 @@ vs 59/66 unnamed. It is not recoverable by PROMPT — a controlled pair testing 
 await messages" clause produced one `idle_notification` each either way, both recorded
 `"taskKind": "in_process_teammate"`. It IS recoverable by TOOL: `TaskStop` closes a named agent by
 name or agent ID, `SendMessage` resumes it. So `name:` now costs a leak you must remember to clean
-up — not an unkillable row. See "Closing an idle agent" below.
+up — not an unkillable row. See "Closing a finished agent" below.
 (conventions R13; proof: `bash test/agent-name-gate.test.sh`)
 
 Spawn every role in a wave in ONE message, each `run_in_background: true`:
@@ -337,40 +337,8 @@ to the spawn call. You collect its output via `SendMessage`, not by awaiting the
 Accept what it costs: you OWN its lifecycle. Nothing reaps it for you. If you name it, you must
 `TaskStop` it. A role that does a unit of work and reports back is NOT this case. Spawn it unnamed.
 
-### Closing an idle agent — automatic, no human input
+### Closing a finished agent — automatic, no human input
 
-When a spawned agent parks, the harness delivers an `idle_notification` to the parent:
+When a background agent's completion notice reads `Agent "<desc>" finished`, `TaskStop` its id in the same turn, unless you are keeping it for a follow-up (say why). A notice reading `is waiting on its own background work` is not finished: leave it. Never `TaskStop` an agent that is still working. `idle_notification` only comes from named agents, so it does not drive closing the unnamed agents you spawn.
 
-```json
-{"type":"idle_notification","from":"<agent name>","idleReason":"available"}
-```
-
-**The rule: on an `idle_notification` from an agent whose work is complete, call `TaskStop` on it.**
-Immediately, without asking. This is judgement, not reflex:
-
-- Delivered its result and parked → **stop it.**
-- Deliberately kept resident for a multi-turn conversation you intend to continue via `SendMessage`
-  → **keep it**, and say so explicitly in your reasoning ("keeping <name>: still driving it for X").
-  A keep you cannot justify in one sentence is a leak.
-- **Never `TaskStop` an agent that is still working.** Killing live work is far worse than a
-  lingering idle row. `idleReason: "available"` means parked-and-available — confirm the notification
-  actually says that. Never stop on an inference that an agent "looks done".
-
-Agents that parked BEFORE this rule applied send no fresh notification. Sweep them:
-
-```bash
-bin/heimdall-agents orphans      # lists parked mailbox teammates by name
-```
-
-`TaskStop` each name whose work is complete, applying the same three checks.
-
-**Verification status: `TaskStop` is CONFIRMED PRESENT and functional.** It ships in Claude Code
-2.1.198+ and was added to the agent definitions in `b214eb1`; definitions load at session start, so
-the session that first wrote this rule could not exercise it — a later session could, and `TaskStop`
-correctly enumerated the running agent set.
-
-**Verified scoping limit — this is the part that bites.** `TaskStop` only reaches agents the CALLING
-SESSION spawned. A cross-session stop returns `No task found with ID`. So you can always close what
-YOU opened, and you can NEVER close what another session opened. That is precisely why
-`bin/heimdall-agents orphans` still earns its place: agents stranded by a dead session are beyond
-`TaskStop`'s reach and need the sweep.
+`TaskStop` reaches only agents the calling session spawned: a cross-session stop returns `No task found with ID`, so you can close what you opened and never what another session opened. Agents stranded by a dead session, or parked before this rule, are swept with `bin/heimdall-agents orphans`. The full rule, the notice table and the finished-but-open backstop (`hmd agents finished list`) are in `agents/heimdall.md` §4d.
