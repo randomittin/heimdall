@@ -5,8 +5,10 @@
 
 WHY. A long session spawns thousands of subagents and each leaves its transcript on disk: one session measured 8.7 GB in 2,051
 files, five over 425 MB (docs/analysis/2026-11-20-finished-agents-still-listed.md, recommendation 7). Stopping an agent does not
-remove its transcript and nothing else does. They are also the only record of what an agent did, so this is a tool you run: no hook,
-timer or other command calls it, and with no --compress or --delete it only lists what it would touch.
+remove its transcript and nothing else does. They are also the only record of what an agent did, so deleting is a tool you run:
+nothing calls --delete for you. The one automatic caller is bin/heimdall-agents-auto-prune (the agents-auto-prune SessionStart hook,
+at most once a day, off with HMD_AUTO_PRUNE=off), which asks for `--compress --older-than 14d` and nothing else. With no --compress or
+--delete the tool only lists what it would touch.
 
 WHAT IT TOUCHES: only <config>/projects/<project>/<session>/subagents/agent-<id>.jsonl and agent-<id>.meta.json (and the .gz of
 either, which --compress leaves and a later --delete removes), where <config> is $CLAUDE_CONFIG_DIR or ~/.claude. One agent is
@@ -372,8 +374,9 @@ def build_parser():
         description=(
             "Compress or delete the transcripts of old, finished subagents:\n"
             "<config>/projects/<project>/<session>/subagents/agent-<id>.jsonl and .meta.json, <config> being\n"
-            "$CLAUDE_CONFIG_DIR or ~/.claude. Opt-in: it never runs by itself (no hook, timer or command calls it),\n"
-            "and with neither --compress nor --delete it only lists what it would touch (count and bytes)."),
+            "$CLAUDE_CONFIG_DIR or ~/.claude. --delete never runs by itself. Once a day a SessionStart hook runs\n"
+            "--compress --older-than 14d for you (off: HMD_AUTO_PRUNE=off, or hmd guardrails off agents-auto-prune).\n"
+            "With neither --compress nor --delete it only lists what it would touch (count and bytes)."),
         epilog=(
             "An agent is finished when its newest file is older than --older-than and its session is not running: no\n"
             "live process in <config>/sessions/*.json names it and nothing in the session (these agents' files included)\n"

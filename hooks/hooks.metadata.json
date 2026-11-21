@@ -412,6 +412,16 @@
       "remote_toggle": false
     },
     {
+      "event": "SessionStart",
+      "index": 16,
+      "id": "agents-auto-prune",
+      "description": "Once a day, in the background, compresses (never deletes) the transcripts of subagents finished more than 14 days ago: launches bin/heimdall-agents-auto-prune detached (nohup + setsid, stdin, stdout and stderr cut off, so a SessionStart hook's stdout never reaches the model and the session never waits). Not launched for a subagent's own session start (CLAUDE_CODE_CHILD_SESSION is set, and every subagent start fires SessionStart), so a long session's thousands of subagents cost a shell test each. It takes an flock lock and a 24 h stamp under $HEIMDALL_HOME, then runs heimdall-agents-prune --compress --older-than 14d (HMD_AUTO_PRUNE_DAYS, at least 3; never --delete; the tool's own rules skip a session with a live process and anything written in the last 10 minutes), at the lowest CPU priority, killed after HMD_AUTO_PRUNE_TIMEOUT_S (600), and appends ONE line (agents, files, bytes reclaimed, or why it failed) to $HEIMDALL_HOME/logs/agents-prune.log. Off: HMD_AUTO_PRUNE=off in the environment Claude Code runs in, or heimdall-hooks disable agents-auto-prune (hmd guardrails off agents-auto-prune). Fail-open, exit 0 on every path.",
+      "matcher": "",
+      "fingerprint": "ed84f43964301dcda783047c7dc7bf5a4da7f450702826863789938f353e1677",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "SubagentStop",
       "index": 0,
       "id": "subagent-metric",

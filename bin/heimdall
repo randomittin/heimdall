@@ -2487,9 +2487,11 @@ case "${1:-}" in
     # each with the command that re-attaches it: `hmd --resume <id>`, which attaches instead of letting `claude --continue`
     # refuse a conversation that is running in the background (bin/heimdall-bg-sessions has the facts). Not the tracker of
     # Agent-tool SUBAGENTS in bin/heimdall-agents, which is a different thing. Exit: 0 listed (or none), 3 claude could not list.
-    # `hmd agents prune [...]`: the OPT-IN disk clean-up of old subagent transcripts (bin/heimdall-agents-prune): compress or
-    # delete those of finished subagents past an age, a dry run unless told otherwise, called by nothing but this verb. Its
-    # arguments are forwarded verbatim. `hmd agents --help` is answered here, since the list verb's own help cannot know prune.
+    # `hmd agents prune [...]`: the disk clean-up of old subagent transcripts (bin/heimdall-agents-prune): compress or delete
+    # those of finished subagents past an age, a dry run unless told otherwise. By hand it is called by nothing but this verb;
+    # the one automatic caller is bin/heimdall-agents-auto-prune (the agents-auto-prune SessionStart hook, once a day), which
+    # only compresses. Its arguments are forwarded verbatim. `hmd agents --help` is answered here, since the list verb's own
+    # help cannot know prune.
     shift
     case "${1:-}" in
       prune)
@@ -2508,8 +2510,9 @@ hmd agents -- background sessions and subagent transcripts
 
   hmd agents                  list this directory's background Claude Code sessions, with the command that re-attaches one
   hmd agents finished [list|clear]  finished Agent-tool subagents never closed with TaskStop
-  hmd agents prune [OPTIONS]  opt-in disk clean-up: compress or delete the transcripts of old, finished subagents
-                              (~/.claude/projects/<project>/<session>/subagents/agent-*). It never runs by itself, and with
+  hmd agents prune [OPTIONS]  disk clean-up: compress or delete the transcripts of old, finished subagents
+                              (~/.claude/projects/<project>/<session>/subagents/agent-*). --delete never runs by itself; once a
+                              day a SessionStart hook runs --compress --older-than 14d (HMD_AUTO_PRUNE=off turns that off). With
                               neither --compress nor --delete it is a dry run that lists the count and the bytes.
 
   prune options: --older-than 14d  --compress | --delete [--yes]  --dry-run  --project DIR

@@ -93,9 +93,11 @@ The skill registry (`skills.manifest.json`) is behind the flag `skills.registry`
 
 Guardrails are tiered in `guardrails.manifest.json`. `hmd guardrails list|why|off|on` shows and records the choice; `core` guards cannot be turned off. `hmd guardrails off` records the choice now; the per-guard switches inside the Bash and Agent hooks are pending operator approval and land with it.
 
-## Disk clean-up (opt-in)
+## Disk clean-up
 
-`hmd agents prune` compresses or deletes the transcripts of old, finished subagents (`~/.claude/projects/<project>/<session>/subagents/agent-*`, gigabytes after a long session): a dry run that lists the count and the bytes unless you pass `--compress` (gzip in place, read back with `gzip -dc FILE.gz`) or `--delete` (asks first, or `--yes`); it never runs by itself and never touches a running session, a main transcript or anything outside `~/.claude/projects`; `hmd agents prune --help` lists the options.
+`hmd agents prune` compresses or deletes the transcripts of old, finished subagents (`~/.claude/projects/<project>/<session>/subagents/agent-*`, gigabytes after a long session): a dry run that lists the count and the bytes unless you pass `--compress` (gzip in place, read back with `gzip -dc FILE.gz`) or `--delete` (asks first, or `--yes`); it never touches a running session, a main transcript or anything outside `~/.claude/projects`; `hmd agents prune --help` lists the options.
+
+Once a day, on session start, a detached hook (`agents-auto-prune`) runs `hmd agents prune --compress --older-than 14d` for you, so the transcripts of subagents that finished more than two weeks ago shrink without anyone remembering to. It compresses and never deletes (deleting stays a manual `hmd agents prune --delete`), it skips a session that has a live process or was written to in the last 10 minutes, it prints nothing, and it adds one line (the bytes reclaimed) to `~/.heimdall/logs/agents-prune.log`. It is on by default. Off: `HMD_AUTO_PRUNE=off` in the environment Claude Code runs in, or `hmd guardrails off agents-auto-prune` (back on with `hmd guardrails on agents-auto-prune`). The age is `HMD_AUTO_PRUNE_DAYS` (default 14, never fewer than 3); a run that hangs is stopped after `HMD_AUTO_PRUNE_TIMEOUT_S` seconds (default 600) and the next day continues from there.
 
 ## Self-maintenance (auto-update + self-heal)
 

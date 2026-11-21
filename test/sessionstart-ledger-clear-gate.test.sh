@@ -448,12 +448,24 @@ fi
 #                                           switchable with `heimdall-hooks disable
 #                                           continue-inject`, covered by
 #                                           test/hmd-continue.test.sh.
+#
+# 16 -> 17 on 2026-11-22, one entry, known and advisory:
+#   SessionStart[16] agents-auto-prune    -- bin/heimdall-agents-auto-prune, launched
+#                                           detached (nohup + setsid, no stream held):
+#                                           once a day it compresses, never deletes,
+#                                           the transcripts of old, finished subagents
+#                                           (hmd agents prune --compress). Registered
+#                                           in hooks/hooks.metadata.json, switchable
+#                                           with `heimdall-hooks disable
+#                                           agents-auto-prune` (or `hmd guardrails off
+#                                           agents-auto-prune`), covered by
+#                                           test/agents-auto-prune.test.sh.
 # ══════════════════════════════════════════════════════════════════════════
 SS_COUNT="$(jq '.hooks.SessionStart | length' "$HOOKS_JSON")"
-if [ "$SS_COUNT" -eq 16 ]; then
-  ok "G9 all 16 SessionStart entries still present"
+if [ "$SS_COUNT" -eq 17 ]; then
+  ok "G9 all 17 SessionStart entries still present"
 else
-  bad "G9 expected 16 SessionStart entries, found $SS_COUNT"
+  bad "G9 expected 17 SessionStart entries, found $SS_COUNT"
 fi
 
 # The caveman `rules` entry specifically: it is the ONLY thing that puts hmd's
