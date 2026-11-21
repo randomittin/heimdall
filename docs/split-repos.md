@@ -11,6 +11,8 @@ The decisions and the measured inventory are in `docs/superpowers/plans/2026-11-
 | `hmd-skills` | `skills/stacks`, `skills/designmatch`, `skills/self-improve`, `skills/system-health`, `skills/mac-deep-clean` | 21 |
 | `hmd-statusline` | the statusline renderer and its parts (below), `conformance/statusline/`, and the test suites that call only the renderer | 18 runtime files, 26 conformance files, plus suites |
 
+Since T3.2 the 24 suites that call only the renderer, and the 17 files of `conformance/statusline/` that are not sigil goldens (`INVARIANTS.md`, the 12 density goldens, the 4 fixtures), are deleted from heimdall: they live only in `hmd-statusline`, history included, and are not in the lock. Heimdall keeps the 9 sigil goldens, which `test/heimdall-sigil-render.test.sh` compares against. `test/vendor-parity.test.sh` checks both halves: the 41 files are gone here, and present in the tag at the recorded bytes.
+
 The statusline runtime files are:
 
 - Hooks: `hooks/statusline.sh`, `hooks/subagent-statusline.sh`.
@@ -23,13 +25,13 @@ The statusline runtime files are:
 - The skill registry: `skills.manifest.json`, `bin/heimdall-skills`, `bin/lib/skills_*.py`, `bin/skill-manager`.
 - The helpers the moved skills call: `bin/designmatch`, `bin/heimdall-self-improve`, `bin/heimdall-sysmon`, `bin/heimdall-cleanup`, `bin/stack-pack`, `bin/stack-detect`.
 - The statusline's host side, which the renderer calls by path: `bin/heimdall-identity`, `bin/heimdall-presence`, `bin/heimdall-tier`, `bin/heimdall-agents`, `bin/heimdall-ctx-meter`, `bin/heimdall-face`, and the ledger writer `bin/heimdall-status-json`.
-- The statusline suites that need the host. They stay in heimdall as integration tests.
+- The statusline suites that need the host. They stay in heimdall as integration tests, together with the 9 sigil goldens in `conformance/statusline/goldens/sigil/` that `test/heimdall-sigil-render.test.sh` compares against.
 
 Every moved file keeps its path, so host code that reaches one by path (`bin/heimdall-board`, `bin/summary-card`, and `sentinels/hmd-banner.sh` loading `sentinels/hmd_sigil.py`) needed no edit.
 
 ## How heimdall consumes them
 
-Each moved file is in heimdall at the same relative path as in its repo, with the same bytes and the same executable bit as the pinned tag. The new repos keep heimdall's layout (`skills/<id>/...`, `hooks/`, `bin/`, `sentinels/`, `conformance/statusline/`), so the copy is path for path with no renames.
+Each mirrored file is in heimdall at the same relative path as in its repo, with the same bytes and the same executable bit as the pinned tag. The new repos keep heimdall's layout (`skills/<id>/...`, `hooks/`, `bin/`, `sentinels/`, `conformance/statusline/`), so the copy is path for path with no renames.
 
 The pin is `vendor/vendor.lock.json`, strict JSON with one entry per repo:
 

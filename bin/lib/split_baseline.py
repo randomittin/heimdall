@@ -4,10 +4,10 @@
 Plan: docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md (sections 1a, 1b and 5; task T0.1). The later waves mirror these files into
 two new repos and prove against this recording that nothing moved: INV-S1 (the same bytes at the same path), INV-S2 (the registered entry points
 unchanged) and INV-S3 (the same rendered bytes). This tool holds NO expected value of its own: `record` measures the tree it is pointed at, `check`
-measures it again and compares with evals/split/baseline.json. It never reads bin/heimdall-suite-closure (plan section 1b: the static closure of a
+measures it again and compares with evals/split/baseline.json (the one exception is what left heimdall in T3.2, below). It never reads bin/heimdall-suite-closure (plan section 1b: the static closure of a
 statusline suite is the whole of heimdall): the boundary is the explicit path lists below, taken from the plan's two inventories.
 
-  split_baseline.py record [--root DIR] [--out FILE]
+  split_baseline.py record [--root DIR] [--out FILE] [--baseline FILE]
   split_baseline.py check  [--root DIR] [--baseline FILE] [--only paths|host-calls|renders]... [--match TEXT]
 
 --root is the tree that is measured (default: the tree this file lives in); --baseline / --out default to <this tree>/evals/split/baseline.json
@@ -29,6 +29,12 @@ WHAT IS RECORDED
 
 `record` renders every fixture twice and refuses to write when the two renders differ or a render exits non-zero, writes to stderr or prints nothing:
 a baseline with a silent gap, or of a render that is not reproducible, is worse than none.
+
+WHAT LEFT HEIMDALL (T3.2). The 24 suites that call only the renderer and the 17 conformance files that are not a sigil golden (MOVED, 41 paths) now
+live in hmd-statusline at v1.0.0, not here. The recording keeps them: it is the record of the tree BEFORE the split, and test/vendor-parity.test.sh holds
+it against that tag. `check` measures every other recorded path as before, requires each moved one to be GONE from the tree (a restored copy is one nobody
+pins) and to be still in the baseline (the recording stays whole). `record` cannot measure a file that is no longer here, so it carries the entries of the
+moved paths over from the previous baseline (--baseline, default evals/split/baseline.json) and refuses when that baseline lacks one.
 
 Exit: 0 ok (check: no difference), 1 a difference or a measurement that failed, 2 usage or an unreadable baseline.
 """
@@ -105,6 +111,18 @@ TESTS = (
 GROUPS = (("skills", SKILLS), ("statusline-runtime", RUNTIME), ("statusline-conformance", CONFORMANCE), ("statusline-tests", TESTS))
 PATHS = [(group, rel) for group, rels in GROUPS for rel in sorted(rels)]
 
+# ── what left heimdall (T3.2) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# The suites that call only the renderer (plan section 4) and the conformance files that are not the sigil goldens test/heimdall-sigil-render.test.sh
+# (an integration suite that stays) compares against. They live in hmd-statusline at v1.0.0 and are neither measured nor pinned here (module docstring).
+MOVED_SUITES = """
+sigil-cache sigil-custom sigil-detailed sigil-eyestrip-mini sigil-micro sigil-png sigil-sprites sigil-team-mini
+statusline-agents-cache statusline-cc-columns statusline-cc-region-reserve statusline-cols-detect statusline-crossbranch statusline-density
+statusline-eyestrip statusline-fullbleed statusline-gauge statusline-host-boundary statusline-identity-flip statusline-panel-floor
+statusline-perf-budget statusline-register-cursor statusline-terminals statusline-width
+""".split()
+MOVED_SUITE_PATHS = ["test/heimdall-%s.test.sh" % name for name in MOVED_SUITES]
+MOVED = frozenset(MOVED_SUITE_PATHS + [rel for rel in CONFORMANCE if not rel.startswith("conformance/statusline/goldens/sigil/")])
+
 # The HOST side of the statusline: the plan's "not moved, stays core" list (section 1b) and the core files that consume the moved code.
 HOST_PATHS = sorted("""
 bin/heimdall-status-json bin/heimdall-face bin/heimdall-ctx-meter bin/heimdall-agents bin/heimdall-identity bin/heimdall-presence bin/heimdall-tier
@@ -140,6 +158,8 @@ def measure_file(root, rel):
 def measure_paths(root):
     out = {}
     for group, rel in PATHS:
+        if rel in MOVED:
+            continue
         got = measure_file(root, rel)
         out[rel] = got if isinstance(got, str) else dict(group=group, **got)
     return out
@@ -156,6 +176,8 @@ def measure_host_calls(root):
     patterns = [(path, host_pattern(path)) for path in HOST_PATHS]
     out = {}
     for suite in TESTS:
+        if suite in MOVED:
+            continue
         try:
             with open(os.path.join(root, suite), "rb") as fh:
                 text = fh.read().decode("utf-8", "replace")
@@ -330,18 +352,44 @@ def measure_renders(root, match=""):
 
 
 # ── the recording ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+def moved_path_failures(root, doc):
+    """FAIL lines for the moved paths: one still in root (a restored copy is one nobody pins) or with no record in the baseline (the recording stays whole)."""
+    recorded = {entry["path"] for entry in doc["paths"]}
+    out = []
+    for rel in sorted(MOVED):
+        if rel not in recorded:
+            out.append("FAIL paths %s: moved to hmd-statusline, but the baseline has no record of it" % rel)
+        if os.path.lexists(os.path.join(root, rel)):
+            out.append("FAIL paths %s: moved to hmd-statusline, but it is still in this tree" % rel)
+    return out
+
+
+def moved_call_failures(doc):
+    """FAIL lines for the moved suites the baseline has no host-call row for."""
+    return ["FAIL host-calls %s: moved to hmd-statusline, but the baseline has no record of it" % suite
+            for suite in sorted(MOVED_SUITE_PATHS) if suite not in doc["host_calls"]]
+
+
 def _failures(kind, measured):
     return ["FAIL %s %s: %s" % (kind, ident, got) for ident, got in sorted(measured.items()) if isinstance(got, str)]
 
 
-def build(root):
-    """(document, failures): the measurements of root as a baseline document, and every measurement that did not work."""
+def build(root, previous):
+    """(document, failures): the measurements of root as a baseline document, and every measurement that did not work. The moved paths cannot be
+    measured here: their entries are carried over from `previous`, the baseline they were recorded in."""
     paths, calls = measure_paths(root), measure_host_calls(root)
     problems = _failures("paths", paths) + _failures("host-calls", calls)
     problems += ["FAIL host-paths %s: the plan names it as host, root has no such file" % path
                  for path in HOST_PATHS if not os.path.isfile(os.path.join(root, path))]
+    problems += moved_path_failures(root, previous) + moved_call_failures(previous)
     if problems:
         return None, problems
+    carried = {entry["path"]: entry for entry in previous["paths"]}
+    for group, rel in PATHS:
+        if rel in MOVED:
+            paths[rel] = dict(group=group, sha256=carried[rel]["sha256"], bytes=carried[rel]["bytes"], exec=carried[rel]["exec"])
+    for suite in MOVED_SUITE_PATHS:
+        calls[suite] = previous["host_calls"][suite]
     first, second = measure_renders(root), measure_renders(root)
     problems = _failures("renders", first)
     problems += ["FAIL renders %s: two renders of one fixture differ, so it cannot be a baseline" % ident
@@ -441,13 +489,16 @@ def check(root, baseline, phases, match):
     doc = load_baseline(baseline)
     fails, counts = [], []
     if "paths" in phases:
-        expected = {e["path"]: {k: v for k, v in e.items() if k != "path"} for e in doc["paths"]}
+        expected = {e["path"]: {k: v for k, v in e.items() if k != "path"} for e in doc["paths"] if e["path"] not in MOVED}
         fails += compare("paths", expected, measure_paths(root))
-        counts.append("%d paths" % len(expected))
+        fails += moved_path_failures(root, doc)
+        counts.append("%d paths here, %d moved out" % (len(expected), len(MOVED)))
     if "host-calls" in phases:
+        expected_calls = {suite: calls for suite, calls in doc["host_calls"].items() if suite not in MOVED}
         fails += compare("host-paths", {p: p for p in doc["host_paths"]}, {p: p for p in HOST_PATHS})
-        fails += compare("host-calls", doc["host_calls"], measure_host_calls(root))
-        counts.append("%d suites" % len(doc["host_calls"]))
+        fails += compare("host-calls", expected_calls, measure_host_calls(root))
+        fails += moved_call_failures(doc)
+        counts.append("%d suites here, %d moved out" % (len(expected_calls), len(MOVED_SUITE_PATHS)))
     if "renders" in phases:
         if match and not any(match in fx.ident for fx in fixtures()):
             raise Usage("--match %r selects no render fixture" % match)
@@ -461,15 +512,16 @@ def check(root, baseline, phases, match):
     return 1 if fails else 0
 
 
-def record(root, out):
-    doc, problems = build(root)
+def record(root, out, baseline):
+    doc, problems = build(root, load_baseline(baseline))
     for line in problems:
         print(line)
     if problems:
         print("split-baseline record: nothing written, %d measurement(s) failed" % len(problems))
         return 1
     write_atomic(out, dumps(doc))
-    print("split-baseline record: wrote %s (%d paths, %d suites, %d renders)" % (out, len(doc["paths"]), len(doc["host_calls"]), len(doc["renders"])))
+    print("split-baseline record: wrote %s (%d paths, %d suites, %d renders; the %d moved-out paths carried over from the previous baseline)"
+          % (out, len(doc["paths"]), len(doc["host_calls"]), len(doc["renders"]), len(MOVED)))
     return 0
 
 
@@ -481,6 +533,8 @@ def main(argv=None):
     for sp in (rec, chk):
         sp.add_argument("--root", default=TOOL_ROOT, help="the tree to measure (default: the tree this file lives in)")
     rec.add_argument("--out", default=DEFAULT_BASELINE, help="where to write the baseline (default: evals/split/baseline.json)")
+    rec.add_argument("--baseline", default=DEFAULT_BASELINE,
+                     help="the previous recording the moved-out paths' entries are carried over from (default: evals/split/baseline.json)")
     chk.add_argument("--baseline", default=DEFAULT_BASELINE, help="the recording to compare with (default: evals/split/baseline.json)")
     chk.add_argument("--only", action="append", choices=PHASES, help="check only this phase (repeatable; default: all three)")
     chk.add_argument("--match", default="", help="with the renders phase: only the fixtures whose id contains this text")
@@ -490,7 +544,7 @@ def main(argv=None):
         if not os.path.isdir(root):
             raise Usage("--root %s is not a directory" % root)
         if args.command == "record":
-            return record(root, os.path.abspath(args.out))
+            return record(root, os.path.abspath(args.out), os.path.abspath(args.baseline))
         return check(root, os.path.abspath(args.baseline), tuple(args.only or PHASES), args.match)
     except Usage as exc:
         print("split_baseline: %s" % exc, file=sys.stderr)
