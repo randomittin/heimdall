@@ -1,0 +1,17 @@
+# Mutant M5 of test/split-falsify.test.sh (docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md, section 4 'Oracle gate', task T4.1).
+# CHANGE: one byte of conformance/statusline/goldens/sigil/rj_M_256.txt changes (colour 231 becomes 232 in the first cell that has it): the golden no longer says what the renderer prints.
+# The suite applies this patch to a COPY of the tracked tree, never to the real one, and runs the split's gates on the copy.
+# MUST TURN RED: bin/heimdall-vendor verify --all, test/vendor-parity.test.sh, test/split-baseline.test.sh and the golden check of the suite itself (sentinels/hmd_sigil.py rendered for the nine sigil goldens, byte for byte).
+# This is the render-parity row of the plan's coverage matrix: the reference moved, the renderer did not.
+# It applies to the pinned bytes only: when a pin moves, make the same edit in a copy of the tree and keep `git diff` (a patch that no longer applies fails the suite, it never counts as a kill).
+
+diff --git a/conformance/statusline/goldens/sigil/rj_M_256.txt b/conformance/statusline/goldens/sigil/rj_M_256.txt
+index e236e4f..980e61f 100644
+--- a/conformance/statusline/goldens/sigil/rj_M_256.txt
++++ b/conformance/statusline/goldens/sigil/rj_M_256.txt
+@@ -1,4 +1,4 @@
+ [38;5;234m[48;5;234m▄[0m[38;5;43m[48;5;234m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;43m[48;5;234m▄[0m[38;5;234m[48;5;234m▄[0m
+-[38;5;234m[48;5;234m▄[0m[38;5;234m[48;5;234m▄[0m[38;5;231m[48;5;231m▄[0m[38;5;234m[48;5;234m▄[0m[38;5;234m[48;5;234m▄[0m[38;5;231m[48;5;231m▄[0m[38;5;234m[48;5;234m▄[0m[38;5;234m[48;5;234m▄[0m
++[38;5;234m[48;5;234m▄[0m[38;5;234m[48;5;234m▄[0m[38;5;232m[48;5;231m▄[0m[38;5;234m[48;5;234m▄[0m[38;5;234m[48;5;234m▄[0m[38;5;231m[48;5;231m▄[0m[38;5;234m[48;5;234m▄[0m[38;5;234m[48;5;234m▄[0m
+ [38;5;234m[48;5;234m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;234m[48;5;43m▄[0m[38;5;234m[48;5;43m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;234m[48;5;234m▄[0m
+ [38;5;234m[48;5;234m▄[0m[38;5;43m[48;5;234m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;234m[48;5;43m▄[0m[38;5;234m[48;5;43m▄[0m[38;5;43m[48;5;43m▄[0m[38;5;43m[48;5;234m▄[0m[38;5;234m[48;5;234m▄[0m

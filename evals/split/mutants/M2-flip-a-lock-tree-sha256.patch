@@ -1,0 +1,20 @@
+# Mutant M2 of test/split-falsify.test.sh (docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md, section 4 'Oracle gate', task T4.1).
+# CHANGE: one hex digit of hmd-statusline's tree_sha256 in vendor/vendor.lock.json changes (c to d, still 64 lowercase hex: the lock stays well formed).
+# The suite applies this patch to a COPY of the tracked tree, never to the real one, and runs the split's gates on the copy.
+# MUST TURN RED: bin/heimdall-vendor verify --all, test/vendor-parity.test.sh.
+# The recording (evals/split/baseline.json) never reads the lock, so test/split-baseline.test.sh is not expected to notice this one.
+# It applies to the pinned bytes only: when a pin moves, make the same edit in a copy of the tree and keep `git diff` (a patch that no longer applies fails the suite, it never counts as a kill).
+
+diff --git a/vendor/vendor.lock.json b/vendor/vendor.lock.json
+index dbb22c1..5b79c69 100644
+--- a/vendor/vendor.lock.json
++++ b/vendor/vendor.lock.json
+@@ -36,7 +36,7 @@
+       "repo": "git@github.com:randomittin/hmd-statusline.git",
+       "tag": "v1.0.0",
+       "commit": "f1786a50849984d145c0fe02ee5f15705c75dc92",
+-      "tree_sha256": "35344e5b82dddb7984700950c396e14a0461f27366ceb9197e6229b543590fdb",
++      "tree_sha256": "35344e5b82dddb7984700950d396e14a0461f27366ceb9197e6229b543590fdb",
+       "paths": [
+         "bin/heimdall-sigil",
+         "bin/heimdall-sigil-png",
