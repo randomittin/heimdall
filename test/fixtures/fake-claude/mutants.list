@@ -1,10 +1,10 @@
 bin/lib/hmd_restart_gate.py	s/idle/busy/g	M1-skip-G4-restart-while-busy
-bin/lib/hmd_restart_gate.py	/agent/s/ != 0/ == 0/;/agent/s/ > 0/ == 0/;/agent/s/ >= 1/ == 0/;/child/s/ != 0/ == 0/;/child/s/ > 0/ == 0/;/child/s/ >= 1/ == 0/	M2-skip-G5-restart-with-live-work
+bin/lib/hmd_restart_gate.py	s/ppid == claude and pid not in own/ppid == -1 and pid not in own/;s/if int(count) > 0:/if int(count) < 0:/	M2-skip-G5-restart-with-live-work
 bin/lib/hmd_restart_gate.py	s/atime/mtime/g;s/-f %a/-f %m/g;s/-f %Fa/-f %Fm/g;s/-c %X/-c %Y/g	M3-ignore-keystroke-window
 bin/lib/hmd_supervise.sh	s/HMD_RESUME_SESSION_ID=/HMD_RESUME_SESSION_ID_OFF=/g	M4-relaunch-without-resume
 bin/lib/hmd_supervise.sh	s/sessionId/session_id/g	M5-relaunch-with-stale-session-id
 bin/lib/hmd_supervise.sh	s/kill -TERM/kill -KILL/g;s/kill -s TERM/kill -s KILL/g;s/kill -15/kill -9/g;s/kill -SIGTERM/kill -SIGKILL/g	M6-sigkill-the-child
 bin/lib/hmd_supervise.sh	s/-[fe] "[^"]*restarting\.json"/-e \//;s/-[fe] [^ ]*restarting\.json/-e \//	M7-relaunch-without-marker
-bin/heimdall	s/capture_and_emit_usage/hmd_supervised_claude/g	M8-supervise-print-path
+bin/heimdall	s/capture_and_emit_usage "\$RUN_MODEL" \\$/hmd_supervised_claude "\$RUN_MODEL" \\/	M8-supervise-print-path
 bin/lib/hmd_supervise.sh	s/stty/true/g	M9-drop-terminal-restore
-bin/lib/hmd_restart_gate.py	/target/s/>= 1/>= 99/;/target/s/> 0/> 98/;/target/s/<= 1/<= 99/;/last/s/>= 1/>= 99/;/last/s/> 0/> 98/	M10-second-restart-same-version
+bin/lib/hmd_restart_gate.py	s/if set(ctx.targets.items()) <= set(done.items()):/if False:/	M10-second-restart-same-version
