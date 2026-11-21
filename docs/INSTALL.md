@@ -93,6 +93,10 @@ The skill registry (`skills.manifest.json`) is behind the flag `skills.registry`
 
 Guardrails are tiered in `guardrails.manifest.json`. `hmd guardrails list|why|off|on` shows and records the choice; `core` guards cannot be turned off. `hmd guardrails off` records the choice now; the per-guard switches inside the Bash and Agent hooks are pending operator approval and land with it.
 
+## Disk clean-up (opt-in)
+
+`hmd agents prune` compresses or deletes the transcripts of old, finished subagents (`~/.claude/projects/<project>/<session>/subagents/agent-*`, gigabytes after a long session): a dry run that lists the count and the bytes unless you pass `--compress` (gzip in place, read back with `gzip -dc FILE.gz`) or `--delete` (asks first, or `--yes`); it never runs by itself and never touches a running session, a main transcript or anything outside `~/.claude/projects`; `hmd agents prune --help` lists the options.
+
 ## Self-maintenance (auto-update + self-heal)
 
 hmd keeps itself and its host current, in the background, on session start — both are

@@ -2487,7 +2487,36 @@ case "${1:-}" in
     # each with the command that re-attaches it: `hmd --resume <id>`, which attaches instead of letting `claude --continue`
     # refuse a conversation that is running in the background (bin/heimdall-bg-sessions has the facts). Not the tracker of
     # Agent-tool SUBAGENTS in bin/heimdall-agents, which is a different thing. Exit: 0 listed (or none), 3 claude could not list.
+    # `hmd agents prune [...]`: the OPT-IN disk clean-up of old subagent transcripts (bin/heimdall-agents-prune): compress or
+    # delete those of finished subagents past an age, a dry run unless told otherwise, called by nothing but this verb. Its
+    # arguments are forwarded verbatim. `hmd agents --help` is answered here, since the list verb's own help cannot know prune.
     shift
+    case "${1:-}" in
+      prune)
+        shift
+        PRUNE_BIN="$PLUGIN_DIR/bin/heimdall-agents-prune"
+        if [ ! -x "$PRUNE_BIN" ]; then
+          echo "  Error: heimdall-agents-prune not found at $PRUNE_BIN" >&2
+          echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+          exit 1
+        fi
+        exec "$PRUNE_BIN" "$@"
+        ;;
+      -h|--help)
+        cat <<'EOF'
+hmd agents -- background sessions and subagent transcripts
+
+  hmd agents                  list this directory's background Claude Code sessions, with the command that re-attaches one
+  hmd agents prune [OPTIONS]  opt-in disk clean-up: compress or delete the transcripts of old, finished subagents
+                              (~/.claude/projects/<project>/<session>/subagents/agent-*). It never runs by itself, and with
+                              neither --compress nor --delete it is a dry run that lists the count and the bytes.
+
+  prune options: --older-than 14d  --compress | --delete [--yes]  --dry-run  --project DIR
+  Details, and what it never touches: hmd agents prune --help
+EOF
+        exit 0
+        ;;
+    esac
     BG_SESSIONS_BIN="$PLUGIN_DIR/bin/heimdall-bg-sessions"
     if [ ! -x "$BG_SESSIONS_BIN" ]; then
       echo "  Error: heimdall-bg-sessions not found at $BG_SESSIONS_BIN" >&2
