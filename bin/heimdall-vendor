@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# heimdall-vendor -- keep heimdall's mirror of the split-out skills and statusline repos equal to the tag vendor/vendor.lock.json pins.
+#
+# This file is only the launcher. The rules, the usage, the lock format and the hash (`heimdall-vendor --help` prints them) are in bin/lib/vendor_lock.py,
+# and test/heimdall-vendor.test.sh is the proof. Python runs isolated (-I -S), like the other hook helpers, so nothing from the cwd or the environment is imported.
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+exec python3 -I -S "$(cd "$(dirname "$SELF")" && pwd)/lib/vendor_lock.py" "$@"
