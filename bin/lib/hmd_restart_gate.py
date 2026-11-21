@@ -21,21 +21,26 @@ this cannot read is UNSAFE, never SAFE. The gate runs no model, writes nothing a
      install-running    some process command line matches heimdall.*install\.sh
      binary-fresh       claude is pending and its newest versions/<v> binary was written less than 30 s ago
   G4 not-idle           ~/.claude/sessions/<claude_pid>.json: status is idle (measured values: idle | busy | waiting | shell; busy or shell for a whole
-                        background Bash job or subagent), and the idle began within -2..+10 s of the request's Stop, i.e. no later turn is missing
+                        background Bash job or subagent), and the idle began within -2..+30 s of the request's Stop (HMD_RESTART_STOP_BEFORE_IDLE_S), i.e.
+                        no later turn is missing
      settling           ...and the status has been idle for HMD_RESTART_SETTLE_S (15) or more: idle flashes for 0.1 s between turns
   G5 agents-live        heimdall-agents count (asked about the SESSION's cwd) is 0; parked mailbox teammates are not counted by it
      sweep-running      no live pid in receipts/sweep.lock of the session's repository or of $HEIMDALL_HOME (the reader of hmd_sweep_guard.py)
      task-live          no harness task .output written in the last 60 s, and no child of claude that is not infrastructure: caffeinate, a zombie, a
                         hook runner or helper of hmd (a script under bin/heimdall-* or hooks/), an MCP server. A Bash-tool job is a shell -c child
-  G6 user-active        the tty's atime (it moves on a keystroke, measured on macOS) is HMD_RESTART_QUIET_S (300, the prompt-cache lifetime) or more ago
-  G7 loop-guard         the session is at least 60 s old; $HEIMDALL_HOME/restart/last.json, {"ts": <epoch s>, "targets": {"claude": v, "hmd": v}} (the
-                        versions the previous restart went to), is at least 600 s old and does not already cover every pending target
+  G6 user-active        the tty's atime (it moves on a keystroke, measured on macOS) is HMD_RESTART_QUIET_S (300, the prompt-cache lifetime) or more ago,
+                        and no `hmd restart defer` runs: $HEIMDALL_HOME/restart/defer-until holds an epoch that has not come. `hmd restart now` writes
+                        $HEIMDALL_HOME/restart/now, an epoch less than 120 s old, and ends this wait like --now does
+  G7 loop-guard         the session is at least 60 s old (HMD_RESTART_SESSION_MIN_AGE_S); $HEIMDALL_HOME/restart/last.json, {"ts": <epoch s>, "targets":
+                        {"claude": v, "hmd": v}} (the versions the previous restart went to), is at least 600 s old (HMD_RESTART_GAP_S) and does not
+                        already cover every pending target
   G8 git-midop          no rebase-merge, rebase-apply or MERGE_HEAD in the git directory of the session's cwd (a linked worktree's own, too)
   signal-unreadable     any input that is missing, malformed, of an unknown value, hung, or unavailable on this platform (a tty that cannot be stat'ed)
 
 Seams (env): HMD_RESTART_NOW (epoch, the clock), HMD_RESTART_SESSIONS_DIR (~/.claude/sessions), HMD_RESTART_TTY (no default: the supervisor sets it),
 HMD_RESTART_AGENTS_CMD (heimdall-agents count), HMD_RESTART_PENDING_CMD (no default: the supervisor sets it), HMD_RESTART_PS_CMD (ps -axww, rows of
-`pid ppid command`), HMD_RESTART_QUIET_S, HMD_RESTART_SETTLE_S, HMD_RESTART_CMD_TIMEOUT_S (10, for each helper), HEIMDALL_CC_VERSIONS (cc-selfheal's own
+`pid ppid command`), HMD_RESTART_QUIET_S, HMD_RESTART_SETTLE_S, HMD_RESTART_STOP_BEFORE_IDLE_S (30), HMD_RESTART_SESSION_MIN_AGE_S (60),
+HMD_RESTART_GAP_S (600), HMD_RESTART_CMD_TIMEOUT_S (10, for each helper), HEIMDALL_CC_VERSIONS (cc-selfheal's own
 seam for the claude versions directory), HMD_AGENT_TASKDIR (heimdall-agents' own seam for the harness tasks directory), HEIMDALL_HOME. A number that is
 not one is the default, said on stderr, never 0.
 """
@@ -56,12 +61,13 @@ BIN = os.path.normpath(os.path.join(HERE, os.pardir))
 DEFAULT_QUIET_S = 300.0  # claude's prompt-cache lifetime: a restart after it re-reads the context at no extra price (plan Q2)
 DEFAULT_SETTLE_S = 15.0
 DEFAULT_CMD_TIMEOUT_S = 10.0
-SESSION_MIN_AGE_S = 60
-RESTART_GAP_S = 600
+SESSION_MIN_AGE_S = 60  # the default of HMD_RESTART_SESSION_MIN_AGE_S
+RESTART_GAP_S = 600  # the default of HMD_RESTART_GAP_S
 BINARY_FRESH_S = 30
 TASK_FRESH_S = 60
-STOP_BEFORE_IDLE_S = 10  # the Stop hook is capped at 5 s and runs while status is still busy; idle follows it by 0.1-1 s (spike Q4)
+STOP_BEFORE_IDLE_S = 30  # the default of HMD_RESTART_STOP_BEFORE_IDLE_S: idle follows the Stop (which runs while status is still busy) by 0.1-1 s, and by 10.05 s after a 10 s busy window
 STOP_AFTER_IDLE_S = 2
+NOW_VALID_S = 120  # how long an `hmd restart now` stays an ask: the launcher looks at a waiting request again every 5 s
 STOP_FUTURE_S = 5
 MAX_FILE = 1 << 20
 
@@ -338,6 +344,9 @@ class Ctx(object):
         self.home = os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall")
         self.settle = seconds("HMD_RESTART_SETTLE_S", DEFAULT_SETTLE_S)
         self.quiet = seconds("HMD_RESTART_QUIET_S", DEFAULT_QUIET_S)
+        self.stop_before_idle = seconds("HMD_RESTART_STOP_BEFORE_IDLE_S", STOP_BEFORE_IDLE_S)
+        self.session_min_age = seconds("HMD_RESTART_SESSION_MIN_AGE_S", SESSION_MIN_AGE_S)
+        self.restart_gap = seconds("HMD_RESTART_GAP_S", RESTART_GAP_S)
         self.timeout = seconds("HMD_RESTART_CMD_TIMEOUT_S", DEFAULT_CMD_TIMEOUT_S) or DEFAULT_CMD_TIMEOUT_S
         self.targets = {}
         self._req = self._session = self._table = self._own = self._git = None
@@ -457,7 +466,7 @@ def g4_turn_ended(ctx):
     if ctx.now - session["status_at"] < ctx.settle:
         return SETTLING
     lag = session["status_at"] - ctx.req()["stop_at"]  # how long after the recorded Stop the idle began
-    if lag > STOP_BEFORE_IDLE_S or lag < -STOP_AFTER_IDLE_S:
+    if lag > ctx.stop_before_idle or lag < -STOP_AFTER_IDLE_S:
         return NOT_IDLE
     return None
 
@@ -478,9 +487,36 @@ def g5_background(ctx):
     return None
 
 
+def operator_epoch(ctx, name, what):
+    """The epoch seconds in $HEIMDALL_HOME/restart/<name> (the operator's `hmd restart defer` / `now`), or None when the file is not there. Unreadable when it holds anything else."""
+    path = os.path.join(ctx.home, "restart", name)
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise Unreadable("%s cannot be read (%s)" % (what, exc.strerror))
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 64:
+        raise Unreadable("%s is not a regular file of a sane size" % what)
+    try:
+        with open(path, "rb") as f:
+            text = f.read(64).decode("ascii").strip()
+    except (OSError, ValueError):
+        raise Unreadable("%s cannot be read" % what)
+    if not re.match(r"^[0-9]{1,12}$", text):
+        raise Unreadable("%s is not a number of seconds" % what)
+    return float(text)
+
+
 def g6_quiet(ctx):
     if ctx.skip_quiet:
         return None
+    asked = operator_epoch(ctx, "now", "the record of `hmd restart now`")
+    if asked is not None and 0 <= ctx.now - asked <= NOW_VALID_S:
+        return None
+    until = operator_epoch(ctx, "defer-until", "the record of `hmd restart defer`")
+    if until is not None and ctx.now < until:
+        return USER_ACTIVE
     tty = os.environ.get("HMD_RESTART_TTY", "")
     if not tty:
         raise Unreadable("HMD_RESTART_TTY is not set, so the time of the last keystroke is unknown")
@@ -494,7 +530,7 @@ def g6_quiet(ctx):
 
 
 def g7_loops(ctx):
-    if ctx.now - ctx.session()["started_at"] < SESSION_MIN_AGE_S:
+    if ctx.now - ctx.session()["started_at"] < ctx.session_min_age:
         return LOOP_GUARD
     last = read_json(os.path.join(ctx.home, "restart", "last.json"), "the record of the last restart", optional=True)
     if last is None:
@@ -503,7 +539,7 @@ def g7_loops(ctx):
     done = last.get("targets")
     if not isinstance(done, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in done.items()):
         raise Unreadable("the record of the last restart has no targets map of name -> version")
-    if ctx.now - restarted_at < RESTART_GAP_S:
+    if ctx.now - restarted_at < ctx.restart_gap:
         return LOOP_GUARD
     if set(ctx.targets.items()) <= set(done.items()):
         return LOOP_GUARD

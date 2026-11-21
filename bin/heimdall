@@ -12,6 +12,10 @@
 #
 set -euo pipefail
 
+# A launcher that restarted itself after an update (bin/lib/hmd_supervise.sh execs it, keeping the pid, and names that pid in HMD_LAUNCHER_PID) must survive the
+# Stop hook's SIGUSR1 until the supervisor installs its own handler: until then USR1 has its default action, which ends the process.
+[ "${HMD_LAUNCHER_PID:-}" != "$$" ] || trap : USR1
+
 # Resolve the plugin root (bin/heimdall → heimdall/).
 # Must follow symlinks (readlink) so brew-installed heimdall resolves to
 # the actual Cellar/libexec path, not /opt/homebrew/.
@@ -22,6 +26,26 @@ if command -v readlink &>/dev/null; then
 fi
 PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 WORK_DIR="$(pwd)"
+
+# _heimdall_self_path ARGV0 RESOLVED WORKDIR -- the path the supervisor re-execs to restart this launcher: ARGV0 (the path it was invoked by) when it has a slash and names the
+# very same file as RESOLVED (the realpath'd launcher), made absolute, so an exec through the `hmd` link finds the files an update put behind it; otherwise RESOLVED. A bare
+# name is NEVER joined onto the working directory: that would run whatever file of that name sits in the repository the user is in, or was put there during the session.
+# Prints nothing unless the result is an absolute path, and the supervisor then does not supervise (it has nothing safe to re-exec).
+_heimdall_self_path() {
+  local argv0="$1" resolved="$2" workdir="$3" self="$2"
+  case "$argv0" in
+    /*) if [ "$argv0" -ef "$resolved" ]; then self="$argv0"; fi ;;
+    */*) if [ "$argv0" -ef "$resolved" ]; then self="$workdir/${argv0#./}"; fi ;;
+  esac
+  case "$self" in /*) printf '%s' "$self" ;; esac
+}
+
+# The launcher as it was started, for the seamless restart (bin/lib/hmd_supervise.sh): when an update lands while a session runs, the supervisor ends claude at a safe
+# moment and re-execs THIS launcher with the argv it started with, so both are recorded here, before anything shifts $@.
+# shellcheck disable=SC2034  # read by bin/lib/hmd_supervise.sh
+ORIG_ARGV=("$@")
+# shellcheck disable=SC2034  # read by bin/lib/hmd_supervise.sh
+HEIMDALL_SELF="$(_heimdall_self_path "$0" "$SELF" "$WORK_DIR")"
 
 # Early default for PERMISSION_FLAG — same default the flag-parsing block at
 # ~line 2806 sets unconditionally before its own --auto check. That block only
@@ -43,6 +67,14 @@ PERMISSION_FLAG="--dangerously-skip-permissions"
 if [ -f "$PLUGIN_DIR/bin/lib/select.sh" ]; then
   # shellcheck disable=SC1091
   . "$PLUGIN_DIR/bin/lib/select.sh" 2>/dev/null || true
+fi
+
+# The supervised claude launch of the seamless restart (bin/lib/hmd_supervise.sh): ONE function in place of the bare `claude ...` of both interactive launches. It
+# defines functions only and is read completely here, before any child starts, so an update that rewrites it while a session runs cannot change what this launcher
+# executes. Same convention as the receipted-install helpers below: it ships in this tree, and a checkout without it fails at the call with "command not found".
+if [ -f "$PLUGIN_DIR/bin/lib/hmd_supervise.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$PLUGIN_DIR/bin/lib/hmd_supervise.sh" 2>/dev/null || true
 fi
 
 # Real-user detection (bin/lib/real-home.sh) — the fail-safe gate for the side effects
@@ -3385,6 +3417,19 @@ EOF
     fi
     exec "$WRAP_BIN" "$@"
     ;;
+  restart)
+    # Pass-through to bin/heimdall-restart: the operator's switches for the automatic restart after an update (status | on | off | defer [minutes] | now). It writes only
+    # $HEIMDALL_HOME/no-auto-restart and $HEIMDALL_HOME/restart/* and signals nothing; the gate and the supervising launcher read those files. The verb is consumed:
+    # `hmd restart now` reaches the runner as `now`. All args forward verbatim.
+    shift
+    RESTART_BIN="$PLUGIN_DIR/bin/heimdall-restart"
+    if [ ! -x "$RESTART_BIN" ]; then
+      echo "  Error: heimdall-restart not found at $RESTART_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$RESTART_BIN" "$@"
+    ;;
   '')
     # §7 EMPTY ARGS → wrap-and-launch the default tool.
     #
@@ -3692,6 +3737,39 @@ _heimdall_launch_cleanup() {
   exit "$rc"
 }
 
+# ── Seamless restart: what the supervised launch needs from this launcher ──
+#
+# Both interactive claude launches (the default one and --resume) go through ONE function of bin/lib/hmd_supervise.sh. It runs claude as a child of this shell and, when
+# an update has landed and the session is at a safe point, ends it and re-execs THIS launcher with ORIG_ARGV (the argv it started with, recorded at the top) and the
+# session to bring back in HMD_RESUME_SESSION_ID. Plan: docs/superpowers/plans/2026-11-13-seamless-update-restart.md.
+#
+# _heimdall_supervise_prepare CLEANUP_FN -- called just before that call.
+#   HMD_SUPERVISED=1 is exported ONLY for a real terminal on stdin and stdout, and removed otherwise: the library then runs a plain `claude ...`, so -p, a pipe, a CI
+#   run and an hmd started inside someone else's supervised session (which inherits the variable) are never supervised.
+#   CLEANUP_FN names the function holding this launch's cleanup (the EXIT trap's body): exec does not run that trap, so the library runs it before the re-exec.
+_heimdall_supervise_prepare() {
+  # shellcheck disable=SC2034  # read by bin/lib/hmd_supervise.sh
+  HMD_SUPERVISE_CLEANUP_FN="$1"
+  if [ -t 0 ] && [ -t 1 ]; then
+    export HMD_SUPERVISED=1
+  else
+    unset HMD_SUPERVISED
+  fi
+}
+
+# _heimdall_restart_sid -- sets RESTART_SID to the session a restart left in HMD_RESUME_SESSION_ID, or "" when this launch is not a restart. The library's exec keeps the
+# pid, so the re-entered launcher is the one whose own pid is HMD_LAUNCHER_PID; an hmd run INSIDE that session inherits both variables but not the pid, and must not
+# resume the outer session. The id goes to claude as an argument, so it is a plain token (it starts alphanumeric, never an option) or it is ignored.
+_heimdall_restart_sid() {
+  RESTART_SID=""
+  if [ "${HMD_LAUNCHER_PID:-}" != "$$" ]; then return 0; fi
+  case "${HMD_RESUME_SESSION_ID:-}" in
+    ''|[!0-9A-Za-z]*|*[!0-9A-Za-z._-]*) return 0 ;;
+  esac
+  if [ "${#HMD_RESUME_SESSION_ID}" -le 128 ]; then RESTART_SID="$HMD_RESUME_SESSION_ID"; fi
+  return 0
+}
+
 # ── Skill pause for the life of a launch, shared by both launch paths ──
 #
 # Pauses the plugins this project does not need and records where the undo lives. Sets
@@ -3852,7 +3930,17 @@ except: pass
   # Main Claude Code agent: never pinned (CLAUDE.md "Model routing" directive) —
   # a resumed session runs on the operator's own configured default, same as a
   # fresh launch (select_model() below), so no --model flag is passed here.
-  claude --continue \
+  # A restart (the supervisor's re-exec of this launcher) brings the session it ended back with --resume <id> in place of --continue, and re-enters through the
+  # foreground resume: the argv it execs with skips the background-session attach above, which could grab an unrelated session. Ending in `exit` inside this compound
+  # command keeps the launcher from reading the rest of its own file, which an update may have rewritten.
+  _heimdall_restart_sid
+  RESUME_TARGET=(--continue)
+  if [ -n "$RESTART_SID" ]; then RESUME_TARGET=(--resume "$RESTART_SID"); fi
+  # shellcheck disable=SC2034  # read by bin/lib/hmd_supervise.sh
+  ORIG_ARGV=(--resume --foreground)
+  _heimdall_supervise_prepare cleanup_resume
+  hmd_supervised_claude \
+    "${RESUME_TARGET[@]}" \
     --agent heimdall \
     $PERMISSION_FLAG \
     --plugin-dir "$PLUGIN_DIR" \
@@ -5359,6 +5447,7 @@ echo "$PREAMBLE" > "$PREAMBLE_FILE"
 # Activate project-aware skill management (enable needed plugins, pause rest)
 _heimdall_skills_activate
 
+# shellcheck disable=SC2329  # runs via the EXIT trap on the next line; shellcheck drops that reference because every path below ends in exit
 cleanup() { _heimdall_launch_cleanup "$PREAMBLE_FILE"; }
 trap cleanup EXIT
 
@@ -5627,12 +5716,20 @@ else
   # doc comment above resolve_model. No-op for every state except 'switch'.
   apply_switch_fallback_env
 
-  # Interactive mode: preamble injected via system prompt file, Claude stays interactive
+  # Interactive mode: preamble injected via system prompt file, Claude stays interactive.
+  # A restart (the supervisor's re-exec of this launcher) brings the session it ended back with --resume <id>. Ending in `exit` inside this compound command keeps the
+  # launcher from reading the rest of its own file, which an update may have rewritten.
+  _heimdall_restart_sid
+  RESUME_FLAGS=()
+  if [ -n "$RESTART_SID" ]; then RESUME_FLAGS=(--resume "$RESTART_SID"); fi
+  _heimdall_supervise_prepare cleanup
   # shellcheck disable=SC2086  # PERMISSION_FLAG/MODEL_FLAG stay unquoted on purpose: empty -> no argument, "--model X" -> two
-  claude \
+  hmd_supervised_claude \
+    ${RESUME_FLAGS[@]+"${RESUME_FLAGS[@]}"} \
     --agent heimdall \
     $PERMISSION_FLAG \
     $MODEL_FLAG \
     --plugin-dir "$PLUGIN_DIR" \
     --append-system-prompt-file "$PREAMBLE_FILE"
+  exit $?
 fi

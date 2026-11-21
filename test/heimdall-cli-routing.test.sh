@@ -45,6 +45,11 @@ mkdir -p "$FAKE_BIN" "$FAKE_HOME" "$FAKE_DIR/.claude-plugin"
 cp "$REAL_BIN" "$FAKE_BIN/heimdall"
 chmod +x "$FAKE_BIN/heimdall"
 
+# The interactive and --resume launches call the supervisor library (bin/lib/hmd_supervise.sh), which a real install ships beside bin/heimdall; the copy has no
+# tree around it, so without this the launch dies with "command not found" before it reaches the stub claude.
+mkdir -p "$FAKE_BIN/lib"
+cp "$REPO/bin/lib/hmd_supervise.sh" "$FAKE_BIN/lib/hmd_supervise.sh"
+
 # Mark setup done → first_run_setup returns immediately without network calls.
 touch "$FAKE_HOME/setup-done"
 
@@ -604,6 +609,7 @@ md|heimdall-md|report.pdf -o out.md
 checkpoint-share|heimdall-checkpoint-share|precheck src/a.py src/b.py
 registry-hygiene|heimdall-registry-hygiene|--max-idle-days 30 --json
 queue mcp|heimdall-queue-mcp|--verbose
+restart|heimdall-restart|defer 30
 ARMS
 
 # The carve-out must not swallow the queue's own verbs: they still reach heimdall-queue.
