@@ -68,7 +68,8 @@ The first turn after a restart reads the whole context at full price; at 300 s o
 
 - Print mode (`-p`, `hmd <task>`), a non-terminal launch, `hmd --team` panes, `heimdall-wrap` tools other than claude, and anything started by hand with
   `claude`: no supervisor, no restart, ever.
-- Claude ignores the `SIGTERM` for 20 s: the request is dropped and the session is left alone until the next turn asks again.
+- Claude ignores the `SIGTERM` for 20 s: the request is dropped and the session is left alone until the next turn asks again. If it was only slow to shut down and exits 143 after
+  that, the session is still resumed (the TERM was ours; there is never a `SIGKILL`); any other late exit is yours.
 - The update did not take (claude still reports the old version after the restart): one restart per target version, so it does not loop. At most three
   restarts per launcher lifetime.
 - The resume fails within 5 s: the launcher tries `--continue`, then a fresh launch that reads the checkpoint written seconds earlier, printing one line each.

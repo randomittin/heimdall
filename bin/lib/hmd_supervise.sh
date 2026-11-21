@@ -34,7 +34,9 @@
 # wakes every second), runs the gate on a poll of HMD_RESTART_POLL_S, and after two SAFE answers HMD_RESTART_RECHECK_S apart runs `heimdall-checkpoint write`,
 # reads the session id NOW (the sessions file follows /clear; the request's id is only the fallback), writes restarting.json and sends ONE TERM to its own
 # child. Never a KILL, never a signal to any other pid. Claude exits 143 by itself within seconds (memo Q1) and restores its own terminal. If the child is still
-# there after HMD_RESTART_TERM_WAIT_S, restarting.json and the request are deleted and the session is left alone until a NEW Stop. When the child ends and
+# there after HMD_RESTART_TERM_WAIT_S, restarting.json and the request are deleted and the session is left alone until a NEW Stop; the TERM was delivered all the
+# same, so that child is still ours: when it exits 143 later (a slow SessionEnd or MCP shutdown, a swapping machine) it is resumed like any other (F8), and any other
+# late exit is the user's or a crash. When the child ends and
 # restarting.json is there for THAT child, the launcher puts the tty back (`stty` of the state it found: claude leaves a sane cooked state, not the pre-launch
 # bits, and no escape-sequence mode: memo Q2), runs the cleanup, records the restart in $HEIMDALL_HOME/restart/last.json (the gate's loop guard reads it),
 # prints ONE line and execs the launcher with HMD_RESUME_SESSION_ID, HMD_RESTART_COUNT+1, HMD_RESTARTED_FROM and HEIMDALL_NO_INTRO=1. Any other exit (the
@@ -257,18 +259,19 @@ _hmd_sv_decide() {
     _hmd_sv_log "no restart: restarting.json could not be written"
     return 0
   fi
-  _HMD_SV_TERMED=$_HMD_SV_PID
   _hmd_sv_log "restart: claude $_HMD_SV_PID, session $sid, $_HMD_SV_DESC"
   if ! kill -TERM "$_HMD_SV_PID" 2>/dev/null; then
     # gone already (the user's /exit won the race): a normal exit, not ours
     rm -f "$HMD_RESTART_DIR/restarting.json" 2>/dev/null || true
     return 0
   fi
+  # delivered: from here on an exit 143 of this child is ours, also after the wait below has run out (hmd_supervised_claude reads it; F8)
+  _HMD_SV_TERMED=$_HMD_SV_PID
   deadline=$((SECONDS + _HMD_SV_TERM_WAIT))
   while kill -0 "$_HMD_SV_PID" 2>/dev/null; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       rm -f "$HMD_RESTART_DIR/restarting.json" "$HMD_RESTART_DIR/req.json" 2>/dev/null || true
-      _hmd_sv_log "term-ignored: claude $_HMD_SV_PID still running ${_HMD_SV_TERM_WAIT}s after the TERM; the session is left alone until a new Stop"
+      _hmd_sv_log "term-ignored: claude $_HMD_SV_PID still running ${_HMD_SV_TERM_WAIT}s after the TERM; the session is left alone until a new Stop, and an exit 143 of that child still resumes it"
       return 0
     fi
     sleep 0.2 2>/dev/null || sleep 1 || true
@@ -366,8 +369,10 @@ hmd_supervised_claude() {
   while :; do
     _hmd_sv_wait
     rc=$_HMD_SV_RC
-    # a restart is ours only when restarting.json is there AND the TERM went to THIS child; any other exit is the user's or a crash
-    if [ -f "$HMD_RESTART_DIR/restarting.json" ] && [ "$_HMD_SV_TERMED" = "$_HMD_SV_PID" ]; then
+    # a restart is ours when the TERM went to THIS child and the child went with it: restarting.json is still there (it exited inside HMD_RESTART_TERM_WAIT_S), or it exited
+    # 143, the status of a child our TERM ended, after that wait had run out (F8: a slow SessionEnd or MCP shutdown; the TERM was delivered all the same). Any other exit is the
+    # user's or a crash
+    if [ "$_HMD_SV_TERMED" = "$_HMD_SV_PID" ] && { [ -f "$HMD_RESTART_DIR/restarting.json" ] || [ "$rc" -eq 143 ]; }; then
       _hmd_sv_relaunch
       break
     fi
