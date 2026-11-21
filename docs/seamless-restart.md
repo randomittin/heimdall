@@ -28,7 +28,9 @@ Only the halves that changed are named. Plan and measurements: `docs/superpowers
    hours, a new turn makes a new one).
 4. On the second `SAFE` it writes a checkpoint, notes the session id **in effect at that moment** (a `/clear` changes it), and sends claude exactly one
    `SIGTERM`: claude exits by itself, restores its own terminal and flushes its transcript. Never a `SIGKILL`, never a signal to any other process.
-5. The launcher restores the terminal, prints the one line and re-execs the NEW launcher (new preamble, new routing, new hooks) with `--resume <session id>`.
+5. The launcher restores the terminal, prints the one line and re-execs the NEW launcher (new preamble, new routing, new hooks) with `--resume <session id>`. The
+   re-entered launcher prints nothing else (no banner, no loaded-state or model line, no nudge; the supervisor marks the exec with `HMD_RELAUNCHED`, which the launcher
+   believes only beside its own pid, reads once and removes), so a restart leaves one line on the screen.
 
 ## The safe point
 

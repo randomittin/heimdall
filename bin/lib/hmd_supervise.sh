@@ -39,7 +39,8 @@
 # late exit is the user's or a crash. When the child ends and
 # restarting.json is there for THAT child, the launcher puts the tty back (`stty` of the state it found: claude leaves a sane cooked state, not the pre-launch
 # bits, and no escape-sequence mode: memo Q2), runs the cleanup, records the restart in $HEIMDALL_HOME/restart/last.json (the gate's loop guard reads it),
-# prints ONE line and execs the launcher with HMD_RESUME_SESSION_ID, HMD_RESTART_COUNT+1, HMD_RESTARTED_FROM and HEIMDALL_NO_INTRO=1. Any other exit (the
+# prints ONE line and execs the launcher with HMD_RESUME_SESSION_ID, HMD_RESTART_COUNT+1, HMD_RESTARTED_FROM, HEIMDALL_NO_INTRO=1 and HMD_RELAUNCHED=1 (the launcher then
+# prints nothing of its own: that one line is the whole notice, see _heimdall_relaunch_quiet in bin/heimdall). Any other exit (the
 # user's /exit, a crash) is the plain exit with claude's status. In the re-entered launcher a resume that fails within HMD_RESTART_RESUME_FAIL_S falls back to
 # `--continue`, then to a fresh launch (HMD_RESTART_FALLBACK=checkpoint in its environment), one printed line each.
 #
@@ -347,7 +348,9 @@ _hmd_sv_relaunch() {
   fi
   printf '%s\n' "$(_hmd_sv_line)"
   shopt -s execfail
-  HMD_RESUME_SESSION_ID="$_HMD_SV_SID" HMD_RESTART_COUNT=$((n + 1)) HMD_RESTARTED_FROM="$_HMD_SV_DESC" HEIMDALL_NO_INTRO=1 \
+  # HMD_RELAUNCHED=1: the re-entered launcher prints nothing of its own (no banner, no loaded-state lines, no nudge). It believes the marker only beside this pid in
+  # HMD_LAUNCHER_PID, a plain session id and a count of 1 or more, reads it once and removes it
+  HMD_RELAUNCHED=1 HMD_RESUME_SESSION_ID="$_HMD_SV_SID" HMD_RESTART_COUNT=$((n + 1)) HMD_RESTARTED_FROM="$_HMD_SV_DESC" HEIMDALL_NO_INTRO=1 \
     exec "$HEIMDALL_SELF" ${ORIG_ARGV[@]+"${ORIG_ARGV[@]}"}
   shopt -u execfail
   printf '[heimdall] could not relaunch %s: the session was ended\n' "$HEIMDALL_SELF" >&2
