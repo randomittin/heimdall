@@ -1,0 +1,34 @@
+# scenario: restart-happy (plan section 2 steps 2-5, section 3 all gates open)
+# given: supervised interactive launch on a TTY; claude 2.1.322 running, newest installed 2.1.323; hmd 2.4.1 installed, 2.4.2 landed more than 30 s ago;
+#        no opt-out, no agents, no sweep, tty untouched for longer than HMD_RESTART_QUIET_S, loop guard empty, session older than 60 s
+# when:  one turn ends (the Stop hook fires while status is still busy, idle follows 0.1-1 s later: memo Q4), the session settles, nobody types
+# then:  the gate says SAFE twice, claude gets exactly ONE TERM and exits 143 (memo Q1), the launcher prints ONE line, the new launcher resumes
+#        the session (--resume sid-1, HMD_RESTART_COUNT 1); the user then quits (rc 0) and no further relaunch happens
+# seams: HMD_RESTART_SETTLE_S, HMD_RESTART_QUIET_S, HMD_RESTART_TERM_WAIT_S small enough for a unit run (QUIET and SETTLE below 10 s)
+# run:   fake-claude.sh --extract script THIS > script; FAKE_CLAUDE_SCRIPT=script; compare with fake-claude.sh --trace-diff THIS LOG LAUNCHER_STDOUT
+#env FAKE_CLAUDE_TERM=graceful
+#script @0 set status=idle sessionId=sid-1 version=2.1.322
+#script @0 sleep 1
+#script @0 set status=busy
+#script @0 sleep 1
+#script @0 stop-hook
+#script @0 set status=idle
+#script @1 set status=idle sessionId=sid-1 version=2.1.323
+#script @1 sleep 4
+#script @1 exit 0
+START argv=--agent heimdall resume=none count=0
+STATUS idle
+SESSION sid-1
+VERSION 2.1.322
+STATUS busy
+STOP_HOOK
+STATUS idle
+SIGNAL TERM
+EXIT rc=143
+PRINT [heimdall] updated claude 2.1.322->2.1.323, hmd 2.4.1->2.4.2 - resumed
+START argv=--agent heimdall --resume sid-1 resume=sid-1 count=1
+STATUS idle
+SESSION sid-1
+VERSION 2.1.323
+EXIT rc=0
+?tty TTY restored=yes
