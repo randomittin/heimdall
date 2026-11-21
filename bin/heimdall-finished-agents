@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# heimdall-finished-agents -- finished background agents that were never closed: the hooks that record and name them, and the CLI
+# (`hmd agents finished list|clear`). Why, the hook events and the payload field each reads, the state and its bounds: the header of
+# bin/lib/hmd_finished_agents.py, which holds the behaviour. This file is only the launcher, and the fast path of the one hook that
+# fires on every prompt.
+#
+# FAST PATH. `prompt` runs on every UserPromptSubmit, and nearly always has nothing to say. It reads the payload with builtins,
+# takes the session id out of it, and ends at one file test when this session has no log (a log is removed the moment nothing
+# is open in it). No process is started for that, the interpreter included.
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+if [ "${1:-}" = prompt ] && [ -z "${2:-}" ]; then
+  IFS= read -r -d '' _payload || true
+  _re='"session_id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_-]+)"'
+  [[ $_payload =~ $_re ]] || exit 0
+  _sid="${BASH_REMATCH[1]}"
+  [ -s "${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}/finished-agents/$_sid.jsonl" ] || exit 0
+  set -- prompt --session "$_sid"
+fi
+
+# The interpreter the way bin/heimdall-ctx-meter resolves it (bin/lib/hmd-python.sh: a version-manager shim costs ~145 ms a call).
+PY=""
+if [ -r "$BIN_DIR/lib/hmd-python.sh" ]; then
+  . "$BIN_DIR/lib/hmd-python.sh" 2>/dev/null
+  if type hmd_python >/dev/null 2>&1; then PY="$(hmd_python 2>/dev/null || true)"; fi
+fi
+[ -n "$PY" ] || PY="$(command -v python3 2>/dev/null || true)"
+if [ -z "$PY" ]; then
+  # A hook never breaks a session: with no interpreter the hook verbs end here, quietly. The CLI says so.
+  case "${1:-}" in subagent-stop|tool-done|tool-failed|prompt) exit 0 ;; esac
+  echo "heimdall-finished-agents: python3 not found" >&2
+  exit 1
+fi
+exec "$PY" -I -S "$BIN_DIR/lib/hmd_finished_agents.py" "$@"

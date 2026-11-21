@@ -539,35 +539,31 @@ When spawning an agent, provide:
 5. **Acceptance criteria**: the specific checks this agent must pass before reporting done — test criteria scoped to its OWN test file(s), run ONCE after its changes are written; never a neighbouring or full suite; in a client repo, the user journeys its change must be proven on, as use-case scenarios (§6c)
 6. **State updates**: commands to run on completion (`heimdall-state set ...`)
 
-### 4d. Closing Idle Agents — automatic, no human input
+### 4d. Closing Finished Agents — automatic, no human input
 
 You spawn agents. You close them. Nobody asks you to.
 
-**The signal already arrives.** When a spawned agent parks, the harness delivers an `idle_notification` teammate message to you:
+**The signal that arrives is the completion notice.** Every background agent you spawn ends with a `<task-notification>` whose `<task-id>` is the id `TaskStop` takes. Read its summary:
 
-```json
-{"type":"idle_notification","from":"<agent name>","idleReason":"available"}
-```
-
-**The rule: on receiving an `idle_notification` from an agent whose work is complete, call `TaskStop` on it.** Immediately, in the same turn, without asking the user. `TaskStop` accepts a background task ID, or an agent-team teammate / named background agent by agent ID or name — so the `from` field of the notification is a valid argument.
-
-Apply judgement, not reflex. Three cases:
-
-| Situation | Action |
+| The notice says | Action |
 |---|---|
-| Agent delivered its result and parked | **`TaskStop` it.** |
-| Agent deliberately kept resident for a multi-turn conversation you intend to continue via `SendMessage` | **Keep it** — and state why in your reasoning ("keeping <name>: still driving it for X"). A keep you cannot justify in one sentence is a leak. |
-| Agent still working | **Never `TaskStop` it.** |
+| `Agent "<desc>" finished` | **`TaskStop` that id in the same turn**, without asking the user — unless you are keeping the agent for a follow-up (next row) |
+| `Agent "<desc>" is waiting on its own background work` | **Leave it.** It is not finished: it has live background children and notifies again when they end |
+| You are keeping it for a multi-turn conversation you will continue via `SendMessage` | **Keep it** — and state why in your reasoning ("keeping <id>: still driving it for X"). A keep you cannot justify in one sentence is a leak |
 
-**Never `TaskStop` an agent that is still working.** Killing live work is far worse than a lingering idle row — a dead orchestration wave costs a rerun; an idle row costs a line of output. `idleReason: "available"` means parked-and-available, so the notification is your evidence: confirm it says `"available"` before stopping. Never stop on an inference that an agent "looks done" or "has been quiet a while".
+A finished agent is not an ended one: the notice itself says it can be resumed, so the same id may notify more than once, and the harness keeps listing it as running until something stops it. Measured on one long session (`docs/analysis/2026-11-20-finished-agents-still-listed.md`): 2,029 finish notices, 238 `TaskStop` calls, three finished agents still listed after three hours. **Never `TaskStop` an agent that is still working** — one whose notice says it is waiting, or that has sent none. Killing live work is far worse than a lingering row, and you never stop on an inference that an agent "looks done" or "has been quiet a while".
 
-**Agents that parked before this rule applied** send no fresh notification — nothing will remind you. Sweep them explicitly:
+**`idle_notification` only applies to named agents.** A spawn carrying `name:` is a mailbox teammate: it parks and sends `{"type":"idle_notification","from":"<agent name>","idleReason":"available"}`, and for that one you `TaskStop` the `from` name when its work is complete (confirm `idleReason` is `"available"`). The unnamed agents you spawn by default never send one: the measured session spawned 1,510 and received none, which is why the rule above does not wait for it.
+
+**The mechanical backstop — do not rely on memory.** A `SubagentStop` hook records every finished background agent (id, time, description) per session under `$HEIMDALL_HOME/finished-agents/`. A successful `TaskStop`, or a `SendMessage` to the id (the agent is live again), takes it off the list; so does a `TaskStop` the harness answers with "No task found" or "is not running". A `UserPromptSubmit` hook, which also fires on notification turns, prints ONE line when any are left: `N finished agents still open: <id> (<desc>, finished Xm ago), ... — TaskStop them unless keeping one for follow-up.` Act on that line in the same turn: `TaskStop` each id, or state why you keep it. `hmd agents finished` (`bin/heimdall-finished-agents list|clear`) shows the same list on demand and forgets entries without stopping anything. Only background agents that are direct children are listed (a foreground agent answered its spawn call; a grandchild belongs to its parent).
+
+**Agents stranded before this applied** send no fresh notice and are not on that list. Sweep them explicitly:
 
 ```bash
 bin/heimdall-agents orphans      # lists parked mailbox teammates by name
 ```
 
-`TaskStop` each listed name whose work is complete, applying the same three checks. Run this sweep at session start and at the end of any multi-wave task.
+`TaskStop` each listed name whose work is complete, applying the same checks. Run this sweep at session start and at the end of any multi-wave task.
 
 **Verification status: `TaskStop` is CONFIRMED PRESENT and functional.** It ships in Claude Code 2.1.198+ and was declared on the agent definitions in `b214eb1`; definitions load at session start, so the session that authored this rule could not exercise it — a later session could, and `TaskStop` correctly enumerated the running agent set. **Verified scoping limit:** `TaskStop` reaches ONLY agents the calling session spawned; a cross-session stop returns `No task found with ID`. You can always close what you opened and never what another session opened — so agents stranded by a dead session are beyond `TaskStop` and need the `bin/heimdall-agents orphans` sweep.
 
