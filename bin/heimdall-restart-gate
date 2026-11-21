@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# heimdall-restart-gate -- is NOW a safe moment to end the supervised claude and relaunch it on the updated binary and plugin?
+# Prints `SAFE` (exit 0) or `UNSAFE <reason-token>` (exit 1); exit 2 is a usage error and never a verdict. Read-only: it signals nothing and writes nothing.
+#
+# This file is only the launcher. The conditions (G1-G8), the seams and the contract (`--req`, `--now`, `--json`) are in bin/lib/hmd_restart_gate.py. Python
+# runs isolated (-I -S), like the other hook helpers, so nothing from the cwd or the environment is imported.
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+exec python3 -I -S "$(cd "$(dirname "$SELF")" && pwd)/lib/hmd_restart_gate.py" "$@"
