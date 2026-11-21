@@ -187,6 +187,8 @@
      "why": "delivers companion-app inbox messages at Stop, holding the turn open for a connected phone"},
     {"id": "inbox-wake-arm-stop", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "inbox-wake-arm-stop",
      "why": "re-arms the inbox watcher at the end of every turn"},
+    {"id": "seamless-restart", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "seamless-restart",
+     "why": "after a turn, asks the supervising launcher to restart claude on an updated binary or plugin; it only asks, the launcher decides when it is safe (off with HMD_AUTO_RESTART=off)"},
 
     {"id": "presence-keeper-stop", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "presence-keeper-stop",
      "why": "stops this session's presence keeper"},
