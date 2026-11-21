@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""heimdall-agents-prune -- `hmd agents prune`: the OPT-IN clean-up of the transcripts of old, finished subagents.
+
+    heimdall-agents-prune [--older-than 14d] [--compress | --delete [--yes]] [--dry-run] [--project DIR]
+
+WHY. A long session spawns thousands of subagents and each leaves its transcript on disk: one session measured 8.7 GB in 2,051
+files, five over 425 MB (docs/analysis/2026-11-20-finished-agents-still-listed.md, recommendation 7). Stopping an agent does not
+remove its transcript and nothing else does. They are also the only record of what an agent did, so this is a tool you run: no hook,
+timer or other command calls it, and with no --compress or --delete it only lists what it would touch.
+
+WHAT IT TOUCHES: only <config>/projects/<project>/<session>/subagents/agent-<id>.jsonl and agent-<id>.meta.json (and the .gz of
+either, which --compress leaves and a later --delete removes), where <config> is $CLAUDE_CONFIG_DIR or ~/.claude. One agent is
+its files together; it is a candidate when
+  * the newest of them is older than --older-than (default 14d); and
+  * its session is not running: no live process in <config>/sessions/<pid>.json names the session, and nothing in the session was
+    written in the last 10 minutes (its main transcript, or any file in its subagents directory, these agents' own included, so a
+    short --older-than never reaches an agent that is still writing).
+That is "finished" here: nothing is writing to it and nothing can. A record in sessions/ that cannot be read proves nothing and is
+skipped (the 10-minute rule still holds); a sessions directory that cannot be read at all stops the run, because it could not
+tell which sessions run. A pid owned by someone else counts as alive: a false "alive" costs an agent left alone, a false "dead"
+costs a live agent's history (bin/lib/session-liveness.sh makes the same trade).
+NEVER TOUCHED: a main session transcript, <session>/tool-results, any file that is not agent-*.jsonl|.meta.json in a subagents
+directory, a symlink (not followed, not removed: only real directories and regular files are walked), anything outside
+<config>/projects. Every path comes from walking down from there, never from joining a name that was read from a file.
+
+--compress  gzips each file next to itself, keeping the original's mode and mtime (so the age survives), and removes the
+            original only once the .gz is written and synced; read one with `gzip -dc FILE.gz`. An existing .gz is never
+            replaced and a file that changed while it was being compressed is left whole (the .gz is dropped). The temporary
+            name is FILE.gz.partial. Needs room for the .gz: on a full disk use --delete.
+--delete    removes them for good; needs --yes, or "yes" typed at a terminal. After the answer it scans again and deletes only
+            what is still selected, so an agent written to while the prompt waited is kept.
+--dry-run   changes nothing even with --compress/--delete (and --yes); it is also what you get with neither.
+Output: counts and bytes (selected, kept, the five largest), then for --compress/--delete the bytes reclaimed.
+Exit: 0 done (or nothing to prune); 1 an agent could not be processed, or a directory could not be read; 2 usage; 3 --delete not
+confirmed (no terminal and no --yes, or the answer was not yes): nothing was deleted.
+"""
+import argparse
+import gzip
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import time
+from collections import namedtuple
+
+LIVE_WINDOW_S = 600
+DEFAULT_AGE = "14d"
+AGE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+AGE_RE = re.compile(r"^([0-9]{1,7})([smhdw])$")
+SUFFIXES = (".jsonl", ".jsonl.gz", ".meta.json", ".meta.json.gz")
+CHUNK = 1 << 20
+RECORD_CAP = 1 << 20
+SHOW_LARGEST = 5
+CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f  ]")
+
+File = namedtuple("File", "name size mtime")
+Plan = namedtuple("Plan", "selected recent running")
+
+
+class Unreadable(Exception):
+    """A directory the run depends on could not be read; the message says which and why."""
+
+
+class Skip(Exception):
+    """One agent is left exactly as it was; the message says why."""
+
+
+class Agent(object):
+    """One subagent: the files of a subagents directory that share the stem agent-<id>."""
+
+    def __init__(self, project, session, directory, stem):
+        self.project, self.session, self.directory, self.stem = project, session, directory, stem
+        self.files = []
+
+    @property
+    def key(self):
+        return (self.directory, self.stem)
+
+    @property
+    def newest(self):
+        return max(f.mtime for f in self.files)
+
+    @property
+    def size(self):
+        return sum(f.size for f in self.files)
+
+    @property
+    def label(self):
+        return "%s/%s/%s" % (self.project, self.session, self.stem)
+
+
+class Result(object):
+    def __init__(self):
+        self.agents = self.files = self.bytes_before = self.bytes_after = 0
+        self.failed = []
+
+
+def clean(text):
+    return CONTROL_RE.sub("?", text)
+
+
+def warn(text):
+    print("hmd agents prune: %s" % clean(text), file=sys.stderr)
+
+
+def plural(count, word):
+    return "%d %s%s" % (count, word, "" if count == 1 else "s")
+
+
+def human(count):
+    sign, count = ("-" if count < 0 else ""), abs(count)
+    if count < 1000:
+        return "%s%d B" % (sign, count)
+    value = float(count)
+    for unit in ("KB", "MB", "GB", "TB"):
+        value /= 1000.0
+        if value < 1000 or unit == "TB":
+            return "%s%.1f %s" % (sign, value, unit)
+
+
+def age(text):
+    """argparse type: (the text as typed, seconds); a number and a unit, nothing else."""
+    match = AGE_RE.match(text)
+    if not match:
+        raise argparse.ArgumentTypeError("%r is not an age: a number and a unit (s, m, h, d or w), like %s" % (text, DEFAULT_AGE))
+    return text, int(match.group(1)) * AGE_UNITS[match.group(2)]
+
+
+def config_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def read_dir(path):
+    """The entries of PATH by name; [] when it is not there (or vanished); Unreadable when it cannot be read."""
+    try:
+        with os.scandir(path) as entries:
+            return sorted(entries, key=lambda entry: entry.name)
+    except FileNotFoundError:
+        return []
+    except OSError as err:
+        raise Unreadable("cannot read %s: %s" % (path, err.strerror or err))
+
+
+def is_dir(entry):
+    return entry.is_dir(follow_symlinks=False)
+
+
+def is_file(entry):
+    return entry.is_file(follow_symlinks=False)
+
+
+def stat_of(entry):
+    """lstat of a directory entry, None when a running session removed it since the listing."""
+    try:
+        return entry.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def pid_alive(pid):
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OverflowError, ValueError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def read_record(path):
+    try:
+        with open(path, "rb") as fh:
+            data = json.loads(fh.read(RECORD_CAP).decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def running_sessions(config):
+    """Ids of the sessions with a live process, from the status files Claude Code keeps in <config>/sessions/<pid>.json."""
+    ids = set()
+    for entry in read_dir(os.path.join(config, "sessions")):
+        if not entry.name.endswith(".json") or not is_file(entry):
+            continue
+        record = read_record(entry.path)
+        if record is not None and isinstance(record.get("sessionId"), str) and pid_alive(record.get("pid")):
+            ids.add(record["sessionId"])
+    return ids
+
+
+def stem_of(name):
+    if name.startswith("agent-"):
+        for suffix in SUFFIXES:
+            if name.endswith(suffix) and len(name) > len("agent-") + len(suffix):
+                return name[: -len(suffix)]
+    return None
+
+
+def scan(root, only):
+    """-> (agents, activity). Every agent under <root>/<project>/<session>/subagents, and for each (project, session) the newest
+    write to its main transcript or to anything in its subagents directory. Symlinks are never followed."""
+    agents, activity = [], {}
+    for project in read_dir(root):
+        if not is_dir(project) or (only is not None and project.name not in only):
+            continue
+        entries = read_dir(project.path)
+        transcripts = {entry.name: entry for entry in entries if is_file(entry)}
+        for session in entries:
+            if not is_dir(session):
+                continue
+            subagents = [c for c in read_dir(session.path) if c.name == "subagents" and is_dir(c)]
+            if not subagents:
+                continue
+            main = stat_of(transcripts[session.name + ".jsonl"]) if session.name + ".jsonl" in transcripts else None
+            newest = main.st_mtime if main is not None else 0.0
+            by_stem = {}
+            for entry in read_dir(subagents[0].path):
+                if not is_file(entry):
+                    continue
+                info = stat_of(entry)
+                if info is None:
+                    continue
+                newest = max(newest, info.st_mtime)
+                stem = stem_of(entry.name)
+                if stem is not None:
+                    if stem not in by_stem:
+                        by_stem[stem] = Agent(project.name, session.name, subagents[0].path, stem)
+                    by_stem[stem].files.append(File(entry.name, info.st_size, info.st_mtime))
+            activity[(project.name, session.name)] = newest
+            agents.extend(by_stem[stem] for stem in sorted(by_stem))
+    return agents, activity
+
+
+def make_plan(root, only, live_sessions, now, older_than_s):
+    agents, activity = scan(root, only)
+    cutoff, live_after = now - older_than_s, now - LIVE_WINDOW_S
+    selected, recent, running = [], [], []
+    for agent in agents:
+        if agent.newest > cutoff:
+            recent.append(agent)
+        elif agent.session in live_sessions or activity[(agent.project, agent.session)] > live_after:
+            running.append(agent)
+        else:
+            selected.append(agent)
+    return Plan(selected, recent, running)
+
+
+def slug_of(path):
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def project_slugs(directory, root):
+    """Names of the project directories Claude Code keeps for DIRECTORY: its path with every non-alphanumeric turned into '-',
+    spelled as typed and with links resolved (/tmp is /private/tmp), whichever exist as real directories."""
+    found = set()
+    for path in {os.path.abspath(directory), os.path.realpath(directory)}:
+        candidate = os.path.join(root, slug_of(path))
+        if os.path.isdir(candidate) and not os.path.islink(candidate):
+            found.add(os.path.basename(candidate))
+    return found
+
+
+def write_gzip(src, partial, info):
+    discard(partial)
+    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "wb") as out:
+        os.fchmod(out.fileno(), stat.S_IMODE(info.st_mode))
+        with gzip.GzipFile(filename="", mode="wb", fileobj=out, compresslevel=6, mtime=int(info.st_mtime)) as packed:
+            shutil.copyfileobj(src, packed, CHUNK)
+        out.flush()
+        os.fsync(out.fileno())
+
+
+def discard(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+
+
+def refuse_existing(dest):
+    if os.path.lexists(dest):
+        raise Skip("%s already exists; both left as they were" % os.path.basename(dest))
+
+
+def compress_file(path):
+    """Replace PATH by PATH.gz (same mode and mtime) once the .gz is written and synced. -> (bytes before, bytes after)."""
+    dest, partial = path + ".gz", path + ".gz.partial"
+    refuse_existing(dest)
+    with open(path, "rb") as src:
+        before = os.fstat(src.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise Skip("%s is not a regular file" % os.path.basename(path))
+        try:
+            write_gzip(src, partial, before)
+            after = os.fstat(src.fileno())
+            if (after.st_size, after.st_mtime_ns, after.st_ino) != (before.st_size, before.st_mtime_ns, before.st_ino):
+                raise Skip("%s changed while it was being compressed; left as it was" % os.path.basename(path))
+            os.utime(partial, ns=(before.st_atime_ns, before.st_mtime_ns))
+            refuse_existing(dest)
+            os.replace(partial, dest)
+        finally:
+            discard(partial)
+    os.unlink(path)
+    return before.st_size, os.lstat(dest).st_size
+
+
+def compress_agent(agent, result):
+    did = False
+    for f in sorted(agent.files, key=lambda f: (not f.name.endswith(".jsonl"), f.name)):
+        if f.name.endswith(".gz"):
+            continue
+        before, after = compress_file(os.path.join(agent.directory, f.name))
+        result.files += 1
+        result.bytes_before += before
+        result.bytes_after += after
+        did = True
+    return did
+
+
+def delete_agent(agent, result):
+    for f in agent.files:
+        os.unlink(os.path.join(agent.directory, f.name))
+        result.files += 1
+        result.bytes_before += f.size
+    return True
+
+
+def reason(err):
+    return err.strerror if isinstance(err, OSError) and err.strerror else str(err)
+
+
+def run_action(agents, action):
+    result = Result()
+    for agent in agents:
+        try:
+            did = compress_agent(agent, result) if action == "compress" else delete_agent(agent, result)
+        except (Skip, OSError) as err:
+            result.failed.append(agent.label)
+            warn("%s: %s" % (agent.label, reason(err)))
+        else:
+            result.agents += 1 if did else 0
+    return result
+
+
+def typed_yes(question):
+    sys.stderr.write(question)
+    sys.stderr.flush()
+    return sys.stdin.readline().strip().lower() in ("y", "yes")
+
+
+def describe(plan, root, scope, age_text, header):
+    files = [(f.size, os.path.relpath(os.path.join(a.directory, f.name), root)) for a in plan.selected for f in a.files]
+    size = sum(a.size for a in plan.selected)
+    print("hmd agents prune: %s" % header)
+    print("  scope     %s" % clean(scope))
+    print("  selected  %s older than %s: %s, %s (%d bytes)" % (
+        plural(len(plan.selected), "finished agent"), age_text, plural(len(files), "file"), human(size), size))
+    for position, (nbytes, rel) in enumerate(sorted(files, reverse=True)[:SHOW_LARGEST]):
+        print("  %-9s %s  %s" % ("largest" if position == 0 else "", human(nbytes), clean(rel)))
+    print("  kept      %d newer than %s, %d in running sessions (never touched)" % (len(plan.recent), age_text, len(plan.running)))
+    return size
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="hmd agents prune", allow_abbrev=False, formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Compress or delete the transcripts of old, finished subagents:\n"
+            "<config>/projects/<project>/<session>/subagents/agent-<id>.jsonl and .meta.json, <config> being\n"
+            "$CLAUDE_CONFIG_DIR or ~/.claude. Opt-in: it never runs by itself (no hook, timer or command calls it),\n"
+            "and with neither --compress nor --delete it only lists what it would touch (count and bytes)."),
+        epilog=(
+            "An agent is finished when its newest file is older than --older-than and its session is not running: no\n"
+            "live process in <config>/sessions/*.json names it and nothing in the session (these agents' files included)\n"
+            "was written in the last 10 minutes. Never touched: a main session transcript, a running session's agents,\n"
+            "any other file, a symlink, anything outside <config>/projects.\n"
+            "Read a compressed transcript with: gzip -dc FILE.gz   (zcat on Linux)\n"
+            "Exit: 0 done or nothing to prune; 1 an agent failed or a directory could not be read; 2 usage;\n"
+            "      3 --delete not confirmed (nothing was deleted)."))
+    parser.add_argument("--older-than", type=age, default=DEFAULT_AGE, metavar="AGE",
+                        help="only agents whose newest file is older than this: a number and s, m, h, d or w (default: %s)" % DEFAULT_AGE)
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--compress", action="store_true", help="gzip them in place, keeping mode and mtime (reversible)")
+    action.add_argument("--delete", action="store_true", help="remove them for good; asks first, or pass --yes")
+    parser.add_argument("--dry-run", action="store_true", help="change nothing, even with --compress or --delete (the default with neither)")
+    parser.add_argument("--project", metavar="DIR", help="only the Claude project of this working directory (default: every project)")
+    parser.add_argument("--yes", action="store_true", help="the person already said yes to --delete")
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    age_text, older_than_s = args.older_than
+    action = "compress" if args.compress else "delete" if args.delete else None
+    dry = args.dry_run or action is None
+    config = config_dir()
+    root = os.path.join(config, "projects")
+    only, scope = None, "all projects under %s" % root
+    if args.project is not None:
+        only = project_slugs(args.project, root)
+        if not only:
+            parser.error("no Claude project directory for %s (looked for %s)" % (
+                args.project, os.path.join(root, slug_of(os.path.abspath(args.project)))))
+        scope = "project %s (%s)" % (args.project, ", ".join(sorted(only)))
+    if only is None and not os.path.isdir(root):
+        print("hmd agents prune: nothing to prune (no Claude projects directory at %s)" % clean(root))
+        return 0
+
+    try:
+        plan = make_plan(root, only, running_sessions(config), time.time(), older_than_s)
+    except Unreadable as err:
+        warn("%s; nothing was changed" % err)
+        return 1
+    header = "dry run, nothing changed" if dry else "compressing" if action == "compress" else "deleting"
+    size = describe(plan, root, scope, age_text, header)
+    if not plan.selected:
+        print("hmd agents prune: nothing to prune")
+        return 0
+    plain = [f for a in plan.selected for f in a.files if not f.name.endswith(".gz")]
+    nfiles = sum(len(a.files) for a in plan.selected)
+
+    if dry:
+        if action == "compress":
+            nxt = "would gzip %s in place (read one later with: gzip -dc FILE.gz)" % plural(len(plain), "file")
+        elif action == "delete":
+            nxt = "would delete %s and reclaim %s (%d bytes)" % (plural(nfiles, "file"), human(size), size)
+        else:
+            nxt = "--compress gzips them in place (read one later with: gzip -dc FILE.gz); --delete removes them (asks first, or pass --yes)"
+        print("  next      %s" % nxt)
+        return 0
+    if action == "compress" and not plain:
+        print("hmd agents prune: nothing left to compress (%s already .gz)" % plural(len(plan.selected), "finished agent"))
+        return 0
+    if action == "delete" and not args.yes:
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            warn("--delete removes files for good: ask the person, then pass --yes (or run this at a terminal to confirm). Nothing was deleted.")
+            return 3
+        if not typed_yes("Delete %s (%s, %s) older than %s? This cannot be undone. Type yes to continue: " % (
+                plural(len(plan.selected), "finished agent"), plural(nfiles, "file"), human(size), age_text)):
+            warn("not confirmed; nothing was deleted")
+            return 3
+
+    confirmed = {a.key for a in plan.selected}
+    try:
+        again = make_plan(root, only, running_sessions(config), time.time(), older_than_s)
+    except Unreadable as err:
+        warn("%s; nothing was changed" % err)
+        return 1
+    result = run_action([a for a in again.selected if a.key in confirmed], action)
+    if action == "compress":
+        reclaimed = result.bytes_before - result.bytes_after
+        print("hmd agents prune: compressed %s (%s): %s -> %s, reclaimed %s (%d bytes)" % (
+            plural(result.agents, "finished agent"), plural(result.files, "file"), human(result.bytes_before),
+            human(result.bytes_after), human(reclaimed), reclaimed))
+    else:
+        print("hmd agents prune: deleted %s (%s), reclaimed %s (%d bytes)" % (
+            plural(result.agents, "finished agent"), plural(result.files, "file"), human(result.bytes_before), result.bytes_before))
+    if result.failed:
+        print("  failed    %s (the reasons are on stderr; they were left as they were)" % plural(len(result.failed), "agent"))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    sys.exit(main(sys.argv[1:]))

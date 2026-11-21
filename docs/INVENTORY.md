@@ -389,7 +389,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-ctx-meter` | context meter; makes runaway context impossible to miss |
 | `heimdall-session-usage` | pre-exhaustion session-budget advisory |
 | `heimdall-memory-budget` | memory-aware cap on further agent spawns |
-| `heimdall-agents` / `heimdall-agent-watchdog` / `heimdall-reap-idle` / `heimdall-agent-resume` | subagent tracker+reaper; enforcement; idle reaper; per-agent resume reporting |
+| `heimdall-agents` / `heimdall-agent-watchdog` / `heimdall-reap-idle` / `heimdall-agent-resume` / `heimdall-agents-prune` | subagent tracker+reaper; enforcement; idle reaper; per-agent resume reporting; opt-in prune of old subagent transcripts (`hmd agents prune`) |
 | `heimdall-gc` / `heimdall-cleanup` / `heimdall-sysmon` | resource-hygiene GC; unified system-health core; disk/memory advisor |
 | `shared-memory` | SQLite shared memory for parallel agents |
 | `heimdall-blackboard` | shared key-value facts (Protocol v2 mech 5) |
