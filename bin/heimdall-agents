@@ -116,8 +116,10 @@
 #   working   — last transcript event is a tool_use: the agent is AWAITING A TOOL
 #               RESULT and is genuinely alive no matter how old its mtime is.
 #               NEVER reaped. This is the guard that makes a 40-minute build safe.
-#   hung      — awaiting a tool result for >= HMD_AGENT_HUNG_SECS (default 3600).
-#               An hour on one tool call is not work; it is a wedge.
+#   hung      — awaiting a tool result for >= HMD_AGENT_HUNG_SECS (default 3600) by
+#               BOTH clocks: the transcript's mtime AND the stamp on its last record,
+#               which is the agent's last tool call. An hour on one tool call is not
+#               work; it is a wedge. A recent tool call is an agent that is working.
 #   done      — a task-notification says `completed`. THE AGENT SUCCEEDED. This
 #               outranks every negative state, including a dead session: the work
 #               was finished and returned before the session went away. Calling a
@@ -777,6 +779,16 @@ _collect_candidates() {
   done
 }
 
+# _last_record_age_at_least <transcript> <secs>: true unless the transcript's LAST record carries a readable timestamp younger than <secs>. For an agent awaiting a tool result that record is its
+# last tool_use, so the stamp is the time of its last tool call. No stamp, an unparsable one (jq cannot read it) or one from the future proves nothing, so the mtime's verdict stands (true).
+_last_record_age_at_least() {
+  local ts
+  ts="$(tail -n 1 "$1" 2>/dev/null | jq -r '.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601' 2>/dev/null)"
+  case "$ts" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$ts" -le "$NOW" ] || return 0
+  [ $(( NOW - ts )) -ge "$2" ]
+}
+
 enumerate() {
   local taskdir subdirs reaped cands sessions tsess slug
   local id tr meta mt age term state name kind nstat sess
@@ -878,7 +890,9 @@ enumerate() {
     # age, of a dead session, or of any earlier notification (it may have been
     # resumed). This is what makes a 40-minute build safe from the reaper.
     if [ -z "$state" ] && [ "$awaiting" = "true" ]; then
-      if [ "$age" -ge "$HUNG_SECS" ]; then state="hung"; else state="working"; fi
+      # `hung` needs BOTH clocks old: the transcript's mtime (age) AND the stamp on its last record, which for an agent awaiting a tool result IS its last tool call. The stamp is read only for an
+      # agent the mtime already calls hung, so every other agent pays nothing. A recent tool call on a stale mtime (a copied or synced transcript) is an agent that is working, not a wedge.
+      if [ "$age" -ge "$HUNG_SECS" ] && _last_record_age_at_least "$tr" "$HUNG_SECS"; then state="hung"; else state="working"; fi
     fi
 
     # AUTHORITATIVE COMPLETION EVIDENCE, SECOND. A notified result outranks every

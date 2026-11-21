@@ -675,7 +675,7 @@ fi
 # large prompt cannot fail it on the argument-size limit.
 #
 # COMMIT RULE FOLLOWS ISOLATION (review finding F2, 2026-11-12). Only a spawn whose tool_input says isolation "worktree" has a checkout of its own, so only it is told to commit early and often. Any other spawn runs in
-# the MAIN checkout, next to the session and every parallel agent: told to commit early it would commit on main mid-task and sweep in whatever the others have edited. It gets rule 4 as "do not commit, leave your
+# the MAIN checkout, next to the session and every parallel agent: told to commit early it would commit on main mid-task and sweep in whatever the others have edited. It gets rule 5 as"do not commit, leave your
 # changes for the orchestrator", and its report line does not ask for a commit sha. Anything but exactly "worktree" (absent, remote, not a string) is that safe default. The choice is made inside the rewrite's own jq
 # call, on the same parsed tool_input, so it cannot disagree with what is rewritten.
 #
@@ -686,21 +686,23 @@ fi
 #
 # FAILS OPEN on everything: no jq, an unparsable payload, no prompt or a prompt that is not a string, a jq call that fails on the rewrite. The spawn then goes through with the input the
 # harness sent, exactly as before this section existed. Nothing here can deny a spawn, and nothing here exits: allow() below is the one place that emits the rewrite.
+# Rule 4 is the wait limit (docs/analysis/2026-11-20-finished-agents-still-listed.md, recommendation 5): an agent waiting on a build slot sat for hours and looked stuck, so it now gives up after 30 minutes and says what it waited for.
 GP_RULES_MARKER='[hmd agent rules]'
 GP_RULES_HEAD="$GP_RULES_MARKER
 1. Never poll in the foreground: no until/while/for + sleep loops, tail -f, or pgrep waits. They block you, burn turns and bloat your context.
 2. Start long jobs with run_in_background and wait for the completion notification (or use Monitor). Never sit in a Bash call waiting on a job.
-3. Set an explicit timeout on every Bash call that can run long."
-# Rules 4 and 6 are the only lines that depend on the spawn (COMMIT RULE above). GP_RULES_BLOCK is what a general-purpose spawn gets by default: it shares the main checkout, so it must not commit.
+3. Set an explicit timeout on every Bash call that can run long.
+4. If you are waiting on something outside your control (a build slot, a lock, another agent), give up after 30 minutes and report what you were waiting for."
+# Rules 5 and 7 are the only lines that depend on the spawn (COMMIT RULE above). GP_RULES_BLOCK is what a general-purpose spawn gets by default: it shares the main checkout, so it must not commit.
 GP_RULES_BLOCK="$GP_RULES_HEAD
-4. Do not commit: you share the main checkout with other agents. Leave your changes uncommitted for the orchestrator.
-5. Run only the tests you touched, once, after all edits.
-6. Report concisely: what changed, test result line."
+5. Do not commit: you share the main checkout with other agents. Leave your changes uncommitted for the orchestrator.
+6. Run only the tests you touched, once, after all edits.
+7. Report concisely: what changed, test result line."
 # The variant for a spawn whose tool_input says isolation "worktree": it commits in a checkout of its own.
 GP_RULES_BLOCK_WORKTREE="$GP_RULES_HEAD
-4. Commit early and often in your worktree, unless told not to.
-5. Run only the tests you touched, once, after all edits.
-6. Report concisely: what changed, commit sha, test result line."
+5. Commit early and often in your worktree, unless told not to.
+6. Run only the tests you touched, once, after all edits.
+7. Report concisely: what changed, commit sha, test result line."
 
 # gp_rules_apply <tool_input_json>: prints the tool_input with the rules block appended to .prompt, or NOTHING when no rewrite applies (opted out or switched off, not a general-purpose
 # spawn, no string prompt, block already there, or jq failed). Always returns 0.
