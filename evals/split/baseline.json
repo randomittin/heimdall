@@ -101,7 +101,8 @@
     {"path": "test/heimdall-statusline-register-cursor.test.sh", "group": "statusline-tests", "sha256": "cafbe6f2d691e8f875d1208421e0d1f672f05472deb5bdbbc12907f39fa7be93", "bytes": 15296, "exec": true},
     {"path": "test/heimdall-statusline-terminals.test.sh", "group": "statusline-tests", "sha256": "032f1c86fa2d78781178b20f2fd036e995fbd37755e1d07ee5c9a37b5db3f0b2", "bytes": 8650, "exec": false},
     {"path": "test/heimdall-statusline-update-notice.test.sh", "group": "statusline-tests", "sha256": "cbb99650e5b9186af38179dcd5bc3ff0b2e1464dea73ae4e37deeabadb7e7052", "bytes": 7997, "exec": false},
-    {"path": "test/heimdall-statusline-width.test.sh", "group": "statusline-tests", "sha256": "45b117159045722a5626232299372e4ff1f984319c90308491714b38a33a25fd", "bytes": 5591, "exec": true}
+    {"path": "test/heimdall-statusline-width.test.sh", "group": "statusline-tests", "sha256": "45b117159045722a5626232299372e4ff1f984319c90308491714b38a33a25fd", "bytes": 5591, "exec": true},
+    {"path": "test/heimdall-subagent-statusline.test.sh", "group": "statusline-tests", "sha256": "c81a1c42b67e03cef62b9845520813fba36a8cda7378c1f202ba6f49e6b6f210", "bytes": 7475, "exec": false}
   ],
   "host_paths": [
     "bin/agent-pool",
@@ -165,7 +166,8 @@
     "test/heimdall-statusline-register-cursor.test.sh": [],
     "test/heimdall-statusline-terminals.test.sh": [],
     "test/heimdall-statusline-update-notice.test.sh": [],
-    "test/heimdall-statusline-width.test.sh": []
+    "test/heimdall-statusline-width.test.sh": [],
+    "test/heimdall-subagent-statusline.test.sh": []
   },
   "renders": [
     {"id": "density:full:16", "entry": "sentinels/hmd-statusline.py", "sha256": "747f2b116ce0961c2ab6d3ab6ac37e51695f7ecae0f33616834615ba5c124683", "bytes": 1968},

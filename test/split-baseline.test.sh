@@ -6,8 +6,8 @@
 # The later waves mirror the files into two new repos and prove, against this recording, that no byte moved (INV-S1), that the registered entry points
 # are where they were (INV-S2) and that the renderers print the same bytes (INV-S3). A recording is worth something only if it is the right one and
 # its check can go RED, so:
-#   A. the recording is the plan's inventory: 100 paths in four groups (skills 21, statusline runtime 18, conformance 26, suites 35) whose byte totals
-#      are the numbers the plan measured (skills 163,291 B; hooks 2,775; bin 63,077; sentinels 323,741), every suite of the 35 has a host-call row,
+#   A. the recording is the plan's inventory: 101 paths in four groups (skills 21, statusline runtime 18, conformance 26, suites 36) whose byte totals
+#      are the numbers the plan measured (skills 163,291 B; hooks 2,775; bin 63,077; sentinels 323,741), every suite of the 36 has a host-call row,
 #      and the host calls are the real ones (agent-pool.json is a data file, not a call of bin/agent-pool; prose "heimdall" is not bin/heimdall).
 #   B. the renders were not made up: the 21 recorded density and sigil renders are, byte for byte, the goldens committed under conformance/statusline.
 #   C. the tool reproduces the recording: `check` on this tree is green, and `record` writes the committed file byte for byte (the recording is
@@ -69,9 +69,9 @@ fresh() {
 
 echo "== A) the recording is the plan's inventory =="
 jqok "the plan's accept: at least 60 paths" '.paths|length>=60'
-jqok "100 paths: skills 21, statusline-runtime 18, statusline-conformance 26, statusline-tests 35" \
-  '(.paths|length)==100 and ([.paths[]|select(.group=="skills")]|length)==21 and ([.paths[]|select(.group=="statusline-runtime")]|length)==18
-   and ([.paths[]|select(.group=="statusline-conformance")]|length)==26 and ([.paths[]|select(.group=="statusline-tests")]|length)==35'
+jqok "101 paths: skills 21, statusline-runtime 18, statusline-conformance 26, statusline-tests 36" \
+  '(.paths|length)==101 and ([.paths[]|select(.group=="skills")]|length)==21 and ([.paths[]|select(.group=="statusline-runtime")]|length)==18
+   and ([.paths[]|select(.group=="statusline-conformance")]|length)==26 and ([.paths[]|select(.group=="statusline-tests")]|length)==36'
 jqok "every path appears once, with a sha256 and a positive byte count" \
   'all(.paths[]; (.sha256|test("^[0-9a-f]{64}$")) and .bytes>0) and ((.paths|map(.path)|unique|length)==(.paths|length))'
 jqok "skills total 163291 bytes (plan 1a)" '[.paths[]|select(.group=="skills")|.bytes]|add==163291'
@@ -79,7 +79,7 @@ jqok "hooks 2775, the five bin files 63077, the seven measured sentinels 323741 
   '([.paths[]|select(.path|startswith("hooks/"))|.bytes]|add)==2775
    and ([.paths[]|select(.group=="statusline-runtime" and (.path|startswith("bin/")))|.bytes]|add)==63077
    and ([.paths[]|select(.group=="statusline-runtime" and (.path|startswith("sentinels/")) and (.path|test("hmd_(layout|termcaps|ledger|wall)")|not))|.bytes]|add)==323741'
-jqok "a host-call row for each of the 35 suites, and no other" \
+jqok "a host-call row for each of the 36 suites, and no other" \
   '([.paths[]|select(.group=="statusline-tests")|.path]|sort)==(.host_calls|keys|sort)'
 jqok "host calls are the real ones: bin/heimdall-identity, -agents, -ctx-meter, hooks/hooks.json, bin/heimdall" \
   '.host_calls["test/heimdall-statusline-identity-flip.test.sh"]==["bin/heimdall-identity"]
@@ -103,7 +103,7 @@ if [ "$T" = 21 ] && [ "$F" = 0 ]; then ok "all 21 recorded density and sigil ren
 else bad "recorded renders vs committed goldens: $T equal, $F not (want 21 and 0)"; fi
 
 echo "== C) the tool reproduces the recording =="
-green "check: this tree is the recorded tree (100 paths, 35 suites, 32 renders)" check
+green "check: this tree is the recorded tree (101 paths, 36 suites, 32 renders)" check
 run record --out "$WORK/rec.json"
 if [ "$RC" = 0 ] && cmp -s "$WORK/rec.json" "$BASE"; then ok "record writes the committed baseline byte for byte (reproducible, two renders of each fixture agree)"
 else bad "record: exit $RC, $(cmp "$WORK/rec.json" "$BASE" 2>&1 | head -1)"; fi
@@ -112,7 +112,7 @@ echo "== D) every check can go RED =="
 jq -r '.paths[].path' "$BASE" > "$WORK/moved.list"
 M="$WORK/tree"
 fresh "$M"
-green "control: a clean copy of the 100 moved files passes the paths and host-calls checks" check --root "$M" --only paths --only host-calls
+green "control: a clean copy of the 101 moved files passes the paths and host-calls checks" check --root "$M" --only paths --only host-calls
 
 fresh "$M"; printf 'X' | dd of="$M/skills/stacks/SKILL.md" bs=1 count=1 conv=notrunc 2>/dev/null
 red "one byte of skills/stacks/SKILL.md flipped (same size): the sha256 differs" "FAIL paths skills/stacks/SKILL.md: sha256" check --root "$M" --only paths
