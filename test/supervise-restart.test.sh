@@ -10,6 +10,7 @@
 # alone, never from this library):
 #   * golden: the restart-happy, restart-deferred and restart-loop-guard traces (START argv/resume/count, SIGNAL, EXIT, the ONE printed line, tty restore)
 #   * term-ignored, user-exit (with a request pending), off, unsupervised, exit-status, the restart cap, inplace-rewrite, the resume-failure fallback
+#   * term-slow (F8): a child that outlasts HMD_RESTART_TERM_WAIT_S after our TERM and then exits 143 is still resumed, once, on the same session id
 #   * the printed line for each combination of halves, with and without parked agents; sourcing has no side effect
 # The gate is the REAL gate, run from a temp copy with three constants lowered: G7's 60 s session age and 600 s spacing (the fake session is seconds old; the
 # loop-guard trace asks for the spacing at 0 so ONLY the per-version cap can block a second restart) and G4's 10 s Stop-before-idle window, which the
@@ -311,8 +312,8 @@ send_exit() {   # send_exit NAME SECONDS: the user types /exit SECONDS from now
   ( sleep "$after"; perl -e 'alarm 5; exec @ARGV' sh -c 'echo /exit > "$1"' sh "$fifo" ) &
 }
 
-probe() {   # probe NAME DELAY [term]: DELAY seconds from now (from the first TERM with `term`) note what is left on disk, then the user types /exit
-  local sd="$T/$1" delay="$2" mode="${3:-}"
+probe() {   # probe NAME DELAY [term [keep]]: DELAY seconds from now (from the first TERM with `term`) note what is left on disk, then the user types /exit (not with `keep`: the child is ending on our TERM)
+  local sd="$T/$1" delay="$2" mode="${3:-}" keep="${4:-}"
   (
     n=0
     if [ "$mode" = term ]; then
@@ -326,7 +327,7 @@ probe() {   # probe NAME DELAY [term]: DELAY seconds from now (from the first TE
       if [ -e "$sd/rd/req.json" ]; then echo "req=left"; else echo "req=gone"; fi
     } > "$sd/mid"
     cp "$sd/rd/supervisor.log" "$sd/mid.log" 2>/dev/null
-    perl -e 'alarm 5; exec @ARGV' sh -c 'echo /exit > "$1"' sh "$sd/fifo"
+    if [ "$keep" != keep ]; then perl -e 'alarm 5; exec @ARGV' sh -c 'echo /exit > "$1"' sh "$sd/fifo"; fi
   ) &
 }
 
@@ -334,6 +335,14 @@ term_ignored_ok() {   # the session was left alone: alive, no marker, no request
   local d="$1"
   [ "$(tr '\n' ' ' < "$d/mid" 2>/dev/null)" = "alive=yes marker=gone req=gone " ] && grep -q 'term-ignored' "$d/mid.log" 2>/dev/null \
     && [ "$(cat "$d/rc" 2>/dev/null)" = 0 ] && [ "$(count_in '"event":"start"' "$d/claude.log")" = 1 ] \
+    && [ "$(count_in '"signal":"TERM"' "$d/claude.log")" = 1 ] && [ "$(count_in '"signal":"KILL"' "$d/claude.log")" = 0 ]
+}
+
+term_slow_ok() {   # the TERM went out once and the child was slow to go: when the wait ran out it was alive and the marker and the request were gone; it then exited 143 and the session
+                   # came back ONCE (TERM count 1, no KILL, two starts), the launcher's status being the last child's
+  local d="$1"
+  [ "$(tr '\n' ' ' < "$d/mid" 2>/dev/null)" = "alive=yes marker=gone req=gone " ] && grep -q 'term-ignored' "$d/mid.log" 2>/dev/null \
+    && [ "$(cat "$d/rc" 2>/dev/null)" = 0 ] && [ "$(count_in '"event":"start"' "$d/claude.log")" = 2 ] \
     && [ "$(count_in '"signal":"TERM"' "$d/claude.log")" = 1 ] && [ "$(count_in '"signal":"KILL"' "$d/claude.log")" = 0 ]
 }
 
@@ -393,6 +402,7 @@ launch happy "$T/s.happy" "$(HMD_FAKE_CLAUDE=1 bash "$FAKE" --extract env "$TRAC
 launch deferred "$T/s.deferred" HMD_RESTART_QUIET_S=8 HMD_RESTART_SETTLE_S=2 SC_HMD_FIRST=2.4.2
 launch loop-guard "$T/s.loopguard" SC_HMD_FIRST=2.4.2
 launch term-ignored "$T/s.ti" FAKE_CLAUDE_TERM=ignore HMD_RESTART_TERM_WAIT_S=3
+launch term-slow "$T/s.happy" FAKE_CLAUDE_TERM=slow FAKE_CLAUDE_SLOW_S=10 HMD_RESTART_TERM_WAIT_S=2
 launch no-update "$T/s.first" NEWEST_CLAUDE=2.1.322 SC_HMD_FIRST=2.4.2
 launch ttl "$T/s.first" HMD_RESTART_QUIET_S=1000000000 HMD_RESTART_SETTLE_S=1 HMD_RESTART_REQ_TTL_S=5
 launch mut-M4 "$T/s.happy" SC_LIB="$T/mut/M4.sh"
@@ -409,6 +419,7 @@ send_exit user-exit 8
 send_exit cap 10
 ( sleep 1.5; cp "$T/launcher.v2.sh" "$T/inplace/launcher.sh" ) &
 probe term-ignored 6 term
+probe term-slow 5 term keep
 probe no-update 6
 probe ttl 11
 probe mut-M7 6 term
@@ -486,6 +497,12 @@ else bad "loop-guard: verdicts seen" "$(awk '{ $1 = ""; print }' "$D/gate.log" |
 D="$T/term-ignored"
 if term_ignored_ok "$D"; then ok "term-ignored: session kept, no relaunch"
 else bad "term-ignored" "mid=[$(tr '\n' ' ' < "$D/mid" 2>/dev/null)] rc=$(cat "$D/rc" 2>/dev/null) starts=$(count_in '"event":"start"' "$D/claude.log") terms=$(count_in '"signal":"TERM"' "$D/claude.log")"; fi
+
+# ---- term-slow (F8): the TERM is delivered, claude needs longer than HMD_RESTART_TERM_WAIT_S to shut down (a slow SessionEnd or MCP shutdown, a swapping machine) and then exits 143.
+# The wait ran out by then (the probe saw it alive, the marker and the request gone), but the TERM was ours: the same session comes back once, exactly as in restart-happy
+D="$T/term-slow"
+if term_slow_ok "$D" && trace_diff term-slow "$TRACES/restart-happy.trace"; then ok "term-slow: a child that outlasts the wait and then exits 143 is resumed once on the same session id"
+else bad "term-slow" "mid=[$(tr '\n' ' ' < "$D/mid" 2>/dev/null)] rc=$(cat "$D/rc" 2>/dev/null) starts=$(count_in '"event":"start"' "$D/claude.log") terms=$(count_in '"signal":"TERM"' "$D/claude.log") diff=[$(sed -n '1,12p' "$D/diff" 2>/dev/null | tr '\n' '|')]"; fi
 
 # ---- a request nobody can satisfy is dropped: no update pending any more (the gate says no-update and the library stops looking), or past its lifetime
 D="$T/no-update"

@@ -28,7 +28,9 @@ Only the halves that changed are named. Plan and measurements: `docs/superpowers
    hours, a new turn makes a new one).
 4. On the second `SAFE` it writes a checkpoint, notes the session id **in effect at that moment** (a `/clear` changes it), and sends claude exactly one
    `SIGTERM`: claude exits by itself, restores its own terminal and flushes its transcript. Never a `SIGKILL`, never a signal to any other process.
-5. The launcher restores the terminal, prints the one line and re-execs the NEW launcher (new preamble, new routing, new hooks) with `--resume <session id>`.
+5. The launcher restores the terminal, prints the one line and re-execs the NEW launcher (new preamble, new routing, new hooks) with `--resume <session id>`. The
+   re-entered launcher prints nothing else (no banner, no loaded-state or model line, no nudge; the supervisor marks the exec with `HMD_RELAUNCHED`, which the launcher
+   believes only beside its own pid, reads once and removes), so a restart leaves one line on the screen.
 
 ## The safe point
 
@@ -68,7 +70,8 @@ The first turn after a restart reads the whole context at full price; at 300 s o
 
 - Print mode (`-p`, `hmd <task>`), a non-terminal launch, `hmd --team` panes, `heimdall-wrap` tools other than claude, and anything started by hand with
   `claude`: no supervisor, no restart, ever.
-- Claude ignores the `SIGTERM` for 20 s: the request is dropped and the session is left alone until the next turn asks again.
+- Claude ignores the `SIGTERM` for 20 s: the request is dropped and the session is left alone until the next turn asks again. If it was only slow to shut down and exits 143 after
+  that, the session is still resumed (the TERM was ours; there is never a `SIGKILL`); any other late exit is yours.
 - The update did not take (claude still reports the old version after the restart): one restart per target version, so it does not loop. At most three
   restarts per launcher lifetime.
 - The resume fails within 5 s: the launcher tries `--continue`, then a fresh launch that reads the checkpoint written seconds earlier, printing one line each.

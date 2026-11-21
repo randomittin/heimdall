@@ -17,11 +17,14 @@
 #     inherited by an hmd run INSIDE the session (another pid), or an id that is not a plain token, do nothing; `hmd --resume` swaps its `--continue` for it
 #   * the exec gap: a USR1 that arrives before the supervisor's own trap is survived
 #   * `hmd restart` (bin/heimdall-restart): on, off, defer, now, status; it writes only its own files and signals nothing
+#   * a restart's relaunch is quiet: the supervisor's exec carries HMD_RELAUNCHED=1, which the re-entered launcher believes only beside its own pid in HMD_LAUNCHER_PID, a plain
+#     session id and a count of 1 or more, reads once and removes (claude never sees it). It then prints nothing of its own (the banner, the loaded-state and model lines, the
+#     nudge: the supervisor's one `updated` line is the whole notice) while every functional step runs; a normal launch, a stray marker and the bare-hmd wrap hop keep today's output
 # Falsifiability: every case was seen RED against the launcher before the change (the supervised ones for lack of a supervisor, the gap and the in-place ones for lack of
 # a trap and of an `exit`, the lib-missing ones for lack of the launcher's fallback); the unsupervised cases are the controls that must hold before AND after. Nothing
 # outside the temp tree is read, written or signalled.
 #
-# budget: 40 -- ~15 s solo: about fifteen launcher runs, half of them under a real pty (python3 pty), each a few hundred ms of launcher setup before the stub claude
+# budget: 60 -- ~35 s solo: about thirty launcher runs, most of them under a real pty (python3 pty), each a few hundred ms of launcher setup before the stub claude
 # Usage:  bash test/launcher-supervised.test.sh
 set -u
 
@@ -35,7 +38,7 @@ ok()  { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf '       %s\n' "$2"; }
 
 # nothing the operator exports changes a case
-unset HMD_AUTO_RESTART HMD_SUPERVISED HMD_LAUNCHER_PID HMD_RESTART_DIR HMD_RESTART_COUNT HMD_RESTARTED_FROM HMD_RESUME_SESSION_ID HMD_RESTART_FALLBACK \
+unset HMD_RELAUNCHED HMD_AUTO_RESTART HMD_SUPERVISED HMD_LAUNCHER_PID HMD_RESTART_DIR HMD_RESTART_COUNT HMD_RESTARTED_FROM HMD_RESUME_SESSION_ID HMD_RESTART_FALLBACK \
       HMD_RESTART_TTY HMD_LAUNCHER_START_HMD HMD_SUPERVISE_CLEANUP_FN HMD_CLAUDE_BIN HEIMDALL_SELF ORIG_ARGV HEIMDALL_HOME
 
 echo "launcher-supervised"
@@ -71,9 +74,27 @@ log="${CLAUDE_LOG:-/dev/null}"
 case " $* " in *" --agent heimdall "*) ;; *) exit 0 ;; esac
 d=""
 if [ -d "${HMD_RESTART_DIR:-/nonexistent}" ]; then d=$(ls -ld "$HMD_RESTART_DIR" | cut -c1-10); fi
-printf 'LAUNCH: ppid=%s supervised=%s launcher=%s dir=%s start_hmd=%s tty=%s\n' "$PPID" "${HMD_SUPERVISED:-}" "${HMD_LAUNCHER_PID:-}" "$d" "${HMD_LAUNCHER_START_HMD:-}" "${HMD_RESTART_TTY:-}" >> "$log"
+pf=""; prev=""
+for a in "$@"; do if [ "$prev" = "--append-system-prompt-file" ]; then pf="$a"; fi; prev="$a"; done
+ckpt=no
+if [ -n "$pf" ] && grep -q 'LAST CHECKPOINT' "$pf" 2>/dev/null; then ckpt=yes; fi
+printf 'LAUNCH: ppid=%s supervised=%s launcher=%s dir=%s start_hmd=%s tty=%s marker=%s ckpt=%s\n' "$PPID" "${HMD_SUPERVISED:-}" "${HMD_LAUNCHER_PID:-}" "$d" "${HMD_LAUNCHER_START_HMD:-}" "${HMD_RESTART_TTY:-}" "${HMD_RELAUNCHED:-}" "$ckpt" >> "$log"
 if [ -n "${STUB_APPEND_TO:-}" ]; then printf 'echo AFTER-CALL-RAN\n' >> "$STUB_APPEND_TO"; fi
 if [ -n "${STUB_SIGNAL_PARENT:-}" ]; then sleep 0.2; kill -USR1 "$PPID"; fi
+if [ -n "${STUB_REQUEST_RESTART:-}" ]; then
+  case " $* " in
+    *" --resume "*) ;;
+    *)
+      # the Stop hook's request (req.json, then USR1 to the launcher), then wait for the supervisor's TERM and go the way claude does: exit 143
+      printf '{"session_id": "%s"}\n' "$STUB_REQUEST_RESTART" > "$HMD_RESTART_DIR/req.json"
+      sleep 20 &
+      trap 'kill $! 2>/dev/null; exit 143' TERM
+      kill -USR1 "$PPID"
+      wait $!
+      exit 0
+      ;;
+  esac
+fi
 sleep "${STUB_SLEEP:-0}"
 exit "${STUB_RC:-0}"
 EOF
@@ -86,6 +107,32 @@ printf '\n' >> "${CLAUDE_LOG:-/dev/null}"
 exit 0
 EOF
 chmod +x "$STUBS/claude" "$STUBS/tmux"
+# the restart cases: a PLANNED project (a checkpoint and a settings file, what a real session has and the launcher says it loaded; a goal and a state file for the --resume path),
+# the stand-ins the supervisor asks (a gate that says SAFE, an update that is pending, a checkpoint writer) and a second plugin dir with a stand-in of bin/heimdall-wrap for the
+# bare-hmd hop. launch() runs in $LAUNCH_DIR when that is set, else in $WORK.
+WORK_PLANNED="$T/work-planned"
+mkdir -p "$WORK_PLANNED/.planning"
+printf '# checkpoint\nresume from the last session\n' > "$WORK_PLANNED/.planning/CHECKPOINT.md"
+printf '{"parallelism": 4}\n' > "$WORK_PLANNED/.planning/settings.json"
+printf 'current_phase: 2\n' > "$WORK_PLANNED/.planning/STATE.md"
+printf '{"goal": {"condition": "the tests pass"}}\n' > "$WORK_PLANNED/heimdall-state.json"
+git -C "$WORK_PLANNED" init -q 2>/dev/null
+printf '#!/bin/sh\necho SAFE\n' > "$STUBS/gate"
+printf '#!/bin/sh\necho "hmd 2.4.2 2.4.3"\n' > "$STUBS/pending"
+printf '#!/bin/sh\nexit 0\n' > "$STUBS/ckpt"
+chmod +x "$STUBS/gate" "$STUBS/pending" "$STUBS/ckpt"
+FAKEW="$T/plugin-wrap"
+cp -R "$FAKE" "$FAKEW"
+cat > "$FAKEW/bin/heimdall-wrap" <<'EOF'
+#!/bin/sh
+# the stand-in of bin/heimdall-wrap for the bare-hmd hop: records its argv, says one line unless --quiet, and ends as the real one does, back in the launcher with HEIMDALL_WRAP_LAUNCHED=1
+{ printf 'wrap:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "${CLAUDE_LOG:-/dev/null}"
+quiet=0
+for a in "$@"; do if [ "$a" = "--quiet" ]; then quiet=1; fi; done
+if [ "$quiet" = 0 ]; then printf '  WRAP-SAYS-WRAPPED\n'; fi
+HEIMDALL_WRAP_LAUNCHED=1 exec "$(dirname "$0")/heimdall"
+EOF
+chmod +x "$FAKEW/bin/heimdall-wrap"
 
 # the pty runner: the launcher gets a real tty on stdin, stdout and stderr; its output lands in a file; the exit status is the launcher's (128+N for a signal)
 cat > "$T/pty-run.py" <<'EOF'
@@ -141,9 +188,9 @@ launch() {
   : > "$OUT"
   rm -rf "$HOME_DIR/.heimdall/restart"
   if [ "$mode" = tty ]; then
-    ( cd "$WORK" && env -i "${BASEENV[@]}" ${extra[@]+"${extra[@]}"} python3 -I "$T/pty-run.py" 60 "$OUT" "$@" )
+    ( cd "${LAUNCH_DIR:-$WORK}" && env -i "${BASEENV[@]}" ${extra[@]+"${extra[@]}"} python3 -I "$T/pty-run.py" 60 "$OUT" "$@" )
   else
-    ( cd "$WORK" && env -i "${BASEENV[@]}" ${extra[@]+"${extra[@]}"} perl -e 'alarm shift; exec @ARGV' 60 "$@" </dev/null >"$OUT" 2>&1 )
+    ( cd "${LAUNCH_DIR:-$WORK}" && env -i "${BASEENV[@]}" ${extra[@]+"${extra[@]}"} perl -e 'alarm shift; exec @ARGV' 60 "$@" </dev/null >"$OUT" 2>&1 )
   fi
   RC=$?
 }
@@ -156,6 +203,29 @@ launch_argv() { grep -F '[--agent] [heimdall]' "$LOG" | head -n 1; }
 snip() { head -c 300 "$1" 2>/dev/null | LC_ALL=C tr '\n' ' '; }
 tail_snip() { tail -c 300 "$1" 2>/dev/null | LC_ALL=C tr '\n' ' '; }      # where a launcher that died ("command not found") says so: after its banner
 restart_dir_exists() { [ -e "$HOME_DIR/.heimdall/restart" ]; }
+plain_out() { perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' "$OUT"; }      # what the last run printed, without escape sequences and the pty's carriage returns
+banners() { plain_out | grep -c 'autonomous orchestration' || true; }      # how many times the banner's box was printed
+silent_out() { [ -z "$(plain_out | tr -d '[:space:]')" ]; }
+nth_launch() { grep -F 'LAUNCH:' "$LOG" | sed -n "${1}p"; }
+nth_field() { nth_launch "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
+# banner_ok LABEL [FRAGMENT ...]: the last run printed the whole banner, once, and every FRAGMENT (the sandbox has no heimdall-face, so the wordmark is the plain-text one)
+banner_ok() {
+  local label="$1" why="" frag txt
+  shift
+  txt="$(plain_out)"
+  for frag in 'H E I M D A L L' 'Nothing ships unproven.' 'v2.4.2' 'autonomous orchestration' 'wave-based parallel execution' 'smart skill management' 'terser output' 'cwd:' "$@"; do
+    printf '%s' "$txt" | grep -qF -- "$frag" || why="$why '$frag' is missing;"
+  done
+  [ "$(banners)" = 1 ] || why="$why the banner was printed $(banners) times;"
+  if [ -z "$why" ]; then ok "$label"; else bad "$label --$why" "out=[$(snip "$OUT")]"; fi
+}
+# quiet_ok LABEL: the last run printed nothing at all, and claude never saw HMD_RELAUNCHED
+quiet_ok() {
+  local label="$1" why=""
+  silent_out || why="$why the launcher printed [$(plain_out | tr '\n' ' ' | head -c 200)];"
+  [ -z "$(field marker)" ] || why="$why claude saw HMD_RELAUNCHED=$(field marker);"
+  if [ -z "$why" ]; then ok "$label"; else bad "$label --$why"; fi
+}
 
 # supervised_ok LABEL: the last run launched claude as a DIRECT child of a supervising launcher, with what the Stop hook and the gate read
 supervised_ok() {
@@ -191,6 +261,7 @@ if grep -q '_heimdall_launch_cleanup' "$HEIMDALL"; then ok "structure: the clean
 echo "-- the supervised launches"
 launch tty -- "$FAKE/bin/heimdall"
 supervised_ok "interactive: supervised (claude is a direct child of the launcher, 0700 restart dir, version and tty exported)"
+banner_ok "interactive: a normal launch prints the whole banner, once (unchanged)"
 case "$(launch_argv)" in *"[--resume]"*|*"[--continue]"*) bad "interactive: a plain launch must not resume anything" "$(launch_argv)" ;; *) ok "interactive: the argv is the launcher's own, no --resume and no --continue" ;; esac
 launch tty -- "$FAKE/bin/heimdall" --resume
 supervised_ok "resume: supervised (hmd --resume goes through the same call)"
@@ -276,6 +347,95 @@ case "$(launch_argv)" in
   *"[--resume] [sess-42]"*"[--agent]"*) if printf '%s' "$(launch_argv)" | grep -qF '[--continue]'; then bad "re-entry: hmd --resume keeps --continue beside --resume" "$(launch_argv)"; else ok "re-entry: hmd --resume swaps --continue for --resume sess-42"; fi ;;
   *) bad "re-entry: hmd --resume does not pass --resume sess-42" "$(launch_argv)" ;;
 esac
+
+echo "-- a restart's relaunch is quiet"
+# The supervisor's exec carries HMD_RELAUNCHED=1. The re-entered launcher reads it ONCE (claude never sees it) and believes it only beside what the supervisor sets with it: its own
+# pid in HMD_LAUNCHER_PID, a plain session id, a restart count of 1 or more. A relaunch replaces a running session, so the line the supervisor printed is the whole notice.
+LAUNCH_DIR="$WORK_PLANNED"
+launch tty STUB_REQUEST_RESTART=sess-restart-1 HMD_RESTART_GATE_CMD="$STUBS/gate" HMD_UPDATE_PENDING_CMD="$STUBS/pending" HMD_CHECKPOINT_CMD="$STUBS/ckpt" HMD_RESTART_RECHECK_S=0 -- "$FAKE/bin/heimdall"
+nl="$(grep -c 'LAUNCH:' "$LOG")"
+n_upd="$(plain_out | grep -c '^\[heimdall\] updated hmd 2.4.2->2.4.3 - resumed$' || true)"
+after="$(plain_out | sed '1,/^\[heimdall\] updated /d' | tr -d '[:space:]')"
+if [ "$RC" = 0 ] && [ "$nl" = 2 ] && [ "$n_upd" = 1 ] && [ "$(banners)" = 1 ] && [ -z "$after" ]; then
+  ok "relaunch: a real restart through the supervisor's own exec prints its one 'updated' line and nothing else (one banner in the whole run, nothing after the line)"
+else
+  bad "relaunch: a real restart printed more than its one line" "rc=$RC launches=$nl updated-lines=$n_upd banners=$(banners) after=[$(printf '%s' "$after" | head -c 200)]"
+fi
+argv2="$(grep -F '[--agent] [heimdall]' "$LOG" | sed -n 2p)"
+if [ "$(nth_field 1 ckpt)" = yes ] && [ "$(nth_field 2 ckpt)" = yes ] && [ "$(nth_field 2 supervised)" = 1 ] && [ -n "$(nth_field 1 launcher)" ] \
+   && [ "$(nth_field 1 launcher)" = "$(nth_field 2 launcher)" ] && [ -z "$(nth_field 2 marker)" ] && printf '%s' "$argv2" | grep -qF '[--resume] [sess-restart-1]'; then
+  ok "relaunch: every functional step survives it (the same launcher pid, supervised again, --resume <the session id>, the checkpoint still in the preamble, no marker in claude's environment)"
+else
+  bad "relaunch: a functional step was lost" "launch1=[$(nth_launch 1)] launch2=[$(nth_launch 2)] argv2=[$argv2]"
+fi
+launch tty HMD_RELAUNCHED=1 HMD_RESUME_SESSION_ID=sess-42 HMD_RESTART_COUNT=1 -- bash -c "$REENTER" "$FAKE/bin/heimdall"
+supervised_ok "relaunch (default launch): still supervised, claude a direct child of the same pid"
+case "$(launch_argv)" in *"[--resume] [sess-42]"*) ok "relaunch (default launch): --resume sess-42 is still passed" ;; *) bad "relaunch (default launch): --resume sess-42 is gone" "$(launch_argv)" ;; esac
+quiet_ok "relaunch (default launch): the launcher prints nothing at all (no banner, no loaded-state or model line) and claude never sees the marker"
+if [ "$(field ckpt)" = yes ]; then ok "relaunch (default launch): the checkpoint context is still loaded into the preamble"; else bad "relaunch (default launch): the checkpoint context was lost" "$(launch_line)"; fi
+launch tty HMD_RELAUNCHED=1 HMD_RESUME_SESSION_ID=sess-42 HMD_RESTART_COUNT=1 -- bash -c "$REENTER" "$FAKE/bin/heimdall" --resume --foreground
+supervised_ok "relaunch (--resume): still supervised"
+case "$(launch_argv)" in *"[--resume] [sess-42]"*) ok "relaunch (--resume): --resume sess-42 is still passed" ;; *) bad "relaunch (--resume): --resume sess-42 is gone" "$(launch_argv)" ;; esac
+quiet_ok "relaunch (--resume): nothing printed (no banner, no 'Resuming from', no 'state loaded', no 'Goal restored') and no marker in claude's environment"
+launch tty -- "$FAKE/bin/heimdall"
+banner_ok "control (default launch): the same project prints the banner, the loaded-state lines and the model line" 'Project settings loaded' 'Checkpoint loaded' 'Model: inherit'
+launch tty -- "$FAKE/bin/heimdall" --resume --foreground
+banner_ok "control (--resume): the same project prints the banner, the resume lines and the goal" 'Resuming from .planning/STATE.md' 'heimdall state loaded' 'Goal restored'
+LAUNCH_DIR=""
+launch tty HMD_RELAUNCHED=1 -- "$FAKE/bin/heimdall"
+banner_ok "stray marker: HMD_RELAUNCHED=1 alone in a normal launch silences nothing"
+if [ -z "$(field marker)" ]; then ok "stray marker: it is removed from the environment before claude starts"; else bad "stray marker: claude saw HMD_RELAUNCHED=$(field marker)"; fi
+launch tty HMD_RELAUNCHED=1 HMD_LAUNCHER_PID=424242 HMD_RESUME_SESSION_ID=sess-42 HMD_RESTART_COUNT=1 -- "$FAKE/bin/heimdall"
+banner_ok "stray marker: beside another launcher's pid (an hmd run inside a session) silences nothing"
+launch tty HMD_RELAUNCHED=yes HMD_RESUME_SESSION_ID=sess-42 HMD_RESTART_COUNT=1 -- bash -c "$REENTER" "$FAKE/bin/heimdall"
+banner_ok "stray marker: a value other than 1 silences nothing"
+launch tty HMD_RELAUNCHED=1 HMD_RESUME_SESSION_ID=sess-42 -- bash -c "$REENTER" "$FAKE/bin/heimdall"
+banner_ok "stray marker: without a restart count silences nothing"
+launch tty HMD_RELAUNCHED=1 'HMD_RESUME_SESSION_ID=sess;touch-x' HMD_RESTART_COUNT=1 -- bash -c "$REENTER" "$FAKE/bin/heimdall"
+banner_ok "stray marker: beside an id that is not a plain token silences nothing"
+# the bare-hmd hop: a bare `hmd` is wrapped first (bin/heimdall-wrap prints its own lines, then re-enters the launcher), so the relaunch runs the wrap again: quietly, with the marker riding its exec
+launch tty HMD_RELAUNCHED=1 HMD_RESUME_SESSION_ID=sess-42 HMD_RESTART_COUNT=1 -- bash -c "$REENTER" "$FAKEW/bin/heimdall"
+if grep -qF 'wrap: [launch] [--quiet]' "$LOG" && silent_out && [ -z "$(field marker)" ] && launch_argv | grep -qF '[--resume] [sess-42]'; then
+  ok "relaunch (bare hmd): the wrap hop runs with --quiet, the marker rides its exec and is gone before claude, nothing is printed, the session is resumed"
+else
+  bad "relaunch (bare hmd): the wrap hop or what follows it is not quiet" "log=[$(snip "$LOG")] out=[$(snip "$OUT")]"
+fi
+launch tty -- "$FAKEW/bin/heimdall"
+if grep -qF 'wrap: [launch]' "$LOG" && ! grep -qF -- '--quiet' "$LOG" && plain_out | grep -qF 'WRAP-SAYS-WRAPPED' && [ "$(banners)" = 1 ]; then
+  ok "control (bare hmd): a normal launch runs the wrap without --quiet, and the wrap says its line"
+else
+  bad "control (bare hmd): a normal launch changed" "log=[$(snip "$LOG")] out=[$(snip "$OUT")]"
+fi
+launch tty HMD_RELAUNCHED=1 -- "$FAKEW/bin/heimdall"
+if ! grep -qF -- '--quiet' "$LOG" && plain_out | grep -qF 'WRAP-SAYS-WRAPPED' && [ "$(banners)" = 1 ]; then
+  ok "stray marker (bare hmd): the wrap is not told to be quiet"
+else
+  bad "stray marker (bare hmd): a stray marker silenced the wrap hop" "log=[$(snip "$LOG")] out=[$(snip "$OUT")]"
+fi
+# the nudge ("N recommended skills not installed"): the launcher's own function, cut out of bin/heimdall, over stand-ins of its two python helpers; a relaunch shows nothing and writes no stamp
+NUD="$T/nudge"
+mkdir -p "$NUD/plugin/bin/lib" "$NUD/home"
+printf 'print("ask")\n' > "$NUD/plugin/bin/lib/skills_config.py"
+printf 'print("2 skill(s) suggested for this project (this command installs nothing):")\n' > "$NUD/plugin/bin/lib/skills_cli_install.py"
+cat > "$NUD/harness.sh" <<'EOF'
+set -euo pipefail
+PLUGIN_DIR="$NUD_PLUGIN"; HEIMDALL_HOME_DIR="$NUD_HOME"
+_heimdall_home_ensure() { mkdir -p "$HEIMDALL_HOME_DIR"; }
+_hmd_sc_interactive() { return 0; }
+eval "$NUD_FN"
+hmd_skills_nudge
+EOF
+nudge_src="$(sed -n '/^hmd_skills_nudge() {/,/^}/p' "$HEIMDALL")"
+run_nudge() { rm -f "$NUD/home/skills-nudge-stamp"; env -i PATH="$PATH" HOME="$NUD/home" NUD_PLUGIN="$NUD/plugin" NUD_HOME="$NUD/home" NUD_FN="$nudge_src" "$@" bash "$NUD/harness.sh" 2>&1; }
+nudge_normal="$(run_nudge)"
+stamp_normal=no; if [ -e "$NUD/home/skills-nudge-stamp" ]; then stamp_normal=yes; fi
+nudge_quiet="$(run_nudge HMD_RELAUNCH_QUIET=1)"
+stamp_quiet=no; if [ -e "$NUD/home/skills-nudge-stamp" ]; then stamp_quiet=yes; fi
+if printf '%s' "$nudge_normal" | grep -q '2 recommended skills not installed' && [ "$stamp_normal" = yes ] && [ -z "$nudge_quiet" ] && [ "$stamp_quiet" = no ]; then
+  ok "nudge: shown (and stamped) in a normal launch, silent and unstamped in a restart's relaunch"
+else
+  bad "nudge: the relaunch gate does not hold" "normal=[$nudge_normal] stamp=$stamp_normal quiet=[$nudge_quiet] stamp=$stamp_quiet"
+fi
 
 echo "-- the path a restart execs (HEIMDALL_SELF)"
 # The launcher resolves it with _heimdall_self_path, tested here on the function itself (pulled out of bin/heimdall) against real files. A repository that holds an

@@ -47,6 +47,37 @@ ORIG_ARGV=("$@")
 # shellcheck disable=SC2034  # read by bin/lib/hmd_supervise.sh
 HEIMDALL_SELF="$(_heimdall_self_path "$0" "$SELF" "$WORK_DIR")"
 
+# _heimdall_restart_sid -- sets RESTART_SID to the session a restart left in HMD_RESUME_SESSION_ID, or "" when this launch is not a restart. The library's exec keeps the
+# pid, so the re-entered launcher is the one whose own pid is HMD_LAUNCHER_PID; an hmd run INSIDE that session inherits both variables but not the pid, and must not
+# resume the outer session. The id goes to claude as an argument, so it is a plain token (it starts alphanumeric, never an option) or it is ignored.
+_heimdall_restart_sid() {
+  RESTART_SID=""
+  if [ "${HMD_LAUNCHER_PID:-}" != "$$" ]; then return 0; fi
+  case "${HMD_RESUME_SESSION_ID:-}" in
+    ''|[!0-9A-Za-z]*|*[!0-9A-Za-z._-]*) return 0 ;;
+  esac
+  if [ "${#HMD_RESUME_SESSION_ID}" -le 128 ]; then RESTART_SID="$HMD_RESUME_SESSION_ID"; fi
+  return 0
+}
+
+# _heimdall_relaunch_quiet -- sets HMD_RELAUNCH_QUIET=1 when THIS process is the launcher a seamless restart just re-exec'd, 0 otherwise. bin/lib/hmd_supervise.sh marks that
+# exec with HMD_RELAUNCHED=1, and a relaunch replaces a session that is running: the one line the supervisor printed is the whole notice, so the banner, the loaded-state lines,
+# the model line and the nudge are skipped (every functional step still runs; the update notice, the persona prompt and the wake-up animation already stand down for
+# HEIMDALL_NO_INTRO=1, which the supervisor sets too). The marker is believed only beside what the supervisor sets with it: this very pid in HMD_LAUNCHER_PID, a plain session
+# id and a restart count of 1 or more, so a stray HMD_RELAUNCHED silences nothing. It is read ONCE and removed from the environment here, so claude, its children and every hmd
+# run inside the session never see it.
+_heimdall_relaunch_quiet() {
+  local marker="${HMD_RELAUNCHED:-}" count="${HMD_RESTART_COUNT:-}"
+  unset HMD_RELAUNCHED
+  HMD_RELAUNCH_QUIET=0
+  [ "$marker" = 1 ] || return 0
+  _heimdall_restart_sid
+  [ -n "$RESTART_SID" ] || return 0
+  case "$count" in ''|*[!0-9]*|0*) return 0 ;; esac
+  HMD_RELAUNCH_QUIET=1
+}
+_heimdall_relaunch_quiet
+
 # Early default for PERMISSION_FLAG — same default the flag-parsing block at
 # ~line 2806 sets unconditionally before its own --auto check. That block only
 # runs on the default/no-recognized-flag launch path; early-exit branches like
@@ -1643,6 +1674,8 @@ banner_version() {
 }
 
 print_banner() {
+  # a restart's relaunch (HMD_RELAUNCH_QUIET, set at the top of this file) replaces a session that is running: the supervisor's one line is the whole notice
+  [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] && return 0
   local C V G D R
   R='\033[0m'
   if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" ]]; then
@@ -3471,6 +3504,11 @@ EOF
     else
       WRAP_BIN="$PLUGIN_DIR/bin/heimdall-wrap"
       if [ -x "$WRAP_BIN" ]; then
+        if [ "$HMD_RELAUNCH_QUIET" = 1 ]; then
+          # a restart's relaunch (_heimdall_relaunch_quiet, at the top): the wrap redoes its idempotent work without saying it, and the marker rides this exec, set for it alone
+          # (this shell's own environment is already clean of it), back into the launcher it re-enters, which reads it once more and removes it
+          HMD_RELAUNCHED=1 exec "$WRAP_BIN" launch --quiet
+        fi
         exec "$WRAP_BIN" launch
       fi
     fi
@@ -3763,18 +3801,7 @@ _heimdall_supervise_prepare() {
   fi
 }
 
-# _heimdall_restart_sid -- sets RESTART_SID to the session a restart left in HMD_RESUME_SESSION_ID, or "" when this launch is not a restart. The library's exec keeps the
-# pid, so the re-entered launcher is the one whose own pid is HMD_LAUNCHER_PID; an hmd run INSIDE that session inherits both variables but not the pid, and must not
-# resume the outer session. The id goes to claude as an argument, so it is a plain token (it starts alphanumeric, never an option) or it is ignored.
-_heimdall_restart_sid() {
-  RESTART_SID=""
-  if [ "${HMD_LAUNCHER_PID:-}" != "$$" ]; then return 0; fi
-  case "${HMD_RESUME_SESSION_ID:-}" in
-    ''|[!0-9A-Za-z]*|*[!0-9A-Za-z._-]*) return 0 ;;
-  esac
-  if [ "${#HMD_RESUME_SESSION_ID}" -le 128 ]; then RESTART_SID="$HMD_RESUME_SESSION_ID"; fi
-  return 0
-}
+# (_heimdall_restart_sid, which both launches below call, is defined at the top of this file, beside the relaunch marker whose consistency check shares its rule.)
 
 # ── Skill pause for the life of a launch, shared by both launch paths ──
 #
@@ -3880,10 +3907,10 @@ if [[ "${1:-}" == "--resume" || "${1:-}" == "-r" ]]; then
 
   # Check for resumable state
   if [ -f "$WORK_DIR/.planning/STATE.md" ]; then
-    echo "  ▸ Resuming from .planning/STATE.md"
+    [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] || echo "  ▸ Resuming from .planning/STATE.md"
   fi
   if [ -f "$WORK_DIR/heimdall-state.json" ]; then
-    echo "  ▸ heimdall state loaded"
+    [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] || echo "  ▸ heimdall state loaded"
   fi
 
   # Restore active goal from state or checkpoint
@@ -3916,7 +3943,7 @@ except: pass
   RESUME_PREAMBLE_FILE=$(mktemp /tmp/heimdall-resume-XXXXXX)
   if [ -n "$GOAL_CONDITION" ]; then
     printf "heimdall resumed.\n\nRESTORE GOAL: A goal was active in the previous session. Restore it immediately:\n/goal %s\n\nThen read .planning/CHECKPOINT.md and continue working." "$GOAL_CONDITION" > "$RESUME_PREAMBLE_FILE"
-    printf "  \033[38;2;224;86;160m▸ Goal restored\033[0m\n"
+    [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] || printf "  \033[38;2;224;86;160m▸ Goal restored\033[0m\n"
   else
     echo "${PREAMBLE:-heimdall resumed}" > "$RESUME_PREAMBLE_FILE"
   fi
@@ -4469,7 +4496,7 @@ PYEOF
 load_checkpoint_context() {
   CHECKPOINT_CONTEXT=""
   if [ "$SKIP_CHECKPOINT" = true ]; then
-    printf "  \033[38;2;255;200;80m▸ Checkpoint skipped\033[0m (--skip-checkpoint)\n"
+    [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] || printf "  \033[38;2;255;200;80m▸ Checkpoint skipped\033[0m (--skip-checkpoint)\n"
     return 0
   fi
   local cp="$WORK_DIR/.planning/CHECKPOINT.md"
@@ -4484,7 +4511,7 @@ $(cat "$settings")
 --- END SETTINGS ---
 Use these settings: test/lint/build commands, parallelism config, model overrides, directories to avoid. Do NOT rediscover — they are already known.
 "
-    printf "  \033[38;2;78;204;163m▸ Project settings loaded\033[0m\n"
+    [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] || printf "  \033[38;2;78;204;163m▸ Project settings loaded\033[0m\n"
   fi
 
   # Load checkpoint handoff note
@@ -4495,7 +4522,7 @@ $(head -100 "$cp")
 --- END CHECKPOINT ---
 Read .planning/CHECKPOINT.md for full context. Resume from where it says.
 "
-    printf "  \033[38;2;0;212;255m▸ Checkpoint loaded\033[0m — resuming from last session\n"
+    [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] || printf "  \033[38;2;0;212;255m▸ Checkpoint loaded\033[0m — resuming from last session\n"
   elif [ -f "$state" ]; then
     local phase
     # `|| true`: a STATE.md with no current_phase line makes grep exit 1; under set -e/pipefail that must not abort the launch.
@@ -4506,7 +4533,7 @@ Read .planning/CHECKPOINT.md for full context. Resume from where it says.
 Phase: $phase. Read .planning/STATE.md for decisions, blockers, progress.
 --- END STATE ---
 "
-      printf "  \033[38;2;100;100;120m▸ State loaded\033[0m — phase: %s\n" "$phase"
+      [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] || printf "  \033[38;2;100;100;120m▸ State loaded\033[0m — phase: %s\n" "$phase"
     fi
   fi
 
@@ -4518,7 +4545,7 @@ Phase: $phase. Read .planning/STATE.md for decisions, blockers, progress.
 $(head -50 "$ctx")
 --- END CONTEXT ---
 "
-    printf "  \033[38;2;155;89;182m▸ Context loaded\033[0m (legacy)\n"
+    [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] || printf "  \033[38;2;155;89;182m▸ Context loaded\033[0m (legacy)\n"
   fi
 }
 
@@ -5228,6 +5255,7 @@ check_for_update
 # test/skills-session-nudge.test.sh to run it in isolation.
 hmd_skills_nudge() {
   local stamp="$HEIMDALL_HOME_DIR/skills-nudge-stamp" today mode n
+  [ "${HMD_RELAUNCH_QUIET:-0}" != 1 ] || return 0      # a restart's relaunch says nothing of its own; no stamp is written, a normal launch today still shows it
   type _hmd_sc_interactive >/dev/null 2>&1 || return 0
   _hmd_sc_interactive || return 0
   today="$(date +%Y-%m-%d)"
@@ -5440,7 +5468,7 @@ select_model() {
   MODEL_FLAG=""
   MODEL_NAME="inherit (operator default)"
 
-  printf "  \033[38;2;155;89;182m▸ Model:\033[0m %s\n" "$MODEL_NAME"
+  [ "${HMD_RELAUNCH_QUIET:-0}" = 1 ] || printf "  \033[38;2;155;89;182m▸ Model:\033[0m %s\n" "$MODEL_NAME"
 }
 
 select_model "$@"
