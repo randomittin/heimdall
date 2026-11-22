@@ -3,8 +3,12 @@
 #
 #   INV-L8: `install.sh` without `--reset` leaves the tree and $HEIMDALL_HOME byte-identical to the unmodified script's result on the same fixture.
 #
-# The fixture is an EXISTING install: the developer's machine (their own .zshrc line and ~/.claude/settings.json key) after one install.sh run, then the
-# no-flag UPGRADE run (the same script again, no argument). It reuses the offline sandbox of test/use-cases/lib.sh: a private HOME under a private temp
+# The fixture is an EXISTING install: the developer's machine (their own .zshrc line and ~/.claude/settings.json key) after one run of the UNMODIFIED
+# install.sh, then the no-flag UPGRADE run (the tree's own install.sh, no argument). The two scripts differ on purpose: INV-L8 is about what the script
+# under change does to an install that ALREADY EXISTS, and since T3.4 a FRESH install by that script is another thing (it becomes lean and records a
+# profile), so building the existing install with it would grade a different install. The unmodified script is not a copy kept in the tree: the baseline
+# names it (recorded_from.repo_head, the commit it was recorded at, and recorded_from.install_sh_sha256, its hash), lean_fx_baseline_installer reads it
+# from git history and refuses a script whose hash differs. It reuses the offline sandbox of test/use-cases/lib.sh: a private HOME under a private temp
 # root, `env -i`, a fake `claude` and `security` (the keychain is never reached), HEIMDALL_REPO a local snapshot so the one network call never leaves the
 # machine. Nothing here reads or writes the operator's HOME, ~/.heimdall, ~/.claude or keychain.
 #
@@ -13,9 +17,12 @@
 # normalized line, a field set) before it is hashed. The cloned tree is compared to the source tree it was cloned from (a tree id, not a constant: the
 # source moves with every commit), and the tracked files the install itself leaves modified are listed by name.
 #
-#   source bin/lib/lean_install_fixture.sh     then:  lean_fx_run   (builds the fixture, runs the upgrade, sets LEAN_FX_JSON)
-#   bash bin/lib/lean_install_fixture.sh digest   print the components JSON for the tree under test (UC_TREE overrides the tree: a mutant is a snapshot)
-#   bash bin/lib/lean_install_fixture.sh record   print the baseline document (components + provenance) -- run ONLY on an unmodified install.sh
+#   source bin/lib/lean_install_fixture.sh     then:  lean_fx_run [BASELINE]   (builds the fixture, runs the upgrade, sets LEAN_FX_JSON; BASELINE is the
+#                                              baseline document: the existing install is then made by the install.sh it names, with none by the tree's own)
+#   bash bin/lib/lean_install_fixture.sh digest [BASELINE]   print the components JSON for the tree under test (UC_TREE overrides the tree: a mutant is a
+#                                              snapshot); give the baseline to compare with it: that is the run the test makes
+#   bash bin/lib/lean_install_fixture.sh record   print the baseline document (components + provenance) -- run ONLY on an unmodified, COMMITTED install.sh:
+#                                              both runs are the tree's own script, and repo_head must hold it for lean_fx_baseline_installer to find it
 #
 # Bash 3.2 compatible.
 # shellcheck disable=SC2034  # LEAN_FX_* are this library's interface
@@ -75,20 +82,58 @@ lean_fx_components() {
                  funnel: $funnel, install_receipts: $receipts, team: $team, cc_verify: $cc, doctor_diagnosis: $doctor } }'
 }
 
-# lean_fx_run -- build the fixture existing install, run the no-flag upgrade, set LEAN_FX_JSON (components + state_sha256). Leaves the sandbox in UC_HOME.
+# lean_fx_baseline_installer BASELINE DEST -- write to DEST the install.sh BASELINE was recorded from: the file at recorded_from.repo_head in this checkout's
+# git history, locked by recorded_from.install_sh_sha256. History is the store (a second copy of a 100 KB installer in the tree would be dead weight in
+# every install), the hash is the lock: a commit this repository lacks (a shallow clone, rewritten history), a commit id that is not one, or a script
+# whose hash differs (a baseline recorded from an edited install.sh) is a refusal that names the cause on stderr (return 1), never a quiet run of another
+# script.
+lean_fx_baseline_installer() {
+  local baseline="$1" dest="$2" commit want got
+  commit="$(jq -r '.recorded_from.repo_head // empty' "$baseline" 2>/dev/null)"
+  want="$(jq -r '.recorded_from.install_sh_sha256 // empty' "$baseline" 2>/dev/null)"
+  if [ "${#commit}" -ne 40 ] || [ -n "${commit//[[:xdigit:]]/}" ]; then
+    printf 'the baseline names no commit: recorded_from.repo_head is "%s", not a 40-digit commit id\n' "$commit" >&2
+    return 1
+  fi
+  if ! git -C "$LEAN_FX_REPO" cat-file -e "$commit:install.sh" 2>/dev/null; then
+    printf 'commit %s (recorded_from.repo_head) with an install.sh is not in this repository (a shallow clone or rewritten history?)\n' "$commit" >&2
+    return 1
+  fi
+  mkdir -p "$(dirname "$dest")" && git -C "$LEAN_FX_REPO" cat-file blob "$commit:install.sh" > "$dest" \
+    || { printf 'cannot read install.sh at %s into %s\n' "$commit" "$dest" >&2; return 1; }
+  got="$(lean_fx_hash < "$dest")"
+  if [ "$got" != "$want" ]; then
+    printf 'install.sh at %s hashes to %s but the baseline was recorded from %s (record from a committed, unmodified install.sh)\n' "$commit" "$got" "${want:-nothing}" >&2
+    return 1
+  fi
+}
+
+# lean_fx_run [BASELINE] -- build the fixture existing install, run the no-flag upgrade, set LEAN_FX_JSON (components + state_sha256). Leaves the sandbox in UC_HOME.
+#   The existing install is made by LEAN_FX_BASE_INSTALL (its hash in LEAN_FX_BASE_INSTALL_SHA256), the upgrade by the tree's install.sh. With a BASELINE the
+#   first is the install.sh the baseline was recorded from (lean_fx_baseline_installer); with none it is the tree's own: only `record` runs that way, on an
+#   install.sh that is unmodified by contract.
 lean_fx_run() {
+  local baseline="${1:-}"
   uc_begin lean_install_fixture
   uc_need_node
   uc_need_crypto
   uc_tree
   uc_fakebin
   uc_sandbox fixture
+  LEAN_FX_BASE_INSTALL="$UC_TREE/install.sh"
+  if [ -n "$baseline" ]; then
+    LEAN_FX_BASE_INSTALL="$UC_ROOT/baseline-installer/install.sh"
+    lean_fx_baseline_installer "$baseline" "$LEAN_FX_BASE_INSTALL" 2>"$UC_ROOT/baseline-installer.err" \
+      || uc_fatal "the install.sh the baseline was recorded from is not available: $(head -c 400 "$UC_ROOT/baseline-installer.err" | LC_ALL=C tr '\n' ' ')"
+  fi
+  LEAN_FX_BASE_INSTALL_SHA256="$(lean_fx_hash < "$LEAN_FX_BASE_INSTALL")"
   printf '# my zshrc\nexport EDITOR=vim\n' > "$UC_HOME/.zshrc"
   mkdir -p "$UC_HOME/.claude"
   printf '{"theme":"dark"}\n' > "$UC_HOME/.claude/settings.json"
-  uc_install "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh
+  # the existing install: uc_install's own run (the checkout is the only source), by the base script instead of the tree's
+  uc_run "$UC_HOME" "$UC_WORK" HEIMDALL_REPO="$UC_TREE" HEIMDALL_REF="$UC_REF" SHELL=/bin/zsh -- bash "$LEAN_FX_BASE_INSTALL"
   LEAN_FX_INSTALL_RC=$UC_RC
-  uc_install "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh      # the no-flag upgrade: the script again, no argument
+  uc_install "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh      # the no-flag upgrade: the tree's own script, no argument
   LEAN_FX_UPGRADE_RC=$UC_RC
   LEAN_FX_JSON="$(lean_fx_seal "$(lean_fx_components)")"
 }
@@ -102,7 +147,9 @@ lean_fx_seal() {
 
 case "${1:-}" in
   digest|record)
-    lean_fx_run
+    baseline=""
+    [ "$1" != digest ] || baseline="${2:-}"      # `digest BASELINE` is the comparison the test makes; `record` runs both with the tree's own (unmodified) script
+    lean_fx_run "$baseline"
     doc="$LEAN_FX_JSON"
     if [ "$1" = record ]; then
       head_sha="$(git -C "$LEAN_FX_REPO" rev-parse HEAD)"
