@@ -179,6 +179,7 @@ bin/heimdall-metrics
 bin/heimdall-model-resolve
 bin/heimdall-modules
 bin/heimdall-omniroute-install
+bin/heimdall-pack-build
 bin/heimdall-persona
 bin/heimdall-phone-control
 bin/heimdall-phone-deny
