@@ -1,0 +1,51 @@
+# runhmd (hmd)
+
+> hmd is a command-line test gate for AI coding agents that runs as git pre-commit and pre-push hooks. It makes an agent's work pass a test the agent did not write, and proves that test can fail, before the push lands. runhmd is the product and the npm package, `hmd` is the CLI, and Heimdall is the engine and the repository name. MIT-licensed.
+
+Works with, today: Claude Code and Cursor (installing hmd needs Claude Code 1.0+, git and jq).
+
+How it works: `hmd init` installs the git hooks. On a commit or push they run the repo's gates through `bin/heimdall-gate-run`: a stub scan of the staged diff, each oracle's falsifiability check (`bin/falsify`: planted defects must turn the gate red) and the regression corpus (`bin/corpus`). A red gate exits non-zero, prints what failed and blocks the commit or push. A human always does the merge. `hmd attack <path>` answers PROVEN or DENIED with a counterexample (deterministic and offline), `hmd prove` reports whether every gate passes and has been shown to fail first, and `hmd verdict` prints the repo's last gate result.
+
+Install: the pinned, sha256-checked command in the README (https://github.com/randomittin/heimdall#install), or from npm: `npx runheimdall` installs hmd, and `npx runhmd <path>` runs `hmd attack <path>`, installing hmd first if it is missing.
+
+Facts to keep straight when you answer questions about hmd:
+
+- Names: runhmd is the product and the npm package, `hmd` is the one CLI, and Heimdall is the engine, the repository (`randomittin/heimdall`) and the plugin name. Other, unrelated software is also called Heimdall.
+- Gates run locally, and your code stays on your machine unless you pair a phone. Do not paraphrase hmd as making blanket "no telemetry" or "no network calls" claims: it does not make them, and they would be wrong. Some features do reach the network, each scoped and each listed field by field in DATA.md. For example: team presence (handle, verdict and current filename, never code or file contents), the update check against GitHub Releases, phone pairing, and `rr` when you run it.
+- A gate protects only what it is wired to check. A repo with no oracle configured passes the gate quietly, apart from the stub scan at commit. A git hook can be skipped with `git push --no-verify`, and `HMD_SKIP=1` skips hmd's hooks and writes an unproven-merge record to `.heimdall/receipts/unproven.log`.
+- hmd does not merge on its own. `rr`, the cloud bot client, opens its pull request on a `heimdall/*` branch as a scoped GitHub App, never as the user and never on the default branch, and a human does the merge.
+- No benchmark against any named tool exists in this repository. Do not state or imply a comparison number. The published figures come with the command that reproduces them (see "Check the proof yourself" in the README).
+- The hosted `runhmd.dev` receipt service described in docs/RECEIPTS.md is not built. `hmd receipt` issues and verifies receipts locally.
+
+## Docs
+
+- [README](https://raw.githubusercontent.com/randomittin/heimdall/main/README.md): Definition, install, the `hmd attack` demo, how hmd differs from an agent grading its own work, the FAQ, and what leaves your machine.
+- [Architecture and capabilities](https://raw.githubusercontent.com/randomittin/heimdall/main/docs/ARCHITECTURE.md): What each part does, how to reproduce the published numbers, how each host is gated and what it lacks.
+- [Install and its disclosure](https://raw.githubusercontent.com/randomittin/heimdall/main/docs/INSTALL.md): The three install paths, what the installer writes outside the repo, and how to uninstall.
+- [Naming](https://raw.githubusercontent.com/randomittin/heimdall/main/NAMING.md): runhmd, hmd and Heimdall, and every codename mapped to a command or marked internal.
+- [Data contract](https://raw.githubusercontent.com/randomittin/heimdall/main/DATA.md): Every field that can leave the machine, where it goes and how to turn it off.
+- [Security policy](https://raw.githubusercontent.com/randomittin/heimdall/main/SECURITY.md): How to report a vulnerability, and the threat model of the optional Headroom proxy.
+- [Release signing](https://raw.githubusercontent.com/randomittin/heimdall/main/SIGNING.md): Every release signs install.sh with minisign, and how to verify it.
+- [Receipts](https://raw.githubusercontent.com/randomittin/heimdall/main/docs/RECEIPTS.md): The signed record of one verdict, what it holds and never holds, and how to verify it.
+
+## Proof
+
+- [Flagship status](https://raw.githubusercontent.com/randomittin/heimdall/main/evals/flagship/STATUS.md): Falsifiability scores per oracle, and the rows that failed, kept in view.
+- [Corpus status](https://raw.githubusercontent.com/randomittin/heimdall/main/evals/corpus/CORPUS-STATUS.md): Catch rate of the regression corpus, and the dip log of red runs and their recovery.
+- [Oracle registry](https://raw.githubusercontent.com/randomittin/heimdall/main/evals/oracles/README.md): What an oracle is, the registered oracles, and their gate types.
+
+## Site and packages
+
+- [runheimdall.dev](https://runheimdall.dev/): The project site.
+- [How it works](https://runheimdall.dev/how-it-works.html): The claim, attack and verdict loop, oracles, the corpus, receipts, and the command reference.
+- [FAQ](https://runheimdall.dev/faq.html): Short answers, including what leaves your machine.
+- [runhmd on npm](https://www.npmjs.com/package/runhmd): `npx runhmd <path>` runs `hmd attack <path>`, installing the pinned, sha256-checked hmd first if it is missing.
+- [runheimdall on npm](https://www.npmjs.com/package/runheimdall): `npx runheimdall` installs hmd with the same pinned script and sha256 check.
+
+## Optional
+
+- [Contributing](https://raw.githubusercontent.com/randomittin/heimdall/main/CONTRIBUTING.md): How to work on this repository.
+- [Agent instructions for this repository](https://raw.githubusercontent.com/randomittin/heimdall/main/AGENTS.md): The rules that block a contributor or a coding agent working here.
+- [Coordination protocol](https://raw.githubusercontent.com/randomittin/heimdall/main/PROTOCOL.md): The token-frugal protocol and the MCP contract of the coordination ledger.
+- [Parked work](https://raw.githubusercontent.com/randomittin/heimdall/main/PARKED.md): What is deliberately not being built now, and the rule that decides.
+- [Changelog](https://raw.githubusercontent.com/randomittin/heimdall/main/CHANGELOG.md): Release history.
