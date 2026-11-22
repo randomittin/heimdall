@@ -66,3 +66,4 @@
 - docs/split-repos.md Publish step 3 still shows hmd-skills v1.0.0.
 - Two stale demo app copies (heimdall-demo-app/, packages/runheimdall/heimdall-demo-app/) hold the old pytest spec.
 - hmd-statusline: 2 STALE fixtures (prefix-and-elements, viral-statusline) to rewrite or retire.
+- HIGH-watch: Claude Code warns `plugin-agent-setting-deprecated` for hmd's plugin `settings.json` `agent: heimdall` ("will stop applying in a future release"). Move to a user-level `agent` key (backed up by lean T2.5) before it stops applying. Evidence: docs/analysis/2026-11-12-lean-agent-override.md.
