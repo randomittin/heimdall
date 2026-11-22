@@ -1,0 +1,15 @@
+mutant: reset-deletes-ledger
+gate:   test/install-reset-userdata.test.sh (INV-L10)
+defect: install.sh --reset removes <runtime home>/ledger before it narrows the tree: the user's ledger is lost
+applied by test/lean-gate-falsify.test.sh to a temp snapshot of the tree, never to a worktree
+
+--- a/install.sh
++++ b/install.sh
+@@ -1119,6 +1119,7 @@
+     return 1
+   fi
+ 
++  rm -rf "$rt/ledger"
+   # 5/8 lean tree
+   if [ "$deferred" -eq 1 ]; then
+     pending="$pending lean-tree"
