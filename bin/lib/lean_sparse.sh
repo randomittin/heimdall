@@ -14,7 +14,11 @@
 #     release/runtime-files.txt       what the code can reach (bin/heimdall-runtime-closure). "Reachable", not "lean": it names skills/ whole.
 #   + the convention-loaded core      Claude Code reads these by name and no file names them: .claude-plugin/ agents/ commands/ hooks/ skills/heimdall/ and
 #                                     settings.json, .mcp.json (the heimdall-ledger MCP server), LICENSE (a lean tree is still a copy of the software)
-#   - the on-demand skills            skills/{stacks,designmatch,self-improve,system-health,mac-deep-clean}
+#   - the on-demand cut               skills.manifest.json names it: every on_demand_paths entry and every pack.paths entry of a kind "bundled" entry (today the five
+#                                     skill directories and commands/designmatch.md). The manifest is the one place that lists them, so the lean tree and the
+#                                     manifest cannot drift apart. A cut path inside a core directory is negated after that directory's pattern. A manifest that
+#                                     cannot be read, names a path that is not one literal tree path, or would take the core itself (a core directory or file, or a
+#                                     directory above one) refuses the update before anything is written.
 #   + what `add` recorded             .git/info/hmd-lean-on-demand, one path per line (a re-apply, an upgrade, lean off then on: all keep it)
 # test/ and docs/ are out because nothing reachable names them. The few docs/ files the closure DOES name stay: bin/lib/companion_cc_login.py reads
 # docs/samples/login/allowlist.json at run time, and without it every login URL is refused. .planning/ is never runtime.
@@ -24,16 +28,18 @@
 # another repository, a linked worktree whose config is shared), and a failed update puts the previous tree back.
 #
 # Exit: 0 done (or nothing to do) | 1 git failed (tree put back) | 2 usage | 3 refused before touching anything (not a clone root, no commit, no runtime list,
-# a bad path). Needs git 2.27+ (`sparse-checkout reapply`); an older git fails closed with the tree as it was. Bash 3.2 compatible.
+# no manifest to take the cut from, a bad path). Needs git 2.27+ (`sparse-checkout reapply`) and python3 (it reads the manifest); an older git or a python3 that does
+# not run fails closed with the tree as it was. Bash 3.2 compatible.
 set -u
 
 LSP_PROG="lean_sparse"
 LSP_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LSP_LIST="release/runtime-files.txt"
+LSP_MANIFEST="skills.manifest.json"
 LSP_RECORD="info/hmd-lean-on-demand"
 LSP_CORE_DIRS=".claude-plugin agents commands hooks skills/heimdall"
 LSP_CORE_FILES="settings.json .mcp.json LICENSE"
-LSP_ON_DEMAND="stacks designmatch self-improve system-health mac-deep-clean"
+LSP_CUT=""   # the cut, on one line (a cut path has no space); set by lsp_inputs
 
 # A stray GIT_* variable (this runs from installers and hooks) could point git at another repository; lazy fetch off makes "no network" a hard failure.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
@@ -47,7 +53,7 @@ lsp_git()   { git -C "$LSP_DIR" "$@"; }
 
 # the three behaviours the test breaks one by one: pattern escaping, the on-demand cut, the return to a full tree
 lsp_escape()         { sed -e 's/\\/\\\\/g' -e 's/[][*?]/\\&/g'; }
-lsp_drop_on_demand() { awk -v ids="$LSP_ON_DEMAND" 'BEGIN { n = split(ids, id, " ") } { for (i = 1; i <= n; i++) if (index($0, "skills/" id[i] "/") == 1) next; print }'; }
+lsp_drop_on_demand() { awk -v cut="$LSP_CUT" 'BEGIN { n = split(cut, c, " ") } { for (i = 1; i <= n; i++) if (($0 "") == (c[i] "") || index($0, c[i] "/") == 1) next; print }'; }
 lsp_disable()        { lsp_git sparse-checkout disable; }
 
 # lsp_valid_path P -- a plain relative path inside the tree: no escape (`..`, leading `/`), no pattern character (`! # * ? [ ] \`), no control character
@@ -91,15 +97,115 @@ lsp_read_list() {
     || lsp_die "$LSP_LIST at HEAD is empty or names a path outside the tree; the tree is as it was" 3
 }
 
-# lsp_build OUT -- the sparse-checkout file of the lean set at HEAD to OUT. Side file $LSP_TMP/keep: the exact files it names (what lsp_check_present checks).
+# lsp_manifest_cut FILE -- the cut the manifest FILE names, one path per line on stdout: the on_demand_paths and pack.paths of every entry whose kind is "bundled" (an entry of
+# any other kind names none). On stderr, with exit 1: a file that is not JSON (a duplicate key counts), not an object with an entries array, an entry that is not an object, or
+# a path that is not one literal tree path (segments of letters, digits, . _ - joined by /, none starting with a dot: the pattern docs/schemas/skills.manifest.v1.json SM13 states).
+lsp_manifest_cut() {
+  python3 -I - "$1" <<'PY'
+import json, re, sys
+
+PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
+LIMIT = 1 << 20
+
+
+def once(pairs):
+    found = {}
+    for key, value in pairs:
+        if key in found:
+            raise ValueError("duplicate key " + ascii(key))
+        found[key] = value
+    return found
+
+
+def paths(value, where):
+    if not isinstance(value, list):
+        sys.exit(where + " is not an array")
+    for item in value:
+        if not (isinstance(item, str) and PATH.fullmatch(item)):
+            sys.exit("%s names %s, which is not one literal tree path" % (where, ascii(item)))
+    return value
+
+
+with open(sys.argv[1], "rb") as handle:
+    raw = handle.read(LIMIT + 1)
+if len(raw) > LIMIT:
+    sys.exit("larger than %d bytes" % LIMIT)
+try:
+    doc = json.loads(raw.decode("utf-8"), object_pairs_hook=once)
+except (ValueError, RecursionError) as exc:
+    sys.exit("not valid JSON: " + str(exc)[:100])
+entries = doc.get("entries") if isinstance(doc, dict) else None
+if not isinstance(entries, list):
+    sys.exit("no entries array")
+cut = []
+for n, entry in enumerate(entries):
+    if not isinstance(entry, dict):
+        sys.exit("entries[%d] is not an object" % n)
+    if entry.get("kind") != "bundled":
+        continue
+    pack = entry.get("pack", {})
+    if not isinstance(pack, dict):
+        sys.exit("entries[%d] pack is not an object" % n)
+    cut += paths(entry.get("on_demand_paths", []), "entries[%d] on_demand_paths" % n)
+    cut += paths(pack.get("paths", []), "entries[%d] pack.paths" % n)
+sys.stdout.write("".join(path + "\n" for path in sorted(set(cut))))
+PY
+}
+
+# lsp_check_cut FILE -- the cut may reach INTO a core directory (commands/designmatch.md) but never take a core path itself or a directory above one (skills would take
+# skills/heimdall): a typo in a manifest a release ships must not leave a plugin Claude Code cannot load
+lsp_check_cut() {
+  local p c
+  while IFS= read -r p; do
+    for c in $LSP_CORE_DIRS $LSP_CORE_FILES; do
+      case "$c" in "$p"|"$p"/*) lsp_die "$LSP_MANIFEST at HEAD cuts $p, which is or holds $c: loaded by name, never on demand; the tree is as it was" 3 ;; esac
+    done
+  done < "$1"
+}
+
+# lsp_read_cut OUT -- the cut of HEAD to OUT, one path per line. The manifest decides what a lean tree lacks, so a missing or unusable one refuses (a python3 that cannot run
+# too: its own message is shown), and so does a cut that would take the core.
+lsp_read_cut() {
+  lsp_git cat-file blob "HEAD:$LSP_MANIFEST" > "$LSP_TMP/manifest.json" 2>/dev/null || lsp_die "HEAD has no $LSP_MANIFEST, so the lean cut cannot be derived; the tree is as it was" 3
+  lsp_manifest_cut "$LSP_TMP/manifest.json" > "$1" 2> "$LSP_TMP/cut.err" \
+    || lsp_die "$LSP_MANIFEST at HEAD cannot be used ($(head -c 200 "$LSP_TMP/cut.err" | tr '\n' ' ')); the tree is as it was" 3
+  lsp_check_cut "$1"
+}
+
+# lsp_inputs -- what the lean set is made of, all read BEFORE anything is written, so a refusal leaves the tree and the record as they were: the runtime list
+# ($LSP_TMP/list) and the cut ($LSP_TMP/cut, and $LSP_CUT, the same paths on one line)
+lsp_inputs() {
+  lsp_read_list "$LSP_TMP/list"
+  lsp_read_cut "$LSP_TMP/cut"
+  LSP_CUT="$(tr '\n' ' ' < "$LSP_TMP/cut")"
+}
+
+# lsp_negations -- a `!/path` line for each cut path, to stdout, after the core directories' patterns (a directory pattern takes everything below it; the cut is what is taken
+# back out). A path an `add` record names, or sits under, gets none: git reads the last pattern that matches the path ITSELF, so the record's directory line could not put
+# back a path a negation names, while without the negation it can.
+lsp_negations() {
+  local p r restored
+  while IFS= read -r p; do
+    restored=0
+    if [ -f "$LSP_REC" ]; then
+      while IFS= read -r r; do
+        r="${r%/}"
+        case "$p" in "$r"|"$r"/*) restored=1 ;; esac
+      done < "$LSP_REC"
+    fi
+    if [ "$restored" -eq 0 ]; then printf '!/%s\n' "$p"; fi
+  done < "$LSP_TMP/cut"
+}
+
+# lsp_build OUT -- (after lsp_inputs) the sparse-checkout file of the lean set at HEAD to OUT. Side file $LSP_TMP/keep: the exact files it names (what lsp_check_present checks).
 lsp_build() {
   local f d line
-  lsp_read_list "$LSP_TMP/list"
   { cat "$LSP_TMP/list"; for f in $LSP_CORE_FILES; do printf '%s\n' "$f"; done; } | lsp_drop_on_demand | LC_ALL=C sort -u > "$LSP_TMP/keep"
   {
-    printf '%s\n' "# hmd lean sparse set, generated by bin/lib/lean_sparse.sh from $LSP_LIST at HEAD: run apply or add, never edit"
+    printf '%s\n' "# hmd lean sparse set, generated by bin/lib/lean_sparse.sh from $LSP_LIST and $LSP_MANIFEST at HEAD: run apply or add, never edit"
     lsp_escape < "$LSP_TMP/keep" | sed 's|^|/|'
     for d in $LSP_CORE_DIRS; do printf '/%s/\n' "$d"; done
+    lsp_negations
     if [ -f "$LSP_REC" ]; then
       while IFS= read -r line; do
         if lsp_valid_path "${line%/}"; then printf '/%s\n' "$line"; else echo "$LSP_PROG: ignoring a bad line in $LSP_REC: $line" >&2; fi
@@ -114,7 +220,7 @@ lsp_check_present() {
   lsp_git -c core.quotepath=false ls-files | LC_ALL=C sort > "$LSP_TMP/tracked"
   {
     LC_ALL=C comm -12 "$LSP_TMP/keep" "$LSP_TMP/tracked"
-    lsp_git -c core.quotepath=false ls-files -- $LSP_CORE_DIRS
+    lsp_git -c core.quotepath=false ls-files -- $LSP_CORE_DIRS | lsp_drop_on_demand
     if [ -f "$LSP_REC" ]; then while IFS= read -r line; do lsp_git -c core.quotepath=false ls-files -- "$line"; done < "$LSP_REC"; fi
   } > "$LSP_TMP/want"
   while IFS= read -r p; do
@@ -142,7 +248,7 @@ lsp_restore() {
   if [ "$LSP_WAS" = true ]; then lsp_git sparse-checkout reapply; else lsp_disable; fi
 }
 
-# lsp_apply_lean -- (after lsp_snapshot) write the lean sparse file, turn it on, update the work tree, check it; any failure puts the previous state back
+# lsp_apply_lean -- (after lsp_inputs and lsp_snapshot) write the lean sparse file, turn it on, update the work tree, check it; any failure puts the previous state back
 lsp_apply_lean() {
   lsp_build "$LSP_TMP/new"
   if ! { cp "$LSP_TMP/new" "$LSP_SF.tmp.$$" && mv -f "$LSP_SF.tmp.$$" "$LSP_SF"; }; then lsp_restore; lsp_die "cannot write $LSP_SF" 1; fi
@@ -164,7 +270,8 @@ lsp_apply_full() {
   [ "$n" -eq 0 ] || lsp_die "$n path(s) are still skipped after the return to the full tree" 1
 }
 
-# lsp_add PATH DIR -- record PATH (a directory keeps its trailing slash) and re-apply; on a full tree there is nothing to put back
+# lsp_add PATH DIR -- record PATH (a directory keeps its trailing slash) and re-apply; on a full tree there is nothing to put back. The inputs are read before the record is
+# written, so an add the lean set cannot be rebuilt for (an unusable manifest) leaves the record as it was.
 lsp_add() {
   local p="${1#./}" kind entry
   p="${p%/}"
@@ -173,6 +280,7 @@ lsp_add() {
   kind="$(lsp_git cat-file -t "HEAD:$p" 2>/dev/null)"
   case "$kind" in tree|blob) ;; *) lsp_die "$p is not a tracked file or directory at HEAD" 3 ;; esac
   if ! lsp_sparse_on; then echo "$LSP_PROG: $LSP_DIR is a full tree, $p is already on disk"; return 0; fi
+  lsp_inputs
   entry="$p"
   if [ "$kind" = tree ]; then entry="$p/"; fi
   lsp_snapshot
@@ -186,7 +294,7 @@ case "${1:-}" in
     [ "$#" -eq 3 ] || lsp_usage
     case "$2" in lean|full) ;; *) lsp_usage ;; esac
     lsp_target "$3"
-    if [ "$2" = lean ]; then lsp_snapshot; lsp_apply_lean; else lsp_apply_full; fi
+    if [ "$2" = lean ]; then lsp_inputs; lsp_snapshot; lsp_apply_lean; else lsp_apply_full; fi
     ;;
   add)
     { [ "$#" -ge 2 ] && [ "$#" -le 3 ]; } || lsp_usage
