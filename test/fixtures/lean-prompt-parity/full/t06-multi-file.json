@@ -1,8 +1,8 @@
 {
   "task": "t06-multi-file",
   "agent": "heimdall",
-  "source": "recorded-fixture",
-  "prompt_sha256": "0df586298be287e5eb891e4ba6cdb54823aeae0f89200e3f84f09183feecd221",
+  "source": "fixture",
+  "prompt_sha256": "@SHA@",
   "events": [
     {
       "kind": "spawn",
