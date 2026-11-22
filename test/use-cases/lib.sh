@@ -85,7 +85,7 @@ uc_snapshot() {
   rm -f "$list"
   ver="$(cat "$dest/VERSION" 2>/dev/null || echo 0.0.0)"
   git -c core.hooksPath=/dev/null -C "$dest" init -q || return 1
-  git -C "$dest" add -A || return 1
+  git -C "$dest" add -A -f || return 1   # -f: a file the checkout tracks although .gitignore names it is still part of the tree
   git -c core.hooksPath=/dev/null -c commit.gpgsign=false -c user.email=use-case@example.invalid -c user.name=use-case \
     -C "$dest" commit -q --no-verify -m "use-case snapshot of the checkout" || return 1
   git -c tag.gpgsign=false -C "$dest" tag "v$ver"
@@ -182,15 +182,15 @@ uc_hang() {
 # uc_rc LABEL WANT -- the last run's exit status is WANT.
 uc_rc() {
   if uc_hang "$1"; then return 0; fi
-  if [ "$UC_RC" -eq "$2" ]; then uc_ok "$1 (exit $2)"; else uc_bad "$1 (exit $UC_RC, wanted $2)" "$(head -c 400 "$UC_ERR" | tr '\n' ' ')"; fi
+  if [ "$UC_RC" -eq "$2" ]; then uc_ok "$1 (exit $2)"; else uc_bad "$1 (exit $UC_RC, wanted $2)" "$(head -c 400 "$UC_ERR" | LC_ALL=C tr '\n' ' ')"; fi
 }
 
 # uc_has LABEL FILE REGEX / uc_lacks LABEL FILE REGEX -- FILE matches (or does not match) the extended regex.
-uc_has()   { if grep -Eq -- "$3" "$2" 2>/dev/null; then uc_ok "$1"; else uc_bad "$1" "no match for /$3/ in $(basename "$2"): $(head -c 300 "$2" 2>/dev/null | tr '\n' ' ')"; fi; }
+uc_has()   { if grep -Eq -- "$3" "$2" 2>/dev/null; then uc_ok "$1"; else uc_bad "$1" "no match for /$3/ in $(basename "$2"): $(head -c 300 "$2" 2>/dev/null | LC_ALL=C tr '\n' ' ')"; fi; }
 uc_lacks() { if grep -Eq -- "$3" "$2" 2>/dev/null; then uc_bad "$1" "unexpected match for /$3/ in $(basename "$2")"; else uc_ok "$1"; fi; }
 
 # uc_jq LABEL FILTER FILE -- the jq filter is true on FILE.
-uc_jq() { if jq -e "$2" "$3" >/dev/null 2>&1; then uc_ok "$1"; else uc_bad "$1" "jq $2 on: $(head -c 300 "$3" 2>/dev/null | tr '\n' ' ')"; fi; }
+uc_jq() { if jq -e "$2" "$3" >/dev/null 2>&1; then uc_ok "$1"; else uc_bad "$1" "jq $2 on: $(head -c 300 "$3" 2>/dev/null | LC_ALL=C tr '\n' ' ')"; fi; }
 
 # uc_manifest DIR -- every path and file hash under DIR: equal before and after means nothing changed.
 uc_manifest() { ( cd "$1" && { find . -print | LC_ALL=C sort; find . -type f -exec shasum -a 256 {} + | LC_ALL=C sort -k2; } ) 2>/dev/null; }

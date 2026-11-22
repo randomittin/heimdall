@@ -50,7 +50,8 @@ uc_jq "it ran no model: cost 0, agent none" '.cost_usd == 0 and .agent.name == "
 attack webhook-service --yes
 uc_rc "the card run is DENIED too" 1
 uc_has "the card shows the verdict" "$UC_OUT" 'VERDICT: DENIED'
-uc_has "the card names the counterexample" "$UC_OUT" 'duplicate settlement \(webhook\+retry within 50ms\)'
+uc_has "the card names the counterexample (the title wraps inside the box)" "$UC_OUT" 'duplicate settlement'
+uc_has "…and the 50ms window" "$UC_OUT" 'within 50ms'
 
 # 3. the printed repro command reproduces it
 REPRO="$(jq -r '.findings[0].counterexample.repro_cmd' "$DENIED")"

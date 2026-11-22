@@ -1,0 +1,5 @@
+# test/use-cases/mutants.list -- one line of the product broken per row; the journey named in column 1 must go RED (run.sh builds each from the snapshot and checks).
+# Columns, tab separated: journey (file name without .sh) | file in the tree | sed expression (portable: no -E, no \+ or \|) | mutant name
+04_attack_a_planted_bug	bin/lib/runhmd_attack.py	s/^    if args.yes:$/    if True:/	M04a-assume-consent-without-yes
+04_attack_a_planted_bug	bin/heimdall	s/^  attack)$/  attack-unrouted)/	M04b-attack-falls-through-to-a-claude-session
+04_attack_a_planted_bug	evals/oracles/attack/engine/battery.mjs	s#^export const CASES = \[\.\.\.duplicateCases(), \.\.\.readCases(), \.\.\.roundingCases()\];$#export const CASES = [...duplicateCases(), ...readCases(), ...roundingCases()].filter((c) => !/^duplicate\\.(retry-at|burst)/.test(c.id));#	M04c-engine-blind-to-the-retry-race
