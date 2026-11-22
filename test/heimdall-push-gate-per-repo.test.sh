@@ -35,7 +35,8 @@
 # records where and whether it was called, fake secret-scan); no real push is ever made.
 #
 #   A  bin/heimdall-repo-checks  run / status, receipt binding, forged and mismatched receipts, and the ONE receipt definition
-#      (bin/lib/hmd_repo_receipt.py): a receipt `run` writes passes, every field mutated on its own fails
+#      (bin/lib/hmd_repo_receipt.py): a receipt `run` writes passes, every field mutated on its own fails; A11 `init` (the declaration of
+#      a managed repo: lint + use-cases per stack, never replaced, never a scenario file); A12 a `use-cases` check that runs a whole suite is refused
 #   B  bin/lib/hmd_push_target.py  (the target resolver + classifier): classes, forms, fail-closed, git differential,
 #      the parse model (substitutions, eval, sh -c, xargs, pushd, chains of cd, cd - / ~ / "$VAR"), classes from commits
 #   C  the hook: each class, target != cwd, multi-target, downgrade attempts, forged receipts, resolver missing
@@ -443,6 +444,203 @@ A10H="$(new_repo a10h)"; mkdir -p "$A10H/.heimdall"
 python3 -c 'import json, sys; sys.stdout.write(json.dumps({"schema": 1, "checks": [{"name": "x", "cmd": "true"}], "pad": "a" * 2000000}))' > "$A10H/.heimdall/repo-checks.json"; commit_all "$A10H" "a 2 MB declaration"
 bash "$RC_BIN" status --repo "$A10H" >"$W/o" 2>&1; rcx=$?
 { [ "$rcx" = 2 ] && grep -qi 'larger' "$W/o"; } && ok "A10h. a committed declaration of 2 MB is refused, not parsed (exit 2)" || bad "A10h. an oversized declaration" "rc=$rcx $(head -c 300 "$W/o")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# ── A11. `init` writes the declaration of a managed repo -- the two checks, lint and use-cases, with the real commands of the stack bin/stack-detect
+#    finds -- and nothing else: it never replaces a declaration, never writes through a link, and never writes a scenario file (a placeholder scenario
+#    would be a stub); with nothing to run yet it says what to create ──
+init_run() {  # init_run <repo> [args...] -> INRC INOUT INERR
+  local repo="$1"; shift
+  bash "$RC_BIN" init --repo "$repo" "$@" >"$W/in.out" 2>"$W/in.err"; INRC=$?; INOUT="$(cat "$W/in.out")"; INERR="$(cat "$W/in.err")"
+}
+mk_stack() {  # mk_stack <name> [<file> <content> ...] -> a fresh repo whose work tree holds those manifests (uncommitted)
+  local d; d="$(new_repo "$1")"; shift
+  while [ $# -ge 2 ]; do printf '%s\n' "$2" > "$d/$1"; shift 2; done
+  printf '%s' "$d"
+}
+init_case() {  # init_case <label> <want lint cmd> <want use-cases cmd> <repo>
+  local label="$1" want_lint="$2" want_uc="$3" d="$4"
+  init_run "$d"
+  if [ "$INRC" = 0 ] && grep -qF -- "$want_lint" <<<"$INOUT" && grep -qF -- "$want_uc" <<<"$INOUT" \
+      && jq -e --arg l "$want_lint" --arg u "$want_uc" '.schema == 1 and (.checks | length) == 2 and .checks[0] == {name: "lint", cmd: $l} and .checks[1] == {name: "use-cases", cmd: $u}' \
+           "$d/.heimdall/repo-checks.json" >/dev/null 2>&1; then
+    ok "A11. $label -> exactly two checks, lint [$want_lint] and use-cases [$want_uc], both printed"
+  else
+    bad "A11. $label" "rc=$INRC err=$(printf '%s' "$INERR" | head -c 300) decl=$(head -c 300 "$d/.heimdall/repo-checks.json" 2>/dev/null)"
+  fi
+  commit_all "$d" "declare"; status_of "$d"
+  { [ "$STRC" = 1 ] && grep -q 'no receipt' <<<"$STOUT"; } \
+    && ok "A11. $label -> the gate accepts it: committed, NOT GREEN only for want of a receipt" || bad "A11. $label: the gate refused init's declaration" "rc=$STRC $STOUT"
+}
+init_case "python (requirements.txt)"                 'ruff check .' 'pytest tests/use_cases -q' "$(mk_stack i-py requirements.txt 'requests==2.31')"
+init_case "fastapi (a python stack id)"               'ruff check .' 'pytest tests/use_cases -q' "$(mk_stack i-fastapi requirements.txt 'fastapi==0.110')"
+init_case "fastapi + python ids in one repo (one family, no ambiguity)" 'ruff check .' 'pytest tests/use_cases -q' "$(mk_stack i-two requirements.txt 'fastapi==0.110' pyproject.toml '[project]')"
+init_case "node (package.json)"                       'npm run lint' 'npm run test:use-cases' "$(mk_stack i-node package.json '{"name":"shop"}')"
+init_case "nextjs (a node stack id)"                  'npm run lint' 'npm run test:use-cases' "$(mk_stack i-next package.json '{"dependencies":{"next":"14.0.0"}}')"
+init_case "go (go.mod)"                               'golangci-lint run' 'go test ./usecases/...' "$(mk_stack i-go go.mod 'module example.com/shop')"
+init_case "rust (Cargo.toml)"                         'cargo clippy --all-targets -- -D warnings' 'cargo test --test use_cases' "$(mk_stack i-rust Cargo.toml '[package]')"
+init_case "spring-boot on Gradle, wrapper in the repo" './gradlew check -x test' "./gradlew test --tests '*UseCase*'" "$(mk_stack i-gradlew build.gradle "id 'org.springframework.boot'" gradlew '#!/bin/sh')"
+init_case "Gradle without a wrapper (the system gradle)" 'gradle check -x test' "gradle test --tests '*UseCase*'" "$(mk_stack i-gradle build.gradle.kts 'plugins { java }')"
+init_case "Maven, wrapper in the repo"                './mvnw -B -q verify -DskipTests' "./mvnw -B -q test -Dtest='*UseCase*'" "$(mk_stack i-mvnw pom.xml '<project/>' mvnw '#!/bin/sh')"
+init_case "Maven without a wrapper (the system mvn)"  'mvn -B -q verify -DskipTests' "mvn -B -q test -Dtest='*UseCase*'" "$(mk_stack i-mvn pom.xml '<project/>')"
+
+# a zero-stub init: ONE new file, the declaration; with no scenarios yet it names what to create, with them it asks for nothing
+PYI="$(mk_stack i-py2 requirements.txt 'requests==2.31')"
+find "$PYI" -path "$PYI/.git" -prune -o -type f -print | sort > "$W/i-py2.before"
+init_run "$PYI"
+find "$PYI" -path "$PYI/.git" -prune -o -type f -print | sort > "$W/i-py2.after"
+{ [ "$INRC" = 0 ] && [ "$(comm -13 "$W/i-py2.before" "$W/i-py2.after")" = "$PYI/.heimdall/repo-checks.json" ] && [ -z "$(comm -23 "$W/i-py2.before" "$W/i-py2.after")" ] && [ ! -e "$PYI/tests" ]; } \
+  && ok "A11. init wrote ONE new file, .heimdall/repo-checks.json: no scenario file, no tests directory, nothing else touched" || bad "A11. init wrote more than the declaration" "rc=$INRC $(comm -13 "$W/i-py2.before" "$W/i-py2.after")"
+{ grep -qF 'tests/use_cases' <<<"$INOUT" && grep -qi 'create' <<<"$INOUT" && grep -qF 'use-case-tests.md' <<<"$INOUT"; } \
+  && ok "A11. ...and with no scenarios yet it says what to create (tests/use_cases, one scenario per user journey) and where the rule is" || bad "A11. no 'what to create' note" "$INOUT"
+PYE="$(mk_stack i-py3 requirements.txt 'requests==2.31')"; mkdir -p "$PYE/tests/use_cases"
+init_run "$PYE"
+{ [ "$INRC" = 0 ] && grep -qF 'tests/use_cases' <<<"$INOUT" && ! grep -qi 'create' <<<"$INOUT"; } \
+  && ok "A11. ...and with tests/use_cases already there it finds it and asks for nothing" || bad "A11. scenarios present but the note still asks to create them" "rc=$INRC $INOUT"
+# the receipt is build output: a repo that does not git-ignore it is told to (a committed receipt makes every later run record dirty:true)
+GI="$(mk_stack i-gi requirements.txt 'requests==2.31')"; printf 'node_modules\n' > "$GI/.gitignore"
+init_run "$GI"
+{ [ "$INRC" = 0 ] && grep -qF '.gitignore' <<<"$INOUT" && grep -qF '.heimdall/receipts/' <<<"$INOUT"; } \
+  && ok "A11. a repo that does not git-ignore .heimdall/receipts/ is told to" || bad "A11. no .gitignore note" "rc=$INRC $INOUT"
+init_run "$(mk_stack i-gi2 requirements.txt 'requests==2.31')"
+{ [ "$INRC" = 0 ] && ! grep -qF '.gitignore' <<<"$INOUT"; } && ok "A11. ...and a repo that already ignores it hears nothing about it" || bad "A11. a spurious .gitignore note" "rc=$INRC $INOUT"
+FRESH="$W/repos/i-fresh"; mkdir -p "$FRESH"; ( cd "$FRESH" && git init -q ); printf 'module example.com/shop\n' > "$FRESH/go.mod"
+init_run "$FRESH"
+{ [ "$INRC" = 0 ] && [ -f "$FRESH/.heimdall/repo-checks.json" ]; } && ok "A11. a repository with no commit yet (right after git init) can be initialised" || bad "A11. init in a repository with no commit" "rc=$INRC $INERR"
+
+# never replaces: an existing declaration, one committed at HEAD but deleted from the work tree, a link in its place, a .heimdall that is a link
+OV="$(mk_stack i-ov requirements.txt 'requests==2.31')"; mkdir -p "$OV/.heimdall"; printf '%s\n' "$(decl_json mine 'true')" > "$OV/.heimdall/repo-checks.json"
+SUM_OV="$(sha256 "$OV/.heimdall/repo-checks.json")"
+init_run "$OV"
+{ [ "$INRC" = 2 ] && [ "$(sha256 "$OV/.heimdall/repo-checks.json")" = "$SUM_OV" ] && grep -q 'already' <<<"$INERR" && [ -z "$INOUT" ]; } \
+  && ok "A11. an existing declaration is never replaced: exit 2, the file is byte for byte what it was, stdout empty" || bad "A11. init touched an existing declaration" "rc=$INRC $INERR"
+OVC="$(mk_checks i-ovc "$GREEN_DECL")"; printf 'requests\n' > "$OVC/requirements.txt"; rm "$OVC/.heimdall/repo-checks.json"
+init_run "$OVC"
+{ [ "$INRC" = 2 ] && [ ! -e "$OVC/.heimdall/repo-checks.json" ] && grep -q 'already' <<<"$INERR"; } \
+  && ok "A11. a declaration committed at HEAD and deleted from the work tree is still a declaration: refused, nothing written" || bad "A11. init replaced a committed declaration" "rc=$INRC $INERR"
+OVL="$(mk_stack i-ovl requirements.txt 'requests==2.31')"; mkdir -p "$OVL/.heimdall"; ln -s "$W/i-ovl.target" "$OVL/.heimdall/repo-checks.json"
+init_run "$OVL"
+{ [ "$INRC" = 2 ] && [ ! -e "$W/i-ovl.target" ]; } && ok "A11. a (dangling) link where the declaration goes is refused, never followed: nothing lands at its target" || bad "A11. init wrote through a link" "rc=$INRC $INERR"
+OVD="$(mk_stack i-ovd requirements.txt 'requests==2.31')"; mkdir -p "$W/i-ovd.out"; ln -s "$W/i-ovd.out" "$OVD/.heimdall"
+init_run "$OVD"
+{ [ "$INRC" = 2 ] && [ -z "$(ls -A "$W/i-ovd.out")" ] && grep -qi 'link' <<<"$INERR"; } \
+  && ok "A11. a .heimdall that is a link out of the repository is refused: exit 2, nothing lands outside it" || bad "A11. init wrote through a linked .heimdall" "rc=$INRC out=$(ls -A "$W/i-ovd.out") $INERR"
+
+# the stack: none found, two families found (never a guess), --stack settles it, an id that is not a stack, a JVM repo that cannot say Gradle or Maven
+NS="$(new_repo i-none)"
+init_run "$NS"
+{ [ "$INRC" = 2 ] && grep -q -- '--stack' <<<"$INERR" && [ ! -e "$NS/.heimdall/repo-checks.json" ]; } \
+  && ok "A11. no stack detected -> exit 2, nothing written, says to pass --stack" || bad "A11. an undetectable stack" "rc=$INRC $INERR"
+AMB="$(mk_stack i-amb package.json '{"name":"shop"}' go.mod 'module example.com/shop')"
+init_run "$AMB"
+{ [ "$INRC" = 2 ] && grep -q 'node' <<<"$INERR" && grep -q 'go' <<<"$INERR" && grep -q -- '--stack' <<<"$INERR" && [ ! -e "$AMB/.heimdall/repo-checks.json" ]; } \
+  && ok "A11. node and go in one repo -> exit 2, nothing written (never a guess), names both and --stack" || bad "A11. an ambiguous repo was guessed at" "rc=$INRC $INERR"
+init_run "$AMB" --stack go
+{ [ "$INRC" = 0 ] && jq -e '.checks[1].cmd == "go test ./usecases/..."' "$AMB/.heimdall/repo-checks.json" >/dev/null 2>&1; } \
+  && ok "A11. ...and --stack go settles it" || bad "A11. --stack go" "rc=$INRC $INERR"
+FRC="$(new_repo i-forced)"; init_run "$FRC" --stack nextjs
+{ [ "$INRC" = 0 ] && jq -e '.checks[0].cmd == "npm run lint"' "$FRC/.heimdall/repo-checks.json" >/dev/null 2>&1; } \
+  && ok "A11. --stack names the stack when there is nothing to detect" || bad "A11. --stack nextjs in an empty repo" "rc=$INRC $INERR"
+BOG="$(new_repo i-bogus)"; init_run "$BOG" --stack cobol
+{ [ "$INRC" = 2 ] && grep -q 'nextjs' <<<"$INERR" && [ ! -e "$BOG/.heimdall/repo-checks.json" ]; } \
+  && ok "A11. --stack with an id that is not a stack -> exit 2, lists the ids, nothing written" || bad "A11. --stack cobol" "rc=$INRC $INERR"
+JV="$(new_repo i-jvm)"; init_run "$JV" --stack jvm
+{ [ "$INRC" = 2 ] && grep -q 'build.gradle' <<<"$INERR" && [ ! -e "$JV/.heimdall/repo-checks.json" ]; } \
+  && ok "A11. a JVM stack with neither a Gradle nor a Maven file cannot say which tool -> exit 2, nothing written" || bad "A11. --stack jvm without a build file" "rc=$INRC $INERR"
+
+# usage
+init_run "$NS" --pushes x; [ "$INRC" = 2 ] && ok "A11. init takes no --pushes (exit 2)" || bad "A11. init accepted --pushes" "rc=$INRC"
+bash "$RC_BIN" run --repo "$NS" --stack python >"$W/o" 2>&1; [ "$?" = 2 ] && ok "A11. --stack belongs to init alone: run refuses it (exit 2)" || bad "A11. run accepted --stack"
+bash "$RC_BIN" init --repo "$W/notrepo" >"$W/o" 2>&1; [ "$?" = 2 ] && ok "A11. init in a directory that is not a git repository -> exit 2" || bad "A11. init in a non-repo" "$(cat "$W/o")"
+bash "$RC_BIN" --help >"$W/o" 2>&1; grep -q 'heimdall-repo-checks init' "$W/o" && ok "A11. --help documents init" || bad "A11. --help does not mention init"
+
+# ════════════════════════════════════════════════════════════════════════════
+# ── A12. a `use-cases` check must run the use-case scenarios, not the whole suite: a bare runner (pytest, npm test, go test ./..., mvn test, cargo test)
+#    would let the generic sweep satisfy the gate, the thing use-case-tests.md rules out. `run` and `status` refuse such a declaration (exit 2); a
+#    command that names a directory, a marker or a script is accepted. An EXTRA check that sweeps a whole suite is allowed -- existing repos declare
+#    more -- and warned about on stderr. ──
+mkdir -p "$W/fakebin"; printf '#!/bin/sh\nexit 0\n' > "$W/fakebin/pytest"; chmod +x "$W/fakebin/pytest"
+V12="$(mk_checks a12 "$(decl_json lint true use-cases true)")"
+declare_uc() {  # declare_uc <use-cases cmd> -> commits a declaration whose use-cases check is that command
+  printf '%s\n' "$(decl_json lint true use-cases "$1")" > "$V12/.heimdall/repo-checks.json"; commit_all "$V12" "use-cases: $1" </dev/null >/dev/null 2>&1
+}
+while IFS= read -r cmd; do
+  declare_uc "$cmd"; bash "$RC_BIN" status --repo "$V12" >"$W/o" 2>&1 </dev/null; rc=$?
+  { [ "$rc" = 2 ] && grep -q 'whole test suite' "$W/o"; } && ok "A12. use-cases = [$cmd] -> refused as a whole-suite runner  [rc=2]" || bad "A12. use-cases = [$cmd] was not refused" "rc=$rc $(head -c 300 "$W/o")"
+done <<'EOF'
+pytest
+pytest -q
+python -m pytest
+python3 -m pytest -q -x
+uv run pytest -q
+CI=1 pytest
+env CI=1 pytest -q
+.venv/bin/pytest
+npm test
+npm run test
+npm t
+yarn test
+pnpm test
+npm test -- --coverage
+go test ./...
+go test -race ./...
+go test -count=1 ./...
+mvn test
+mvn -q clean test
+./mvnw verify
+./gradlew test
+gradle clean test --info
+cargo test
+cargo test --workspace
+jest
+npx jest --ci
+vitest run
+pytest -q && echo done
+EOF
+while IFS= read -r cmd; do
+  declare_uc "$cmd"; bash "$RC_BIN" status --repo "$V12" >"$W/o" 2>&1 </dev/null; rc=$?
+  { [ "$rc" = 1 ] && grep -q 'no receipt' "$W/o" && ! grep -q 'whole test suite' "$W/o"; } && ok "A12. use-cases = [$cmd] -> accepted: it names what it runs" || bad "A12. use-cases = [$cmd] was refused" "rc=$rc $(head -c 300 "$W/o")"
+done <<'EOF'
+pytest tests/use_cases -q
+pytest -m use_case
+pytest -k book_a_cab
+python -m pytest tests/use_cases
+uv run pytest tests/use_cases
+npm run test:use-cases
+yarn test:use-cases
+npm test -- tests/use-cases
+npm test -- --testPathPattern=use-cases
+go test ./usecases/...
+go test -run TestBookACab ./...
+mvn -q test -Dtest=*UseCase*
+./gradlew test --tests '*UseCase*'
+cargo test --test use_cases
+cargo test use_cases
+jest tests/use-cases
+vitest run tests/use-cases
+cd tests/use_cases && pytest
+bash scripts/use-cases.sh
+make use-cases
+echo "pytest -q"
+true
+EOF
+A12R="$(mk_checks a12r "$(decl_json lint true use-cases 'pytest -q')")"
+PATH="$W/fakebin:$PATH" bash "$RC_BIN" run --repo "$A12R" >"$W/o" 2>&1; rc=$?
+{ [ "$rc" = 2 ] && [ ! -e "$(receipt_of "$A12R")" ] && grep -q 'use-cases' "$W/o" && grep -q 'whole test suite' "$W/o"; } \
+  && ok "A12. run refuses it too: exit 2, nothing run, no receipt, the message names the check" || bad "A12. run accepted a whole-suite use-cases check" "rc=$rc $(head -c 300 "$W/o")"
+W12="$(mk_checks a12w "$(decl_json lint true use-cases true unit 'pytest -q' sweep 'bash test/run-all.sh')")"
+bash "$RC_BIN" status --repo "$W12" >"$W/st.out" 2>"$W/st.err"; rc=$?
+{ [ "$rc" = 1 ] && grep -q 'no receipt' "$W/st.out" && [ "$(grep -c 'WARNING' "$W/st.err")" = 2 ] && grep 'WARNING' "$W/st.err" | grep -q '"unit"' && grep 'WARNING' "$W/st.err" | grep -q '"sweep"'; } \
+  && ok "A12. extra checks that run a whole suite (pytest -q, test/run-all.sh) are allowed, each warned about on stderr (the verdict is the receipt's, rc=1, not a refusal)" || bad "A12. extra whole-suite checks" "rc=$rc out=$(cat "$W/st.out") err=$(cat "$W/st.err")"
+# the stub is named by its path, not found on PATH: a pyenv shim in front of python3 rewrites the PATH the checks inherit, so a stub placed first on the
+# test's own PATH can lose to a real pytest (it did on a developer machine: exit 5, no tests ran). A runner is recognised by its file name either way.
+W12B="$(mk_checks a12b "$(decl_json lint true use-cases true unit "\"$W/fakebin/pytest\" -q")")"
+bash "$RC_BIN" run --repo "$W12B" >"$W/rc.out" 2>"$W/rc.err"; rc=$?
+{ [ "$rc" = 0 ] && jq -e '.exit_code == 0 and (.checks | map(.name) == ["lint", "use-cases", "unit"])' "$(receipt_of "$W12B")" >/dev/null 2>&1 && [ "$(grep -c 'WARNING' "$W/rc.err")" = 1 ]; } \
+  && ok "A12. run: the extra whole-suite check still runs and records green, with one warning" || bad "A12. run with an extra whole-suite check" "rc=$rc $(head -c 400 "$W/rc.err")"
+W12C="$(mk_checks a12c "$(decl_json lint true use-cases true integrity 'python3 gates/site-integrity.py' docs 'echo docs ok')")"
+bash "$RC_BIN" status --repo "$W12C" >"$W/st.out" 2>"$W/st.err"
+{ [ ! -s "$W/st.err" ] && grep -q 'no receipt' "$W/st.out"; } && ok "A12. ...and an extra check that is not a suite sweep (a gate script) draws no warning" || bad "A12. a spurious warning" "out=$(cat "$W/st.out") err=$(cat "$W/st.err")"
 
 # ════════════════════════════════════════════════════════════════════════════
 section "B. bin/lib/hmd_push_target.py -- which repo, which class"
@@ -1143,6 +1341,8 @@ expect_rc "C6. (c) unmanaged repo, a failing sweep gate would block -> allowed" 
 [ "$(state_calls)" = 0 ] && ok "C6. ...heimdall's sweep gate was never consulted for it" || bad "C6. heimdall-state was called for an unmanaged repo"
 { [ "$(grep -c 'WARNING' <<<"$ERR")" = 1 ] && grep 'WARNING' <<<"$ERR" | grep -qF "$PLAIN" && grep 'WARNING' <<<"$ERR" | grep -qF '.heimdall/repo-checks.json'; } \
   && ok "C6. ...exactly one WARNING line, naming the repo and how to gate it" || bad "C6. warning line" "$ERR"
+grep 'WARNING' <<<"$ERR" | grep -qF "heimdall-repo-checks init --repo $PLAIN" \
+  && ok "C6. ...and the one command that gates it: heimdall-repo-checks init --repo <repo>" || bad "C6. the warning does not name heimdall-repo-checks init" "$ERR"
 [ -z "$OUT" ] && ok "C6. ...stdout stays empty (it is reserved for a deny)" || bad "C6. unexpected stdout" "$OUT"
 run_hook "$PLUGIN" "$NOGIT" 'git push' FAKE_HSTATE_RC=2
 strict_blocks "C7. a cwd that is not inside a repository cannot be positively resolved: the strict gate runs on it (not a warning)" "$NOGIT"

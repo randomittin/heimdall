@@ -9,12 +9,21 @@ is what the hook calls) and runs none of heimdall's sweep rules for it.
 DECLARATION  <repo>/.heimdall/repo-checks.json  (tracked AND committed: the commit is what is read, never the work tree)
                {"schema":1,"checks":[{"name":"integrity","cmd":"python3 gates/site-integrity.py"}, ...]}
              name: unique, non-empty. cmd: a shell command, run with `bash -c` from the repository root.
+             A managed repo (not heimdall's own) declares exactly two checks, `lint` and `use-cases` (`init` writes them). A `use-cases` check that
+             runs a WHOLE test suite (a bare pytest, npm test, go test ./..., mvn test, cargo test) makes the declaration invalid (exit 2): the
+             generic suite would satisfy the gate. Extra checks stay allowed (existing repos declare more); one that sweeps a whole suite draws a
+             WARNING line on stderr.
 RECEIPT      <repo>/.heimdall/receipts/repo-checks.json  (ignored build output; written by `run`, atomically)
                schema, head_sha, tree_sha, decl_sha256, dirty, exit_code, finished_at, checks[{name, cmd, exit_code, secs}]
              Its fields, their types and formats are defined ONCE, in bin/lib/hmd_repo_receipt.py, which `run` builds the receipt
              with and `status` verifies it against; test/heimdall-push-gate-per-repo.test.sh walks that definition.
 
 Usage:
+  heimdall-repo-checks init   [--repo PATH] [--stack ID]
+                                              write .heimdall/repo-checks.json for the repo's stack: the two checks of a managed repo, `lint` and
+                                              `use-cases` (skills/heimdall/references/use-case-tests.md), with that stack's real commands. It never
+                                              replaces a declaration and never writes a scenario file (a placeholder would be a stub): with no
+                                              scenarios yet it says what to create
   heimdall-repo-checks run    [--repo PATH]   run every declared check, in order, from the repo root, one after the other even when
                                               one fails; record each check's exit code and seconds
   heimdall-repo-checks status [--repo PATH] [--pushes IDS]
@@ -24,6 +33,8 @@ Usage:
   --git-dir PATH  the git directory the push gate resolved TOGETHER with that work tree (--repo then names the work tree root): the two must name
                 each other from both ends, and every git call runs with them pinned, so nothing is rediscovered from a path. A pair that does not
                 match is refused (exit 2); the receipt is read inside that work tree
+  --stack ID    (init) the stack, when bin/stack-detect finds none or stacks of more than one family (node and go, say): one of python, fastapi,
+                flask, django, node, react, vue, svelte, nextjs, react-native, go, rust, jvm, spring-boot. A stack is never guessed
   --pushes IDS  what the push gate passes: the commits the push names as its sources (full object ids, comma separated; - when no commit
                 travels; ? when they cannot be listed). Each must be the receipt's commit. Without it `status` only asks whether the
                 receipt is green and current for HEAD.
@@ -48,17 +59,21 @@ an older declaration, or written by hand without them is refused. But the receip
 catches the stale, the mismatched, the copied and the hand-edited-by-accident; it does not stop a local adversary, and the native hook
 of the repository and CI stay the backstop.
 
-EXIT  run: 0 every check green and the receipt written | 1 a check failed (the red receipt is still written) | 2 refused
+EXIT  init: 0 the declaration written | 2 refused
+      run: 0 every check green and the receipt written | 1 a check failed (the red receipt is still written) | 2 refused
       status: 0 green and current | 1 not | 2 refused
-      refused (2): HEAD carries no (or an irregular) .heimdall/repo-checks.json, an invalid declaration, not a git repository, a bad
-      argument, or the receipt cannot be written. `run` on a dirty tree exits 0 and warns: the checks passed, but the receipt it wrote
-      will not satisfy the gate until the changes are committed and the checks run again.
+      refused (2): HEAD carries no (or an irregular) .heimdall/repo-checks.json, an invalid declaration (a `use-cases` check that runs a whole
+      test suite is one), not a git repository, a bad argument, or the receipt cannot be written. For `init`: a declaration exists already (in
+      the work tree or at HEAD), the stack is unknown or ambiguous (pass --stack), or the file cannot be written. `run` on a dirty tree exits 0
+      and warns: the checks passed, but the receipt it wrote will not satisfy the gate until the changes are committed and the checks run again.
 
 NO SECRETS. No flag takes a token; the environment is never printed or recorded (the checks inherit it unchanged); the receipt holds
 names, commands (they are in the tracked declaration), exit codes and seconds, never output.
 
 Python 3.7+, standard library only.
 """
+import collections
+import glob
 import json
 import os
 import stat
@@ -72,6 +87,8 @@ sys.path.insert(0, HERE)
 import hmd_repo_receipt as rr  # noqa: E402  (the one definition of the receipt)
 
 RUNNER = os.path.join(os.path.dirname(HERE), "heimdall-repo-checks")
+STACK_DETECT = os.path.join(os.path.dirname(HERE), "stack-detect")    # the detector the stack packs use; `init` asks it which stack a repo is
+USE_CASE_DOC = os.path.join(os.path.dirname(os.path.dirname(HERE)), "skills", "heimdall", "references", "use-case-tests.md")
 PINNED = {}   # {GIT_DIR, GIT_WORK_TREE} once `--git-dir` hands over the pair the push gate resolved: every git call below runs with it
 
 
@@ -109,13 +126,17 @@ def top_of(repo_arg, gitdir=None):
 
 
 def parse_declaration(data):
-    """(the parsed declaration, None) or (None, why not)."""
+    """(the parsed declaration, None) or (None, why not). A valid one's warnings (an extra check that sweeps a whole suite) go to stderr, a WARNING line each."""
     try:
         obj = json.loads(data.decode("utf-8"))
     except (ValueError, RecursionError):
         return None, "it is not valid JSON"
     problem = rr.declaration_problem(obj)
-    return (None, problem) if problem else (obj, None)
+    if problem:
+        return None, problem
+    for warning in rr.declaration_warnings(obj):
+        sys.stderr.write("heimdall-repo-checks: WARNING - %s\n" % warning)
+    return obj, None
 
 
 def tree_dirty(top):
@@ -136,11 +157,11 @@ def head_now(top):
     return got[1].strip() if got is not None and got[0] == 0 else ""
 
 
-def prepare_receipt_dir(top):
-    """The receipts directory inside the repository, created when missing, and REFUSED when any part of it is a link: a receipt written through a link
-    would land outside the repository (and the gate would be asked to trust it from there)."""
+def prepare_dir(top, parts, what):
+    """<top>/<parts...> inside the repository, created when missing, and REFUSED when any part of it is a link: what is written there (`what`) would land
+    outside the repository (and the gate would be asked to trust it from there)."""
     cur = top
-    for part in rr.RECEIPT.split("/")[:-1]:
+    for part in parts:
         cur = os.path.join(cur, part)
         try:
             info = os.lstat(cur)
@@ -153,8 +174,13 @@ def prepare_receipt_dir(top):
         except OSError as exc:
             refuse("cannot inspect %s: %s" % (cur, exc))
         if not stat.S_ISDIR(info.st_mode):
-            refuse("%s is a link, or not a directory: a receipt is never written through one (remove it)" % cur)
+            refuse("%s is a link, or not a directory: %s is never written through one (remove it)" % (cur, what))
     return cur
+
+
+def prepare_receipt_dir(top):
+    """The receipts directory inside the repository (see prepare_dir)."""
+    return prepare_dir(top, rr.RECEIPT.split("/")[:-1], "a receipt")
 
 
 def write_receipt(receipt, top):
@@ -188,8 +214,9 @@ def cmd_run(top):
     disk = read_declaration_on_disk(top)
     source = disk if disk is not None else facts.declaration
     if source is None:
-        refuse("%s declares no checks of its own: neither its work tree nor HEAD has %s. Declare them "
-               "({\"schema\":1,\"checks\":[{\"name\":\"...\",\"cmd\":\"...\"}]}) and commit the file." % (top, rr.DECLARATION))
+        refuse("%s declares no checks of its own: neither its work tree nor HEAD has %s. Write the two checks of a managed repo (lint and use-cases) "
+               "with `%s init --repo %s`, or declare your own ({\"schema\":1,\"checks\":[{\"name\":\"...\",\"cmd\":\"...\"}]}), and commit the file."
+               % (top, rr.DECLARATION, RUNNER, top))
     declared, problem = parse_declaration(source)
     if problem:
         refuse("%s is not a valid declaration (%s): want {\"schema\":1,\"checks\":[{\"name\":\"...\",\"cmd\":\"...\"}, ...]} with at least "
@@ -280,6 +307,129 @@ def cmd_status(top, pushes):
     return 0
 
 
+# ── init: the declaration of a managed repo ──────────────────────────────────────────────────────────────────────────────────────────────────────
+# What `init` declares per family of stacks: the two commands of a managed repo (use-case-tests.md), where the scenarios live (a glob under the repo root: a
+# directory, or a file name for Rust and the JVM) and what to create when nothing is there. {tool} is the repo's own wrapper (./gradlew, ./mvnw) when it
+# ships one, else the system program. Each use-cases command names where its scenarios are, so the gate accepts it (whole_suite refuses only a bare
+# runner): test/heimdall-push-gate-per-repo.test.sh A11 walks this table and puts each declaration through the gate.
+Family = collections.namedtuple("Family", "lint use_cases scenarios create")
+FAMILIES = {
+    "python": Family("ruff check .", "pytest tests/use_cases -q", "tests/use_cases",
+                     "tests/use_cases/ with one pytest scenario per user journey, named for it (test_book_a_cab.py)"),
+    "node": Family("npm run lint", "npm run test:use-cases", "tests/use-cases",
+                   "tests/use-cases/ with one scenario per user journey, and a \"test:use-cases\" script in package.json that runs only that directory"),
+    "go": Family("golangci-lint run", "go test ./usecases/...", "usecases",
+                 "usecases/ with one Go test per user journey, named for it (book_a_cab_test.go)"),
+    "rust": Family("cargo clippy --all-targets -- -D warnings", "cargo test --test use_cases", "tests/use_cases*",
+                   "tests/use_cases.rs with one test per user journey, named for it"),
+    "gradle": Family("{tool} check -x test", "{tool} test --tests '*UseCase*'", "src/test/**/*UseCase*",
+                     "test classes named <Journey>UseCaseTest under src/test, one per user journey"),
+    "maven": Family("{tool} -B -q verify -DskipTests", "{tool} -B -q test -Dtest='*UseCase*'", "src/test/**/*UseCase*",
+                    "test classes named <Journey>UseCaseTest under src/test, one per user journey"),
+}
+# the stack ids bin/stack-detect emits -> their family; a JVM stack is Gradle or Maven, which its build file says
+STACK_FAMILY = {"python": "python", "fastapi": "python", "flask": "python", "django": "python",
+                "node": "node", "react": "node", "vue": "node", "svelte": "node", "nextjs": "node", "react-native": "node",
+                "go": "go", "rust": "rust", "jvm": "jvm", "spring-boot": "jvm"}
+
+
+def detected_stacks(top):
+    """The stack ids bin/stack-detect finds in the work tree at `top`, in the order it names them (the detector the stack packs use)."""
+    try:
+        done = subprocess.run(["bash", STACK_DETECT, top], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        found = json.loads(done.stdout.decode("utf-8"))["stacks"]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
+        refuse("cannot detect the stack of %s with %s (%s): name it with --stack ID" % (top, STACK_DETECT, exc))
+    if done.returncode != 0 or not isinstance(found, list):
+        refuse("%s gave no answer for %s: name the stack with --stack ID" % (STACK_DETECT, top))
+    return [s for s in found if isinstance(s, str)]
+
+
+def jvm_tool(top):
+    """(family, program) of a JVM repo: Gradle when it has a Gradle build file, else Maven when it has a pom; the program is the repo's own wrapper when
+    it ships one. None when it has neither build file."""
+    for family, build_files, wrapper, program in (("gradle", ("build.gradle", "build.gradle.kts"), "gradlew", "gradle"),
+                                                  ("maven", ("pom.xml",), "mvnw", "mvn")):
+        if any(os.path.isfile(os.path.join(top, name)) for name in build_files):
+            return family, ("./" + wrapper if os.path.isfile(os.path.join(top, wrapper)) else program)
+    return None
+
+
+def choose_family(top, forced):
+    """(family, program) to declare for the repo at `top`. Refuses (exit 2) when the stack is unknown, when the repo holds stacks of more than one family
+    (a declaration is never a guess), or when it is a JVM repo with no build file to say Gradle or Maven."""
+    if forced is not None and forced not in STACK_FAMILY:
+        refuse("--stack %s is not a stack id (one of: %s)" % (forced, ", ".join(sorted(STACK_FAMILY))))
+    stacks = [forced] if forced else [s for s in detected_stacks(top) if s in STACK_FAMILY]
+    options = []
+    for stack in stacks:
+        option = jvm_tool(top) if STACK_FAMILY[stack] == "jvm" else (STACK_FAMILY[stack], "")
+        if option is None:
+            refuse("%s is a JVM stack, but %s has no build.gradle, build.gradle.kts or pom.xml to say whether it builds with Gradle or Maven" % (stack, top))
+        if option not in options:
+            options.append(option)
+    if not options:
+        refuse("no stack detected in %s (no package.json, pyproject.toml, requirements.txt, go.mod, Cargo.toml, build.gradle or pom.xml): name it with "
+               "--stack ID, one of: %s" % (top, ", ".join(sorted(STACK_FAMILY))))
+    if len(options) > 1:
+        refuse("%s holds stacks of more than one family (%s), and a declaration is never a guess: choose one with --stack ID" % (top, ", ".join(stacks)))
+    return options[0]
+
+
+def has_scenarios(top, pattern):
+    return bool(glob.glob(os.path.join(glob.escape(top), pattern), recursive=True))
+
+
+def write_declaration(top, declaration):
+    """Create <top>/.heimdall/repo-checks.json and return its path. EXCLUSIVELY (O_EXCL, a link never followed): a file, a link or a directory already
+    there is refused, so a declaration that appeared since cmd_init looked is not replaced either."""
+    folder = prepare_dir(top, rr.DECLARATION.split("/")[:-1], "the declaration")
+    path = os.path.join(folder, os.path.basename(rr.DECLARATION))
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    except FileExistsError:
+        refuse("%s already exists: init never replaces a declaration" % path)
+    except OSError as exc:
+        refuse("cannot write %s: %s" % (path, exc))
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(declaration, fh, indent=2)
+            fh.write("\n")
+    except OSError as exc:
+        try:
+            os.unlink(path)
+        except OSError as gone:
+            sys.stderr.write("heimdall-repo-checks: could not remove the partial file %s: %s\n" % (path, gone))
+        refuse("cannot write %s: %s" % (path, exc))
+    return path
+
+
+def cmd_init(top, stack):
+    path = os.path.join(top, *rr.DECLARATION.split("/"))
+    at_head = rr.run_git(["cat-file", "-e", "HEAD:" + rr.DECLARATION], top, genv())
+    if os.path.lexists(path) or (at_head is not None and at_head[0] == 0):
+        refuse("%s already declares checks (%s exists, in the work tree or at HEAD): init never replaces a declaration. Edit that file, or delete it "
+               "(and commit the deletion) to start over" % (top, rr.DECLARATION))
+    family, program = choose_family(top, stack)
+    plan = FAMILIES[family]
+    lint, use_cases = plan.lint.replace("{tool}", program), plan.use_cases.replace("{tool}", program)
+    declaration = {"schema": rr.SCHEMA, "checks": [{"name": rr.LINT, "cmd": lint}, {"name": rr.USE_CASES, "cmd": use_cases}]}
+    lines = ["heimdall-repo-checks: wrote %s (%s)" % (write_declaration(top, declaration), family),
+             "  %-10s %s" % (rr.LINT, lint), "  %-10s %s" % (rr.USE_CASES, use_cases)]
+    if has_scenarios(top, plan.scenarios):
+        lines.append("scenarios: found %s" % plan.scenarios)
+    else:
+        lines.append("scenarios: none found at %s. init writes no scenario files (a placeholder would be a stub): create %s. Derive the journeys from what "
+                     "the product promises, one scenario each (%s)" % (plan.scenarios, plan.create, USE_CASE_DOC))
+    ignored = rr.run_git(["check-ignore", "-q", "--", rr.RECEIPT], top, genv())
+    if ignored is not None and ignored[0] == 1:
+        lines.append("note: .heimdall/receipts/ is not git-ignored: add it to .gitignore, the receipt is build output (a committed one makes every later "
+                     "run record dirty:true)")
+    lines.append("next: commit %s (the push gate reads the committed file), then record the checks: %s run --repo %s" % (rr.DECLARATION, RUNNER, top))
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
 def main(argv):
     if not argv:
         sys.stderr.write(__doc__)
@@ -288,11 +438,11 @@ def main(argv):
     if sub in ("-h", "--help"):
         sys.stdout.write(__doc__)
         return 0
-    if sub not in ("run", "status"):
+    if sub not in ("init", "run", "status"):
         sys.stderr.write("heimdall-repo-checks: unknown command: %s\n" % sub)
         sys.stderr.write(__doc__)
         return 2
-    repo_arg, pushes, gitdir, rest = ".", None, None, argv[1:]
+    repo_arg, pushes, gitdir, stack, rest = ".", None, None, None, argv[1:]
     while rest:
         arg = rest.pop(0)
         if arg == "--repo":
@@ -301,12 +451,18 @@ def main(argv):
             repo_arg = rest.pop(0)
         elif arg.startswith("--repo="):
             repo_arg = arg[len("--repo="):]
-        elif arg == "--git-dir":
+        elif sub != "init" and arg == "--git-dir":
             if not rest:
                 refuse("--git-dir needs a path")
             gitdir = rest.pop(0)
-        elif arg.startswith("--git-dir="):
+        elif sub != "init" and arg.startswith("--git-dir="):
             gitdir = arg[len("--git-dir="):]
+        elif sub == "init" and arg == "--stack":
+            if not rest:
+                refuse("--stack needs a stack id")
+            stack = rest.pop(0)
+        elif sub == "init" and arg.startswith("--stack="):
+            stack = arg[len("--stack="):]
         elif sub == "status" and arg == "--pushes":
             if not rest:
                 refuse("--pushes needs a value")
@@ -317,8 +473,10 @@ def main(argv):
             sys.stdout.write(__doc__)
             return 0
         else:
-            refuse("unexpected argument: %s (usage: heimdall-repo-checks run|status [--repo PATH] [--pushes IDS])" % arg)
+            refuse("unexpected argument: %s (usage: heimdall-repo-checks init|run|status [--repo PATH] [--stack ID] [--pushes IDS])" % arg)
     top = top_of(repo_arg, gitdir)
+    if sub == "init":
+        return cmd_init(top, stack)
     return cmd_run(top) if sub == "run" else cmd_status(top, pushes)
 
 

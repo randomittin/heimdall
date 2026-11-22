@@ -413,7 +413,7 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
           deny "$(printf '{"error": "BLOCKED: pre-push repo-checks gate failed for %s. This repository declares its own checks (.heimdall/repo-checks.json), so a push needs a green, current, clean-tree record of them for the commit it sends (the heimdall sweep rules do not apply to it). --- %s"}' "$PG_ESC" "$ESC")"
         fi ;;
       unmanaged)
-        printf 'heimdall: WARNING - %s is not managed by hmd (no heimdall sweep regime, no .heimdall/repo-checks.json), so no test or lint gate ran for this push; the secret gates below still apply. To gate it, declare its checks in .heimdall/repo-checks.json and record them: %s/bin/heimdall-repo-checks run --repo %s\n' "$PG_DIR" "$PLUGIN" "$PG_DIR" >&2 ;;
+        printf 'heimdall: WARNING - %s is not managed by hmd (no heimdall sweep regime, no .heimdall/repo-checks.json), so no test or lint gate ran for this push; the secret gates below still apply. To gate it: %s/bin/heimdall-repo-checks init --repo %s (writes .heimdall/repo-checks.json with the two checks lint and use-cases for its stack), commit that file, then record the checks with %s/bin/heimdall-repo-checks run --repo %s\n' "$PG_DIR" "$PLUGIN" "$PG_DIR" "$PLUGIN" "$PG_DIR" >&2 ;;
       *)
         if ! cd "$PG_DIR" 2>/dev/null; then
           # the gate belongs to THIS directory: running it wherever the hook happens to be would grade another repository. A candidate that does not exist
