@@ -23,3 +23,5 @@
 09_resume_a_session	bin/heimdall	s/^    "\${RESUME_TARGET\[@]}" \\$/    \\/	M09b-resume-forgets-to-continue-the-last-conversation
 10_update_lands_and_session_returns	bin/heimdall-autoupdate	s/^  if \[ "$vrc" -ne 0 \]; then$/  if false; then/	M10a-update-applied-without-checking-its-signature
 10_update_lands_and_session_returns	bin/lib/hmd_supervise.sh	s/HMD_RESUME_SESSION_ID=/HMD_RESUME_SESSION_ID_OFF=/g	M10b-session-relaunched-without-resume
+08_pair_a_phone	bin/heimdall-relay-client	s/^        if self\._no_confirm and not self\._claim_is_mine(login):$/        if False:/	M08a-a-claim-for-another-account-pairs-the-phone
+08_pair_a_phone	bin/heimdall-relay-client	s/^                INBOX\.append(self\.root, text)$/                last = None/	M08b-pairing-leaves-no-notice-in-the-session
