@@ -546,6 +546,12 @@ fi
 printf "  ${D}gates run on every commit; deny blocks it.${R}\n"
 printf "  ${D}escape once:${R} ${B}HMD_SKIP=1 git commit …${R} ${D}(logged, never silent)${R}\n"
 printf "  ${D}last verdict:${R} ${C}hmd verdict${R}\n"
+# A repo that is not heimdall's own and declares no checks of its own is unmanaged at push time: one warning, no test or lint gate. One line says how to give
+# the push gate a record to read: `heimdall-repo-checks init` writes the declaration (lint + use-cases) for the repo's stack. Heimdall's own sweep regime
+# (test/run-all.sh naming last-sweep.json) is graded by that sweep, so a declaration there would change nothing and is not suggested.
+if [ ! -e "$REPO/.heimdall/repo-checks.json" ] && [ -x "$PLUGIN_BIN/heimdall-repo-checks" ] && ! grep -qs 'last-sweep.json' "$REPO/test/run-all.sh"; then
+  printf "  ${D}gate its own checks:${R} ${C}%s/heimdall-repo-checks init${R} ${D}(writes .heimdall/repo-checks.json: lint + use-cases)${R}\n" "$PLUGIN_BIN"
+fi
 if [ "$CURSOR_STATE" = "registered" ]; then
   printf "  ${D}cursor HUD →${R} registered ${D}(undo: hmd cursor-statusline unregister)${R}\n"
 fi

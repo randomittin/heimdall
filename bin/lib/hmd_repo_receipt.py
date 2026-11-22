@@ -23,6 +23,12 @@ THE RECEIPT, exactly these fields (a receipt with another one is refused):
   finished_at  a UTC timestamp, 2026-10-13T12:00:00Z
   checks       a non-empty list of {name, cmd, exit_code, secs}
 
+THE DECLARATION a repository commits is {"schema":1,"checks":[{"name","cmd"}, ...]}: at least one check, names unique. A managed repo (not
+heimdall's own) declares two, `lint` and `use-cases` (skills/heimdall/references/use-case-tests.md), and a `use-cases` check whose command runs a
+WHOLE test suite -- a bare pytest, npm test, go test ./..., mvn test, cargo test, with no path, marker or filter after the runner -- makes the
+declaration invalid: the generic suite the use-case rule replaces would satisfy the gate. Other checks stay allowed (existing repos declare more);
+declaration_warnings() names the ones that sweep a whole suite.
+
 A COOPERATING-AGENT CONTROL, NOT A SECURITY BOUNDARY. Like heimdall's own .heimdall/receipts/last-sweep.json this is a plain local file:
 the three bindings (commit, tree, committed declaration) catch a receipt that is stale, copied from another checkout or commit, left
 over from other checks, or written by hand without them. Anyone who can write the file can also write all three values correctly, so
@@ -33,12 +39,14 @@ Python 3.7+, standard library only.
 import hashlib
 import os
 import re
+import shlex
 import stat
 import subprocess
 
 DECLARATION = ".heimdall/repo-checks.json"
 RECEIPT = ".heimdall/receipts/repo-checks.json"
 SCHEMA = 1
+LINT, USE_CASES = "lint", "use-cases"   # the two checks a managed repo declares (use-case-tests.md); a check with any other name is an extra one
 GIT_AMBIENT = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")  # a stray one in THIS process must not redirect git
 REGULAR_MODES = (b"100644", b"100755")
 MAX_BYTES = 1 << 20     # a receipt or a declaration over 1 MiB is not one: it is refused, never read whole into memory or handed to a parser
@@ -111,8 +119,106 @@ def shape_problem(receipt):
     return None
 
 
+# ── WHOLE-SUITE RUNNERS: what a `use-cases` check must not be ─────────────────────────────────────────────────────────────────────────────────────
+# A managed repo gates on `lint` + `use-cases` (skills/heimdall/references/use-case-tests.md); the second runs the use-case scenarios and only those. A
+# command that runs the language's whole suite (`pytest`, `npm test`, `go test ./...`, `mvn test`, `cargo test`, nothing after the runner that names a
+# path, a marker or a filter) would let the generic sweep that rule replaces satisfy the gate. whole_suite() finds that shape and declaration_problem()
+# refuses it. It reads the command the way a shell does (quotes, `;` `&&` `||` `|`, `cd`), judges only the runners it knows and lets everything else
+# through: a policy check on a declaration, not a security boundary (a wrapper script can hide anything).
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_LAUNCHERS = ("env", "time", "exec", "nohup", "npx", "bunx")    # words that only start the runner that follows them
+_LAUNCHER_PAIRS = (("uv", "run"), ("poetry", "run"), ("pipenv", "run"), ("pdm", "run"), ("python", "-m"), ("python3", "-m"), ("pnpm", "exec"),
+                   ("yarn", "exec"))
+_RUNNER_NAMES = {"py.test": "pytest", "mvnw": "mvn", "gradlew": "gradle"}    # a program's file name, spelled as the table below has it
+# the words that name a whole-suite runner -> (other words that still mean "everything", at least one of which must be there)
+_WHOLE_SUITE = {
+    ("pytest",): ((), ()),
+    ("jest",): ((), ()),
+    ("vitest",): (("run",), ()),
+    ("npm", "test"): ((), ()),
+    ("npm", "t"): ((), ()),
+    ("npm", "run", "test"): ((), ()),
+    ("yarn", "test"): ((), ()),
+    ("pnpm", "test"): ((), ()),
+    ("go", "test"): (("./...", "..."), ()),
+    ("cargo", "test"): ((), ()),
+    ("mvn",): (("clean", "test", "verify"), ("test", "verify")),
+    ("gradle",): (("clean", "test", "check"), ("test", "check")),
+}
+# flags that select tests (-k EXPR, -m MARKER, --tests PATTERN, -Dtest=PATTERN, --test NAME, -run NAME, ...): with one of them it is not the whole suite
+_PICKS_TESTS = frozenset(("-k", "-m", "-t", "-g", "-p", "-pl", "-run", "--grep", "--tests", "--test", "--lib", "--bin", "--bins", "--doc", "--example",
+                          "--package", "--filter", "--lf", "--last-failed", "--pyargs", "--deselect", "--testPathPattern", "--testNamePattern",
+                          "--runTestsByPath", "-Dtest", "-Dit.test", "-Dgroups"))
+
+
+def _picks_tests(flag):
+    name = flag.split("=", 1)[0]
+    return name in _PICKS_TESTS or name[:2] in ("-k", "-m")     # -kEXPR and -mMARKER, the value glued on
+
+
+def _runs_whole_suite(words):
+    """True when one simple command (its words) is a known test runner with nothing after it that selects tests."""
+    words = list(words)
+    while words:
+        if _ASSIGNMENT.match(words[0]) or words[0] in _LAUNCHERS:
+            words = words[1:]
+        elif tuple(words[:2]) in _LAUNCHER_PAIRS:
+            words = words[2:]
+        else:
+            break
+    if not words:
+        return False
+    program = os.path.basename(words[0])
+    words = [_RUNNER_NAMES.get(program, program)] + words[1:]
+    for runner, (also, needs) in _WHOLE_SUITE.items():
+        if tuple(words[:len(runner)]) == runner:
+            rest = words[len(runner):]
+            plain = [w for w in rest if not w.startswith("-")]
+            return (all(w in also for w in plain) and not any(_picks_tests(w) for w in rest if w.startswith("-"))
+                    and (not needs or any(w in needs for w in plain)))
+    return False
+
+
+def _simple_commands(command):
+    """The simple commands of a shell command line, each a list of words: cut at newlines and at ; & | ( ) < >, quotes and comments honoured, and the
+    descriptor of a redirection (the 2 of 2>&1) dropped. ValueError for an unbalanced quote."""
+    for line in command.splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        simple = []
+        for token in lexer:
+            if token and all(ch in ";&|()<>" for ch in token):
+                if token[0] in "<>" and simple and simple[-1].isdigit():
+                    simple.pop()
+                if simple:
+                    yield simple
+                simple = []
+            else:
+                simple.append(token)
+        if simple:
+            yield simple
+
+
+def whole_suite(command):
+    """True when `command` runs a language's entire test suite: some simple command in it is a known runner (pytest, npm test, go test ./..., mvn test,
+    cargo test, ...) and nothing after the runner names a path, a marker or a filter. A `cd` ahead of it is a choice of directory (`cd tests/use_cases && pytest`
+    runs what is in that directory), so what follows a `cd` is not judged. A command it cannot read (an unbalanced quote) is not judged either: bash refuses
+    it, and the check goes red on its own."""
+    chose_a_directory = False
+    try:
+        for simple in _simple_commands(command):
+            if simple[0] in ("cd", "pushd"):
+                chose_a_directory = True
+            elif not chose_a_directory and _runs_whole_suite(simple):
+                return True
+    except ValueError:
+        return False
+    return False
+
+
 def declaration_problem(declaration):
-    """The first thing wrong with a parsed repo-checks.json, or None. It names at least one check; names are unique."""
+    """The first thing wrong with a parsed repo-checks.json, or None. It names at least one check; names are unique; a `use-cases` check does not run a
+    whole test suite (see whole_suite)."""
     if not isinstance(declaration, dict) or not _int(declaration.get("schema")) or declaration.get("schema") != SCHEMA:
         return "it must be a JSON object with \"schema\": 1"
     checks = declaration.get("checks")
@@ -123,9 +229,22 @@ def declaration_problem(declaration):
         if not isinstance(check, dict) or not _text(check.get("name")) or not _text(check.get("cmd")):
             return "checks[%d] must be an object with a non-empty \"name\" and \"cmd\"" % i
         names.append(check["name"])
+        if check["name"] == USE_CASES and whole_suite(check["cmd"]):
+            return ("checks[%d] is \"use-cases\" but its command runs a whole test suite (%s): it must run only the use-case scenarios, so name their "
+                    "directory, marker or script (for example pytest tests/use_cases -q, npm run test:use-cases, go test ./usecases/...), or the generic "
+                    "suite the use-case rule replaces would satisfy the gate (skills/heimdall/references/use-case-tests.md)" % (i, check["cmd"]))
     if len(set(names)) != len(names):
         return "check names must be unique"
     return None
+
+
+def declaration_warnings(declaration):
+    """What a VALID declaration may carry that the use-case rule discourages, one line each: an extra check (neither `lint` nor `use-cases`) that runs a
+    whole test suite or heimdall's own `run-all` sweep. Existing repos declare more than the two checks, so this warns and never refuses."""
+    return ["check \"%s\" runs a whole test suite (%s): a managed repo gates on lint plus use-case scenarios, so this puts back the full sweep that rule "
+            "removes. It is allowed; consider dropping it (skills/heimdall/references/use-case-tests.md)" % (check["name"], check["cmd"])
+            for check in declaration["checks"]
+            if check["name"] not in (LINT, USE_CASES) and (whole_suite(check["cmd"]) or "run-all" in check["cmd"])]
 
 
 def build_receipt(head_sha, tree_sha, decl_sha256, dirty, exit_code, finished_at, checks):

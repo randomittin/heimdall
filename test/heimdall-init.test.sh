@@ -323,6 +323,35 @@ V4="$( cd "$R4" && "$VERDICT_BIN" --field verdict 2>/dev/null )"
 mv "$WORK/plug-moved" "$WORK/plug"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 11. the push gate reads a record of a repo's OWN checks (bin/heimdall-repo-checks): a repo that declares none, and is not heimdall's own, is told
+#     in ONE line how to get one; a repo that has one, or that runs heimdall's own sweep, hears nothing
+# ══════════════════════════════════════════════════════════════════════════════
+init_out() { ( cd "$1" && env PATH="$NOCLAUDE_PATH" HOME="$HOME" "$INIT_BIN" 2>&1 ); }
+R11="$WORK/r11"; newrepo "$R11"
+OUT11="$(init_out "$R11")"
+if [ "$(grep -cF 'heimdall-repo-checks init' <<<"$OUT11")" = 1 ] && grep -F 'heimdall-repo-checks init' <<<"$OUT11" | grep -qF '/bin/heimdall-repo-checks init'; then
+  ok "11a a repo that declares no checks gets exactly one line naming heimdall-repo-checks init (the plugin's own path)"
+else
+  bad "11a no (or more than one) heimdall-repo-checks init line" "$OUT11"
+fi
+printf 'module example.com/shop\n' > "$R11/go.mod"
+( cd "$R11" && env PATH="$NOCLAUDE_PATH" HOME="$HOME" "$BIN/heimdall-repo-checks" init ) >/dev/null 2>&1
+OUT11B="$(init_out "$R11")"
+if [ -f "$R11/.heimdall/repo-checks.json" ] && ! grep -qF 'heimdall-repo-checks init' <<<"$OUT11B"; then
+  ok "11b the command it names writes the declaration, and a re-init then stops suggesting it"
+else
+  bad "11b the suggestion outlived the declaration (or the command did not write one)" "$OUT11B"
+fi
+R11S="$WORK/r11s"; newrepo "$R11S"; mkdir -p "$R11S/test"
+printf '#!/usr/bin/env bash\nRECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"\n' > "$R11S/test/run-all.sh"
+OUT11S="$(init_out "$R11S")"
+if ! grep -qF 'heimdall-repo-checks init' <<<"$OUT11S"; then
+  ok "11c heimdall's own sweep regime (test/run-all.sh naming last-sweep.json) is not told to declare checks: a declaration would not change its gate"
+else
+  bad "11c a sweep repo was told to declare checks" "$OUT11S"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 9. syntax: the bins AND the generated hooks parse clean
 # ══════════════════════════════════════════════════════════════════════════════
 _syn=1
