@@ -65,6 +65,8 @@ mk_origin() {   # mk_origin DIR [nolist] -- the fixture repository, one commit; 
     put "$o" "$f"
   done
   printf '{"agent": "main"}\n' > "$o/settings.json"
+  # the on-demand cut: bin/lib/lean_sparse.sh takes it from skills.manifest.json at HEAD (a3e11d0e) and refuses to apply the lean set without one
+  printf '%s\n' '{"entries": [{"id": "on-demand", "kind": "bundled", "on_demand_paths": ["skills/stacks", "skills/designmatch", "skills/self-improve", "skills/system-health", "skills/mac-deep-clean"]}]}' > "$o/skills.manifest.json"
   printf '%s\n' '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}], "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "hooks/guard.sh"}, {"type": "command", "command": "true"}]}]}}' > "$o/hooks/hooks.json"
   mkdir -p "$o/bin/lib" "$o/release"
   cp "$CLI" "$o/bin/heimdall-lean"; cp "$REPO/bin/heimdall-footprint" "$o/bin/heimdall-footprint"
