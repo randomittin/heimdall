@@ -56,3 +56,13 @@
 ## Deferred findings (2026-11-22)
 
 - [ ] MEDIUM: req TTL restarts on every Stop (_HMD_SV_SINCE reset on USR1), so an active user who never idles 300s keeps the launcher running the gate (python+git+cc-selfheal) every 5s for the whole session; fix: anchor TTL at first request, not each poke (bin/lib/hmd_supervise.sh:286; review; release after v2.4.10)
+
+## From 2026-11-22 use-case batch (MEDIUM/LOW)
+- use-cases: journey 09 leaves a presence-keeper temp dir; add a presence-off marker in lib.sh `uc_sandbox`.
+- use-cases: journey 09 goal-restore/agents-list/selectors and journey 11 printed-once/curl-log checks have no mutant rows.
+- use-cases: move journey-local helpers (pty run, fake `claude agents --json`, curl double) into lib.sh once a 2nd journey needs them.
+- repo-checks: `run-all` text match also warns on `npm-run-all` (false warning only).
+- agent-templates.md Architect/Reviewer/Fixer templates and test-runner.md:40 still silent on use-case journeys; no guard suite pins the use-case wording in agent files.
+- docs/split-repos.md Publish step 3 still shows hmd-skills v1.0.0.
+- Two stale demo app copies (heimdall-demo-app/, packages/runheimdall/heimdall-demo-app/) hold the old pytest spec.
+- hmd-statusline: 2 STALE fixtures (prefix-and-elements, viral-statusline) to rewrite or retire.
