@@ -53,6 +53,18 @@
 #       verdict line reflecting the same receipt, and its own exit code is provably
 #       IDENTICAL regardless of whether that verdict reads WOULD-PASS or WOULD-BLOCK —
 #       genuinely advisory, never a second gate.
+#   (M) USE-CASE RECEIPT, WRITER (operator decision 2026-11-22, "B": a push of heimdall's own repo
+#       stands on a green use-case journey receipt, a release on the full sweep) — the REAL
+#       test/use-cases/run.sh, on a one-journey fixture, writes .heimdall/receipts/use-cases.json
+#       atomically after a FULL green run on a clean committed tree (commit, tree, counts, time) and
+#       writes none — saying why on stderr — for --only, --no-mutants, a dirty tree or a red run;
+#       bin/lib/hmd_use_case_receipt.py's `write` refuses a HEAD that moved by anything but the
+#       hooks' own journal and ledger records, and `clean` is run-all.sh's own tree_clean predicate.
+#   (N) USE-CASE RECEIPT, GATE — check-quality-gates passes when a green use-case receipt vouches for
+#       HEAD (beside no sweep receipt, or a RED one), re-deriving the commit and its tree from git,
+#       tolerating only the hooks' own journal/ledger commits after the run; it BLOCKS, naming
+#       `bash test/use-cases/run.sh`, on a missing, red, forged, stale, garbled or linked receipt,
+#       and never overrides the other gates; a receipt the writer wrote passes it.
 #
 # HERMETIC. Every case runs inside a throwaway `git init` repo under $TMPDIR. No case
 # ever exports a shared $HEIMDALL_HOME for the whole file: the WRITER case explicitly
@@ -586,6 +598,180 @@ lint_gate "$D"
   || bad "L11 expected exit 0 plus a LINT WAIVED line, got $LG_RC" "$LG_OUT"
 lint_receipt "$D" "2031-01-01T00:00:00Z" 0 1 false; lint_gate "$D"
 lint_gate_blocks "L12 a NEW lint run voids the waiver (it was issued against the previous receipt) -> gate BLOCKS again" "tool-error"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# M. USE-CASE RECEIPT, THE WRITER -- the real test/use-cases/run.sh over a fixture with ONE journey (the tree must hold GOOD in marker.txt) and ONE mutant
+#    (GOOD -> BAD, which the journey must notice). The real journeys take minutes; the writer's rules do not depend on them.
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "M. use-case journey receipt: the writer (test/use-cases/run.sh) and what it refuses to vouch for"
+UC_LIB_PY="$ROOT/bin/lib/hmd_use_case_receipt.py"
+N_STATE="$WORK/uc-state.json"   # the legacy gate flags, green, outside every fixture repo (a state file inside one would be an untracked file)
+FR="$WORK/uc-runner-repo"
+newrepo "$FR"
+mkdir -p "$FR/test/use-cases/journeys" "$FR/bin/lib"
+cp "$ROOT/test/use-cases/run.sh" "$FR/test/use-cases/run.sh"
+cp "$ROOT/test/use-cases/lib.sh" "$FR/test/use-cases/lib.sh"
+for f in hmd_use_case_receipt.py hmd_sweep_guard.py hmd_kill_guard.py hook-owned-path.sh; do cp "$ROOT/bin/lib/$f" "$FR/bin/lib/$f" 2>/dev/null; done
+printf 'GOOD\n' > "$FR/marker.txt"; printf 'notes\n' > "$FR/notes.txt"; printf '0.0.1\n' > "$FR/VERSION"; printf '.heimdall/receipts/\n' > "$FR/.gitignore"
+cat > "$FR/test/use-cases/journeys/01_marker.sh" <<'JEOF'
+#!/usr/bin/env bash
+# fixture journey: the tree under test must hold GOOD in marker.txt and carry no fail.flag
+if grep -q GOOD "$UC_TREE/marker.txt" 2>/dev/null && [ ! -e "$UC_TREE/fail.flag" ]; then echo "  PASS marker holds GOOD"; exit 0; fi
+echo "  FAIL marker does not hold GOOD, or fail.flag exists"; exit 1
+JEOF
+printf '01_marker\tmarker.txt\ts/GOOD/BAD/\tmarker-bad\n' > "$FR/test/use-cases/mutants.list"
+git -C "$FR" add -A; git -C "$FR" commit -q -m "fixture: a one-journey use-case runner"
+( cd "$FR" && HEIMDALL_STATE_FILE="$N_STATE" "$STATE_BIN" init >/dev/null 2>&1 && HEIMDALL_STATE_FILE="$N_STATE" HMD_LINT_WAIVER="$LINT_FIXTURE_WAIVER" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
+FR_RECEIPT="$FR/.heimdall/receipts/use-cases.json"
+uc_run() {  # uc_run [run.sh args...] -> UC_RC, $WORK/uc.out, $WORK/uc.err (an earlier receipt is removed first)
+  rm -f "$FR_RECEIPT"
+  ( cd "$FR" && env -u HEIMDALL_HOME HMD_MIN_FREE_PCT=0 bash test/use-cases/run.sh "$@" ) >"$WORK/uc.out" 2>"$WORK/uc.err"
+  UC_RC=$?
+}
+uc_lib() {  # uc_lib <subcommand args...> -> UC_LIB_RC, UC_LIB_OUT (stdout and stderr, no HEIMDALL_HOME)
+  UC_LIB_OUT="$(env -u HEIMDALL_HOME python3 -I -S "$UC_LIB_PY" "$@" 2>&1)"; UC_LIB_RC=$?
+}
+uc_write() {  # uc_write <started-head> -> a green one-journey, one-mutant receipt through the lib's own `write`
+  uc_lib write --repo "$FR" --started-head "$1" --journeys-total 1 --journeys-passed 1 --mutants-total 1 --mutants-killed 1 --duration-s 3
+}
+
+uc_run
+FR_HEAD="$(git -C "$FR" rev-parse HEAD)"; FR_TREE="$(git -C "$FR" rev-parse 'HEAD^{tree}')"
+[ "$UC_RC" = 0 ] && ok "M1 a full green run on a clean committed tree exits 0" || bad "M1 expected exit 0, got $UC_RC" "$(tail -n 12 "$WORK/uc.out") $(cat "$WORK/uc.err")"
+if jq -e --arg h "$FR_HEAD" --arg t "$FR_TREE" '(keys | length) == 8 and .schema == 1 and .head_sha == $h and .tree_sha == $t and .exit_code == 0
+     and .journeys == {total: 1, passed: 1} and .mutants == {total: 1, killed: 1} and (.duration_s | type == "number")
+     and (.finished_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' "$FR_RECEIPT" >/dev/null 2>&1; then
+  ok "M2 ...and writes use-cases.json: schema, the commit and the tree it graded, exit_code 0, the journey and mutant counts, duration_s, finished_at, nothing else"
+else
+  bad "M2 the receipt is missing or has the wrong shape" "$(cat "$FR_RECEIPT" 2>/dev/null)"
+fi
+[ -z "$(ls -A "$FR/.heimdall/receipts" 2>/dev/null | grep -v '^use-cases.json$')" ] \
+  && ok "M3 atomic: use-cases.json is the only file in the receipts directory (no temp file left behind)" \
+  || bad "M3 stray files beside the receipt" "$(ls -A "$FR/.heimdall/receipts")"
+grep -q 'use-cases receipt: ' "$WORK/uc.out" && ok "M4 the run says where the receipt is" || bad "M4 no 'use-cases receipt:' line" "$(tail -n 5 "$WORK/uc.out")"
+
+uc_run --only marker
+if [ "$UC_RC" = 0 ] && [ ! -e "$FR_RECEIPT" ] && grep -q -- '--only' "$WORK/uc.err"; then ok "M5 --only (a subset of the journeys) exits 0, writes NO receipt, and says why on stderr"; else bad "M5 --only: rc=$UC_RC receipt=$([ -e "$FR_RECEIPT" ] && echo yes || echo no)" "$(cat "$WORK/uc.err")"; fi
+uc_run --no-mutants
+if [ "$UC_RC" = 0 ] && [ ! -e "$FR_RECEIPT" ] && grep -q -- '--no-mutants' "$WORK/uc.err"; then ok "M6 --no-mutants (nothing showed the journeys notice a break) writes NO receipt, and says why"; else bad "M6 --no-mutants: rc=$UC_RC receipt=$([ -e "$FR_RECEIPT" ] && echo yes || echo no)" "$(cat "$WORK/uc.err")"; fi
+echo changed >> "$FR/notes.txt"
+uc_run
+if [ "$UC_RC" = 0 ] && [ ! -e "$FR_RECEIPT" ] && grep -q 'uncommitted' "$WORK/uc.err"; then ok "M7 a tree with uncommitted changes: the run is still green (exit 0), but NO receipt -- a receipt attests a commit -- and stderr says why"; else bad "M7 dirty tree: rc=$UC_RC receipt=$([ -e "$FR_RECEIPT" ] && echo yes || echo no)" "$(cat "$WORK/uc.err")"; fi
+git -C "$FR" checkout -q -- notes.txt
+: > "$FR/fail.flag"; git -C "$FR" add fail.flag; git -C "$FR" commit -q -m "fixture: break the journey"
+uc_run
+if [ "$UC_RC" = 1 ] && [ ! -e "$FR_RECEIPT" ] && grep -q 'not green' "$WORK/uc.err"; then ok "M8 a RED run (a journey fails) exits 1, writes NO receipt, and says the run was not green"; else bad "M8 red run: rc=$UC_RC receipt=$([ -e "$FR_RECEIPT" ] && echo yes || echo no)" "$(cat "$WORK/uc.err")"; fi
+git -C "$FR" rm -q fail.flag; git -C "$FR" commit -q -m "fixture: mend the journey"
+
+S0="$(git -C "$FR" rev-parse HEAD)"
+mkdir -p "$FR/.planning/journal"; echo e > "$FR/.planning/journal/2026-11-22-haid_t.md"; git -C "$FR" add .planning/journal; git -C "$FR" commit -q -m "journal: hook-owned entry"
+rm -f "$FR_RECEIPT"; uc_write "$S0"
+if [ "$UC_LIB_RC" = 0 ] && [ "$(jq -r .head_sha "$FR_RECEIPT" 2>/dev/null)" = "$S0" ]; then ok "M9 HEAD moved mid-run by ONLY the hooks' own journal commit: the receipt is written and names the commit the run STARTED on"; else bad "M9 hook-owned HEAD move: rc=$UC_LIB_RC" "$UC_LIB_OUT $(cat "$FR_RECEIPT" 2>/dev/null)"; fi
+echo "echo hi" > "$FR/code.sh"; git -C "$FR" add code.sh; git -C "$FR" commit -q -m "code lands mid-run"
+rm -f "$FR_RECEIPT"; uc_write "$S0"
+if [ "$UC_LIB_RC" = 1 ] && [ ! -e "$FR_RECEIPT" ] && grep -q 'HEAD moved' <<<"$UC_LIB_OUT"; then ok "M10 a real code commit landing mid-run: NO receipt (the journeys no longer say which commit they graded), and the reason names the move"; else bad "M10 code HEAD move: rc=$UC_LIB_RC" "$UC_LIB_OUT"; fi
+uc_lib clean --repo "$FR"
+[ "$UC_LIB_RC" = 0 ] && [ -z "$UC_LIB_OUT" ] && ok "M11 clean: a committed tree is clean (exit 0, prints nothing)" || bad "M11 clean on a committed tree: rc=$UC_LIB_RC" "$UC_LIB_OUT"
+mkdir -p "$FR/.planning/ledger/checkpoints"; echo '{}' > "$FR/.planning/ledger/checkpoints/haid_x.json"
+uc_lib clean --repo "$FR"
+[ "$UC_LIB_RC" = 0 ] && ok "M12 clean: an untracked hook-owned ledger record is not uncommitted code (the sweep's own tree_clean carve-out)" || bad "M12 clean beside a hook-owned file: rc=$UC_LIB_RC" "$UC_LIB_OUT"
+echo stray > "$FR/stray.txt"
+uc_lib clean --repo "$FR"
+[ "$UC_LIB_RC" = 1 ] && grep -q 'stray.txt' <<<"$UC_LIB_OUT" && ok "M13 clean: an untracked file outside the hook-owned paths IS uncommitted code, and is named" || bad "M13 clean beside a stray file: rc=$UC_LIB_RC" "$UC_LIB_OUT"
+rm -f "$FR/stray.txt" "$FR/.planning/ledger/checkpoints/haid_x.json"
+echo changed >> "$FR/notes.txt"
+uc_write "$(git -C "$FR" rev-parse HEAD)"
+[ "$UC_LIB_RC" = 1 ] && grep -q 'uncommitted' <<<"$UC_LIB_OUT" && ok "M14 write refuses a tree that holds uncommitted changes NOW, even when the run started clean" || bad "M14 write on a dirty tree: rc=$UC_LIB_RC" "$UC_LIB_OUT"
+git -C "$FR" checkout -q -- notes.txt
+
+# ═══════════════════════════════════════════════════════════════════════════
+# N. USE-CASE RECEIPT, THE GATE -- bin/heimdall-state check-quality-gates against receipts built BY HAND (not by the writer under test), so the checker is held to the
+#    schema and not to whatever the writer happens to emit. The legacy flags are green throughout: only the sweep part of the gate is the variable.
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "N. use-case journey receipt: the push gate takes it in place of the sweep receipt (operator decision 2026-11-22, B) and stays closed on anything else"
+RN="$WORK/uc-gate-repo"; newrepo "$RN"
+echo one > "$RN/f.txt"; git -C "$RN" add -A; git -C "$RN" commit -q -m one
+N_SHA="$(git -C "$RN" rev-parse HEAD)"; N_TREE="$(git -C "$RN" rev-parse 'HEAD^{tree}')"
+RN_CANON="$(git -C "$RN" rev-parse --show-toplevel)"
+HN="$WORK/home-n"; mkdir -p "$HN"
+uc_receipt() {  # uc_receipt <home> <commit> [jq filter]: a use-case journey receipt for <commit> of the RN repo, as the writer would emit it, optionally mutated
+  mkdir -p "$1/receipts"
+  jq -n --arg h "$2" --arg t "$(git -C "$RN" rev-parse "$2^{tree}" 2>/dev/null || echo 0)" \
+    '{schema: 1, head_sha: $h, tree_sha: $t, exit_code: 0, journeys: {total: 11, passed: 11}, mutants: {total: 25, killed: 25}, duration_s: 352, finished_at: "2026-11-22T12:00:00Z"}' \
+    | jq "${3:-.}" > "$1/receipts/use-cases.json"
+}
+n_gate() {  # n_gate <home> -> N_OUT, N_RC
+  N_OUT="$(cd "$RN" && HEIMDALL_HOME="$1" HEIMDALL_STATE_FILE="$N_STATE" "$STATE_BIN" check-quality-gates 2>&1)"; N_RC=$?
+}
+n_blocks() {  # n_blocks <label> <fragment> (reads N_OUT / N_RC): exit 2 and the message holds the fragment
+  if [ "$N_RC" = 2 ] && grep -qF -- "$2" <<<"$N_OUT"; then ok "$1"; else bad "$1 -- expected exit 2 naming '$2', got exit $N_RC" "$N_OUT"; fi
+}
+red_case() {  # red_case <label> <fragment> <jq filter>
+  uc_receipt "$HN" "$N_SHA" "$3"; n_gate "$HN"; n_blocks "$1" "$2"
+}
+
+n_gate "$HN"
+n_blocks "N1 neither receipt: the gate BLOCKS, and still names the missing sweep receipt (that message is unchanged)" "no sweep receipt"
+n_blocks "N2 ...and names the use-case runner as the way to a green (bash test/use-cases/run.sh)" "bash test/use-cases/run.sh"
+uc_receipt "$HN" "$N_SHA"; n_gate "$HN"
+if [ "$N_RC" = 0 ] && grep -q 'All quality gates pass' <<<"$N_OUT" && grep -qi 'use-case journey receipt' <<<"$N_OUT" && ! grep -q 'GATE FAILED' <<<"$N_OUT"; then
+  ok "N3 a green use-case receipt for HEAD and NO sweep receipt: the gate PASSES, and says it rests on the use-case receipt"
+else
+  bad "N3 expected exit 0 on a green use-case receipt" "rc=$N_RC $N_OUT"
+fi
+write_receipt "$HN" "$RN_CANON" "$N_SHA" true 1
+n_gate "$HN"
+[ "$N_RC" = 0 ] && ok "N4 ...even beside a RED sweep receipt (either record is enough for a push; a release still needs the sweep)" || bad "N4 expected exit 0 beside a red sweep receipt" "rc=$N_RC $N_OUT"
+rm -f "$HN/receipts/last-sweep.json"
+N_STATE_RED="$WORK/uc-state-red.json"
+( cd "$RN" && HEIMDALL_STATE_FILE="$N_STATE_RED" "$STATE_BIN" init >/dev/null 2>&1 )
+N_OUT="$(cd "$RN" && HEIMDALL_HOME="$HN" HEIMDALL_STATE_FILE="$N_STATE_RED" "$STATE_BIN" check-quality-gates 2>&1)"; N_RC=$?
+n_blocks "N5 the use-case receipt never overrides the OTHER gates: tests_passing=false still BLOCKS" "Tests not passing"
+
+red_case "N6 a red run (exit_code 1) is no proof" "RED" '.exit_code = 1'
+red_case "N7 a failed journey (10 of 11 passed) is no proof" "RED" '.journeys.passed = 10'
+red_case "N8 a surviving mutant (24 of 25 killed) is no proof" "RED" '.mutants.killed = 24'
+red_case "N9 a run that found no journey checked nothing: no proof" "RED" '.journeys = {total: 0, passed: 0}'
+red_case "N10 a run with no mutants never showed the journeys notice a break: no proof" "RED" '.mutants = {total: 0, killed: 0}'
+red_case "N11 a forged tree sha (the commit is right, its tree is not what git says)" "tree sha" '.tree_sha = "1111111111111111111111111111111111111111"'
+red_case "N12 a commit this checkout does not have" "does not have" '.head_sha = "2222222222222222222222222222222222222222"'
+red_case "N13 a TREE id in head_sha is not a commit (git is asked for a commit, never trusted on the id)" "does not have" ".head_sha = \"$N_TREE\""
+red_case "N14 a missing field is a malformed receipt" "malformed" 'del(.tree_sha)'
+red_case "N15 a field the schema does not have is a malformed receipt" "malformed" '. + {extra: 1}'
+red_case "N16 another schema number is a malformed receipt" "malformed" '.schema = 2'
+red_case "N17 a mistyped count (a string) is a malformed receipt" "malformed" '.journeys.passed = "11"'
+printf 'not json at all {{{' > "$HN/receipts/use-cases.json"; n_gate "$HN"
+n_blocks "N18 a receipt that is not JSON BLOCKS, saying so" "not valid JSON"
+printf '[]' > "$HN/receipts/use-cases.json"; n_gate "$HN"
+n_blocks "N19 valid JSON that is not an object BLOCKS as malformed" "malformed"
+uc_receipt "$HN" "$N_SHA"; mv "$HN/receipts/use-cases.json" "$HN/real-receipt.json"; ln -s "$HN/real-receipt.json" "$HN/receipts/use-cases.json"
+n_gate "$HN"
+n_blocks "N20 a receipt that is a symlink is never followed" "link"
+rm -f "$HN/receipts/use-cases.json" "$HN/real-receipt.json"
+
+# the receipt the WRITER wrote, not one built by hand: the writer and the gate share one definition of it
+HW="$WORK/home-nw"; mkdir -p "$HW"
+FR_NOW="$(git -C "$FR" rev-parse HEAD)"
+HEIMDALL_HOME="$HW" python3 -I -S "$UC_LIB_PY" write --repo "$FR" --started-head "$FR_NOW" --journeys-total 1 --journeys-passed 1 --mutants-total 1 --mutants-killed 1 --duration-s 3 >/dev/null 2>&1
+OUT_NW="$(cd "$FR" && HEIMDALL_HOME="$HW" HEIMDALL_STATE_FILE="$N_STATE" "$STATE_BIN" check-quality-gates 2>&1)"; RC_NW=$?
+[ "$RC_NW" = 0 ] && grep -qi 'use-case journey receipt' <<<"$OUT_NW" && ok "N21 a receipt the WRITER wrote (bin/lib/hmd_use_case_receipt.py write) passes the gate: one definition of the receipt on both sides" || bad "N21 the writer's own receipt did not pass the gate: rc=$RC_NW" "$OUT_NW"
+
+# history: only the hooks' own commits may come after the run
+uc_receipt "$HN" "$N_SHA"
+mkdir -p "$RN/.planning/journal"; echo e > "$RN/.planning/journal/2026-11-22-haid_n.md"
+git -C "$RN" add .planning/journal/2026-11-22-haid_n.md; git -C "$RN" commit -q -m "journal: hook-owned entry"
+n_gate "$HN"
+[ "$N_RC" = 0 ] && ok "N22 a commit after the run that touches ONLY the hooks' own journal records leaves the receipt fresh (the hooks commit these after every real commit)" || bad "N22 expected exit 0 past a hook-owned-only commit" "rc=$N_RC $N_OUT"
+echo "echo hi" > "$RN/code.sh"; git -C "$RN" add code.sh; git -C "$RN" commit -q -m "code lands"
+N_CODE_SHA="$(git -C "$RN" rev-parse HEAD)"
+n_gate "$HN"
+n_blocks "N23 a real code commit after the run makes the receipt STALE" "STALE"
+n_blocks "N24 ...and the message names the path that made it stale (code.sh)" "code.sh"
+git -C "$RN" reset -q --hard "$N_SHA"; echo other > "$RN/f.txt"; git -C "$RN" commit -q -am "rewrite history"
+uc_receipt "$HN" "$N_CODE_SHA"; n_gate "$HN"
+n_blocks "N25 a receipt for a commit that is no longer an ancestor of HEAD (history rewritten) is STALE" "rewritten"
 
 echo
 printf "  Results: %d passed, %d failed\n" "$PASS" "$FAIL"

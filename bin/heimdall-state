@@ -269,6 +269,16 @@ _sweep_cache_violation() {
   printf '%s' "$out" | sed 's/^verify-receipt: //' | paste -sd';' - | sed 's/;/; /g'
 }
 
+# _use_case_receipt_verdict REPO -- ONE line on stdout and an exit status: 0 when the use-case journey receipt of REPO (`bash test/use-cases/run.sh` writes it after a green full run) is green and vouches
+# for HEAD, 1 with the reason when it does not. bin/lib/hmd_use_case_receipt.py is the one definition of the receipt and re-derives its commit and tree from git, never taking the file's word. Fails
+# CLOSED like the sweep checks beside it: a checker or a python3 that is not there is a receipt that cannot be verified, and so a receipt that does not count.
+_use_case_receipt_verdict() {
+  local repo="$1" lib="$HMD_STATE_SELF_DIR/lib/hmd_use_case_receipt.py"
+  if [ ! -r "$lib" ]; then echo "it cannot be verified: bin/lib/hmd_use_case_receipt.py is missing next to heimdall-state"; return 1; fi
+  if ! command -v python3 >/dev/null 2>&1; then echo "it cannot be verified: python3 is not on PATH"; return 1; fi
+  python3 -I -S "$lib" status --repo "$repo" 2>&1 || return 1
+}
+
 cmd_check_quality_gates() {
   ensure_state
   local tests lint reflection dirty
@@ -331,13 +341,28 @@ cmd_check_quality_gates() {
   # reporter). grep 'receipts/last-sweep.json' to find all three call sites.
   local sweep_repo
   if sweep_repo="$(git rev-parse --show-toplevel 2>/dev/null)"; then
-    local receipt cur_sha full_receipt hint
+    local receipt cur_sha full_receipt hint uc_receipt uc_out="" uc_ok=0 failed_other sweep_failed
     receipt="${HEIMDALL_HOME:-$sweep_repo/.heimdall}/receipts/last-sweep.json"
     # The chain anchor an incremental receipt must lead back to: written by test/run-all.sh ONLY for a green, clean, FULL sweep.
     full_receipt="${HEIMDALL_HOME:-$sweep_repo/.heimdall}/receipts/last-full-green.json"
     cur_sha="$(git -C "$sweep_repo" rev-parse HEAD 2>/dev/null || true)"
     hint="$(_sweep_run_hint "$sweep_repo" "$full_receipt")"
-    if [ ! -f "$receipt" ]; then
+    # USE-CASE JOURNEY RECEIPT (operator decision 2026-11-22, "B"): a push of this repo passes on EITHER a green full-equivalent sweep receipt (everything below, unchanged) OR a green use-case journey
+    # receipt, which `bash test/use-cases/run.sh` writes after a green full run. bin/lib/hmd_use_case_receipt.py is its one definition and RE-DERIVES the commit and tree from git (the file's word is never
+    # taken). A missing, red, forged, stale, garbled or unverifiable one leaves the sweep rule exactly as it was and its reason is added to the failure. A release (release/ship.sh) still demands the full
+    # sweep: nothing here touches it. A repo that never ran the journeys pays one stat and no python.
+    uc_receipt="${HEIMDALL_HOME:-$sweep_repo/.heimdall}/receipts/use-cases.json"
+    if [ -e "$uc_receipt" ] || [ -L "$uc_receipt" ]; then
+      uc_out="$(_use_case_receipt_verdict "$sweep_repo")" && uc_ok=1
+    else
+      uc_out="there is no use-case journey receipt at $uc_receipt"
+    fi
+    # the sweep rule below is judged on its own count (the other gates' failures are put back after it), so the failure it ends in can name the use-case runner too
+    failed_other=$failed
+    failed=0
+    if [ "$uc_ok" = 1 ]; then
+      echo "NOTICE: push gate satisfied by the use-case journey receipt, not by a full sweep: ${uc_out} (a release still needs a green full sweep: bash test/run-all.sh)." >&2
+    elif [ ! -f "$receipt" ]; then
       echo "GATE FAILED: no sweep receipt at $receipt — a full sweep has never recorded a result in this checkout. Run: $hint" >&2
       failed=1
     elif ! jq -e . "$receipt" >/dev/null 2>&1; then
@@ -436,10 +461,15 @@ cmd_check_quality_gates() {
         esac
         # Counted green, never hidden: a suite that failed under parallel load and passed alone is named whenever the gate passes.
         flaky_names="$(jq -r '[.flaky_under_load[]?.suite] | join(", ")' "$receipt" 2>/dev/null || true)"
-        if [ "$failed" -eq 0 ] && [ -n "$flaky_names" ]; then
+        if [ "$((failed | failed_other))" -eq 0 ] && [ -n "$flaky_names" ]; then
           echo "NOTICE: sweep receipt counts green, but these suites failed under parallel load and passed only on a solo re-run: ${flaky_names} (flaky_under_load in the receipt has the failing lines)." >&2
         fi
       fi
+    fi
+    sweep_failed=$failed
+    failed=$((failed_other | sweep_failed))
+    if [ "$sweep_failed" -eq 1 ]; then
+      echo "GATE FAILED: no use-case journey receipt vouches for HEAD either: ${uc_out}. Run: bash test/use-cases/run.sh (a green full run on a clean, committed tree writes ${uc_receipt}, which this gate takes in place of a full sweep; only a release needs the sweep)." >&2
     fi
   fi
 
