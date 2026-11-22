@@ -130,6 +130,7 @@ bin/heimdall-fallback
 bin/heimdall-feedback
 bin/heimdall-findings
 bin/heimdall-finished-agents
+bin/heimdall-footprint
 bin/heimdall-frontdoor
 bin/heimdall-funnel
 bin/heimdall-gate
@@ -1030,6 +1031,7 @@ receipts-worker/src/types.ts
 relay/src/types.ts
 release/HOSTING.md
 release/heimdall-signing.pub
+release/lean-budget.json
 release/publish-checklist.md
 release/runtime-files.txt
 release/ship.sh
