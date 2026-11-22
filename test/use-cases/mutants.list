@@ -15,3 +15,5 @@
 02_uninstall_leaves_nothing_behind	bin/heimdall	s/^_heimdall_remove_plugin() {$/_heimdall_remove_plugin() { return 0/	M02b-uninstall-leaves-the-install-tree
 03_first_launch_in_an_empty_folder	bin/heimdall	s#^  touch "\$SETUP_MARKER" 2>/dev/null || true$#  true#	M03a-setup-never-recorded-as-done
 03_first_launch_in_an_empty_folder	bin/lib/skills_consent.sh	s/^hmd_skills_consent() {$/hmd_skills_consent() { return 0/	M03b-skills-installed-without-asking
+09_resume_a_session	bin/heimdall	s/^    \*) _heimdall_resume_attach_bg "\${2:-}" ;;$/    *) true ;;/	M09a-resume-never-reattaches-a-background-session
+09_resume_a_session	bin/heimdall	s/^    "\${RESUME_TARGET\[@]}" \\$/    \\/	M09b-resume-forgets-to-continue-the-last-conversation
