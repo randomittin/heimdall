@@ -375,6 +375,7 @@ bin/lib/fg_repo.py
 bin/lib/fg_summary.py
 bin/lib/fg_taskgen.py
 bin/lib/fg_verify.py
+bin/lib/first_launch_checklist.sh
 bin/lib/frontdoor.py
 bin/lib/funnel.py
 bin/lib/guardrails_manifest.py
@@ -479,6 +480,7 @@ bin/lib/runhmd_schema.py
 bin/lib/select.sh
 bin/lib/session-liveness.sh
 bin/lib/skill_restore.py
+bin/lib/skills_checklist.py
 bin/lib/skills_cli_install.py
 bin/lib/skills_cli_read.py
 bin/lib/skills_config.py

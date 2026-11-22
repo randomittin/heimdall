@@ -139,6 +139,13 @@ if [ -f "$PLUGIN_DIR/bin/lib/skills_consent.sh" ]; then
   # shellcheck disable=SC1091
   . "$PLUGIN_DIR/bin/lib/skills_consent.sh" 2>/dev/null || true
 fi
+# The first-launch checklist (operator ask, 2026-11-22: a fresh install SHOWS its skills on the first launch, to be added by the person, never installed silently):
+# one function that first_run_setup asks. Sourced best-effort like the gate it sits on, and first_run_setup calls it only when `type` finds it, so a tree without
+# the file keeps the one question it always asked.
+if [ -f "$PLUGIN_DIR/bin/lib/first_launch_checklist.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$PLUGIN_DIR/bin/lib/first_launch_checklist.sh" 2>/dev/null || true
+fi
 
 # ── First-run completion marker (USER-writable, NEVER the install dir) ──
 #
@@ -1368,6 +1375,14 @@ first_run_setup() {
     fi
     return "$_fr_go"
   }
+
+  # First launch, ONE checklist (bin/lib/first_launch_checklist.sh): at a terminal, the recommended skills and (lean install) the bundled ones it left out are SHOWN
+  # with their why, and the person picks by number / a (all) / Enter (none) / n (never ask). A pick goes through `hmd skills install ID --yes`; superpowers is the
+  # first-run set's key, so picking it is the consent the two legacy installs below need (HMD_FLC_FIRST_RUN_GO), and not picking it skips them. It returns non-zero
+  # when nobody was asked (no terminal: ONE line pointing to `hmd skills suggest`; consent auto; HMD_SKILLS_YES=1), and then the gate below runs exactly as before.
+  if type hmd_first_launch_checklist >/dev/null 2>&1 && hmd_first_launch_checklist; then
+    _fr_go="$HMD_FLC_FIRST_RUN_GO"
+  fi
 
   # superpowers (brainstorming, debugging) — part of the `skills` step.
   if ! claude plugins list 2>/dev/null | grep -q "superpowers" && _first_run_consent; then

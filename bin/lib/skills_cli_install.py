@@ -13,8 +13,11 @@ commands (list, why, lock) are skills_cli_read.py; bin/heimdall-skills dispatche
             `detected` ones whose files are in the working directory (the manifest's detection rules and file triggers).
             Not listed: what is installed (a lock row installed or adopted, a plugin known to ~/.claude/settings.json, a
             directory in ~/.claude/skills), what was declined, install:false entries, and the bundled, on_demand and community
-            tiers (INV-S9). It makes no `claude` or `git` call and writes nothing; --reset first moves every declined row of the
-            project and machine locks back to suggested.
+            tiers (INV-S9) -- except on a LEAN install (bin/lib/hmd_profile.py get): there the bundled entries it leaves out
+            (on_demand_paths or a pack: stacks, designmatch, mac-deep-clean, system-health, self-improve), until `install` puts
+            them back, are a block of their own after the project's, each `[on demand]`, so the first line (the count the session
+            nudge reads) stays the project's. It makes no `claude` or `git` call and writes nothing; --reset first moves every
+            declined row of the project and machine locks back to suggested.
   install   the single consented install path. Per id: refuse what hmd does not install (install:false, a bundled entry that names no
             path, unknown), skip what is installed, ask the consent gate, run the receipted install, record the lock row.
               consent   hmd_skills_consent ID hmd-skills-install (bin/lib/skills_consent.sh) decides: this module never
@@ -63,6 +66,7 @@ import tempfile
 sys.dont_write_bytecode = True  # importing the sibling modules must not leave a .pyc in the plugin directory
 LIB_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, LIB_DIR)  # python3 -I keeps the script's directory off sys.path
+import hmd_profile  # noqa: E402
 import skills_config  # noqa: E402
 import skills_lock  # noqa: E402
 import skills_resolver  # noqa: E402
@@ -369,6 +373,25 @@ def reset_declined():
     return moved
 
 
+def lean_install():
+    """True when this machine runs the lean profile (bin/lib/hmd_profile.py get: no file, or one it cannot use, reads as full)."""
+    return hmd_profile.resolve() == "lean"
+
+
+def left_out(doc, present):
+    """The bundled entries a lean install leaves out and this machine does not have back: those `install` puts back (on_demand_paths or a pack) whose id is not in
+    `present`. Empty on a full install, where nothing was left out."""
+    if not lean_install():
+        return []
+    return [entry for entry in doc["entries"] if entry["kind"] == "bundled" and sparse_paths(entry) and entry["id"] not in present]
+
+
+def shown_why(entry):
+    """The manifest's why as one clause for a person: cut where it turns to "ships in-tree, never installed" (true of the entry, wrong as an offer), and without
+    the name of the coding agent underneath, which user-facing text never says."""
+    return re.sub(r"\bClaude(?: Code)?\b\s*", "", entry["why"].split("; ")[0]).strip()
+
+
 def cmd_suggest(args):
     doc = skills_resolver.load_manifest(MANIFEST)
     if args.reset:
@@ -391,6 +414,8 @@ def cmd_suggest(args):
             held_back += 1
         else:
             shown.append((entry, label))
+    put_back = [entry for entry in left_out(doc, present) if entry["id"] not in declined]
+    held_back += len(left_out(doc, present)) - len(put_back)
     if shown:
         print("%d skill(s) suggested for this project (this command installs nothing):" % len(shown))
         for entry, label in shown:
@@ -398,6 +423,10 @@ def cmd_suggest(args):
         print("install one: hmd skills install ID    the recommended set: hmd skills install --recommended")
     else:
         print("no skills to suggest: what is recommended here is installed or declined")
+    if put_back:
+        print("%d bundled skill(s) this lean install leaves out (hmd skills install ID puts one back from this copy; nothing is downloaded):" % len(put_back))
+        for entry in put_back:
+            print("  %s  [on demand]  %s" % (entry["id"], shown_why(entry)))
     if held_back:
         print("%d declined (hmd skills suggest --reset asks again)" % held_back)
     return 0
