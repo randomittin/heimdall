@@ -15,3 +15,5 @@
 02_uninstall_leaves_nothing_behind	bin/heimdall	s/^_heimdall_remove_plugin() {$/_heimdall_remove_plugin() { return 0/	M02b-uninstall-leaves-the-install-tree
 03_first_launch_in_an_empty_folder	bin/heimdall	s#^  touch "\$SETUP_MARKER" 2>/dev/null || true$#  true#	M03a-setup-never-recorded-as-done
 03_first_launch_in_an_empty_folder	bin/lib/skills_consent.sh	s/^hmd_skills_consent() {$/hmd_skills_consent() { return 0/	M03b-skills-installed-without-asking
+07_push_blocked_until_checks_pass	bin/heimdall-precheck-bash	s/^        if \[ "\$PG_RC" = 0 \]; then$/        if true; then/	M07a-gate-lets-a-push-through-with-no-record
+07_push_blocked_until_checks_pass	bin/lib/hmd_repo_checks.py	s/stdin=subprocess.DEVNULL).returncode$/stdin=subprocess.DEVNULL).returncode * 0/	M07b-a-failing-check-is-recorded-as-passing
