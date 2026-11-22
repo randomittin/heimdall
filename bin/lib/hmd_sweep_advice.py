@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-r"""hmd_sweep_advice -- is this Bash command a MERGE, and what does the developer need to know about a full test run before it?
+r"""hmd_sweep_advice -- is this Bash command the FINAL merge, and what does the developer need to know about a full test run before it?
 
 Operator directive 2026-11-12: full test runs are RECOMMENDED to developers, with the explanation and the token cost, and suggested just before a merge and not
-before. bin/heimdall-precheck-bash asks this file, for a command that mentions merge, push or pull (and git or gh), whether the command IS a merge, and if so
+before. Refined 2026-11-22: "only do the full sweep before final merge and not on every merge". An orchestrator lands a batch of agent worktree branches with one local
+`git merge` per branch: each is an INTEGRATION step inside the batch and says nothing; the one recommendation comes at the final merge, the push, pull request
+merge or pull that sends the batch to the default branch. bin/heimdall-precheck-bash asks this file, for a command that mentions merge, push or pull (and git or gh),
+whether the command IS the final merge, and if so
 prints the recommendation as hook JSON: systemMessage for the developer, hookSpecificOutput.additionalContext so the agent relays it. It never blocks (there is no
 permissionDecision), it never speaks at any other moment, and the call stays the developer's: run it now, or merge without it. It reads the command the way a shell
 does by reusing bin/lib/hmd_kill_guard.py's lexer and wrapper handling (quotes and escapes, env / time / timeout / sudo / xargs, ; && || | & and newlines, subshells,
@@ -10,12 +13,14 @@ substitutions, if / for / while bodies, sh -c, eval, heredocs fed to a shell), b
 bin/lib/hmd_sweep_guard.py's reading of the records (the receipt, the hooks' own journal paths, ancestry), so text that only MENTIONS a merge (echo, grep, a commit
 message, a script written to disk) is no merge, as it is no sweep to the sweep guard.
 
-  a merge     the merge subcommand of git, with refs (not --abort, --continue, --quit or help; merge-base, merge-tree and mergetool are other commands)
-              the pr-merge subcommand of gh (not help, and not for ANOTHER repository: -R, --repo, GH_REPO: the records here are not that repo's)
+  final merge the pr-merge subcommand of gh (not help, and not for ANOTHER repository: -R, --repo, GH_REPO: the records here are not that repo's)
               the pull subcommand of git, on the default branch, when it merges (a pull that rebases -- --rebase, -r, pull.rebase -- is no merge)
               the push subcommand of git, whose target is the default branch: main, master, or what origin/HEAD names, however the refspec is spelled (a bare push,
               HEAD, src:dst, refs/heads/..., --all, --mirror); a push of another branch, of tags, or a deletion is no merge
-  the subject the commits that stand to land: HEAD, plus what a merge or a pull brings in (the refs named, else the upstream), or, for a push, the commits it sends.
+  not one     the merge subcommand of git, in every form (--no-ff, --squash, --abort, a bare `git merge`): it merges refs into a LOCAL branch, the default one too, an
+              integration step inside a batch of agent worktree branches, so it gets no advice; the push that sends the result to the default branch is the final merge.
+              merge-base, merge-tree and mergetool are other commands
+  the subject the commits that stand to land: HEAD, plus what a pull brings in (the branch it names, else the upstream), or, for a push, the commits it sends.
               A ref that cannot be placed in this checkout is said so, and it keeps the commits from being called proven
   its class   read from the commit like the push gate does (bin/lib/hmd_push_target.py commit_class):
               sweep        test/run-all.sh names last-sweep.json: heimdall's own regime. The records are receipts/last-sweep.json, last-full-green.json (the anchor)
@@ -75,9 +80,7 @@ ROW_BYTES = 91  # the width of one row of run-all.sh's table: printf '%-9s %-52s
 TAIL_LINES = 40  # what an agent reads of a run when it reads only the summary: `tail -n 40`
 BYTES_PER_TOKEN = 4  # the usual rule of thumb for English and code
 DEFAULTS = ("main", "master")  # the default branch, besides what origin/HEAD names
-NOUN = {"merge": "merge", "pr-merge": "pull request merge", "pull": "pull", "push": "push"}
-NOT_A_MERGE = frozenset(("--abort", "--continue", "--quit", "-h", "--help"))
-MERGE_VALUE_OPTS = frozenset(("-m", "--message", "-F", "--file", "-s", "--strategy", "-X", "--strategy-option", "--into-name", "--cleanup"))
+NOUN = {"pr-merge": "pull request merge", "pull": "pull", "push": "push"}
 PULL_VALUE_OPTS = frozenset(("-s", "--strategy", "-X", "--strategy-option", "--depth", "--deepen", "--shallow-since", "--shallow-exclude", "-j", "--jobs",
                              "-o", "--server-option", "--upload-pack", "--refmap"))
 PUSH_VALUE_OPTS = pt.PUSH_VALUE_OPTS | frozenset(("--repo",))
@@ -95,7 +98,7 @@ U_VAR = "a directory option of git is held in a variable, so the repository it m
 
 
 class Op(object):
-    """One simple command that merges, or may merge, into a branch: kind is merge, pull, push or pr-merge; args are the words after the subcommand, opts git's
+    """One simple command that may be the final merge: kind is pull, push or pr-merge; args are the words after the subcommand, opts git's
     global options (as words), cwd the directory the shell is in, text the command as shown to the developer."""
     __slots__ = ("kind", "args", "cwd", "opts", "text")
 
@@ -144,10 +147,8 @@ def note_git(rest, cwd, ops):
         return
     sub, args = rest[k].text, rest[k + 1:]
     text = "git " + shown(rest[k:])
-    if sub == "merge":
-        if not any(not w.dynamic and w.text in NOT_A_MERGE for w in args):
-            ops.append(Op("merge", args, cwd, opts, text))
-    elif sub == "pull":
+    # no branch for `git merge`: a local merge of refs is an integration step inside a batch, not the final merge, so it is no op and gets no advice (2026-11-22)
+    if sub == "pull":
         if not rebasing(args):  # the configuration (pull.rebase) is asked later, in the repository the pull is in
             ops.append(Op("pull", args, cwd, opts, text))
     elif sub == "push":
@@ -314,23 +315,6 @@ def positional(args, value_opts):
     return out
 
 
-def merge_subjects(op, top, head):
-    subs = Subjects()
-    subs.add("HEAD", head)
-    refs = positional(op.args, MERGE_VALUE_OPTS)
-    if not refs:  # a merge with no ref merges the upstream
-        found = upstream(top)
-        if found:
-            subs.add(*found)
-    for ref in refs:
-        sha = resolve(top, ref)
-        if sha:
-            subs.add(ref, sha)
-        else:
-            subs.unplaced.append(ref)
-    return subs
-
-
 def pull_subjects(op, top, head, branch, names):
     """None unless this pull merges into the default branch."""
     if branch not in names or rebasing(op.args) or (not explicit_merge(op.args) and config_rebases(top, branch)):
@@ -424,8 +408,6 @@ def subjects_of(op, top):
     if rc != 0 or not sg.COMMIT.match(head):
         raise sg.Unread("HEAD of %s names no commit (a repository with no commits yet)" % top)
     branch = current_branch(top)
-    if op.kind == "merge":
-        return merge_subjects(op, top, head), head
     if op.kind == "pr-merge":
         subs = Subjects()
         subs.add("HEAD", head)
@@ -732,7 +714,7 @@ def compose(op, found):
         lines = ["%s: a full test run before this %s is worth considering." % (lead, noun), "Why: " + found["why"], "Run: " + found["run"]]
         if found.get("where"):
             lines.append("  " + found["where"])
-        lines += ["Cost: " + found["cost"], "Your call: run it now, or merge without it. This note shows only at merge time and never blocks anything."]
+        lines += ["Cost: " + found["cost"], "Your call: run it now, or merge without it. This note shows only at the final merge (a push to the default branch, a pull request merge, a pull on it) and never blocks anything."]
         text = "\n".join(lines)
     context = ("hmd merge-time advice: a recommendation from the hmd hook, not a block; the developer decides. Tell the developer about it in your next message, in a line "
                "or two (why, what to run, what it costs), and let them choose between running it now and going ahead without it. Do not start the full test run yourself "

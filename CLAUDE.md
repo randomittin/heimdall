@@ -102,15 +102,18 @@ linked co-author with an avatar.
 - No untested changes
 - Canonical checklist agents cross-check: `skills/heimdall/references/definition-of-done.md`
 
-## When the full gate runs — recommended to the developer just before a merge, never started by an agent
+## When the full gate runs — recommended to the developer just before the final merge, never started by an agent
 Test once, at the end — operator directive 2026-10-08: avoid over-testing the same
 stuff; save testing for the end. Refined by the operator on 2026-11-12, verbatim: *"full
 test runs should be recommended to devs along with explanation and token usage -- plus
-should always be suggested just before merge operations and not before."* So the full
-sweep (`bash test/run-all.sh`, ~524 suites, ~45-60 min cold) is a RECOMMENDATION to the
-developer, made at exactly one moment: immediately before a merge operation (a branch
-merge, a PR merge, a pull or push into the default branch), on the final frozen tree. The
-developer decides. An agent NEVER starts it on its own initiative: not after an agent's
+should always be suggested just before merge operations and not before."* And on
+2026-11-22, verbatim: *"only do the full sweep before final merge and not on every
+merge."* So the full sweep (`bash test/run-all.sh`, ~524 suites, ~45-60 min cold) is a
+RECOMMENDATION to the developer, made at exactly one moment: immediately before the FINAL
+merge, on the final frozen tree. "Merge operation" in these docs means that: a push to the
+default branch, a PR merge or a pull into the default branch. Integrating agent worktree
+branches into a local branch with a local `git merge` is a step inside a batch, not the
+final merge, and gets no recommendation. The developer decides. An agent NEVER starts it on its own initiative: not after an agent's
 branch is merged, not before a checkpoint, a `/hmd:save` or a demo, not at session start,
 not after each file edit, not at mid-work checkpoints (`wip:` auto-commits, a save of
 unfinished work), not "to be safe", not "whenever it feels done". It runs only when the
@@ -124,10 +127,11 @@ state of the code that never existed.
   the run proves for this merge), the command (`bash test/run-all.sh`; `--failed` after a
   red) and the cost: wall time (~45-60 min cold; a cached run costs what the change reaches)
   and tokens (an estimate: an agent that reads only the summary spends few, one that streams
-  the per-suite output spends many). `bin/lib/hmd_sweep_advice.py` prints it when a merge
-  operation is about to run; it only advises, never denies, and `HMD_SWEEP_ADVICE=off` in the
+  the per-suite output spends many). `bin/lib/hmd_sweep_advice.py` prints it when the final
+  merge is about to run (a push to the default branch, a PR merge, a pull into it; never a
+  local `git merge`); it only advises, never denies, and `HMD_SWEEP_ADVICE=off` in the
   environment Claude Code runs in turns it off. An orchestrator does not rely on it: it puts
-  the same three things to the developer itself, right before the merge operation, and waits.
+  the same three things to the developer itself, right before the final merge, and waits.
   Not before: a recommendation at a checkpoint, a save, a demo or mid-work is noise the
   developer learns to ignore.
 - **When the developer says yes.** Run it ONCE, on the frozen tree, in the background
@@ -228,9 +232,9 @@ state of the code that never existed.
   gets ONE solo re-run, then it is real: fix it or report it. Regressions elsewhere
   are for the merge-time full run, if the developer chooses one.
 - **The orchestrator does not re-run suites per merge, and does not start the sweep
-  itself.** It takes each agent's reported run as given, integrates, and, immediately
-  before the merge operation, recommends the one full run to the developer; only the
-  developer's yes starts it.
+  itself.** It takes each agent's reported run as given, integrates (a local `git merge`
+  of each agent branch: no recommendation, no run) and, immediately before the final
+  merge, recommends the one full run to the developer; only the developer's yes starts it.
 - **Measured, 2026-10-08 chat-replies wave:** three coder agents hit their 50-turn
   limit mid-regression after running 10–25 neighbouring suites each, one suite was
   re-run three times under load, and the orchestrator re-ran the same suites after
@@ -492,8 +496,8 @@ through `bin/lib/hmd_wait_guard.py`:
   stderr and an allow. Best effort, said plainly: a wait inside a script file or a python loop is not read, and a loop
   sent to the background with `&` is held like any other (use `run_in_background`). Proof: `test/wait-guard.test.sh`.
 
-## Sweep advice: a full test run is recommended at merge time, never before (2026-11-12)
-Operator directive, 2026-11-12: *full test runs should be recommended to devs along with explanation and token usage, and always suggested just before merge operations and not before.* The sweep guard says when a full run is pointless; this says when one is worth it, and it speaks at exactly one moment. `bin/heimdall-precheck-bash` asks `bin/lib/hmd_sweep_advice.py`, for a command that mentions merge, push or pull (and git or gh), whether the command IS a merge: a merge of refs, a pull request merge, a pull on the default branch (never a rebasing one), or a push to the default branch (main, master, or what origin/HEAD names). Text that only mentions one (echo, grep, a commit message), an abort, a merge-base and a push of another branch are not, and nothing else ever triggers it.
+## Sweep advice: a full test run is recommended at the final merge, never before (2026-11-12, refined 2026-11-22)
+Operator directive, 2026-11-12: *full test runs should be recommended to devs along with explanation and token usage, and always suggested just before merge operations and not before.* Refined 2026-11-22: *only do the full sweep before final merge and not on every merge.* The sweep guard says when a full run is pointless; this says when one is worth it, and it speaks at exactly one moment: the FINAL merge. `bin/heimdall-precheck-bash` asks `bin/lib/hmd_sweep_advice.py`, for a command that mentions merge, push or pull (and git or gh), whether the command IS the final merge: a pull request merge, a pull on the default branch (never a rebasing one), or a push to the default branch (main, master, or what origin/HEAD names). A local `git merge` of refs is NOT: integrating agent worktree branches that way is a step inside a batch and gets no advice, and the push that sends the batch to the default branch is the one that does. Text that only mentions one (echo, grep, a commit message), a merge-base and a push of another branch are not either, and nothing else ever triggers it.
 
 - **What it prints** (hook JSON on exit 0: `systemMessage` for the developer, `hookSpecificOutput.additionalContext` so the agent relays it, never a `permissionDecision`): *Why* (commits and files changed since the last green full record, the hooks' own journal and ledger records not counted, or "no green record yet" and the reason), *Run* (`bash test/run-all.sh`, `--failed` after a red sweep, for heimdall's own regime; `bin/heimdall-repo-checks run` for a repo that declares `.heimdall/repo-checks.json`; lint plus the use-case suite, `skills/heimdall/references/use-case-tests.md`, for any other repo), *Cost* (suites or checks, the last measured wall clock from the receipt, and tokens as labelled estimates: none when the developer runs it in a terminal, a 40-line summary tail times 91 B over 4 when an agent runs it in the background and reads only that, the whole output of (suites + 40) rows times 91 B over 4 when an agent reads all of it) and *Your call*: run it now, or merge without it. A commit the records already prove green gets one line, "already proven green ... nothing to run", and no recommendation.
 - **It never blocks, and it speaks last.** The advice is computed after every other gate has let the command through and is the one JSON object on stdout, so a command a gate denies prints only its deny; the parallelism tracker's own output goes to stderr while advice is printed.
