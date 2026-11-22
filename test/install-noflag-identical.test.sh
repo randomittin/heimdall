@@ -3,13 +3,16 @@
 # UNMODIFIED script did on the same fixture.
 #
 # Journey: a developer who already has hmd installed runs `install.sh` again with no flag (the upgrade). Given the fixture existing install of
-# bin/lib/lean_install_fixture.sh (offline sandbox, fake claude and keychain, local snapshot as the source), when the no-flag upgrade has run, then
-# every normalized component of what it left behind equals evals/lean/install-baseline.json, which was recorded from the unmodified install.sh.
-# The reference is independent of the code under change: the baseline is a committed file, the fixture builds its own sandbox, nothing here reads the
-# operator's HOME, ~/.heimdall or keychain.
+# bin/lib/lean_install_fixture.sh (offline sandbox, fake claude and keychain, local snapshot as the source) made by the UNMODIFIED install.sh, when the
+# tree's install.sh runs over it with no flag, then every normalized component of what it left behind equals evals/lean/install-baseline.json, which was
+# recorded from the unmodified install.sh. The existing install is NOT made by the tree's own script: since T3.4 a fresh install by it is lean and records
+# a profile, which is not the install INV-L8 is about. The unmodified script is the one the baseline names (commit and hash), read from git history.
+# The reference is independent of the code under change: the baseline is a committed file, the script it was recorded from is pinned by that hash, the
+# fixture builds its own sandbox, nothing here reads the operator's HOME, ~/.heimdall or keychain.
 #
-# Re-run by the W6 sweep against the final tree and by T5.2's mutant (UC_TREE = a snapshot with one install.sh line broken must go RED here).
-# To re-record (ONLY from an unmodified install.sh): bash bin/lib/lean_install_fixture.sh record > evals/lean/install-baseline.json
+# Re-run by the W6 sweep against the final tree and by T5.2's mutant (UC_TREE = a snapshot with one install.sh line broken must go RED here: a line the
+# no-flag upgrade of an existing install runs and whose effect shows in what it leaves, the existing install itself is made by the pinned script).
+# To re-record (ONLY from an unmodified, committed install.sh): bash bin/lib/lean_install_fixture.sh record > evals/lean/install-baseline.json
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASELINE="$HERE/../evals/lean/install-baseline.json"
@@ -17,7 +20,7 @@ BASELINE="$HERE/../evals/lean/install-baseline.json"
 . "$HERE/../bin/lib/lean_install_fixture.sh"
 
 [ -f "$BASELINE" ] || uc_fatal "missing $BASELINE"
-lean_fx_run
+lean_fx_run "$BASELINE"
 got="$LEAN_FX_JSON"
 want="$(jq -S .components "$BASELINE")"
 
@@ -25,6 +28,14 @@ want="$(jq -S .components "$BASELINE")"
 if [ "$LEAN_FX_INSTALL_RC" -eq 0 ]; then uc_ok "the first install.sh run finished"; else uc_bad "the first install.sh run exited $LEAN_FX_INSTALL_RC"; fi
 if [ "$LEAN_FX_UPGRADE_RC" -eq 0 ]; then uc_ok "the no-flag upgrade run finished"; else uc_bad "the no-flag upgrade run exited $LEAN_FX_UPGRADE_RC"; fi
 if [ ! -s "$UC_SECURITY_LOG" ]; then uc_ok "the keychain was never asked"; else uc_bad "the installer asked the keychain" "$(head -c 200 "$UC_SECURITY_LOG")"; fi
+
+# the existing install is the unmodified script's, not the tree's: INV-L8 grades what the tree's script does to an install that already exists
+base_want="$(jq -r .recorded_from.install_sh_sha256 "$BASELINE")"
+if [ "$LEAN_FX_BASE_INSTALL_SHA256" = "$base_want" ]; then
+  uc_ok "the existing install was made by the install.sh the baseline was recorded from"
+else
+  uc_bad "the existing install was made by another install.sh than the baseline's" "ran $LEAN_FX_BASE_INSTALL_SHA256, the baseline says $base_want"
+fi
 
 # the whole state, then each component so a failure names the part that moved
 if [ "$(printf '%s' "$got" | jq -r .state_sha256)" = "$(printf '%s' "$want" | jq -r .state_sha256)" ]; then
@@ -61,5 +72,20 @@ if [ "$(printf '%s' "$mut" | jq -r .digests.zshrc)" != "$(printf '%s' "$want" | 
 else
   uc_bad "an extra profile line went unnoticed: the digest cannot tell a changed install from an unchanged one"
 fi
+
+# the pinned input is locked, not trusted: a baseline whose hash, commit or commit field does not fit what git holds is refused with the cause named
+# (lean_fx_run then stops with "cannot run this journey"), never answered by running some other install.sh
+expect_refused() {   # LABEL JQ-EDIT-OF-THE-BASELINE CAUSE-TEXT
+  local doc="$UC_ROOT/refused-baseline.json" out rc
+  jq "$2" "$BASELINE" > "$doc"
+  out="$(lean_fx_baseline_installer "$doc" "$UC_ROOT/refused-installer/install.sh" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF -- "$3"; then uc_ok "$1"; else uc_bad "$1" "exit $rc: $(printf '%s' "$out" | head -c 300)"; fi
+}
+expect_refused "a baseline naming another install.sh hash is refused" \
+  '.recorded_from.install_sh_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' "was recorded from"
+expect_refused "a baseline naming a commit this repository lacks is refused" \
+  '.recorded_from.repo_head = "1111111111111111111111111111111111111111"' "not in this repository"
+expect_refused "a baseline whose repo_head is not a commit id is refused" \
+  '.recorded_from.repo_head = "--output=elsewhere"' "names no commit"
 
 uc_finish
