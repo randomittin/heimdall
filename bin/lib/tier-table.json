@@ -137,6 +137,7 @@
 
   "agents": {
     "heimdall": "orchestrator",
+    "heimdall-lean": "orchestrator",
     "architect": "architecture",
     "planner": "architecture",
     "database-architect": "architecture",
