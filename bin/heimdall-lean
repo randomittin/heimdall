@@ -4,15 +4,25 @@
     heimdall-lean status    the recorded profile, what the tree on disk is, and the footprint now
     heimdall-lean on        lean: narrow the clone to what runs (bin/lib/lean_sparse.sh apply lean) and record `lean`
     heimdall-lean off       full: the whole tree again (git sparse-checkout disable, INV-L6) and record `full`
+    heimdall-lean restore DIR   undo `install.sh --reset`: put back what the backup in DIR holds (the command it prints is `hmd lean restore <dir>`, INV-L9)
     heimdall-lean -h | --help
 
 `on` and `off` print the footprint of bin/heimdall-footprint before and after the move: disk bytes and files, the bytes and estimated tokens a session is
 handed at its start, and the hooks registered. The saving is a number, not a claim. A session reads skills and commands when it starts, so the change
 reaches a session after a restart of Claude Code.
 
-This is a thin sequence over three helpers that have their own proofs: bin/lib/hmd_profile.py (the record, $HEIMDALL_HOME/profile.json),
-bin/lib/lean_sparse.sh (the sparse checkout of this clone: every git object stays, so lean off and `hmd skills install` need no network) and
-bin/heimdall-footprint (the meter). It operates on the clone this script lives in, and on nothing else.
+`restore DIR` is the undo that `install.sh --reset` prints (INV-L9), DIR being the backup that reset took first. It runs bin/lib/lean_backup.py `restore DIR` FIRST: that
+verifies every file of the backup against its recorded sha256 and writes nothing at all when one differs, so a tampered, damaged or mistyped directory is refused with the
+install exactly as it was, the tree and the profile record included (`heimdall-lean off` is the way to the full tree without a backup). Only after the files are back does it
+remove the unfinished-reset record (<runtime home>/backups/lean-reset-pending: once restored there is no reset left to finish, and a kept record would make the next
+`--reset` reuse an old backup) and bring the tree to the profile the RESTORED profile.json records: a backup of a pre-lean install holds none, so the record goes and the tree is
+full; a backup of a lean install gets its lean tree back. The profile record is what the backup wrote, byte for byte, and is never re-recorded. A second restore of the same
+backup changes nothing. If the tree cannot be brought there, the files stay restored and the same command, run again, retries just that.
+
+This is a thin sequence over four helpers that have their own proofs: bin/lib/hmd_profile.py (the record, $HEIMDALL_HOME/profile.json),
+bin/lib/lean_sparse.sh (the sparse checkout of this clone: every git object stays, so lean off and `hmd skills install` need no network),
+bin/lib/lean_backup.py (the backup `install.sh --reset` takes and its restore) and bin/heimdall-footprint (the meter). It operates on the clone this script lives in, and
+on nothing else.
 
 ORDER, so a failure never leaves the record and the tree at odds. `on` records `lean` FIRST: a profile.json that cannot be used stops it before the tree is
 touched, and if the sparse apply then fails the previous profile is put back. `off` restores the tree FIRST: it is the way out, so a profile.json that cannot
@@ -25,7 +35,7 @@ INV-L12: lean keeps the `claude` wrapper (the hmd launcher) and installs and rou
 `hmd headroom`, and writes nothing outside the clone and profile.json: no shell rc, no ~/.claude settings, no environment a session routes through. The
 untracked files beside the clone (ledger, receipts, memory, team, pairing, data/) are not touched either (INV-L10): sparse-checkout leaves them alone.
 
-Exit 0 done. 1 the move failed, or `off` could not record its profile (stderr says which, and what state the install is in). 2 usage. The footprint
+Exit 0 done. 1 the move failed, `off` could not record its profile, or `restore` was refused or could not finish (stderr says which, and what state the install is in). 2 usage. The footprint
 is information, never a gate: a meter that cannot answer prints n/a and a line on stderr, and the move still counts.
 """
 import json
@@ -36,11 +46,13 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 PROFILE_LIB = os.path.join(ROOT, "bin", "lib", "hmd_profile.py")
 SPARSE_LIB = os.path.join(ROOT, "bin", "lib", "lean_sparse.sh")
+BACKUP_LIB = os.path.join(ROOT, "bin", "lib", "lean_backup.py")
 FOOTPRINT = os.path.join(ROOT, "bin", "heimdall-footprint")
 GIT_TIMEOUT_S = 60
 FOOTPRINT_TIMEOUT_S = 120
 CHOICES = ("lean", "full")
-USAGE = "usage: heimdall-lean status | on | off\n"
+PENDING_RECORD = "lean-reset-pending"   # <runtime home>/backups/: written by install.sh --reset while steps of it are unfinished
+USAGE = "usage: heimdall-lean status | on | off | restore BACKUP-DIR\n"
 
 DISK_BYTES = ("disk", "total_bytes")
 DISK_FILES = ("disk", "total_files")
@@ -188,6 +200,44 @@ def cmd_off():
     return 0 if recorded else 1
 
 
+def runtime_home():
+    """$HEIMDALL_HOME, else ~/.heimdall: the runtime home the way bin/lib/hmd_profile.py and bin/lib/lean_backup.py read it."""
+    return os.path.abspath(os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall"))
+
+
+def drop_pending_record():
+    """Remove the unfinished-reset record install.sh --reset keeps. True when none is left; a record that cannot be removed is said on stderr."""
+    path = os.path.join(runtime_home(), "backups", PENDING_RECORD)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        warn("cannot remove the unfinished-reset record %s: %s (remove it by hand, or the next `install.sh --reset` reuses its old backup)" % (path, exc))
+        return False
+    say("heimdall-lean: removed the unfinished-reset record %s" % path)
+    return True
+
+
+def cmd_restore(directory):
+    before = footprint()
+    status, _ = helper([sys.executable, "-I", BACKUP_LIB, "restore", directory])
+    if status != 0:
+        warn("%s was not restored: the reason is above, and this command left the tree and the profile record as they were "
+             "(`heimdall-lean off` brings the full tree back without a backup)" % directory)
+        return 1
+    dropped = drop_pending_record()
+    profile = recorded_profile()
+    if profile is None:
+        warn("the files of %s are back, but the restored profile could not be read, so the tree was left as it is: run this command again" % directory)
+        return 1
+    if not apply_tree(profile):
+        warn("the files of %s are back, but the %s tree was not applied: run this command again once the cause above is fixed" % (directory, profile))
+        return 1
+    show("heimdall-lean: restored from %s: profile %s, tree %s (%s)" % (directory, profile, profile, ROOT), before)
+    return 0 if dropped else 1
+
+
 COMMANDS = {"status": cmd_status, "on": cmd_on, "off": cmd_off}
 
 
@@ -198,6 +248,8 @@ def main(argv):
         return 0
     if len(args) == 1 and args[0] in COMMANDS:
         return COMMANDS[args[0]]()
+    if len(args) == 2 and args[0] == "restore":
+        return cmd_restore(args[1])
     sys.stderr.write(USAGE)
     return 2
 

@@ -24,7 +24,8 @@
 # HEIMDALL_INSTALL_SOURCE_ONLY seam, in a copy of the same existing install, so each costs seconds, not an installer run.
 #
 # budget: 260 -- about 190 s solo: one existing install by the pinned installer, three real install.sh --reset runs (a local fetch, python and git starts, the
-# doctor, a sparse apply of ~2300 files, the fake claude), two `heimdall-lean off` undo runs, and eight lean_reset calls through the seam. No sleep, no timing
+# doctor, a sparse apply of ~2300 files, the fake claude), two `hmd lean restore` undo runs (the printed command, through the installed launcher), and eight
+# lean_reset calls through the seam. No sleep, no timing
 # assertion: the only clock is the hang watchdog of the harness.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,6 +70,9 @@ ir_copy() {
   # same machine at another path, so the profile is re-homed, or the installer would append a second PATH line that has nothing to do with the reset
   sed "s|$BASE_HOME|$UC_HOME|g" "$UC_HOME/.zshrc" > "$UC_HOME/.zshrc.copy" && mv "$UC_HOME/.zshrc.copy" "$UC_HOME/.zshrc" || uc_fatal "cannot re-home the .zshrc of the copy"
   CLONE="$UC_HOME/.heimdall"
+  # ...and so are the launcher links the installer put in ~/.local/bin (absolute symlinks into the BASE clone): the printed undo is `hmd lean restore <dir>`, and
+  # the `hmd` a shell finds on its PATH has to be the one of THIS copy
+  for n in hmd heimdall; do ln -sf "$CLONE/bin/heimdall" "$UC_HOME/.local/bin/$n" || uc_fatal "cannot re-home the $n launcher link of the copy"; done
   [ "${2:-}" != double ] || ( cd "$CLONE" && ir_edit_double )
   : > "$UC_ROOT/headroom.log"
 }
@@ -158,7 +162,7 @@ uc_has "4/8 profile lean" "$UC_ROOT/happy.out" '4/8 profile: lean'
 uc_has "5/8 the lean tree is applied" "$UC_ROOT/happy.out" '5/8 lean tree: applied'
 uc_has "6/8 the lean prompt is skipped, in one line, for want of a green receipt" "$UC_ROOT/happy.out" '6/8 lean prompt: skipped, this release has no green prompt-parity receipt'
 uc_has "7/8 Headroom is off for the next session" "$UC_ROOT/happy.out" '7/8 headroom: off for the next session'
-uc_has "8/8 the undo command is printed" "$UC_ROOT/happy.out" '8/8 to undo: .*lean_backup.py.* restore '
+uc_has "8/8 the undo command is printed: the one short command, hmd lean restore <backup>" "$UC_ROOT/happy.out" '8/8 to undo: hmd lean restore .*/backups/'
 uc_jq "consent is ask and the install is no longer grandfathered" '.consent == "ask" and .grandfathered == false' "$CLONE/skills-config.json"
 uc_jq "the lean profile is recorded in the runtime home" '.profile == "lean"' "$CLONE/profile.json"
 ir_is_lean "after the reset" "$CLONE"
@@ -180,7 +184,8 @@ uc_jq "the user's settings key and the route entry they had are untouched, and n
 if [ ! -s "$UC_SECURITY_LOG" ]; then uc_ok "the keychain was never asked"; else uc_bad "the reset asked the keychain"; fi
 # the undo, as printed
 UNDO="$(ir_line '8\/8 to undo' "$UC_ROOT/happy.out")"
-uc_run "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh -- bash -c "$UNDO"
+if [ "$UNDO" = "hmd lean restore $(printf '%q' "$HAPPY_BACKUP")" ]; then uc_ok "INV-L9: the printed undo is exactly hmd lean restore <the backup dir>, and nothing else"; else uc_bad "INV-L9: the printed undo is not hmd lean restore <the backup dir>" "$UNDO"; fi
+uc_run "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh PATH="$UC_HOME/.local/bin:$UC_PATH" -- bash -c "$UNDO"   # hmd as a shell finds it: ~/.local/bin is where the installer put it
 uc_rc "the printed undo command runs" 0
 if cmp -s "$UC_ROOT/happy-skills-config.before" "$CLONE/skills-config.json"; then uc_ok "INV-L9: the undo returns skills-config.json byte for byte"; else uc_bad "INV-L9: skills-config.json is not what it was before the reset"; fi
 if [ ! -e "$CLONE/profile.json" ]; then uc_ok "the undo drops the profile record the reset made"; else uc_bad "the undo left a profile record"; fi
@@ -222,7 +227,7 @@ if [ ! -e "$CLONE/backups/lean-reset-pending" ]; then uc_ok "the unfinished-rese
 if [ "$(ir_backups "$CLONE" | wc -l | tr -d ' ')" = 1 ]; then uc_ok "no second backup was taken"; else uc_bad "a second backup was taken over the half-reset install"; fi
 UNDO="$(ir_line '8\/8 to undo' "$UC_ROOT/defer-next.out")"
 case "$UNDO" in *"$FIRST_BACKUP"*) uc_ok "the undo points at the FIRST backup" ;; *) uc_bad "the undo does not point at the first backup" "$UNDO" ;; esac
-uc_run "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh -- bash -c "$UNDO"
+uc_run "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh PATH="$UC_HOME/.local/bin:$UC_PATH" -- bash -c "$UNDO"
 uc_rc "the undo of the resumed reset runs" 0
 if cmp -s "$UC_ROOT/defer-skills-config.before" "$CLONE/skills-config.json"; then uc_ok "the undo returns the install to what it was before the FIRST run began"; else uc_bad "the undo did not return skills-config.json to its original"; fi
 ir_is_full "after the undo of the resumed reset" "$CLONE"
