@@ -437,6 +437,7 @@ bin/lib/issue_queue.py
 bin/lib/land_consolidate.py
 bin/lib/lean_context_parity.py
 bin/lib/lean_install_fixture.sh
+bin/lib/lean_sparse.sh
 bin/lib/liveness-subsystems.conf
 bin/lib/maintain_loop.py
 bin/lib/md_convert.py
