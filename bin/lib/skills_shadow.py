@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """skills_shadow.py -- shadow mode for the stack packs: the same stack-detect fixtures resolved from two roots, the pack text diffed.
 
-    skills_shadow.py --bundled ROOT --package ROOT [--stack-pack FILE] [--timeout SECONDS]
+    skills_shadow.py --bundled ROOT --package ROOT [--package-home HOME] [--stack-pack FILE] [--timeout SECONDS]
 
 WHY. The lean profile moves the stack packs out of the install and ships them as a package (docs/superpowers/plans/2026-11-12-3x-lean-core.md, T1.3; spec
 section 5 Stage 2: "Shadow mode: run both package and bundled versions on the same tasks, compare outcomes. Promote only if outcomes are identical"). This is that
@@ -15,13 +15,19 @@ bin/stack-pack next to this script), so whatever bin/stack-pack does later is wh
 text and the ordered list of (the file's `<dir>/<name>`, its bytes). Order is part of the answer (base packs first, refinements on top); the root part of a path is not
 (the roots differ by design). Both roots are only read and the package root is never run: the resolver is FILE, not anything inside a root.
 
+THE INSTALLED PACK (--package-home HOME). The package side may read its packs from an installed pack instead of from its root (lean-core plan T3.1): HOME is the HEIMDALL_HOME
+the package side runs with, holding the pack as bin/heimdall-pack-build makes it at HOME/packs/stacks and the machine lock, HOME/skills.lock, that pins it: what bin/stack-pack
+resolves through bin/lib/skills_packs.py. Before any run the harness asks that resolver's own check, once, whether the pack is exactly the build the lock pins. If it is not, the
+real resolver would fall back to the bundled copy (INV-L5) and the pack would go uncompared, so there is no verdict. A verified pack is then read like a root's skills/stacks, which
+is the point of a package root that holds none (a lean one). The bundled side never gets a home to read: its answer is always the bundled copy. HOME is only read.
+
 HERMETIC. Each call gets an environment built from nothing: PATH as inherited, LC_ALL=C, CLAUDE_PLUGIN_ROOT of its side, and a HOME and HEIMDALL_HOME of its own (HEIMDALL_HOME
-does not exist, as on a machine where nothing was ever installed), so an answer never depends on the operator's machine. The calls run in parallel; the report is in
-fixture order.
+does not exist, as on a machine where nothing was ever installed, unless --package-home gives the package side's), so an answer never depends on the operator's machine. The
+calls run in parallel; the report is in fixture order.
 
 TRUST. A root is third-party content. A file the resolver names is read only if its real path stays inside the root's skills/stacks (or the fixture project, for a
-refinement), it is a regular file and it is at most 4 MiB: a symlink out of the root, a missing file or an oversized one is "no verdict", never a pass. Everything printed
-from a root (names, stderr, diff lines) is escaped: a pack is untrusted text.
+refinement; or, on the package side, its verified installed pack), it is a regular file and it is at most 4 MiB: a symlink out of the root, a missing file or an oversized
+one is "no verdict", never a pass. Everything printed from a root (names, stderr, diff lines) is escaped: a pack is untrusted text.
 
 COVERAGE. A comparison that resolves nothing proves nothing. Every pack the bundled root ships (skills/stacks/<id>/PACK.md) must be resolved by at least one fixture on the
 bundled side, and the bundled side must exit 0 on every fixture (it is the reference); otherwise there is no verdict. Add a row to FIXTURES when a pack is added.
@@ -30,7 +36,8 @@ OUTPUT. stdout: a header, one `PASS <fixture>: identical (...)` or `FAIL <fixtur
 per file: only in one side, a different name at that position, or the sizes, the first differing byte and a short unified diff. Nothing is printed on stdout without a verdict.
 
 EXIT. 0 every fixture identical; 1 at least one differs; 2 usage, or no verdict (a root that is not a directory, the same directory twice, a resolver that is not
-executable, hangs, fails on the bundled side or names a path it must not, a shipped pack no fixture exercises). stdlib only, Python 3.7+: run it as `python3 -I`.
+executable, hangs, fails on the bundled side or names a path it must not, a shipped pack no fixture exercises, a package home whose pack is not the build its lock pins). stdlib only
+(the pack check imports bin/lib/skills_packs.py, and only with --package-home), Python 3.7+: run it as `python3 -I`.
 """
 import argparse
 import collections
@@ -43,7 +50,9 @@ import subprocess
 import sys
 import tempfile
 
-STACKS_REL = os.path.join("skills", "stacks")
+PACK_SKILL = "stacks"  # the skill id of the stack packs: skills/stacks in a plugin root, packs/stacks in a heimdall home
+STACKS_REL = os.path.join("skills", PACK_SKILL)
+LIB_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STACK_PACK = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "bin", "stack-pack")
 TIMEOUT_S = 30.0
 MAX_PACK_BYTES = 4 * 1024 * 1024
@@ -68,7 +77,7 @@ FIXTURES = (
     ("no-signal", {"README.md": "# a tree with no stack signal\n"}),
 )
 
-Side = collections.namedtuple("Side", "name root")
+Side = collections.namedtuple("Side", "name root home pack")  # home, pack: the HEIMDALL_HOME the side runs with and its verified installed pack (real paths), or None
 Resolved = collections.namedtuple("Resolved", "identity kind data")  # kind: "pack" (under the root's skills/stacks) or "refinement" (under the project)
 Outcome = collections.namedtuple("Outcome", "status stderr files")
 
@@ -111,12 +120,13 @@ def read_resolved(label, line, project, side):
     if "\0" in line:
         raise Unjudgeable("%s: the resolver names a path with a NUL byte" % label)
     real = os.path.realpath(os.path.join(project, line))
-    if inside(real, os.path.join(side.root, STACKS_REL)):
+    if inside(real, os.path.join(side.root, STACKS_REL)) or (side.pack is not None and inside(real, side.pack)):
         kind = "pack"
     elif inside(real, os.path.realpath(project)):
         kind = "refinement"
     else:
-        raise Unjudgeable("%s: the resolver names %s, outside its root and the fixture project" % (label, shown(line)))
+        where = "its root, its installed pack and the fixture project" if side.pack is not None else "its root and the fixture project"
+        raise Unjudgeable("%s: the resolver names %s, outside %s" % (label, shown(line), where))
     if not os.path.isfile(real):
         raise Unjudgeable("%s: the resolver names %s, which is not a regular file" % (label, shown(line)))
     try:
@@ -134,7 +144,7 @@ def resolve(stack_pack, side, name, project, work, timeout):
     label = "%s side, fixture %s" % (side.name, name)
     home = os.path.join(work, "home", side.name, name)
     os.makedirs(home)
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C", "HOME": home, "HEIMDALL_HOME": os.path.join(home, ".heimdall"),
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C", "HOME": home, "HEIMDALL_HOME": side.home or os.path.join(home, ".heimdall"),
            "CLAUDE_PLUGIN_ROOT": side.root}
     try:
         done = subprocess.run([stack_pack, "load", project], env=env, cwd=project, stdin=subprocess.DEVNULL,
@@ -212,16 +222,31 @@ def shipped_packs(root):
     return {entry for entry in os.listdir(stacks) if os.path.isfile(os.path.join(stacks, entry, "PACK.md"))}
 
 
-def real_root(name, path):
+def real_dir(what, path):
     real = os.path.realpath(path)
-    if not os.path.isdir(real):
-        raise Unjudgeable("the %s root %s is not a directory" % (name, shown(path)))
+    if not path or not os.path.isdir(real):
+        raise Unjudgeable("the %s %s is not a directory" % (what, shown(path)))
     return real
 
 
+def verified_pack(root, home):
+    """The real path of the installed pack of the stacks under HOME when it is exactly the build HOME's machine lock pins, judged by the resolver's own check
+    (bin/lib/skills_packs.py); Unjudgeable when it is not: the resolver would fall back to the bundled copy and the pack would go uncompared."""
+    sys.path.insert(0, LIB_DIR)  # python3 -I keeps this script's directory off sys.path
+    import skills_packs
+    try:
+        found = skills_packs.resolve(PACK_SKILL, plugin_root=root, heimdall_home=home)
+    except OSError as exc:
+        raise Unjudgeable("cannot check the installed pack of %s under %s: %s" % (PACK_SKILL, shown(home), exc.strerror or exc))
+    if found.source != "pack":
+        raise Unjudgeable("the installed pack of %s under %s is not the build its lock pins (SHA256SUMS, the files and %s must agree): the resolver would fall back "
+                          "to the bundled copy and the pack would go unchecked" % (PACK_SKILL, shown(home), skills_packs.LOCK_FILE))
+    return os.path.realpath(found.path)
+
+
 def shadow(args):
-    bundled = Side("bundled", real_root("bundled", args.bundled))
-    package = Side("package", real_root("package", args.package))
+    bundled = Side("bundled", real_dir("bundled root", args.bundled), None, None)
+    package = Side("package", real_dir("package root", args.package), None, None)
     if bundled.root == package.root:
         raise Unjudgeable("the bundled and package roots are the same directory (%s): a tree compared with itself proves nothing" % shown(bundled.root))
     if not (os.path.isfile(args.stack_pack) and os.access(args.stack_pack, os.X_OK)):
@@ -229,6 +254,9 @@ def shadow(args):
     shipped = shipped_packs(bundled.root)
     if not shipped:
         raise Unjudgeable("the bundled root ships no pack (skills/stacks/<id>/PACK.md): nothing to shadow")
+    if args.package_home is not None:
+        home = real_dir("package home", args.package_home)
+        package = package._replace(home=home, pack=verified_pack(package.root, home))
 
     work = tempfile.mkdtemp(prefix="skills-shadow.")
     try:
@@ -254,7 +282,7 @@ def shadow(args):
         raise Unjudgeable("no fixture resolves the bundled pack(s) %s: shadow mode would leave them unchecked (add a fixture to FIXTURES in %s)"
                           % (", ".join(escaped(pack) for pack in unreached), os.path.abspath(__file__)))
 
-    report = ["skills-shadow: bundled=%s package=%s" % (escaped(bundled.root), escaped(package.root))]
+    report = ["skills-shadow: bundled=%s package=%s%s" % (escaped(bundled.root), escaped(package.root), " package-home=" + escaped(package.home) if package.home else "")]
     different = 0
     for name, _project in projects:
         problems = differences(pairs[name]["bundled"], pairs[name]["package"])
@@ -277,6 +305,9 @@ def parse(argv):
                     "Exit 0 identical, 1 different, 2 usage or no verdict.")
     parser.add_argument("--bundled", required=True, metavar="ROOT", help="plugin root holding the bundled packs: ROOT/skills/stacks/<id>/PACK.md")
     parser.add_argument("--package", required=True, metavar="ROOT", help="plugin root laid out the same way, holding the package's packs")
+    parser.add_argument("--package-home", metavar="HOME",
+                        help="HEIMDALL_HOME of the package side: its installed pack of the stacks (HOME/packs/stacks, as bin/heimdall-pack-build makes it) and the machine lock "
+                             "(HOME/skills.lock) that pins it; the pack must be exactly the build the lock pins, else there is no verdict (default: an empty home, as for the bundled side)")
     parser.add_argument("--stack-pack", default=DEFAULT_STACK_PACK, metavar="FILE",
                         help="the resolver, run as `FILE load PROJECT` (default: bin/stack-pack next to this script)")
     parser.add_argument("--timeout", type=float, default=TIMEOUT_S, metavar="SECONDS", help="per resolver call (default: %g)" % TIMEOUT_S)

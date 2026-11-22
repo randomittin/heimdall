@@ -15,6 +15,10 @@
 #   E. NO VERDICT  exit 2 with nothing on stdout, never a pass: a shipped pack no fixture resolves, a resolver that resolves nothing, a bundled root with no pack, a bundled
 #                  side that fails, a resolved path that is not a file / is outside its root / leaves it by a symlink / is over the size cap, a resolver that hangs.
 #   F. USAGE       bad arguments, the same directory for both roots, a resolver that is not executable, --help.
+#   G. PACK HOME   --package-home, the package side's HEIMDALL_HOME (lean-core plan T3.1). A pack there that is exactly the build its machine lock pins is read like a root's
+#                  skills/stacks (the package root of these cases holds none): identical text passes, one changed byte in a verified pack is FAIL, a pack that is not the pinned
+#                  build (a byte changed after the build, no lock) or a home that is not a directory is no verdict (exit 2, nothing on stdout), a file of the home that is not a
+#                  file of the pack is no verdict, and each side gets its own HEIMDALL_HOME.
 #
 # Every expectation is derived independently of the harness (wc -c, cmp, the copied files), never read back from it. HMD_SHADOW_BIN points the suite at another copy of the
 # harness (a mutated copy, to watch an assertion go red). bash 3.2 compatible. Cost is process spawns, not Python: four runs
@@ -38,6 +42,8 @@ echo "skills-shadow (the stack packs resolved from two roots over the same fixtu
 echo "-- 0. the harness exists --"
 if [ -f "$SHADOW" ]; then ok "bin/lib/skills_shadow.py exists"; else bad "bin/lib/skills_shadow.py is missing (T1.3 creates it)"; finish; fi
 if [ -x "$SP" ] && [ -d "$STACKS" ]; then ok "bin/stack-pack and skills/stacks exist (the real resolver and the bundled packs)"; else bad "bin/stack-pack or skills/stacks is missing"; finish; fi
+BUILDER="$REPO/bin/heimdall-pack-build"; LOCK_LIB="$REPO/bin/lib/skills_lock.py"
+if [ -x "$BUILDER" ] && [ -f "$LOCK_LIB" ] && [ -f "$REPO/bin/lib/skills_packs.py" ]; then ok "bin/heimdall-pack-build, bin/lib/skills_lock.py and bin/lib/skills_packs.py exist (the pack, the lock and the verification section G uses)"; else bad "the pack builder, the lock writer or the pack resolver is missing"; finish; fi
 
 # nothing of the caller's environment may steer a run: a decoy plugin root and a decoy heimdall home are set for every run below
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX
@@ -221,7 +227,55 @@ if [ "$(rc f7)" = 2 ] && [ "$(rc f7b)" = 2 ] && err_has f7 "--timeout" && err_ha
 run_default f8 --help
 if [ "$(rc f8)" = 0 ] && out_has f8 "--bundled" && out_has f8 "--package" && out_has f8 "--stack-pack"; then ok "--help: exit 0, names --bundled, --package and --stack-pack on stdout"; else bad "--help: $(show f8)"; fi
 
-echo "-- G. hygiene --"
+echo "-- G. the installed pack: --package-home --"
+# a heimdall home holding the pack the real builder makes from a one-pack source, pinned by the real lock writer; these stubs read the pack from HEIMDALL_HOME when it holds one
+mkhome() {   # mkhome NAME SRC
+  local hash
+  mkdir -p "$T/$1/packs" && hash="$("$BUILDER" build --src "$2" --out "$T/$1/packs/stacks")" \
+    && HEIMDALL_HOME="$T/$1" "$REALPY" -B -I "$LOCK_LIB" record --scope machine --id stacks --state installed --kind bundled --content-hash "$hash" --rule fixture --via skills-shadow.test >/dev/null
+}
+cat > "$T/stub-pack" <<'EOF'
+#!/bin/sh
+if [ -f "$HEIMDALL_HOME/packs/stacks/a/PACK.md" ]; then printf '%s\n' "$HEIMDALL_HOME/packs/stacks/a/PACK.md"; else printf '%s\n' "$CLAUDE_PLUGIN_ROOT/skills/stacks/a/PACK.md"; fi
+EOF
+cat > "$T/stub-pack-outside" <<'EOF'
+#!/bin/sh
+if [ -d "$HEIMDALL_HOME/packs" ]; then printf '%s\n' "$HEIMDALL_HOME/skills.lock"; else printf '%s\n' "$CLAUDE_PLUGIN_ROOT/skills/stacks/a/PACK.md"; fi
+EOF
+cat > "$T/stub-pack-home" <<'EOF'
+#!/bin/sh
+echo "home=$HEIMDALL_HOME" >&2
+if [ -f "$HEIMDALL_HOME/packs/stacks/a/PACK.md" ]; then printf '%s\n' "$HEIMDALL_HOME/packs/stacks/a/PACK.md"; else printf '%s\n' "$CLAUDE_PLUGIN_ROOT/skills/stacks/a/PACK.md"; fi
+EOF
+chmod +x "$T/stub-pack" "$T/stub-pack-outside" "$T/stub-pack-home"
+mkdir -p "$T/pk-src/a" "$T/pk-src2/a" "$T/t-lean"
+printf '# pack a\n' > "$T/pk-src/SKILL.md"; printf '# pack a\n' > "$T/pk-src/a/PACK.md"
+printf '# pack a\n' > "$T/pk-src2/SKILL.md"; printf '# pack b\n' > "$T/pk-src2/a/PACK.md"
+printf 'a lean root: no skills/ at all\n' > "$T/t-lean/README"
+if mkhome pk-home "$T/pk-src" && mkhome pk-home2 "$T/pk-src2"; then ok "fixture: two package homes, each holding the pack the real builder makes, pinned by the real lock writer (one pack says a, the other b)"; else bad "fixture: building a package home failed"; fi
+cp -R "$T/pk-home" "$T/pk-home-bad"; printf '\377' | dd of="$T/pk-home-bad/packs/stacks/a/PACK.md" bs=1 seek=0 conv=notrunc 2>/dev/null
+cp -R "$T/pk-home" "$T/pk-home-nolock"; rm "$T/pk-home-nolock/skills.lock"
+
+BEFORE_G="$(tree_hash "$T/pk-home")|$(tree_hash "$T/t-a")|$(tree_hash "$T/t-lean")"
+run g1 --stack-pack "$T/stub-pack" --bundled "$T/t-a" --package "$T/t-lean" --package-home "$T/pk-home"
+AFTER_G="$(tree_hash "$T/pk-home")|$(tree_hash "$T/t-a")|$(tree_hash "$T/t-lean")"
+if [ "$(rc g1)" = 0 ] && no_stderr g1 && split_ok g1 "" && out_has g1 "all 1 shipped packs exercised"; then ok "a verified pack under --package-home is read like a root's stacks: a lean package root, the same text as the bundled copy: exit 0, every fixture PASS"; else bad "verified pack: $(show g1)"; fi
+if out_has g1 "package-home=$T/pk-home"; then ok "the report header names the package home"; else bad "header: $(show g1)"; fi
+if [ "$BEFORE_G" = "$AFTER_G" ]; then ok "the package home and both roots are only read: their trees hash the same after the run"; else bad "a home or a root changed during the run"; fi
+run g2 --stack-pack "$T/stub-pack" --bundled "$T/t-a" --package "$T/t-lean" --package-home "$T/pk-home2"
+if [ "$(rc g2)" = 1 ] && split_ok g2 "$FIXTURES" && out_has g2 "file 1 'a/PACK.md': 9 vs 9 bytes, first difference at byte 7 (0x61 vs 0x62)"; then ok "a verified pack that says b where the bundled copy says a: exit 1, every fixture FAIL, the first differing byte named (the pack's text is compared, not just its presence)"; else bad "verified pack with other text: $(show g2)"; fi
+run g3 --stack-pack "$T/stub-pack" --bundled "$T/t-a" --package "$T/t-lean" --package-home "$T/pk-home-bad"
+if [ "$(rc g3)" = 2 ] && no_stdout g3 && err_has g3 "not the build its lock pins" && err_has g3 "pk-home-bad"; then ok "a pack with one byte changed after the build: exit 2, nothing on stdout, the home is named (the resolver would fall back to the bundled copy: nothing of the pack would be compared)"; else bad "unverified pack: $(show g3)"; fi
+run g4 --stack-pack "$T/stub-pack" --bundled "$T/t-a" --package "$T/t-lean" --package-home "$T/pk-home-nolock"
+if [ "$(rc g4)" = 2 ] && no_stdout g4 && err_has g4 "not the build its lock pins"; then ok "a pack with no lock to pin it: exit 2, nothing on stdout"; else bad "no lock: $(show g4)"; fi
+run g5 --stack-pack "$T/stub-pack-outside" --bundled "$T/t-a" --package "$T/t-lean" --package-home "$T/pk-home"
+if [ "$(rc g5)" = 2 ] && no_stdout g5 && err_has g5 "package side" && err_has g5 "outside its root, its installed pack and the fixture project"; then ok "a resolver that names a file of the home outside the pack (the lock): exit 2, only the verified pack is read"; else bad "file outside the pack: $(show g5)"; fi
+run g6 --stack-pack "$T/stub-pack" --bundled "$T/t-a" --package "$T/t-lean" --package-home "$T/no-such-home"
+if [ "$(rc g6)" = 2 ] && no_stdout g6 && err_has g6 "package home" && err_has g6 "not a directory"; then ok "a package home that is not a directory: exit 2, named"; else bad "missing home: $(show g6)"; fi
+run g7 --stack-pack "$T/stub-pack-home" --bundled "$T/t-a" --package "$T/t-lean" --package-home "$T/pk-home"
+if out_has g7 "package 'home=$T/pk-home" && out_has g7 "stderr: bundled 'home=" && out_has g7 "skills-shadow." && ! out_has g7 "decoy-home"; then ok "each side has its own HEIMDALL_HOME: the package side the home it was given, the bundled side the harness's empty one, never the caller's"; else bad "homes: $(show g7)"; fi
+
+echo "-- H. hygiene --"
 LEFT="$(ls -A "$T/tmp")"
 if [ -z "$LEFT" ]; then ok "no work directory is left behind by any run (identical, different, no verdict, timeout)"; else bad "left in TMPDIR: $LEFT"; fi
 
