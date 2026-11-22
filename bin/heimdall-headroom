@@ -2,7 +2,8 @@
 # heimdall-headroom — turn the Headroom compression proxy on or off, on demand.
 #
 #   hmd headroom status                 what is on, what is routed, and what points at the proxy
-#   hmd headroom on                     enable it: add the module if absent, clear an opt-out, re-enable its launchd job
+#   hmd headroom on                     enable it: add the module if absent, clear an opt-out, re-enable its launchd job (exit 1 when launchctl
+#                                       cannot: Headroom is not on then, and a caller that relies on it, hmd lean restore, is told so)
 #   hmd headroom off [--next-session] [--backup-dir DIR]
 #                                       disable it: opt out of the module (route, wrap and the wrap shim then decline it),
 #                                       remove a launchd supervisor job, remove an ANTHROPIC_BASE_URL entry that points a
@@ -304,7 +305,12 @@ cmd_on() {
   fi
   if hmd_headroom_supervised && launchd_ok && job_disabled; then
     if "$LC" enable "$DOMAIN/$LABEL" >/dev/null 2>&1; then echo "  re-enabled the launchd job $LABEL"; did=1
-    else echo "hmd headroom: warning: launchctl enable $DOMAIN/$LABEL failed; the job stays disabled" >&2; fi
+    else
+      # exit 1, not a warning followed by "headroom is on.": a caller that puts a route back on the strength of this command (hmd lean restore) must not be told yes
+      # while the job that starts the proxy at the next login is still disabled
+      echo "hmd headroom: launchctl enable $DOMAIN/$LABEL failed, so the job stays disabled and Headroom is not on. Fix launchd, then run hmd headroom on again (or: launchctl enable $DOMAIN/$LABEL)" >&2
+      exit 1
+    fi
   fi
   if [ "$did" -eq 0 ]; then echo "headroom is already on."; else echo "headroom is on."; fi
   hmd_headroom_bin >/dev/null 2>&1 || echo "  note: the headroom CLI is not installed on this machine yet; hmd modules add printed the command that installs it."

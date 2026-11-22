@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""heimdall-footprint -- what an hmd install costs, as one reproducible command.
+
+The three costs the lean-core plan (docs/superpowers/plans/2026-11-12-3x-lean-core.md) sets out to cut:
+
+  disk      tracked bytes and files per top-level directory, counting only what is on disk (git ls-files, then lstat). A tracked file that is
+            gone, which is what a sparse checkout leaves behind, is counted in absent_files and is not an error. Untracked files never count.
+  context   what a session is handed before the user's first word: the main-session prompt (settings.json "agent" -> agents/NAME.md, the whole
+            file), the YAML frontmatter block of every agents/*.md, commands/*.md and skills/*/SKILL.md (the always-listed metadata), and what
+            the caveman hooks inject: the SessionStart rules and the per-prompt reminder (its additionalContext, not the JSON around it).
+            session_start_bytes is the first three plus the SessionStart rules; session_start_tokens_est is that divided by 4, an estimate and
+            not a tokenizer.
+  hooks     registered hooks per event and per tool: hooks.PreToolUse.Bash is how many hooks fire before a Bash call (a matcher A|B counts for
+            A and for B, "*" or no matcher counts for every tool). "total" is the event's registered hooks, "*" the ones that fire for anything.
+
+--check compares the report with the ceilings of a budget file: {"schema": 1, "max": {...}}, where max mirrors the JSON report with a ceiling in
+place of each number. A measured number above its ceiling is printed as an OVER line and is exit 1. A metric the budget does not list is not
+checked; one it lists that the meter does not report is an error, so a typo can never make a check vacuous.
+
+--root DIR is a tree you trust: the caveman hooks of that tree are RUN, in a clean sandbox HOME with CLAUDE_PLUGIN_ROOT pointing at it, because
+what they print is the only honest measure of what they inject. No other hook is ever run.
+
+Exit 0: measured (and within budget under --check). Exit 1: a metric is over its ceiling. Exit 2: usage, or a number that cannot be trusted
+(not a git work tree, no hooks/hooks.json, a hook matcher it cannot count, a caveman hook that fails): stderr says which, stdout stays empty.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+SCHEMA = 1
+GIT_TIMEOUT_S = 60
+HOOK_TIMEOUT_S = 15
+CAVEMAN_MARKER = "heimdall-caveman"
+TOOL_NAME = re.compile(r"[A-Za-z0-9_-]+")
+AGENT_NAME = re.compile(r"[A-Za-z0-9_-]+")
+SELF_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DEFAULT_BUDGET = os.path.join(SELF_ROOT, "release", "lean-budget.json")
+CONTEXT_GROUPS = (("agents", "agents/*.md"), ("commands", "commands/*.md"), ("skills", "skills/*/SKILL.md"))
+CAVEMAN_EVENTS = (("SessionStart", "session_start_bytes"), ("UserPromptSubmit", "per_prompt_bytes"))
+
+
+class Fail(Exception):
+    """A measurement or a budget that cannot be trusted: said on stderr, exit 2."""
+
+
+def is_count(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def fmt(number):
+    return format(number, ",")
+
+
+def read_json(path, what):
+    try:
+        with open(path, "rb") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        raise Fail("%s is missing: %s" % (what, path))
+    except ValueError as exc:
+        raise Fail("%s is not valid JSON (%s): %s" % (what, exc, path))
+
+
+# ── disk ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def tracked_files(root):
+    # no GIT_* variable may re-point git at another repository (this runs from hooks and tests that set GIT_DIR)
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    try:
+        proc = subprocess.run(["git", "-C", root, "ls-files", "-z"], env=env, capture_output=True, timeout=GIT_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Fail("cannot run git in %s: %s" % (root, exc))
+    if proc.returncode != 0:
+        raise Fail("%s is not a git work tree git can list (git ls-files: %s)" % (root, proc.stderr.decode("utf-8", "replace").strip()))
+    return [os.fsdecode(entry) for entry in proc.stdout.split(b"\0") if entry]
+
+
+def measure_disk(root):
+    by_dir = {}
+    absent = 0
+    for rel in tracked_files(root):
+        top = rel.split("/", 1)[0] if "/" in rel else "."
+        entry = by_dir.setdefault(top, {"bytes": 0, "files": 0})
+        try:
+            info = os.lstat(os.path.join(root, rel))
+        except (FileNotFoundError, NotADirectoryError):
+            absent += 1
+            continue
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+            absent += 1
+            continue
+        entry["bytes"] += info.st_size
+        entry["files"] += 1
+    return {
+        "total_bytes": sum(entry["bytes"] for entry in by_dir.values()),
+        "total_files": sum(entry["files"] for entry in by_dir.values()),
+        "absent_files": absent,
+        "by_dir": by_dir,
+    }
+
+
+# ── hooks ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def load_hooks(root):
+    doc = read_json(os.path.join(root, "hooks", "hooks.json"), "hooks/hooks.json")
+    events = doc.get("hooks") if isinstance(doc, dict) else None
+    if not isinstance(events, dict):
+        raise Fail("hooks/hooks.json has no top-level \"hooks\" object")
+    for event, groups in events.items():
+        if not isinstance(groups, list):
+            raise Fail("hooks/hooks.json: %s is not a list of groups" % event)
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list) or not all(isinstance(h, dict) for h in group["hooks"]):
+                raise Fail("hooks/hooks.json: a %s group is not {\"hooks\": [...]}" % event)
+            if group.get("matcher") is not None and not isinstance(group["matcher"], str):
+                raise Fail("hooks/hooks.json: a %s matcher is not a string" % event)
+    return events
+
+
+def count_hooks(events):
+    counts = {}
+    for event, groups in events.items():
+        total = wildcard = 0
+        named = {}
+        for group in groups:
+            size = len(group["hooks"])
+            total += size
+            matcher = group.get("matcher")
+            if matcher in (None, "", "*"):
+                wildcard += size
+                continue
+            names = matcher.split("|")
+            for name in names:
+                if not TOOL_NAME.fullmatch(name):
+                    raise Fail("hooks/hooks.json: the %s matcher %r is not a tool-name list (Name|Name) or *, so its per-tool count cannot be "
+                               "trusted; teach heimdall-footprint that form first" % (event, matcher))
+            for name in set(names):
+                named[name] = named.get(name, 0) + size
+        entry = {"total": total, "*": wildcard}
+        for name, size in named.items():
+            entry[name] = size + wildcard
+        counts[event] = entry
+    return counts
+
+
+# ── context ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def frontmatter_bytes(path):
+    with open(path, "rb") as handle:
+        lines = handle.read().split(b"\n")
+    if lines[0].rstrip(b"\r") != b"---":
+        return 0
+    for index in range(1, len(lines)):
+        if lines[index].rstrip(b"\r") == b"---":
+            return sum(len(line) + 1 for line in lines[1:index])
+    return 0
+
+
+def injected_bytes(stdout):
+    """Bytes a hook's stdout puts in the session: its additionalContext when it prints the JSON form, else the stdout itself."""
+    try:
+        doc = json.loads(stdout)
+    except ValueError:
+        return len(stdout)
+    if not isinstance(doc, dict):
+        return len(stdout)
+    output = doc.get("hookSpecificOutput")
+    context = output.get("additionalContext") if isinstance(output, dict) else None
+    return len(context.encode("utf-8")) if isinstance(context, str) else 0
+
+
+def run_hook(root, command, home):
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": home,
+        "HEIMDALL_HOME": os.path.join(home, ".heimdall"),
+        "CLAUDE_PLUGIN_ROOT": root,
+        "LC_ALL": "C",
+    }
+    try:
+        proc = subprocess.run(["bash", "-c", command], env=env, cwd=home, stdin=subprocess.DEVNULL, capture_output=True, timeout=HOOK_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Fail("could not run the caveman hook (%s): %s" % (exc, command))
+    if proc.returncode != 0:
+        raise Fail("the caveman hook exited %d, so what it injects cannot be measured: %s" % (proc.returncode, command))
+    return proc.stdout
+
+
+def measure_caveman(root, events):
+    commands = {event: [] for event, _key in CAVEMAN_EVENTS}
+    for event in commands:
+        for group in events.get(event, []):
+            for hook in group["hooks"]:
+                command = hook.get("command")
+                if isinstance(command, str) and CAVEMAN_MARKER in command:
+                    commands[event].append(command)
+    result = {key: 0 for _event, key in CAVEMAN_EVENTS}
+    if not any(commands.values()):
+        return result
+    with tempfile.TemporaryDirectory(prefix="hmd-footprint.") as home:
+        for event, key in CAVEMAN_EVENTS:
+            result[key] = sum(injected_bytes(run_hook(root, command, home)) for command in commands[event])
+    return result
+
+
+def measure_main_prompt(root):
+    settings = os.path.join(root, "settings.json")
+    if not os.path.exists(settings):
+        return {"agent": None, "bytes": 0}
+    doc = read_json(settings, "settings.json")
+    agent = doc.get("agent") if isinstance(doc, dict) else None
+    if agent is None:
+        return {"agent": None, "bytes": 0}
+    if not isinstance(agent, str) or not AGENT_NAME.fullmatch(agent):
+        raise Fail("settings.json: \"agent\" is not a plain agent name: %r" % (agent,))
+    try:
+        size = os.path.getsize(os.path.join(root, "agents", agent + ".md"))
+    except FileNotFoundError:
+        raise Fail("settings.json names the agent %r but agents/%s.md is missing" % (agent, agent))
+    return {"agent": agent, "bytes": size}
+
+
+def measure_context(root, events):
+    context = {"main_prompt": measure_main_prompt(root)}
+    for name, pattern in CONTEXT_GROUPS:
+        paths = sorted(path for path in glob.glob(os.path.join(glob.escape(root), pattern)) if os.path.isfile(path))
+        context[name] = {"count": len(paths), "frontmatter_bytes": sum(frontmatter_bytes(path) for path in paths)}
+    context["caveman"] = measure_caveman(root, events)
+    total = (context["main_prompt"]["bytes"] + sum(context[name]["frontmatter_bytes"] for name, _pattern in CONTEXT_GROUPS)
+             + context["caveman"]["session_start_bytes"])
+    context["session_start_bytes"] = total
+    context["session_start_tokens_est"] = total // 4
+    return context
+
+
+def measure(root):
+    disk = measure_disk(root)
+    events = load_hooks(root)
+    hooks = count_hooks(events)
+    return {
+        "schema": SCHEMA,
+        "disk": disk,
+        "context": measure_context(root, events),
+        "hooks": hooks,
+        "hooks_total": sum(entry["total"] for entry in hooks.values()),
+    }
+
+
+# ── the report ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def render(report):
+    disk, context, hooks = report["disk"], report["context"], report["hooks"]
+    out = ["disk: tracked files present on disk",
+           "  %-20s %13s B  %7s files" % ("total", fmt(disk["total_bytes"]), fmt(disk["total_files"]))]
+    for name, entry in sorted(disk["by_dir"].items(), key=lambda item: (-item[1]["bytes"], item[0])):
+        share = 100.0 * entry["bytes"] / disk["total_bytes"] if disk["total_bytes"] else 0.0
+        out.append("  %-20s %13s B  %7s files  %5.1f%%" % (name, fmt(entry["bytes"]), fmt(entry["files"]), share))
+    if disk["absent_files"]:
+        out.append("  (%s tracked paths are not on disk: a sparse checkout or a delete)" % fmt(disk["absent_files"]))
+    out += ["", "context handed to a session before the first prompt (tokens = bytes / 4, an estimate)",
+            "  %-38s %10s B" % ("main prompt (%s)" % (context["main_prompt"]["agent"] or "none"), fmt(context["main_prompt"]["bytes"]))]
+    for name, _pattern in CONTEXT_GROUPS:
+        group = context[name]
+        out.append("  %-38s %10s B" % ("%s frontmatter (%d files)" % (name, group["count"]), fmt(group["frontmatter_bytes"])))
+    out += ["  %-38s %10s B" % ("caveman rules (SessionStart)", fmt(context["caveman"]["session_start_bytes"])),
+            "  %-38s %10s B  ~%s tokens" % ("session start total", fmt(context["session_start_bytes"]), fmt(context["session_start_tokens_est"])),
+            "  %-38s %10s B  on every prompt" % ("caveman reminder (UserPromptSubmit)", fmt(context["caveman"]["per_prompt_bytes"])),
+            "", "hooks registered (hooks/hooks.json): %s" % fmt(report["hooks_total"])]
+    for event, entry in sorted(hooks.items()):
+        per_tool = "  ".join("%s %d" % (name, count) for name, count in sorted(entry.items()) if name not in ("total", "*"))
+        out.append("  %-18s %3d hooks  %s" % (event, entry["total"], per_tool))
+    return "\n".join(line.rstrip() for line in out)
+
+
+# ── --check ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def leaves(node, path=()):
+    if isinstance(node, dict):
+        for key in sorted(node):
+            yield from leaves(node[key], path + (key,))
+    else:
+        yield path, node
+
+
+def load_budget(path):
+    doc = read_json(path, "budget")
+    if not isinstance(doc, dict) or not is_count(doc.get("schema")) or doc["schema"] != SCHEMA or not isinstance(doc.get("max"), dict):
+        raise Fail("budget %s is not {\"schema\": %d, \"max\": {...}}" % (path, SCHEMA))
+    ceilings = []
+    for leaf, value in leaves(doc["max"]):
+        if not is_count(value) or value < 0:
+            raise Fail("budget %s: the ceiling %s must be a non-negative integer, got %r" % (path, "/".join(leaf), value))
+        ceilings.append((leaf, value))
+    if not ceilings:
+        raise Fail("budget %s lists no ceiling, so it would check nothing" % path)
+    return ceilings
+
+
+def run_check(report, ceilings, budget_path):
+    over = []
+    for leaf, ceiling in ceilings:
+        node = report
+        for key in leaf:
+            if not isinstance(node, dict) or key not in node:
+                raise Fail("the budget lists %s, a metric this meter does not report" % "/".join(leaf))
+            node = node[key]
+        if not is_count(node):
+            raise Fail("the budget lists %s, which is not a number in the report" % "/".join(leaf))
+        if node > ceiling:
+            over.append((leaf, node, ceiling))
+    for leaf, measured, ceiling in over:
+        print("OVER: %s is %s, the budget allows %s (+%s)" % ("/".join(leaf), fmt(measured), fmt(ceiling), fmt(measured - ceiling)))
+    if over:
+        print("FAIL: %d of %d metrics are over budget (%s)" % (len(over), len(ceilings), budget_path))
+        return 1
+    print("ok: %d metrics within budget (%s)" % (len(ceilings), budget_path))
+    return 0
+
+
+# ── entry ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="heimdall-footprint", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     allow_abbrev=False)
+    parser.add_argument("--root", metavar="DIR", help="the tree to measure (default: the tree this script lives in); it must be a git work tree")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--json", action="store_true", help="print the report as one JSON document")
+    mode.add_argument("--check", action="store_true", help="compare with the budget: exit 1 when a metric is over its ceiling")
+    parser.add_argument("--budget", metavar="FILE", help="the budget for --check (default: release/lean-budget.json next to this script)")
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.budget is not None and not args.check:
+        parser.error("--budget only applies to --check")
+    root = os.path.realpath(args.root) if args.root else SELF_ROOT
+    budget_path = args.budget or DEFAULT_BUDGET
+    try:
+        if not os.path.isdir(root):
+            raise Fail("--root is not a directory: %s" % root)
+        ceilings = load_budget(budget_path) if args.check else None
+        report = measure(root)
+        if args.check:
+            return run_check(report, ceilings, budget_path)
+        print(json.dumps(report, indent=2, sort_keys=True) if args.json else render(report))
+        return 0
+    except BrokenPipeError:
+        raise
+    except (Fail, OSError) as exc:
+        sys.stderr.write("heimdall-footprint: %s\n" % exc)
+        return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        raise SystemExit(0)

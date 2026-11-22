@@ -1,0 +1,16 @@
+mutant: sparse-on-demand-cut-skipped
+gate:   test/lean-sparse.test.sh (INV-L3, INV-L4, INV-L6)
+defect: the on-demand cut is never taken out of the lean set: the skills and the command the manifest names stay in what a lean install keeps
+applied by test/lean-gate-falsify.test.sh to a temp snapshot of the tree, never to a worktree
+
+--- a/bin/lib/lean_sparse.sh
++++ b/bin/lib/lean_sparse.sh
+@@ -53,7 +53,7 @@
+ 
+ # the three behaviours the test breaks one by one: pattern escaping, the on-demand cut, the return to a full tree
+ lsp_escape()         { sed -e 's/\\/\\\\/g' -e 's/[][*?]/\\&/g'; }
+-lsp_drop_on_demand() { awk -v cut="$LSP_CUT" 'BEGIN { n = split(cut, c, " ") } { for (i = 1; i <= n; i++) if (($0 "") == (c[i] "") || index($0, c[i] "/") == 1) next; print }'; }
++lsp_drop_on_demand() { cat; }
+ lsp_disable()        { lsp_git sparse-checkout disable; }
+ 
+ # lsp_valid_path P -- a plain relative path inside the tree: no escape (`..`, leading `/`), no pattern character (`! # * ? [ ] \`), no control character

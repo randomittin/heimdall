@@ -85,6 +85,24 @@ docs/superpowers/plans/
 /identity.json
 /team.json
 /*.seed
+# RUNTIME STATE hmd writes at the home root. $HEIMDALL_HOME (default ~/.heimdall) IS the installed
+# plugin clone, so each file lands in the clone's work tree and shows as untracked: bin/heimdall's
+# dev-checkout guard (`git status --porcelain`, which counts untracked files) then reads an untouched
+# install as a contributor's checkout and refuses to update it. Root-anchored (a leading slash), so a
+# same-named file anywhere else in the tree stays visible to git. Only files a writer in bin/ really
+# puts at the root are named (test/update-prompt.test.sh T6b runs each writer to prove it):
+#   /profile.json         bin/lib/hmd_profile.py     the lean|full install profile
+#   /setup-done           bin/heimdall               the first-run marker (.setup-done above is its old in-clone copy)
+#   /skills-config.json   bin/lib/skills_config.py   the per-operator skills settings
+#   /skills.lock          bin/lib/skills_lock.py     the MACHINE lock (the project lock is <project>/.planning/skills.lock)
+#   /backups/             bin/lib/lean_backup.py     the backup taken before a reset (copies of skills-config.json,
+#                                                    profile.json and the hmd slice of the user's settings.json)
+# packs/ ($HEIMDALL_HOME/packs) is NOT listed: bin/lib/skills_packs.py only reads it, nothing writes it yet.
+/profile.json
+/setup-done
+/skills-config.json
+/skills.lock
+/backups/
 # Belt-and-suspenders for a dev who creates them under an in-repo .heimdall/ (already
 # covered by `.heimdall/*`, named here so an un-ignore exception can never leak them).
 # team.json is the per-repo TEAM SECRET — a bearer capability. RECONCILIATION (settled

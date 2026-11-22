@@ -438,6 +438,7 @@
       "install": false,
       "tier": "bundled",
       "why": "Visual QA loop for matching React Native screens to a Claude Design canonical; ships in-tree, never installed",
+      "on_demand_paths": ["skills/designmatch", "commands/designmatch.md"],
       "legacy": [
         {"mechanism": "skills/", "path": "skills/designmatch/SKILL.md"}
       ]
@@ -449,6 +450,12 @@
       "install": false,
       "tier": "bundled",
       "why": "Stack knowledge packs (fastapi, nextjs, react-native, spring-boot) for role agents; ships in-tree, never installed",
+      "pack": {
+        "name": "@runhmd/stacks",
+        "version": "1.0.0",
+        "sha256": "8fe211c9ad683c7991f692cf4ee8df530dc9ff9d4c773d29626417924431c7c4",
+        "paths": ["skills/stacks"]
+      },
       "legacy": [
         {"mechanism": "skills/", "path": "skills/stacks/SKILL.md"}
       ]
@@ -460,6 +467,7 @@
       "install": false,
       "tier": "bundled",
       "why": "Maintainer self-improvement loop over routing evidence; ships in-tree, never installed",
+      "on_demand_paths": ["skills/self-improve"],
       "legacy": [
         {"mechanism": "skills/", "path": "skills/self-improve/SKILL.md"}
       ]
@@ -471,6 +479,7 @@
       "install": false,
       "tier": "bundled",
       "why": "Suggests a disk or memory cleanup when the machine is slow or full; ships in-tree, never installed",
+      "on_demand_paths": ["skills/system-health"],
       "legacy": [
         {"mechanism": "skills/", "path": "skills/system-health/SKILL.md"}
       ]
@@ -482,6 +491,7 @@
       "install": false,
       "tier": "bundled",
       "why": "Deep clean of a macOS dev machine (disk, caches, memory); ships in-tree, never installed",
+      "on_demand_paths": ["skills/mac-deep-clean"],
       "legacy": [
         {"mechanism": "skills/", "path": "skills/mac-deep-clean/SKILL.md"}
       ]

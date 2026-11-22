@@ -1,0 +1,20 @@
+{
+  "task": "t05-docs-only",
+  "agent": "heimdall-lean",
+  "source": "fixture",
+  "prompt_sha256": "@SHA@",
+  "events": [
+    {
+      "kind": "spawn",
+      "name": "hmd:docs-writer"
+    },
+    {
+      "kind": "touch",
+      "name": "README.md"
+    },
+    {
+      "kind": "gate",
+      "name": "verify-edits --quick"
+    }
+  ]
+}

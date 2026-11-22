@@ -13,10 +13,13 @@ commands (list, why, lock) are skills_cli_read.py; bin/heimdall-skills dispatche
             `detected` ones whose files are in the working directory (the manifest's detection rules and file triggers).
             Not listed: what is installed (a lock row installed or adopted, a plugin known to ~/.claude/settings.json, a
             directory in ~/.claude/skills), what was declined, install:false entries, and the bundled, on_demand and community
-            tiers (INV-S9). It makes no `claude` or `git` call and writes nothing; --reset first moves every declined row of the
-            project and machine locks back to suggested.
-  install   the single consented install path. Per id: refuse what hmd does not install (install:false, bundled, unknown), skip
-            what is installed, ask the consent gate, run the receipted install, record the lock row.
+            tiers (INV-S9) -- except on a LEAN install (bin/lib/hmd_profile.py get): there the bundled entries it leaves out
+            (on_demand_paths or a pack: stacks, designmatch, mac-deep-clean, system-health, self-improve), until `install` puts
+            them back, are a block of their own after the project's, each `[on demand]`, so the first line (the count the session
+            nudge reads) stays the project's. It makes no `claude` or `git` call and writes nothing; --reset first moves every
+            declined row of the project and machine locks back to suggested.
+  install   the single consented install path. Per id: refuse what hmd does not install (install:false, a bundled entry that names no
+            path, unknown), skip what is installed, ask the consent gate, run the receipted install, record the lock row.
               consent   hmd_skills_consent ID hmd-skills-install (bin/lib/skills_consent.sh) decides: this module never
                         decides consent itself. --yes is "the person already said yes" (HMD_SKILLS_YES=1 for the gate). An entry
                         whose manifest says explicit_consent is asked EVERY time (the gate runs with HMD_SKILLS_CONSENT=ask, so
@@ -30,6 +33,16 @@ commands (list, why, lock) are skills_cli_read.py; bin/heimdall-skills dispatche
                         HMD_INSTALL_WHY_EVIDENCE win). The lock is bookkeeping: a row that cannot be written is said on stderr and
                         the install result stands.
             --recommended does that for every recommended entry that is not installed, one gate question each.
+            A BUNDLED entry that a lean tree leaves out (lean core, task T3.2 of docs/superpowers/plans/2026-11-12-3x-lean-core.md: the
+            manifest gives it on_demand_paths and/or a pack, rules SM12 and SM13) is PUT BACK, not installed. After the same consent gate
+              put back  `bin/lib/lean_sparse.sh add PATH` for each of its paths (on_demand_paths, then pack.paths), from the objects the
+                        clone already holds, so it needs no network (INV-L4). Nothing is fetched or run: there is no receipt line. A path
+                        put back before a later one fails stays; on a full tree the script says there is nothing to do. It is listed from
+                        the next session, like any plugin.
+              lock      ONE row in the MACHINE lock (the clone is the machine's, and bin/lib/skills_packs.py reads no other lock): state
+                        installed (or failed), kind bundled, the entry's ref, source bundled, the consent basis, why.rule explicit, and for
+                        a pack its version and its full sha256 as content_hash: the pin an installed pack must match to be read instead of
+                        the bundled copy (INV-L5; that copy is never removed).
   consent   prints, or with a mode sets, `consent` in $HEIMDALL_HOME/skills-config.json. The operator's HMD_SKILLS_CONSENT beats
             the file; setting a mode it overrides says so on stderr.
   allow     adds a manifest id to the allowlist of that file (it is used in allowlist mode).
@@ -53,6 +66,7 @@ import tempfile
 sys.dont_write_bytecode = True  # importing the sibling modules must not leave a .pyc in the plugin directory
 LIB_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, LIB_DIR)  # python3 -I keeps the script's directory off sys.path
+import hmd_profile  # noqa: E402
 import skills_config  # noqa: E402
 import skills_lock  # noqa: E402
 import skills_resolver  # noqa: E402
@@ -60,8 +74,10 @@ import skills_resolver  # noqa: E402
 MANIFEST = os.path.normpath(os.path.join(LIB_DIR, "..", "..", "skills.manifest.json"))
 CONSENT_SH = os.path.join(LIB_DIR, "skills_consent.sh")
 RECEIPT_SH = os.path.join(LIB_DIR, "install-receipt.sh")
+LEAN_SPARSE_SH = os.path.join(LIB_DIR, "lean_sparse.sh")
 VIA = "hmd-skills-install"
 SCOPE = "project"
+MACHINE = "machine"
 MODES = ("ask", "allowlist", "auto")
 GATE_DEFER, GATE_DECLINED = 10, 11
 EXIT = {"installed": 0, "already": 0, "failed": 1, "refused": 2, "deferred": 3, "declined": 4}
@@ -80,6 +96,7 @@ case "$2" in
 esac
 '''
 RECEIPT_SCRIPT = '. "$1" && hmd_install_receipt_file'
+SPARSE_SCRIPT = 'exec bash "$1" add "$2"'
 _reported = set()
 
 
@@ -101,17 +118,31 @@ def run_bash(script, args, env, capture=False):
 
 # ---- what the manifest and the machine say ----------------------------------------------------------------------------
 
+def sparse_paths(entry):
+    """The tree paths that put a bundled entry back into a lean clone: its on_demand_paths, then its pack's paths (the manifest has checked
+    that each is one literal path: SM12, SM13). Empty for every entry a lean tree does not leave out."""
+    paths = list(entry.get("on_demand_paths", [])) + list(entry.get("pack", {}).get("paths", []))
+    return list(dict.fromkeys(paths))
+
+
 def installable(entry):
-    return entry["install"] is True and entry["kind"] in ("plugin", "github-skill")
+    """What `install` can do for the entry: a receipted plugin or skill install, or the put-back of a bundled skill a lean tree leaves out."""
+    return (entry["install"] is True and entry["kind"] in ("plugin", "github-skill")) or bool(sparse_paths(entry))
 
 
 def ref_of(entry):
-    return entry["ref"] if entry["kind"] == "plugin" else entry["repo"]
+    if entry["kind"] == "plugin":
+        return entry["ref"]
+    if entry["kind"] == "bundled":
+        return entry.get("ref") or entry["id"]  # the in-tree path, as skills_cli_read.entry_ref gives it
+    return entry["repo"]
 
 
 def source_of(doc, entry):
     if entry["kind"] == "plugin":
         return doc["marketplaces"].get(entry["marketplace"], {}).get("source", "unknown")
+    if entry["kind"] == "bundled":
+        return "bundled"  # as skills_cli_read.declared gives it
     return "github.com/" + entry["repo"]
 
 
@@ -172,22 +203,27 @@ def record(argv, scope=SCOPE):
 
 
 def write_row(doc, entry, state, basis, receipt):
-    """The project-lock row of an install this command attempted: installed or failed, with the consent the gate gave."""
+    """The lock row of an install this command attempted: installed or failed, with the consent the gate gave. A put-back is a MACHINE row
+    (the clone it restores is the machine's, and skills_packs.py reads no other lock); every other install is a project row."""
     ident = entry["id"]
     receipt = receipt or {}
+    pack = entry.get("pack")
+    scope = MACHINE if sparse_paths(entry) else SCOPE
     argv = ["--id=" + ident, "--state=" + state, "--kind=" + entry["kind"], "--ref=" + ref_of(entry), "--consent=" + basis,
             "--via=" + VIA, "--source=" + (receipt.get("source") or source_of(doc, entry))]
     if state == "installed":
-        version = receipt.get("version") or "unknown"
+        version = receipt.get("version") or (pack or {}).get("version") or "unknown"
         argv += ["--version=" + version, "--pin=" + (receipt.get("pin") or "none")]
         if entry["kind"] == "github-skill" and skills_lock.HASH_RE.fullmatch(version):
             argv.append("--content-hash=" + version)  # the commit that was cloned
-    rule = os.environ.get("HMD_INSTALL_WHY_RULE") or ("" if any(row["id"] == ident for row in lock_rows(SCOPE)) else "explicit")
+        if pack:
+            argv.append("--content-hash=" + pack["sha256"])  # the build a pack under $HEIMDALL_HOME/packs must be to be read instead of the bundled copy
+    rule = os.environ.get("HMD_INSTALL_WHY_RULE") or ("" if any(row["id"] == ident for row in lock_rows(scope)) else "explicit")
     if rule:  # a row that exists keeps the rule (and evidence) of the trigger that suggested it
         argv.append("--rule=" + rule)
     if os.environ.get("HMD_INSTALL_WHY_EVIDENCE"):
         argv.append("--evidence=" + os.environ["HMD_INSTALL_WHY_EVIDENCE"])
-    if record(argv) != 0:
+    if record(argv, scope) != 0:
         warn("the lock row for %s (%s) could not be written; the install result stands" % (ident, state))
 
 
@@ -235,8 +271,24 @@ def ask_consent(entry, yes):
     return {GATE_DEFER: "deferred", GATE_DECLINED: "declined"}.get(status, "error"), "n/a"
 
 
+def sparse_add(entry, env):
+    """`lean_sparse.sh add PATH` for each path of a bundled entry -> 0, or the first status that is not 0 (the script says why on stderr).
+    It reads objects the clone already holds, so no network is involved (INV-L4); a path put back stays when a later one fails."""
+    if not os.path.isfile(LEAN_SPARSE_SH):
+        warn("%s is missing, so nothing can be put back" % LEAN_SPARSE_SH)
+        return 1
+    for path in sparse_paths(entry):
+        status = run_bash(SPARSE_SCRIPT, [LEAN_SPARSE_SH, path], env).returncode
+        if status:
+            return status
+    return 0
+
+
 def run_install(entry, env):
-    """The receipted install of one entry -> (exit status, the receipt record it wrote or None)."""
+    """The install of one entry -> (exit status, the receipt record it wrote or None). A bundled entry is put back with no receipt line:
+    nothing is fetched or run, and its lock row is the record."""
+    if sparse_paths(entry):
+        return sparse_add(entry, env), None
     found = run_bash(RECEIPT_SCRIPT, [RECEIPT_SH], env, capture=True)
     path = found.stdout.decode("utf-8", "replace").strip() if found.returncode == 0 else ""
     offset = os.path.getsize(path) if path and os.path.exists(path) else 0
@@ -252,7 +304,7 @@ def run_install(entry, env):
 def install_one(doc, entry, yes, present):
     """One entry through the whole path -> installed, already, refused, deferred, declined or failed."""
     ident = entry["id"]
-    if entry["kind"] == "bundled":
+    if entry["kind"] == "bundled" and not sparse_paths(entry):
         warn("%s ships with hmd: nothing to install" % ident)
         return "refused"
     if not installable(entry):
@@ -270,11 +322,13 @@ def install_one(doc, entry, yes, present):
     status, receipt = run_install(entry, dict(os.environ))
     if status != 0:
         write_row(doc, entry, "failed", basis, None)
-        warn("install failed for %s (the line above says why; the receipt has it too)" % ident)
+        warn("install failed for %s (%s)" % (ident, "the lines above say why" if sparse_paths(entry) else "the line above says why; the receipt has it too"))
         return "failed"
     write_row(doc, entry, "installed", basis, receipt)
     present.add(ident)
     print("installed %s (%s, consent %s)" % (ident, ref_of(entry), basis))
+    if sparse_paths(entry):
+        print("%s is back on disk; it is listed from the next session" % " ".join(sparse_paths(entry)))
     return "installed"
 
 
@@ -319,6 +373,25 @@ def reset_declined():
     return moved
 
 
+def lean_install():
+    """True when this machine runs the lean profile (bin/lib/hmd_profile.py get: no file, or one it cannot use, reads as full)."""
+    return hmd_profile.resolve() == "lean"
+
+
+def left_out(doc, present):
+    """The bundled entries a lean install leaves out and this machine does not have back: those `install` puts back (on_demand_paths or a pack) whose id is not in
+    `present`. Empty on a full install, where nothing was left out."""
+    if not lean_install():
+        return []
+    return [entry for entry in doc["entries"] if entry["kind"] == "bundled" and sparse_paths(entry) and entry["id"] not in present]
+
+
+def shown_why(entry):
+    """The manifest's why as one clause for a person: cut where it turns to "ships in-tree, never installed" (true of the entry, wrong as an offer), and without
+    the name of the coding agent underneath, which user-facing text never says."""
+    return re.sub(r"\bClaude(?: Code)?\b\s*", "", entry["why"].split("; ")[0]).strip()
+
+
 def cmd_suggest(args):
     doc = skills_resolver.load_manifest(MANIFEST)
     if args.reset:
@@ -341,6 +414,8 @@ def cmd_suggest(args):
             held_back += 1
         else:
             shown.append((entry, label))
+    put_back = [entry for entry in left_out(doc, present) if entry["id"] not in declined]
+    held_back += len(left_out(doc, present)) - len(put_back)
     if shown:
         print("%d skill(s) suggested for this project (this command installs nothing):" % len(shown))
         for entry, label in shown:
@@ -348,6 +423,10 @@ def cmd_suggest(args):
         print("install one: hmd skills install ID    the recommended set: hmd skills install --recommended")
     else:
         print("no skills to suggest: what is recommended here is installed or declined")
+    if put_back:
+        print("%d bundled skill(s) this lean install leaves out (hmd skills install ID puts one back from this copy; nothing is downloaded):" % len(put_back))
+        for entry in put_back:
+            print("  %s  [on demand]  %s" % (entry["id"], shown_why(entry)))
     if held_back:
         print("%d declined (hmd skills suggest --reset asks again)" % held_back)
     return 0

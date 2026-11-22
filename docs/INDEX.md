@@ -18,6 +18,7 @@ The single map of Heimdall's knowledge tree. Every committed Markdown doc earns 
 | [../NAMING.md](../NAMING.md) | Canonical name list (runhmd product, `hmd` CLI, Heimdall engine) with every codename mapped to a subcommand or internal; checked against the code by `test/naming.test.sh`. | Load-bearing |
 | [../PARKED.md](../PARKED.md) | What is deliberately not being built now (plan section 16) and the feature-freeze rule that feeds it. | Current |
 | [INSTALL.md](INSTALL.md) | Install disclosure — the three paths, what the installer writes, what leaves the machine, the Headroom proxy, self-maintenance. Moved out of the README. | Load-bearing |
+| [lean-core.md](lean-core.md) | Lean core — what a lean install moves out, `hmd lean` and `hmd reinstall --reset`, rollback, the Headroom and route behaviour, what is not lean yet. | Current (2026-11-22) |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Architecture and capabilities moved out of the README — gates, `rr`, modules, statusline, the Cursor host, the reproducible numbers. | Load-bearing |
 | [superpowers/specs/2026-07-06-teams-growth-strategy.md](superpowers/specs/2026-07-06-teams-growth-strategy.md) | Heimdall Teams growth strategy (Slack-playbook → Cursor-for-teams revenue). | Current (draft) |
 | [../DECISION-GATE.md](../DECISION-GATE.md) | Pre-launch decision gate — written before launch, frozen. | Reference |

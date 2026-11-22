@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://runhmd.dev/schemas/skills.manifest.v1.json",
   "title": "skills.manifest/1",
-  "description": "The skills manifest: ONE source for every skill and plugin hmd knows about, skills.manifest.json in the repo root. It is to replace heimdall-skills.json (which plugins a project activates), skills-registry.json (GitHub skills matched by keyword) and the auto-install table of skills/heimdall/references/plugin-autoinstall.md with the preinstall code that implements it; while the flag skills.registry is off those three stay authoritative and the manifest only records them, every legacy mapping once, each with a legacy[] pointer to where it came from. THIS FILE AND bin/lib/skills_manifest.py STATE ONE CONTRACT: the validator holds the rules in code and never reads this file at run time (a sandbox that copies bin/lib alone still validates), and test/skills-manifest-schema.test.sh fails when the version, kinds, tiers, patterns or key sets of the two differ. The keywords used here are the subset docs/schemas/runhmd.*.v1.json already uses; JSON Schema cannot express cross-field rules, so `x-invariants` lists the extra rules the validator enforces. WHAT AN ENTRY IS: kind plugin (a Claude Code plugin, ref <plugin>@<marketplace>), github-skill (cloned from GitHub, matched by keywords) or bundled (ships in-tree, never installed). tier says how it is offered: bundled (in-tree), recommended (suggested to a new install, installed only on consent), detected (offered when the project's files or the prompt call for it), on_demand (kept for an explicit request), community (reserved: never auto-suggested). install false marks an activation-only entry that hmd never installs. A marketplace outside the allow-list can therefore appear on an install:false entry and nowhere else.",
+  "description": "The skills manifest: ONE source for every skill and plugin hmd knows about, skills.manifest.json in the repo root. It is to replace heimdall-skills.json (which plugins a project activates), skills-registry.json (GitHub skills matched by keyword) and the auto-install table of skills/heimdall/references/plugin-autoinstall.md with the preinstall code that implements it; while the flag skills.registry is off those three stay authoritative and the manifest only records them, every legacy mapping once, each with a legacy[] pointer to where it came from. THIS FILE AND bin/lib/skills_manifest.py STATE ONE CONTRACT: the validator holds the rules in code and never reads this file at run time (a sandbox that copies bin/lib alone still validates), and test/skills-manifest-schema.test.sh fails when the version, kinds, tiers, patterns or key sets of the two differ. The keywords used here are the subset docs/schemas/runhmd.*.v1.json already uses; JSON Schema cannot express cross-field rules, so `x-invariants` lists the extra rules the validator enforces. WHAT AN ENTRY IS: kind plugin (a Claude Code plugin, ref <plugin>@<marketplace>), github-skill (cloned from GitHub, matched by keywords) or bundled (ships in-tree, never installed). tier says how it is offered: bundled (in-tree), recommended (suggested to a new install, installed only on consent), detected (offered when the project's files or the prompt call for it), on_demand (kept for an explicit request), community (reserved: never auto-suggested). install false marks an activation-only entry that hmd never installs. A marketplace outside the allow-list can therefore appear on an install:false entry and nowhere else. OPTIONAL pack AND on_demand_paths (lean core) belong to bundled entries only: pack describes the in-tree content as a hash-pinned pack (name, version, the full sha256, the tree paths it covers) and on_demand_paths lists the tree paths a lean install leaves out and adds on request; a manifest that uses neither is valid and means what it always meant.",
   "x-invariants": [
     {"id": "SM1", "applies_to": "skills.manifest/1", "rule": "schema is the integer 1: not 1.0, not true, not a string; any other version is a different contract"},
     {"id": "SM2", "applies_to": "skills.manifest/1", "rule": "entry ids are unique"},
@@ -13,8 +13,10 @@
     {"id": "SM7", "applies_to": "skills.manifest/1", "rule": "an entry of kind bundled or tier bundled never has install true"},
     {"id": "SM8", "applies_to": "skills.manifest/1", "rule": "a plugin entry has ref and marketplace; a github-skill entry has repo, keywords, category and description; marketplace is null or absent on every other kind"},
     {"id": "SM9", "applies_to": "skills.manifest/1", "rule": "references resolve: detection_rules.*.entries name existing entry ids, activate.detect names existing detection_rules keys, keyword_skills names existing github-skill entries"},
-    {"id": "SM10", "applies_to": "skills.manifest/1", "rule": "every path or glob (triggers.files[].path, detection_rules.*.files[]) is project-relative: no leading slash and no .. segment"},
-    {"id": "SM11", "applies_to": "skills.manifest/1", "rule": "free text (why, description, category, keywords, ref, legacy pointers) is non-blank and single-line; the document is strict JSON of at most 1 MiB with no duplicate object keys"}
+    {"id": "SM10", "applies_to": "skills.manifest/1", "rule": "every path or glob (triggers.files[].path, detection_rules.*.files[], pack.paths[], on_demand_paths[]) is project-relative: no leading slash and no .. segment"},
+    {"id": "SM11", "applies_to": "skills.manifest/1", "rule": "free text (why, description, category, keywords, ref, legacy pointers) is non-blank and single-line; the document is strict JSON of at most 1 MiB with no duplicate object keys"},
+    {"id": "SM12", "applies_to": "skills.manifest/1", "rule": "pack, when present, has exactly name, version, sha256 and paths: name is @<scope>/<name> (scope and name each match the id pattern), version is MAJOR.MINOR.PATCH with an optional -prerelease, sha256 is the full content hash (64 lowercase hex digits: no prefix, no truncation, no upper case) and paths is a non-empty array of install paths"},
+    {"id": "SM13", "applies_to": "skills.manifest/1", "rule": "pack and on_demand_paths appear on bundled entries only (in-tree content); on_demand_paths is a non-empty array; every install path in them (pack.paths[], on_demand_paths[]) is one literal tree path: segments of letters, digits, '.', '_' and '-' joined by '/', each starting with a letter, digit or '_', so no glob, no leading '-', no hidden or '.' segment, no empty segment and no trailing slash"}
   ],
   "type": "object",
   "additionalProperties": false,
@@ -50,6 +52,10 @@
     "pin": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"},
     "text": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000-\\u001f\\u007f]+$"},
     "relpath": {"type": "string", "minLength": 1, "maxLength": 256},
+    "installPath": {"description": "A literal tree path, it ends up in a sparse-checkout command: segments of letters, digits, '.', '_' and '-' joined by '/', each starting with a letter, digit or '_' (no glob, no leading '-', no hidden or '.' segment, no empty segment, no trailing slash).", "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$"},
+    "packName": {"type": "string", "pattern": "^@[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}$"},
+    "packVersion": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]{1,32})?$"},
+    "sha256": {"description": "The full content hash: 64 lowercase hex digits, no prefix, no truncation.", "type": "string", "pattern": "^[0-9a-f]{64}$"},
     "marketplace": {
       "type": "object",
       "additionalProperties": false,
@@ -108,6 +114,18 @@
         "entries": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/id"}}
       }
     },
+    "pack": {
+      "description": "The in-tree content of a bundled entry as a pack: name @<scope>/<name>, version MAJOR.MINOR.PATCH with an optional -prerelease, the full sha256 of the pack's content and the tree paths it covers.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "sha256", "paths"],
+      "properties": {
+        "name": {"$ref": "#/$defs/packName"},
+        "version": {"$ref": "#/$defs/packVersion"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "paths": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/installPath"}}
+      }
+    },
     "entry": {
       "type": "object",
       "additionalProperties": false,
@@ -132,7 +150,9 @@
         "repo": {"description": "github-skill entries: the GitHub owner/repo it is cloned from.", "$ref": "#/$defs/ownerRepo"},
         "keywords": {"description": "github-skill entries: matched as whole words against the prompt.", "type": "array", "minItems": 1, "items": {"$ref": "#/$defs/text"}},
         "category": {"$ref": "#/$defs/text"},
-        "description": {"$ref": "#/$defs/text"}
+        "description": {"$ref": "#/$defs/text"},
+        "pack": {"description": "bundled entries only: the in-tree content as a hash-pinned pack.", "$ref": "#/$defs/pack"},
+        "on_demand_paths": {"description": "bundled entries only: the tree paths a lean install leaves out of the working tree and adds on request.", "type": "array", "minItems": 1, "items": {"$ref": "#/$defs/installPath"}}
       }
     }
   }

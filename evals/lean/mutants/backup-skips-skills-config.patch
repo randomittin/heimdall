@@ -1,0 +1,16 @@
+mutant: backup-skips-skills-config
+gate:   test/lean-backup-restore.test.sh (INV-L9)
+defect: the backup leaves skills-config.json out, so a restore cannot bring back the consent and grandfathering a reset changed
+applied by test/lean-gate-falsify.test.sh to a temp snapshot of the tree, never to a worktree
+
+--- a/bin/lib/lean_backup.py
++++ b/bin/lib/lean_backup.py
+@@ -48,7 +48,7 @@
+ SCHEMA = 1
+ MAX_FILE = 8 * 1024 * 1024
+ SETTINGS_ID = "settings"
+-HOME_FILES = ("skills-config.json", "profile.json")
++HOME_FILES = ("profile.json",)
+ MODULE_FACTS = ("receipt.json", "wired.json", "invariants.json")
+ MODSTATE_FACTS = ("optout.json", "failure.json", "deferred.json")
+ USER_DATA = ("ledger", "receipts", "memory", "team", "team.json", "pairing", "pairing.json", "data", "pki")

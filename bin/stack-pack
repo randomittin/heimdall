@@ -5,10 +5,13 @@
 # Stack specialization ships as KNOWLEDGE PACKS loaded onto existing role agents,
 # never as new role x stack agents. A pack is a Markdown file of conventions,
 # directory layout, lint/test/build commands, acceptance-criteria templates, and
-# failure patterns living at skills/stacks/<stack-id>/PACK.md inside the plugin.
+# failure patterns living at skills/stacks/<stack-id>/PACK.md inside the plugin
+# (or in the installed pack of the stacks: see stacks_dir below).
 #
 # Layering (cold-start scaffold -> per-repo refinement):
-#   1. Base pack    skills/stacks/<id>/PACK.md   — generic, plugin-shipped scaffold
+#   1. Base pack    <stacks dir>/<id>/PACK.md    — generic scaffold: the installed pack of the stacks
+#                   ($HEIMDALL_HOME/packs/stacks) when the machine lock pins exactly that build,
+#                   else the plugin-shipped skills/stacks
 #   2. Repo refine  .planning/skills/*.md        — learned, repo-specific overrides
 # Agents read base packs first, then layer repo refinements on top.
 set -euo pipefail
@@ -34,8 +37,13 @@ Commands:
   --help          Show this help.
 
 Resolution:
-  Base packs resolve via CLAUDE_PLUGIN_ROOT (or the plugin dir containing this
-  script) at: <plugin>/skills/stacks/<stack-id>/PACK.md
+  Base packs are read from the installed pack of the stacks,
+  $HEIMDALL_HOME/packs/stacks (default ~/.heimdall), when that pack is exactly the
+  build the machine lock, $HEIMDALL_HOME/skills.lock, pins. In every other state
+  (no pack, a changed file, no lock row, no python3) they are read from the
+  bundled copy, silently, never as an error. The bundled copy resolves via
+  CLAUDE_PLUGIN_ROOT (or the plugin dir containing this script) at:
+  <plugin>/skills/stacks/<stack-id>/PACK.md
   Repo refinements come from <PATH>/.planning/skills/*.md and layer on top.
 EOF
 }
@@ -75,6 +83,25 @@ parse_stacks() {
   fi
 }
 
+# Which copy of skills/stacks the base packs are read from: the installed pack,
+# $HEIMDALL_HOME/packs/stacks, when it is exactly the build the machine lock pins,
+# else the bundled <plugin>/skills/stacks. bin/lib/skills_packs.py decides, once for
+# the whole directory (docs/superpowers/plans/2026-11-12-3x-lean-core.md T2.1, T3.1).
+# INV-L5: every way a pack cannot be used (no pack, a changed byte, no lock row, no
+# python3, a resolver that fails or answers anything but an absolute path) is the
+# bundled copy, SILENTLY, never an error. A stack the chosen copy lacks has no base
+# pack, as it never had one when the bundled copy lacked it.
+stacks_dir() {
+  local resolver="$BIN_DIR/lib/skills_packs.py" dir=""
+  if [ -f "$resolver" ] && command -v python3 >/dev/null 2>&1; then
+    dir="$(CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" python3 -B -I -S "$resolver" resolve stacks 2>/dev/null)" || dir=""
+  fi
+  case "$dir" in
+    /*) printf '%s\n' "$dir" ;;
+    *) printf '%s\n' "$PLUGIN_ROOT/skills/stacks" ;;
+  esac
+}
+
 case "$CMD" in
   detect)
     run_detect
@@ -84,10 +111,13 @@ case "$CMD" in
     DETECT_JSON="$(run_detect)"
     found_any=0
 
-    # 1. Base packs from the plugin (cold-start scaffold).
+    # 1. Base packs (cold-start scaffold): resolved at the first detected stack, so a
+    #    tree with no stack signal never starts python.
+    STACKS_DIR=""
     while IFS= read -r stack; do
       [ -n "$stack" ] || continue
-      pack="$PLUGIN_ROOT/skills/stacks/$stack/PACK.md"
+      [ -n "$STACKS_DIR" ] || STACKS_DIR="$(stacks_dir)"
+      pack="$STACKS_DIR/$stack/PACK.md"
       if [ -f "$pack" ]; then
         printf '%s\n' "$pack"
         found_any=1

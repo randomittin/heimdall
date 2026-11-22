@@ -38,6 +38,12 @@
 #                               fail-CLOSED UserPromptSubmit hook; see
 #                               ensure_claude_mem_plugin_retired below)
 #
+# Flags:
+#   --reset             switch an EXISTING install to the lean profile, in place: route guard, backup
+#                       first, lean tree, Headroom off for the NEXT session, and the command that undoes
+#                       it printed last (lean_reset below). Never wipes ~/.heimdall: user data lives there.
+#                       Without it nothing here changes: a plain run is the upgrade it always was.
+#
 set -euo pipefail
 
 # ── Pure helpers (defined before main runs them) ────────────────────────────
@@ -953,6 +959,230 @@ install_hmd_plugin() {
   return "$rc"
 }
 
+# ── Lean reset: `install.sh --reset` (3.x lean-core plan, T4.4: docs/superpowers/plans/2026-11-12-3x-lean-core.md) ───────────────────
+# An EXISTING install becomes lean, in place, on request. It runs only for --reset and only after the fetch, so a plain run is untouched (INV-L8).
+# It never removes a file: ~/.heimdall is both the plugin clone and the home of the user's ledger, receipts, memory, team, pairing and data/, which
+# sparse-checkout and the one-key `set` helpers leave alone (INV-L10); `hmd --reinstall`, which wipes that directory, is not how this works.
+# lean_reset only SEQUENCES helpers that carry their own proofs:
+#   1 route guard   2 backup   3 consent ask + not grandfathered   4 profile lean   5 lean tree   6 lean prompt   7 Headroom off   8 the undo command
+# Steps 5 and 7 are the two a live session can feel, and step 4 travels with step 5: a plain `install.sh` run applies the RECORDED profile (T3.4,
+# INV-L7), so a `lean` recorded beside a full tree would narrow that tree under the live session on the next plain run, earlier than "next session".
+# When THIS session is routed through Headroom (the guard says defer, INV-L11) steps 4, 5 and 7 are left for the next run: named on stdout, recorded
+# in <runtime home>/backups/lean-reset-pending, never skipped silently, and no profile is recorded until the tree step runs (the install reads `full`,
+# which a plain run leaves alone: INV-L8). The next `--reset` records the profile and applies the tree together and keeps that FIRST backup, so the
+# printed undo still returns the install to what it was before the reset began. A guard that cannot tell (refuse), a library this release lacks, or a
+# backup that fails stops before anything changes. A failed 3 or 4 stops the reset (the install would be half converted) and prints the undo. A failed
+# 5, 6 or 7 warns and the install carries on: lean never costs an install. The `claude` wrapper (the hmd launcher) is kept and no proxy is installed
+# or routed (INV-L12); Headroom is only ever switched OFF, by its own CLI, and never for the live session.
+
+# lean_reset_record RECORD BACKUP [STEP...] -- the unfinished-reset record: the backup to keep and the steps still pending, one key=value per line
+lean_reset_record() {
+  local record="$1" bdir="$2" step
+  shift 2
+  { printf 'backup=%s\n' "$bdir"; for step in "$@"; do printf 'pending=%s\n' "$step"; done; } > "$record.tmp" && mv "$record.tmp" "$record"
+}
+
+# lean_reset_prompt PLUGIN_DIR -- step 6: select the lean main prompt (`agent: hmd:heimdall-lean` in the USER-level Claude settings, which outranks the
+# plugin's own settings.json agent: docs/analysis/2026-11-12-lean-agent-override.md, the namespaced form is the one that memo verified) ONLY when this
+# release ships agents/heimdall-lean.md AND its prompt-parity receipt (evals/lean/prompt-parity.receipt.json: "verdict": "green" and "lean_prompt_sha256",
+# the sha256 of that very prompt, so a green receipt cannot vouch for an edited one) is green. Both are read at HEAD of the clone, not from the work
+# tree: the lean tree itself drops evals/. Prints ONE state word, the pattern of ensure_statusline_registered:
+#   no-prompt | not-green | selected | current | kept-custom (the user's own agent) | skipped (settings.json unreadable or unwritable)
+# settings.json is only ever merged into: every other key, its indent and its mode stay.
+lean_reset_prompt() {
+  HMD_LR_PLUGIN="$1" HMD_LR_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
+    python3 -I - <<'PY' || printf 'skipped'
+import hashlib, json, os, stat, subprocess, sys, tempfile
+
+PROMPT = "agents/heimdall-lean.md"
+RECEIPT = "evals/lean/prompt-parity.receipt.json"
+AGENT = "hmd:heimdall-lean"
+OURS = (AGENT, "heimdall-lean", "hmd:heimdall", "heimdall")
+plugin = os.environ["HMD_LR_PLUGIN"]
+path = os.path.realpath(os.environ["HMD_LR_SETTINGS"])
+git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
+def at_head(rel):
+    done = subprocess.run(["git", "-C", plugin, "cat-file", "blob", "HEAD:" + rel], capture_output=True, env=git_env)
+    return done.stdout if done.returncode == 0 else None
+
+
+def say(word):
+    print(word)
+    sys.exit(0)
+
+
+prompt = at_head(PROMPT)
+if prompt is None:
+    say("no-prompt")
+try:
+    receipt = json.loads(at_head(RECEIPT) or b"")
+except (ValueError, RecursionError):
+    receipt = None
+if not (isinstance(receipt, dict) and receipt.get("verdict") == "green"
+        and receipt.get("lean_prompt_sha256") == hashlib.sha256(prompt).hexdigest()):
+    say("not-green")
+try:
+    with open(path, encoding="utf-8") as fh:
+        raw = fh.read()
+except FileNotFoundError:
+    raw = None
+except (OSError, UnicodeDecodeError):
+    say("skipped")
+data = {}
+if raw is not None:
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        data = None
+    if not isinstance(data, dict):
+        say("skipped")
+current = data.get("agent")
+if current == AGENT:
+    say("current")
+if current is not None and current not in OURS:
+    say("kept-custom")
+data["agent"] = AGENT
+indent = "  "
+for line in (raw or "").splitlines():
+    if line[:1] in (" ", "\t"):
+        indent = line[: len(line) - len(line.lstrip(" \t"))]
+        break
+text = json.dumps(data, indent=indent, ensure_ascii=False) + ("\n" if raw is None or raw.endswith("\n") else "")
+tmp = ""
+try:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".settings.", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    if raw is not None:
+        os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+    os.replace(tmp, path)
+except OSError:
+    if tmp and os.path.exists(tmp):
+        os.unlink(tmp)
+    say("skipped")
+say("selected")
+PY
+}
+
+# lean_reset PLUGIN_DIR RUNTIME_HOME -- 0 = done (steps 4, 5 and 7 may be pending), 1 = stopped (the reason is on stderr, the install is not left half converted)
+lean_reset() {
+  local plugin="$1" rt="$2"
+  local lib="$1/bin/lib" headroom="$1/bin/heimdall-headroom" record="$2/backups/lean-reset-pending"
+  local guard="$lib/lean_route_guard.sh" backup="$lib/lean_backup.py" config="$lib/skills_config.py" profile="$lib/hmd_profile.py" sparse="$lib/lean_sparse.sh"
+  local f g_out g_rc word rc=0 bdir="" pending="" undo="" envp="" deferred=0
+  printf '   Lean reset (install.sh --reset)\n'
+  command -v python3 >/dev/null 2>&1 || { printf '  ✗ hmd: --reset needs python3 (nothing was changed)\n' >&2; return 1; }
+  for f in "$guard" "$backup" "$config" "$profile" "$sparse"; do
+    [ -f "$f" ] || { printf '  ✗ hmd: --reset needs %s and this release does not ship it (nothing was changed)\n' "${f#"$plugin"/}" >&2; return 1; }
+  done
+
+  # 1/8 route guard: exit 0 + `ok:` proceeds, 10 + `defer:` leaves steps 4, 5 and 7 for the next run, anything else (11 refuse, a crash, a verdict that
+  # does not match its exit status) fails closed before a byte changes
+  g_out="$(bash "$guard" check)" && g_rc=0 || g_rc=$?
+  case "$g_rc:$g_out" in
+    0:ok:*) ;;
+    10:defer:*) deferred=1 ;;
+    *) printf '  ✗ hmd: --reset refused, nothing was changed: %s\n' "${g_out:-the route guard gave no answer (exit $g_rc)}" >&2; return 1 ;;
+  esac
+  printf '   1/8 route guard: %s\n' "$g_out"
+
+  # 2/8 backup: first, and only once per unfinished reset (a re-run keeps the backup of what the install was before the reset began)
+  if [ -f "$record" ]; then bdir="$(sed -n 's/^backup=//p' "$record" | head -1)" || bdir=""; fi
+  if [ -n "$bdir" ] && [ -f "$bdir/manifest.json" ]; then
+    printf '   2/8 backup: kept from the unfinished reset: %s\n' "$bdir"
+  else
+    bdir="$(HEIMDALL_HOME="$rt" python3 -I "$backup" backup)" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] || [ ! -f "$bdir/manifest.json" ]; then
+      printf '  ✗ hmd: --reset could not take its backup, nothing was changed\n' >&2
+      return 1
+    fi
+    printf '   2/8 backup: %s\n' "$bdir"
+  fi
+  if [ -n "${HEIMDALL_HOME:-}" ]; then envp="HEIMDALL_HOME=$(printf '%q' "$rt") "; fi
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then envp="${envp}CLAUDE_CONFIG_DIR=$(printf '%q' "$CLAUDE_CONFIG_DIR") "; fi
+  undo="${envp}hmd lean restore $(printf '%q' "$bdir")"
+  lean_reset_record "$record" "$bdir" || printf '  ⚠ hmd: could not write %s\n' "$record" >&2
+
+  # 3/8 consent ask + grandfathered false: M1's `init` refuses to touch an existing file, so `set` is how a reset changes it
+  if HEIMDALL_HOME="$rt" python3 -I "$config" set grandfathered false && HEIMDALL_HOME="$rt" python3 -I "$config" set consent ask; then
+    printf '   3/8 consent: ask, not grandfathered\n'
+  else
+    printf '  ✗ hmd: --reset could not update skills-config.json and stopped there; to go back: %s\n' "$undo" >&2
+    return 1
+  fi
+
+  # 4/8 profile lean: recorded before the tree changes, as `hmd lean on` does. Not while the guard defers: the recorded profile is what a plain install.sh
+  # run re-applies (T3.4, INV-L7), so `lean` on record beside a full tree would narrow it under this session on the next plain run. The next --reset records
+  # it together with the tree, and until then the install reads `full`.
+  if [ "$deferred" -eq 1 ]; then
+    pending="$pending lean-profile"
+    printf '   4/8 profile: PENDING, this session is routed through Headroom (the next --reset records lean and applies the tree together)\n'
+  elif HEIMDALL_HOME="$rt" python3 -I "$profile" set lean; then
+    printf '   4/8 profile: lean\n'
+  else
+    printf '  ✗ hmd: --reset could not record the lean profile and stopped there; to go back: %s\n' "$undo" >&2
+    return 1
+  fi
+
+  # 5/8 lean tree
+  if [ "$deferred" -eq 1 ]; then
+    pending="$pending lean-tree"
+    printf '   5/8 lean tree: PENDING, this session is routed through Headroom (the next --reset applies it)\n'
+  elif bash "$sparse" apply lean "$plugin" >/dev/null; then
+    printf '   5/8 lean tree: applied (the on-demand parts stay in git)\n'
+  else
+    pending="$pending lean-tree"
+    printf '  ⚠ hmd: the lean tree was not applied, the full tree is kept (the next --reset or `hmd lean on` tries again)\n' >&2
+    printf '   5/8 lean tree: PENDING, the apply failed\n'
+  fi
+
+  # 6/8 lean prompt
+  word="$(lean_reset_prompt "$plugin")" || word=skipped
+  case "$word" in
+    selected)    printf '   6/8 lean prompt: selected (agent hmd:heimdall-lean in the user settings, from the next session)\n' ;;
+    current)     printf '   6/8 lean prompt: already selected\n' ;;
+    kept-custom) printf '   6/8 lean prompt: skipped, the user settings already name another agent (kept)\n' ;;
+    not-green)   printf '   6/8 lean prompt: skipped, this release has no green prompt-parity receipt for it\n' ;;
+    no-prompt)   printf '   6/8 lean prompt: skipped, this release ships no lean prompt\n' ;;
+    *)           printf '   6/8 lean prompt: skipped, the user settings could not be updated\n' ;;
+  esac
+
+  # 7/8 Headroom off, for the NEXT session only: the Headroom CLI's own `off --next-session` (what `hmd headroom off --next-session` execs; called by path
+  # so a dispatcher that predates its arm can never turn it into a task prompt). It changes configuration only and never stops the proxy; it is never
+  # reimplemented here, and an install without it gets one warning and no switch. Its own backup (CHANGES.txt: each change and its undo) is kept INSIDE the reset's
+  # backup, $bdir/headroom: a launchd job it disables is state no file of that backup holds, so `hmd lean restore` finds the record there and switches the job back on
+  # before it writes a Headroom route back (bin/lib/lean_backup.py); without that the login after an undo would route every claude session to a proxy that cannot start.
+  if [ "$deferred" -eq 1 ]; then
+    pending="$pending headroom-off"
+    printf '   7/8 headroom: PENDING, this session is routed through Headroom (the next --reset switches it off for the session after)\n'
+  elif [ -x "$headroom" ]; then
+    if HEIMDALL_HOME="$rt" "$headroom" off --next-session --backup-dir "$bdir/headroom"; then
+      printf '   7/8 headroom: off for the next session (hmd headroom off --next-session)\n'
+    else
+      rc=$?
+      pending="$pending headroom-off"
+      printf '  ⚠ hmd: hmd headroom off --next-session failed (exit %s): run it yourself\n' "$rc" >&2
+      printf '   7/8 headroom: PENDING, the switch failed\n'
+    fi
+  else
+    printf '  ⚠ hmd: bin/heimdall-headroom is not in this install, so Headroom was not switched off (hmd headroom off --next-session, once it is)\n' >&2
+    printf '   7/8 headroom: skipped, not in this install\n'
+  fi
+
+  # 8/8 what is left, and how to go back
+  if [ -n "$pending" ]; then
+    # shellcheck disable=SC2086  # the pending steps are plain words
+    lean_reset_record "$record" "$bdir" $pending || printf '  ⚠ hmd: could not write %s\n' "$record" >&2
+    printf '   unfinished:%s (noted in %s; run install.sh --reset again once this session has ended)\n' "$pending" "$record"
+  else
+    rm -f "$record" || true
+  fi
+  printf '   8/8 to undo: %s\n' "$undo"
+}
+
 main() {
   # TEST SEAM: let the acceptance harness `source` this installer purely to unit-test
   # the pure helpers (ensure_dream_schedule gating, etc.) WITHOUT running a real network
@@ -1193,7 +1423,49 @@ main() {
     fi
     step_ok "Fetched Heimdall ($REF)"
   fi
+
+  # ── Install profile: lean or full (3.x lean-core plan, T3.4) ──────────────
+  # `lean` narrows the clone to what runs (git sparse-checkout, bin/lib/lean_sparse.sh: every object stays in .git, so what the tree lacks
+  # is one local `add` away); `full` is the whole tree, today's install. bin/lib/hmd_profile.py decides ONCE, on a fresh install (a runtime
+  # home that holds the setup marker or a grandfathered skills-config.json is `full`, anything else `lean`) and records it in the runtime
+  # home (INV-L2). A re-run re-applies the RECORDED profile and never decides again, so an upgrade cannot reset it (INV-L7). An install with
+  # no record (every install from before this step) reads as `full`: a re-run over it writes nothing and changes nothing (INV-L8). Lean
+  # never costs an install: the clone is whole when this starts and a failed apply leaves the tree as it was. It installs no proxy and
+  # routes no session (INV-L12). This runs BEFORE the export below: the runtime home is the launcher's rule (HEIMDALL_HOME, else
+  # ~/.heimdall) and that export points HEIMDALL_HOME at the installer's own telemetry store.
+  local RT_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+  local PROFILE_PY="$PLUGIN_DIR/bin/lib/hmd_profile.py"
+  local PROFILE_SPARSE="$PLUGIN_DIR/bin/lib/lean_sparse.sh"
+  if [ -f "$PROFILE_PY" ] && [ -f "$PROFILE_SPARSE" ] && command -v python3 >/dev/null 2>&1; then
+    if [ "$UPGRADING" -eq 0 ]; then
+      local PROFILE_MARKER="--marker-absent"
+      if [ -f "$RT_HOME/setup-done" ]; then PROFILE_MARKER="--marker-present"; fi
+      HEIMDALL_HOME="$RT_HOME" python3 -I "$PROFILE_PY" init "$PROFILE_MARKER" || true
+    fi
+    if [ "$(HEIMDALL_HOME="$RT_HOME" python3 -I "$PROFILE_PY" get || true)" = "lean" ]; then
+      step_begin "Applying lean profile"
+      if bash "$PROFILE_SPARSE" apply lean "$PLUGIN_DIR" >/dev/null; then
+        step_ok "Applying lean profile" "on-demand parts stay in git"
+      else
+        printf '  ⚠ hmd: lean profile not applied, keeping the full tree (the next install.sh run tries again)\n' >&2
+        step_ok "Applying lean profile" "skipped, full tree kept"
+      fi
+    fi
+  fi
   chmod +x "$PLUGIN_DIR/bin/"* 2>/dev/null || true
+
+  # ── --reset: an existing install becomes lean, on request (3.x lean-core plan, T4.4) ──────────────────────────────────────────────────
+  # Only with the flag: a run without it never enters the branch below, so the install it makes is the one it always made (INV-L8). RT_HOME is the
+  # runtime home read above, before the export below points HEIMDALL_HOME at the installer's telemetry store. A stopped reset ends the run here (the
+  # fetch and the profile step above are the plain upgrade); the re-run after the fix does the rest of the install. Other arguments are ignored, as
+  # they always were (`hmd reinstall --reset --yes` hands install.sh both).
+  local RESET=0 RESET_ARG
+  for RESET_ARG in "$@"; do
+    case "$RESET_ARG" in --reset) RESET=1 ;; esac
+  done
+  if [ "$RESET" -eq 1 ]; then
+    lean_reset "$PLUGIN_DIR" "$RT_HOME" || exit 1
+  fi
 
   # ── Telemetry world is live (wrapper just cloned) ─────────────────────────
   # Point the store inside the install footprint so events are test-visible and

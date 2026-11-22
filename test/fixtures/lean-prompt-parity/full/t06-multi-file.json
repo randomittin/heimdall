@@ -1,0 +1,44 @@
+{
+  "task": "t06-multi-file",
+  "agent": "heimdall",
+  "source": "fixture",
+  "prompt_sha256": "@SHA@",
+  "events": [
+    {
+      "kind": "spawn",
+      "name": "hmd:planner"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:coder"
+    },
+    {
+      "kind": "touch",
+      "name": "api/models.py"
+    },
+    {
+      "kind": "touch",
+      "name": "db/schema.py"
+    },
+    {
+      "kind": "touch",
+      "name": "tests/test_models.py"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:test-runner"
+    },
+    {
+      "kind": "gate",
+      "name": "lint"
+    },
+    {
+      "kind": "gate",
+      "name": "verify-edits --quick"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:reviewer"
+    }
+  ]
+}

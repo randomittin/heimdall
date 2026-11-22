@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""heimdall-pack-build -- builds the @runhmd/stacks pack directory from skills/stacks, deterministically, and prints the content hash that pins it.
+
+    heimdall-pack-build build --out DIR [--src DIR]     write the pack to DIR (absent, or an empty directory) and print its content hash
+    heimdall-pack-build hash [--src DIR]                print the content hash a build would give; write nothing
+
+WHY. The lean profile ships the stack packs as a package next to the bundled copy (docs/superpowers/plans/2026-11-12-3x-lean-core.md T2.2; spec section 3 for the
+layout, section 5 Stage 2 for the fallback). The resolver prefers an installed pack only when its bytes match the hash the lock and skills.manifest.json pin (INV-L5:
+anything else falls back to the bundled copy, silently). A pin is worth something only if two builds of one tree give one hash on any machine, so the build is a
+pure function of the file names and bytes under SRC (default: the skills/stacks next to this script) and of the constants below. Not read: mtimes, owners, source
+modes, directory order, the locale, the clock, the cwd, the absolute path of SRC or of the output.
+
+THE PACK. A faithful copy of SRC (SKILL.md, README.md, <stack-id>/PACK.md, ...) plus two generated files at its top:
+  hmd.skill.yaml   the Heimdall metadata of spec section 3, which other agents ignore: id, version, summary, when.signals (the stack ids found in SRC, that is the
+                   directories holding a PACK.md), requires (read the repo, no network), depth, chains_with, conflicts_with, cost_hint. A key the stacks pack has
+                   nothing true to say for (not_when; verify, since no oracle exists for it) is left out, never invented. No date, no path, no host.
+  SHA256SUMS       the listing the hash is taken over, in the format `sha256sum -c` reads.
+Files are written 0644 and directories 0755 whatever the umask, into a staging directory beside the output that is renamed into place, so a build that fails leaves
+no pack and no staging directory. Empty directories carry nothing and are not copied. SRC is only ever read, and an output inside it is refused.
+
+THE HASH (what the lock and skills.manifest.json pin). Every file of the pack except SHA256SUMS, in bytewise order of its path (relative to the pack root, '/'
+separated), gives one line `<sha256 of its bytes, lowercase hex>  <path>` + newline (two spaces). SHA256SUMS holds exactly those lines, and the content hash is the
+sha256 of SHA256SUMS: 64 lowercase hex digits, the form the lock's content_hash takes. To verify an installed pack, recompute the lines from the files on disk,
+require them to equal SHA256SUMS, and require sha256(SHA256SUMS) to equal the pin: SHA256SUMS alone says nothing about a file edited after the build, and the files
+alone say nothing about which build they came from. hmd.skill.yaml is in the listing, so the version is pinned with the content.
+
+WHAT IT REFUSES (exit 2, a message on stderr, nothing on stdout, nothing written). Anything a hash over names and bytes cannot pin honestly: a symbolic link or a
+file that is neither regular nor a directory; an executable file (a pack holds text, and a mode that was silently dropped would be a lie); a name outside
+[A-Za-z0-9._-] or starting with a dot (a newline in a name would forge a SHA256SUMS line; .DS_Store, which macOS drops everywhere, is skipped and is neither copied
+nor listed); a source file named SHA256SUMS or hmd.skill.yaml at the top (the build writes both); a tree with no SKILL.md at the top (not a skill, usually the wrong
+directory); an output that exists and is not an empty directory, or lies inside SRC; an output that cannot be written.
+
+NOT DONE, ON PURPOSE. No signing and no SIGNATURE file, no evals/ directory, no publishing (publish steps, out of scope of the lean plan), no check of an installed
+pack (bin/lib/skills_packs.py's job, by the rule above), no automatic version: PACK_VERSION is edited by hand when the pack changes in a way a consumer should notice,
+and the hash changes with any change of content whether or not it was.
+
+Exit 0 ok, 2 usage, a source it will not pack or an output it cannot write. Python 3.7+, standard library only. Proof: test/pack-build.test.sh.
+"""
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+PACK_NAME = "@runhmd/stacks"
+PACK_ID = "runhmd/stacks"
+PACK_VERSION = "1.0.0"
+PACK_SUMMARY = "Stack knowledge packs (conventions, exact lint/test/build commands, failure patterns) loaded onto the current role agent"
+SKILL_FILE = "SKILL.md"
+PACK_FILE = "PACK.md"
+YAML_FILE = "hmd.skill.yaml"
+SUMS_FILE = "SHA256SUMS"
+SKIPPED_FILES = frozenset([".DS_Store"])
+NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+SELF_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DEFAULT_SRC = os.path.join(SELF_ROOT, "skills", "stacks")
+
+
+class Fail(Exception):
+    """A source this tool will not pack or an output it will not write: the message goes to stderr, stdout stays empty, the exit status is 2."""
+
+
+def safe_name(name):
+    """True for a name made only of [A-Za-z0-9._-] that does not start with a dot (so it cannot carry a newline, a space, a backslash or a path separator)."""
+    return bool(name) and name[0] != "." and all(char in NAME_CHARS for char in name)
+
+
+def scan(src):
+    """{path relative to src, '/' separated: bytes} of every file under src, after refusing what a pack cannot hold (see WHAT IT REFUSES)."""
+    if not os.path.isdir(src):
+        raise Fail("the source is not a directory: %s" % src)
+    found = {}
+
+    def visit(directory, prefix):
+        with os.scandir(directory) as entries:
+            listing = sorted(entries, key=lambda entry: entry.name)
+        for entry in listing:
+            rel = prefix + entry.name
+            if entry.name in SKIPPED_FILES and entry.is_file(follow_symlinks=False):
+                continue
+            if not safe_name(entry.name):
+                raise Fail("%r has a name outside [A-Za-z0-9._-] (or starting with a dot)" % rel)
+            if entry.is_symlink():
+                raise Fail("%s is a symbolic link; a pack holds regular files only" % rel)
+            if entry.is_dir(follow_symlinks=False):
+                visit(entry.path, rel + "/")
+            elif not entry.is_file(follow_symlinks=False):
+                raise Fail("%s is neither a regular file nor a directory" % rel)
+            elif entry.stat(follow_symlinks=False).st_mode & 0o111:
+                raise Fail("%s is executable; a pack holds text, not programs" % rel)
+            else:
+                with open(entry.path, "rb") as handle:
+                    found[rel] = handle.read()
+
+    visit(src, "")
+    return found
+
+
+def stack_ids(files):
+    """The stack ids of a tree: its top-level directories that hold a PACK.md, in bytewise order."""
+    return sorted(set(rel.split("/")[0] for rel in files if rel.count("/") == 1 and rel.endswith("/" + PACK_FILE)))
+
+
+def skill_yaml(files):
+    """The text of hmd.skill.yaml: a function of the constants and the stack ids found in the tree, nothing else."""
+    lines = [
+        "id: %s" % PACK_ID,
+        "version: %s" % PACK_VERSION,
+        "summary: %s" % json.dumps(PACK_SUMMARY),
+        "when:",
+        "  signals: [%s]" % ", ".join(stack_ids(files)),
+        "requires:",
+        "  fs: read-only:repo",
+        "  network: none",
+        "  tools: []",
+        "depth: light",
+        "chains_with: []",
+        "conflicts_with: []",
+        "cost_hint: low",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def plan(src):
+    """(files, listing, digest): every file of the pack but SHA256SUMS as {path: bytes}, SHA256SUMS' bytes, and the content hash."""
+    files = scan(src)
+    if SKILL_FILE not in files:
+        raise Fail("no %s at the top of %s: this is not a skill directory" % (SKILL_FILE, src))
+    for reserved in (YAML_FILE, SUMS_FILE):
+        if reserved in files:
+            raise Fail("%s is reserved: the build writes it" % reserved)
+    files[YAML_FILE] = skill_yaml(files).encode("utf-8")
+    listing = "".join("%s  %s\n" % (hashlib.sha256(files[rel]).hexdigest(), rel) for rel in sorted(files)).encode("ascii")
+    return files, listing, hashlib.sha256(listing).hexdigest()
+
+
+def check_out(out, src):
+    """Refuse an output that lies inside the source, or exists and is not an empty directory."""
+    real_out, real_src = os.path.realpath(out), os.path.realpath(src)
+    if real_out == real_src or real_out.startswith(real_src + os.sep):
+        raise Fail("the output path %s is inside the source %s" % (out, src))
+    if os.path.lexists(out) and (os.path.islink(out) or not os.path.isdir(out) or os.listdir(out)):
+        raise Fail("the output path %s exists and is not an empty directory" % out)
+
+
+def write_pack(out, files, listing):
+    """Write the pack into a staging directory beside out, normalise the modes, rename it into place; a failure removes the staging directory."""
+    staging = None
+    try:
+        parent = os.path.dirname(os.path.abspath(out))
+        os.makedirs(parent, exist_ok=True)
+        staging = tempfile.mkdtemp(prefix=".pack-build-", dir=parent)
+        for rel, data in sorted(files.items()) + [(SUMS_FILE, listing)]:
+            dest = os.path.join(staging, *rel.split("/"))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "xb") as handle:
+                handle.write(data)
+        for base, _dirs, names in os.walk(staging):
+            os.chmod(base, 0o755)
+            for name in names:
+                os.chmod(os.path.join(base, name), 0o644)
+        os.rename(staging, out)
+        staging = None
+    except OSError as exc:
+        raise Fail("cannot write the pack to %s: %s" % (out, exc.strerror or exc))
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="heimdall-pack-build",
+        description="Build the %s pack directory from skills/stacks, deterministically, and print its content hash." % PACK_NAME,
+        epilog="Exit 0 ok; 2 usage, a source it will not pack, or an output it cannot write (stdout stays empty).")
+    commands = parser.add_subparsers(dest="command", metavar="{build,hash}")
+    commands.required = True
+    build = commands.add_parser("build", help="write the pack to --out (absent or an empty directory) and print its content hash")
+    build.add_argument("--out", required=True, metavar="DIR", help="the directory to create: it must not exist, or be empty")
+    show = commands.add_parser("hash", help="print the content hash a build would give; write nothing")
+    for command in (build, show):
+        command.add_argument("--src", default=DEFAULT_SRC, metavar="DIR", help="the skill directory to pack (default: the skills/stacks next to this script)")
+    return parser
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "build":
+            check_out(args.out, args.src)
+        files, listing, digest = plan(args.src)
+        if args.command == "build":
+            write_pack(args.out, files, listing)
+            sys.stderr.write("built %s %s: %d files -> %s\n" % (PACK_NAME, PACK_VERSION, len(files) + 1, args.out))
+    except (Fail, OSError) as exc:
+        sys.stderr.write("heimdall-pack-build: %s\n" % exc)
+        return 2
+    sys.stdout.write(digest + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

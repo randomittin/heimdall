@@ -1,0 +1,89 @@
+{
+  "max": {
+    "context": {
+      "agents": {
+        "count": 17,
+        "frontmatter_bytes": 6860
+      },
+      "caveman": {
+        "per_prompt_bytes": 126,
+        "session_start_bytes": 2668
+      },
+      "commands": {
+        "count": 19,
+        "frontmatter_bytes": 7083
+      },
+      "main_prompt": {
+        "bytes": 67385
+      },
+      "session_start_bytes": 84581,
+      "skills": {
+        "count": 1,
+        "frontmatter_bytes": 585
+      }
+    },
+    "disk": {
+      "total_bytes": 15700000,
+      "total_files": 1130
+    },
+    "hooks": {
+      "PostToolUse": {
+        "*": 2,
+        "Bash": 4,
+        "Edit": 4,
+        "MultiEdit": 3,
+        "NotebookEdit": 3,
+        "SendMessage": 3,
+        "TaskStop": 3,
+        "Write": 4,
+        "total": 7
+      },
+      "PostToolUseFailure": {
+        "*": 0,
+        "TaskStop": 1,
+        "total": 1
+      },
+      "PreCompact": {
+        "*": 1,
+        "total": 1
+      },
+      "PreToolUse": {
+        "*": 2,
+        "Agent": 3,
+        "Bash": 6,
+        "Edit": 6,
+        "Glob": 4,
+        "Grep": 4,
+        "MultiEdit": 5,
+        "NotebookEdit": 3,
+        "Read": 4,
+        "Write": 6,
+        "total": 10
+      },
+      "SessionEnd": {
+        "*": 3,
+        "total": 3
+      },
+      "SessionStart": {
+        "*": 16,
+        "compact": 17,
+        "total": 17
+      },
+      "Stop": {
+        "*": 7,
+        "total": 7
+      },
+      "SubagentStop": {
+        "*": 3,
+        "total": 3
+      },
+      "UserPromptSubmit": {
+        "*": 7,
+        "total": 7
+      }
+    },
+    "hooks_total": 56
+  },
+  "note": "Ceilings for a LEAN install tree: build one the way install.sh does (git clone --depth 1, then bash bin/lib/lean_sparse.sh apply lean DIR) and run bin/heimdall-footprint --check --root DIR --budget release/lean-install-budget.json. Measured on 2026-11-22 after the lean-core merge: 15,631,195 B in 1,122 files, 1 skill and 19 commands described in context, the same 56 hooks as the full tree (INV-L3). The context and hook ceilings are exact. The two disk ceilings are those numbers rounded up (to the next 100 KB and the next 10 files) because the lean tree carries CHANGELOG.md and release/lean-budget.json, which change with every release. The main prompt ceiling is agents/heimdall.md: the lean prompt (agents/heimdall-lean.md, 29,336 B) is selected in the user-level settings by install.sh --reset once its parity receipt is green, which --root does not see; the lean-core doc under docs/ says how much that saves.",
+  "schema": 1
+}

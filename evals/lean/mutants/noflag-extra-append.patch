@@ -1,0 +1,16 @@
+mutant: noflag-extra-append
+gate:   test/install-noflag-identical.test.sh (INV-L8)
+defect: the no-flag upgrade run appends the PATH block to the shell profile again (its idempotence guard stops matching: one changed byte, grep -qF to grep -qxF)
+applied by test/lean-gate-falsify.test.sh to a temp snapshot of the tree, never to a worktree
+
+--- a/install.sh
++++ b/install.sh
+@@ -277,7 +277,7 @@
+   # Match on the bin-dir export, so a profile that already exports this dir (by
+   # any wording) is treated as present — the grep guard that makes re-runs
+   # idempotent (never a double-append).
+-  if [ -f "$profile" ] && grep -qF "$bin_dir" "$profile" 2>/dev/null; then
++  if [ -f "$profile" ] && grep -qxF "$bin_dir" "$profile" 2>/dev/null; then
+     printf 'present'; return 0
+   fi
+   {

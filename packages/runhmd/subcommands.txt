@@ -19,6 +19,8 @@ sigil
 sigil-png
 guard
 uninstall
+reinstall
+lean
 team
 invite
 join

@@ -139,6 +139,13 @@ if [ -f "$PLUGIN_DIR/bin/lib/skills_consent.sh" ]; then
   # shellcheck disable=SC1091
   . "$PLUGIN_DIR/bin/lib/skills_consent.sh" 2>/dev/null || true
 fi
+# The first-launch checklist (operator ask, 2026-11-22: a fresh install SHOWS its skills on the first launch, to be added by the person, never installed silently):
+# one function that first_run_setup asks. Sourced best-effort like the gate it sits on, and first_run_setup calls it only when `type` finds it, so a tree without
+# the file keeps the one question it always asked.
+if [ -f "$PLUGIN_DIR/bin/lib/first_launch_checklist.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$PLUGIN_DIR/bin/lib/first_launch_checklist.sh" 2>/dev/null || true
+fi
 
 # ── First-run completion marker (USER-writable, NEVER the install dir) ──
 #
@@ -1369,6 +1376,14 @@ first_run_setup() {
     return "$_fr_go"
   }
 
+  # First launch, ONE checklist (bin/lib/first_launch_checklist.sh): at a terminal, the recommended skills and (lean install) the bundled ones it left out are SHOWN
+  # with their why, and the person picks by number / a (all) / Enter (none) / n (never ask). A pick goes through `hmd skills install ID --yes`; superpowers is the
+  # first-run set's key, so picking it is the consent the two legacy installs below need (HMD_FLC_FIRST_RUN_GO), and not picking it skips them. It returns non-zero
+  # when nobody was asked (no terminal: ONE line pointing to `hmd skills suggest`; consent auto; HMD_SKILLS_YES=1), and then the gate below runs exactly as before.
+  if type hmd_first_launch_checklist >/dev/null 2>&1 && hmd_first_launch_checklist; then
+    _fr_go="$HMD_FLC_FIRST_RUN_GO"
+  fi
+
   # superpowers (brainstorming, debugging) — part of the `skills` step.
   if ! claude plugins list 2>/dev/null | grep -q "superpowers" && _first_run_consent; then
     echo "  + superpowers (brainstorming, debugging)"
@@ -2169,6 +2184,69 @@ case "${1:-}" in
     fi
     printf "  %bReinstall anytime: curl -fsSL https://runheimdall.dev/install | bash%b\n\n" "$D" "$R"
     exit 0
+    ;;
+  reinstall)
+    # `hmd reinstall --reset [--yes]`: switch THIS install to the lean profile in place (3.x lean-core, task T4.2 of
+    # docs/superpowers/plans/2026-11-12-3x-lean-core.md). A thin wrapper over the installed install.sh, which owns the whole
+    # sequence (backup first, user data untouched, the restore command printed): the wrapper reuses it and implements none of it.
+    # It is deliberately NOT the wipe-and-reclone flag block lower down: that one deletes all of ~/.heimdall, which is the plugin
+    # clone AND the home of the ledger, receipts, memory, team and pairing, so nothing in this arm deletes a file or reaches that
+    # block (test/lean-dispatch.test.sh holds both). Only the word `reinstall` is consumed: --reset goes first, exactly once, and
+    # every other argument (--yes) after it, in the order typed.
+    #   no --reset   usage on stderr, exit 2: a bare `hmd reinstall` has no meaning and is never read as a wipe
+    #   -h|--help    the usage on stdout, exit 0
+    # An install.sh that does not mention --reset (a tree from before 3.1, or none at all) cannot do this, and the wrapper does not
+    # guess: it changes nothing, prints the pinned installer one-liner (/install redirects to the pinned release tag's install.sh,
+    # see _redirects) with the same arguments, and exits 1. It prints that line and never runs it.
+    shift
+    _ri_usage="Usage: hmd reinstall --reset [--yes]
+
+  Switch this install to the lean profile in place. It runs the installed install.sh with --reset:
+  a backup first, then the lean tree. Your ledger, receipts, memory, team and pairing data stay
+  where they are, and the command that undoes it is printed (hmd lean restore <dir>).
+  Without --reset nothing happens."
+    _ri_reset=0
+    _ri_left=$#
+    while [ "$_ri_left" -gt 0 ]; do
+      _ri_arg="$1"; shift
+      case "$_ri_arg" in
+        -h|--help) printf '%s\n' "$_ri_usage"; exit 0 ;;
+        --reset) _ri_reset=1 ;;
+        *) set -- "$@" "$_ri_arg" ;;
+      esac
+      _ri_left=$((_ri_left - 1))
+    done
+    if [ "$_ri_reset" -ne 1 ]; then
+      printf '%s\n' "$_ri_usage" >&2
+      exit 2
+    fi
+    _ri_installer="$PLUGIN_DIR/install.sh"
+    if [ -f "$_ri_installer" ] && grep -q -- '--reset' "$_ri_installer" 2>/dev/null; then
+      exec bash "$_ri_installer" --reset "$@"
+    fi
+    _ri_tail=" --reset"
+    for _ri_arg in "$@"; do _ri_tail="$_ri_tail $(printf '%q' "$_ri_arg")"; done
+    echo "  hmd reinstall --reset: $_ri_installer does not support --reset (it is older than 3.1, or missing). Nothing was changed." >&2
+    echo "  Run the pinned installer instead:" >&2
+    echo "    curl -fsSL https://runheimdall.dev/install | bash -s --$_ri_tail" >&2
+    echo "  To check its sha256 before it runs, take the command in README.md#install and end it with: bash heimdall-install.sh$_ri_tail" >&2
+    exit 1
+    ;;
+  lean)
+    # `hmd lean status|on|off ...`: the lean profile of this install (3.x lean-core, task T4.2 of
+    # docs/superpowers/plans/2026-11-12-3x-lean-core.md): the install tree and the session prompt shrink to what a session needs, and
+    # `off` restores the whole tree. Pass-through to bin/heimdall-lean. Without this arm `hmd lean on` fell through to the task-prompt
+    # path and started a Claude run with "lean on" as the task. The verb is consumed (`hmd lean on --yes` reaches the tool as
+    # `on --yes`), every argument forwards verbatim and the tool is exec'd, so its exit status comes back unchanged. Bare `lean` is
+    # the tool's own answer, never the launch path.
+    shift
+    LEAN_BIN="$PLUGIN_DIR/bin/heimdall-lean"
+    if [ ! -x "$LEAN_BIN" ]; then
+      echo "  Error: heimdall-lean not found at $LEAN_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$LEAN_BIN" "$@"
     ;;
   team)
     # Pass-through to heimdall-team (new/join/share/show and bare dispatch).
@@ -4082,6 +4160,9 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall --setup          Re-run first-time plugin setup"
   echo "  heimdall --team N \"task\"  Spawn N parallel Claude workers in tmux"
   echo "  heimdall --reinstall      Nuke and re-clone from GitHub (fixes zombie states)"
+  echo "  heimdall reinstall --reset  Switch this install to lean in place (backup first, your data stays)"
+  echo "  heimdall lean <status|on|off>  Lean profile: smaller install tree and prompt (off restores the full tree)"
+  echo "  heimdall lean restore <dir>  Undo reinstall --reset from the backup directory it printed"
   echo "  heimdall --uninstall      Remove heimdall completely (add --yes for non-interactive)"
   echo "  heimdall --help           Show this help"
   echo "  heimdall team             Team status (solo/shared, owner, how to grow)"

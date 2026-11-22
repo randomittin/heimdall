@@ -1,0 +1,44 @@
+{
+  "components": {
+    "added_files": [
+      "./.claude/settings.json",
+      "./.heimdall/.heimdall/cc-verify.json",
+      "./.heimdall/.heimdall/skills.lock",
+      "./.heimdall/.heimdall/telemetry/events.ndjson",
+      "./.heimdall/.heimdall/telemetry/funnel/events.ndjson",
+      "./.heimdall/pki/haid_unknown.HOST.doctor-diagnosis",
+      "./.heimdall/receipts/installs-run-RUN.ndjson",
+      "./.heimdall/receipts/installs-run-RUN.ndjson",
+      "./.heimdall/team.json",
+      "./.local/bin/heimdall",
+      "./.local/bin/hmd",
+      "./.zshrc"
+    ],
+    "clone_tracked_modified_by_install": [
+      " M bin/edit-tracker.c",
+      " M bin/parallelism-tracker.c"
+    ],
+    "clone_tree_equals_source": true,
+    "digests": {
+      "bin_links": "25d9fb975e2a20614b116a40ee1a22508cb007a61b644b536803ec263f93fe78",
+      "cc_verify": "851047be720b567d44d8065bf77fde69b5f6af9536fa0b28f3aeb93568d08899",
+      "claude_settings": "0dce98454810b13aedc0a85b917c9fb09356b1e0c1f5cb9911e0ac34a42e3da0",
+      "doctor_diagnosis": "f7ecb35a25b5f55448ebe8e9ed6d77e3f7a6631d41c01023875c9858fff06e37",
+      "funnel": "0ef4c96a2fcf73a483c3cb41320f8ee6641f7d2f70ace4611d2f31aa17e03dba",
+      "install_receipts": "bb5705f9efaefbfd1a4c067dcbba0e3d40e389c41d07ae02aca252be4da6decf",
+      "skills_lock": "1ba7377fbe1128aeeca7528cbb8f428a24b638a4906c0eefb4069186a8b3ff93",
+      "team": "432b4382c0f34e0765d658975b72d6573581fc10e068de3920769af92dc5d9ea",
+      "telemetry": "79b53f5d467e0b5bb9963c8b3869e025d584f102a706deaa3fd321c00f785e7e",
+      "zshrc": "66777b4938d3013c509bebc35f4f021dd7e8c7a7ebbaed2fb3e26a9a13d3c6a5"
+    },
+    "install_exit": 0,
+    "state_sha256": "dc40fc345722b1641197652f05f3be010dea233352278a884b576b210ece3078",
+    "upgrade_exit": 0
+  },
+  "recorded_from": {
+    "install_sh_sha256": "81617bcbc21d990955948b3cd7f24c9bd4935a32271fd387c2e3fc416e7d2b3e",
+    "note": "recorded from the UNMODIFIED install.sh: a no-flag upgrade over an existing install in the offline use-case sandbox",
+    "repo_head": "a467d78b86eed9701fe4ed67c7cad0731d170d43"
+  },
+  "schema": 1
+}
