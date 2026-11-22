@@ -66,11 +66,11 @@ if [ "$(tr -d '\n' < "$UC_OUT")" = pass ]; then uc_ok "hmd verdict says pass"; e
 printf 'function pay(total) { return total; }\n// %s: wire up the payment provider\n' "$MARK" > "$REPO/checkout.js"
 g add checkout.js
 g commit -q -m "add checkout"
-if uc_hang "committing a stub"; then :; elif [ "$UC_RC" -ne 0 ]; then uc_ok "committing an unfinished-code marker is refused (exit $UC_RC)"; else uc_bad "a commit that introduces an unfinished-code marker went through"; fi
+STUB_RC="$UC_RC"; STUB_ERR="$UC_ROOT/stub-commit.err"; cp "$UC_ERR" "$STUB_ERR"
+if uc_hang "committing a stub"; then :; elif [ "$STUB_RC" -ne 0 ]; then uc_ok "committing an unfinished-code marker is refused (exit $STUB_RC)"; else uc_bad "a commit that introduces an unfinished-code marker went through"; fi
 if [ "$(commits)" = 1 ]; then uc_ok "…no commit was made"; else uc_bad "the refused commit still landed ($(commits) commits)"; fi
-g commit -q -m "add checkout"
-uc_has "the BIFROST block names the gate" "$UC_ERR" 'stub-scan'
-uc_has "…and the file the stub is in" "$UC_ERR" 'checkout\.js'
+uc_has "the BIFROST block names the gate" "$STUB_ERR" 'stub-scan'
+uc_has "…and the file the stub is in" "$STUB_ERR" 'checkout\.js'
 g diff --cached --name-only
 uc_has "…and the work stays staged" "$UC_OUT" '^checkout\.js$'
 hmd verdict --field verdict

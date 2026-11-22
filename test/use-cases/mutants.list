@@ -6,3 +6,6 @@
 05_receipt_round_trip	bin/lib/runhmd_receipt.py	s/^    if not _auth().verify_raw(public, SIGN_PREFIX + canonical(body), signature):$/    if False:/	M05a-signature-check-always-passes
 05_receipt_round_trip	bin/lib/runhmd_receipt.py	s/os.O_EXCL, 0o600)/os.O_EXCL, 0o644)/	M05b-secret-key-world-readable
 05_receipt_round_trip	bin/lib/runhmd_attack.py	s/^    p.add_argument("--receipt", action="store_true")$/    p.add_argument("--receipt", action="store_true", dest="receipt_unused")/	M05c-receipt-flag-ignored
+06_init_a_repo_then_try_to_commit_a_stub	bin/lib/heimdall-stub-patterns.sh	s/^HEIMDALL_STUB_RE_TODO=.*$/HEIMDALL_STUB_RE_TODO='NEVER-MATCHES-xq7'/	M06a-stub-marker-pattern-never-matches
+06_init_a_repo_then_try_to_commit_a_stub	bin/heimdall-init	s/^git -C "$REPO" config core.hooksPath "$HOOKS_REL"$/true/	M06b-init-never-wires-the-hooks
+06_init_a_repo_then_try_to_commit_a_stub	bin/heimdall-init	s/318965969+runhmd/111111111+runhmd/	M06c-trailer-names-the-wrong-account
