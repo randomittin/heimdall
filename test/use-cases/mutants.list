@@ -1,0 +1,17 @@
+# test/use-cases/mutants.list -- one line of the product broken per row; the journey named in column 1 must go RED (run.sh builds each from the snapshot and checks).
+# Columns, tab separated: journey (file name without .sh) | file in the tree | sed expression (portable: no -E, no \+ or \|) | mutant name
+04_attack_a_planted_bug	bin/lib/runhmd_attack.py	s/^    if args.yes:$/    if True:/	M04a-assume-consent-without-yes
+04_attack_a_planted_bug	bin/heimdall	s/^  attack)$/  attack-unrouted)/	M04b-attack-falls-through-to-a-claude-session
+04_attack_a_planted_bug	evals/oracles/attack/engine/battery.mjs	s#^export const CASES = \[\.\.\.duplicateCases(), \.\.\.readCases(), \.\.\.roundingCases()\];$#export const CASES = [...duplicateCases(), ...readCases(), ...roundingCases()].filter((c) => !/^duplicate\\.(retry-at|burst)/.test(c.id));#	M04c-engine-blind-to-the-retry-race
+05_receipt_round_trip	bin/lib/runhmd_receipt.py	s/^    if not _auth().verify_raw(public, SIGN_PREFIX + canonical(body), signature):$/    if False:/	M05a-signature-check-always-passes
+05_receipt_round_trip	bin/lib/runhmd_receipt.py	s/os.O_EXCL, 0o600)/os.O_EXCL, 0o644)/	M05b-secret-key-world-readable
+05_receipt_round_trip	bin/lib/runhmd_attack.py	s/^    p.add_argument("--receipt", action="store_true")$/    p.add_argument("--receipt", action="store_true", dest="receipt_unused")/	M05c-receipt-flag-ignored
+06_init_a_repo_then_try_to_commit_a_stub	bin/lib/heimdall-stub-patterns.sh	s/^HEIMDALL_STUB_RE_TODO=.*$/HEIMDALL_STUB_RE_TODO='NEVER-MATCHES-xq7'/	M06a-stub-marker-pattern-never-matches
+06_init_a_repo_then_try_to_commit_a_stub	bin/heimdall-init	s/^git -C "$REPO" config core.hooksPath "$HOOKS_REL"$/true/	M06b-init-never-wires-the-hooks
+06_init_a_repo_then_try_to_commit_a_stub	bin/heimdall-init	s/318965969+runhmd/111111111+runhmd/	M06c-trailer-names-the-wrong-account
+01_install_on_a_clean_machine	install.sh	s#^  } >> "\$profile"$#  } >> /dev/null#	M01a-installer-never-writes-the-path-line
+01_install_on_a_clean_machine	install.sh	s#if ln -s "\$src" "\$dst" 2>/dev/null; then#if false; then#	M01b-entry-points-are-copies-not-symlinks
+02_uninstall_leaves_nothing_behind	bin/heimdall	s/^_heimdall_remove_path_export() {$/_heimdall_remove_path_export() { return 0/	M02a-uninstall-leaves-the-path-export
+02_uninstall_leaves_nothing_behind	bin/heimdall	s/^_heimdall_remove_plugin() {$/_heimdall_remove_plugin() { return 0/	M02b-uninstall-leaves-the-install-tree
+03_first_launch_in_an_empty_folder	bin/heimdall	s#^  touch "\$SETUP_MARKER" 2>/dev/null || true$#  true#	M03a-setup-never-recorded-as-done
+03_first_launch_in_an_empty_folder	bin/lib/skills_consent.sh	s/^hmd_skills_consent() {$/hmd_skills_consent() { return 0/	M03b-skills-installed-without-asking
