@@ -1,0 +1,16 @@
+mutant: packs-hash-unchecked
+gate:   test/skills-packs-resolve.test.sh (INV-L5)
+defect: an installed pack is taken whatever hash the lock pins: only its own SHA256SUMS is checked, so a pack the lock never pinned replaces the bundled copy
+applied by test/lean-gate-falsify.test.sh to a temp snapshot of the tree, never to a worktree
+
+--- a/bin/lib/skills_packs.py
++++ b/bin/lib/skills_packs.py
+@@ -140,7 +140,7 @@
+ def matches(pack, pin):
+     """True when the directory PACK is exactly the build whose content hash is PIN: SHA256SUMS hashes to PIN, and the listing recomputed from the files equals it."""
+     sums = read_regular(os.path.join(pack, SUMS_FILE), MAX_SUMS_BYTES)
+-    if sums is None or hashlib.sha256(sums).hexdigest() != pin:
++    if sums is None:
+         return False
+     try:
+         digests = file_digests(pack)

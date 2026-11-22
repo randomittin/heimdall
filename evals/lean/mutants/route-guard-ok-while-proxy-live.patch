@@ -1,0 +1,16 @@
+mutant: route-guard-ok-while-proxy-live
+gate:   test/lean-route-guard.test.sh (INV-L11)
+defect: the guard answers ok, exit 0, while this session is routed through a live Headroom proxy: a reset would then switch off the route the session reads
+applied by test/lean-gate-falsify.test.sh to a temp snapshot of the tree, never to a worktree
+
+--- a/bin/lib/lean_route_guard.sh
++++ b/bin/lib/lean_route_guard.sh
+@@ -142,7 +142,7 @@
+ done
+ 
+ if [ -n "$headroom_routes" ]; then
+-  say defer "this session is routed through Headroom (port $hp) by $headroom_routes: leave Headroom and everything this route reads for the next session, and stop nothing (module state: $module)" 10
++  say ok "this session is routed through Headroom (port $hp) by $headroom_routes: leave Headroom and everything this route reads for the next session, and stop nothing (module state: $module)" 0
+ fi
+ note=""
+ [ -z "$other_local" ] || note="; left alone, local proxies that are not Headroom's: $other_local"
