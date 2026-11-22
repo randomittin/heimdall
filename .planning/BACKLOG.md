@@ -67,3 +67,5 @@
 - Two stale demo app copies (heimdall-demo-app/, packages/runheimdall/heimdall-demo-app/) hold the old pytest spec.
 - hmd-statusline: 2 STALE fixtures (prefix-and-elements, viral-statusline) to rewrite or retire.
 - HIGH-watch: Claude Code warns `plugin-agent-setting-deprecated` for hmd's plugin `settings.json` `agent: heimdall` ("will stop applying in a future release"). Move to a user-level `agent` key (backed up by lean T2.5) before it stops applying. Evidence: docs/analysis/2026-11-12-lean-agent-override.md.
+- LOW: bin/heimdall-delivery-audit and bin/lib/hmd_plan_verify.py WOULD-BLOCK lines still mirror the sweep-only push gate (decision B accepts a use-case receipt); quality-gates.md and docs/ARCHITECTURE.md same.
+- MEDIUM: install.sh leaves tracked bin/edit-tracker.c and bin/parallelism-tracker.c modified in the clone (found by lean T1.4 install baseline).
