@@ -37,8 +37,8 @@ Invoke these skills for thorough review coverage:
 3. **Understand context**: Read surrounding code to understand what changed and why
 4. **Check each file**: Review every changed file systematically
 5. **Hunt silent failures**: Run `pr-review-toolkit:silent-failure-hunter` on error handling code
-6. **Verify tests**: Ensure tests exist for new functionality
-7. **Check quality gates**: Verify lint and formatting are clean, and run the diff's own test file(s) ONCE — neighbouring suites and the full gate are not yours: the full run is the developer's call at merge time
+6. **Verify tests**: Ensure tests exist for new functionality. In a client (managed) repo, anywhere but heimdall's own, the tests to expect are USE-CASE scenarios (operator directives 2026-11-12, 2026-11-22): one per real user journey the diff touches, given/when/then against the public entry point, real code end to end, fakes only at external boundaries (payments, network, LLM, third-party APIs), plus the touched files' own tests; a unit test only to pin a specific bug. A diff that touches a journey with no scenario for it is REQUEST CHANGES, not an APPROVE. Rules, shape, example: `skills/heimdall/references/use-case-tests.md`
+7. **Check quality gates**: Verify lint and formatting are clean, and run the diff's own test file(s) ONCE — never a full unit-suite or offline-eval sweep as a gate: neighbouring suites and the full gate are not yours, the one full run (heimdall's own repo: the sweep; a client repo: `lint` + the use-case suite) is only RECOMMENDED to the developer immediately before the FINAL merge operation (why, command, cost) and runs on their say-so, never started unasked
 8. **Record findings**: for each issue run `heimdall-findings add --severity BLOCKER|HIGH|MEDIUM|LOW --title T --where file:line` (CRITICAL → BLOCKER or HIGH, WARNING → MEDIUM, SUGGESTION → LOW); the tool routes MEDIUM/LOW to `.planning/BACKLOG.md` and keeps BLOCKER/HIGH open for the orchestrator
 
 ## Review Checklist
@@ -79,6 +79,7 @@ Before you write your verdict, explicitly list the red flags you see (or state "
 - **Silent failures** — error-handling paths you didn't open to check for swallowed errors or misleading fallbacks.
 - **False-green tests** — tests that pass by construction and were never proven able to go RED.
 - **Untested changed lines** — new or changed logic with no test exercising it.
+- **Journey gap** — a client-repo diff that touches a user journey with no scenario for it, or a scenario that passes by patching the repo's own code instead of faking only the external boundary (that tests a script, not a journey).
 - **Unverified gates** — approving without running lint, and the diff's own test file(s) once, yourself this turn.
 - **Rubber-stamping** — approving to be agreeable rather than because the evidence supports it.
 

@@ -79,7 +79,7 @@ For each task, output this exact structure:
 - **Acceptance criteria:**
   - [ ] `grep "export const login" src/api.ts` returns match
   - [ ] `curl -s localhost:3000/health` returns 200
-  - [ ] `npm test -- --grep "auth"` passes
+  - [ ] `npm run test:use-cases -- -t "sign in"` passes (one user journey's scenario)
 - **Verify:** [command to run after implementation]
 - **Done when:** [human-readable completion statement]
 
@@ -91,7 +91,8 @@ For each task, output this exact structure:
 - **Max 10 tasks per wave** (background agents bypass the per-turn tool_use limit).
 - If a wave naturally has >10 tasks, split it into sub-waves (1a, 1b) executed sequentially.
 - Each task = one atomic git commit on completion.
-- Test criteria cover each task's OWN test file(s) only; the plan ends with a RECOMMENDATION of ONE full sweep on the frozen tree to the developer (why, command, cost: `CLAUDE.md` "When the full gate runs"), run only on their yes, never one per task and never an acceptance criterion.
+- **Tests are user journeys** (operator directives 2026-11-12, 2026-11-22). In a client (managed) repo, anywhere but heimdall's own, every task's acceptance criteria and tests are USE-CASE scenarios: one per real user journey the task touches, given/when/then against the public entry point, real code end to end, fakes only at external boundaries (payments, network, LLM, third-party APIs), plus the touched files' own tests, run once; a unit test only to pin a specific bug. Rules, shape, example: `skills/heimdall/references/use-case-tests.md`.
+- Never a full unit-suite or offline-eval sweep as a gate, none per task, and the `/goal` baseline's "all tests pass" means the plan's own scenarios and touched test files, not a full run. The plan ends with a RECOMMENDATION of ONE full run (heimdall's own repo: the sweep; a client repo: `lint` + the use-case suite) on the frozen tree, made to the developer immediately before the FINAL merge operation (why, command, cost: `CLAUDE.md` "When the full gate runs") and run only on their yes, never an acceptance criterion.
 - Tasks in the same wave MUST touch disjoint files (no shared writes → no merge conflicts when parallel).
 
 ## Model & Effort Assignment
