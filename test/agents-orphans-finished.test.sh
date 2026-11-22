@@ -265,7 +265,9 @@ for pair in "${SECRETS[@]}"; do
   sid="$(printf 'ac0de00%02d%s' "$idx" "$Z8")"; SEC_IDS+=("$sid")
   notice "$sid" completed "Agent \"${pair%%|*}\" finished" 'done' $((NOW-2500+idx)); idx=$((idx+1))
 done
-notice "$S_NSEC" completed "Background command \"curl -H 'Authorization: Bearer SHELLSECRET0123456789abcdef' https://u:shellpw9@h.example/x\" completed (exit code 0)" '' $((NOW-1800))
+# Fixture secrets are assembled at runtime (docs/superpowers/specs/heimdall-fixture-secret-convention.md): no static literal.
+_SS_A="SHELL"; _SS_B="SECRET0123456789abcdef"; SHELL_TOK="${_SS_A}${_SS_B}"
+notice "$S_NSEC" completed "Background command \"curl -H 'Authorization: Bearer ${SHELL_TOK}' https://u:shellpw9@h.example/x\" completed (exit code 0)" '' $((NOW-1800))
 : > "$TASKDIR/$S_NSEC.output"; set_mtime "$TASKDIR/$S_NSEC.output" $((NOW-1800))
 if [ "$HAS_LSOF" = 1 ]; then
   launch_nodesc toolu_c1 "$S_CMD" "$CMDTEXT"; : > "$TASKDIR/$S_CMD.output"; set_mtime "$TASKDIR/$S_CMD.output" $((NOW-3600))
@@ -303,7 +305,7 @@ for pair in "${SECRETS[@]}"; do
   if has "$D" "$s"; then bad "secret '$s' survived in the description: $D"; elif has "$D" "REDACTED"; then ok "secret '$s' redacted"; else bad "secret '$s' gone but no REDACTED marker: $D"; fi
 done
 D="$(desc_of "$J7" "$S_NSEC")"
-if has "$D" "SHELLSECRET0123456789abcdef" || has "$D" "shellpw9"; then bad "a secret in a notice summary survived: $D"; else ok "a secret in a shell notice's summary is redacted"; fi
+if has "$D" "$SHELL_TOK" || has "$D" "shellpw9"; then bad "a secret in a notice summary survived: $D"; else ok "a secret in a shell notice's summary is redacted"; fi
 if [ "$HAS_LSOF" = 1 ]; then
   D="$(desc_of "$J7" "$S_CMD")"
   [ "$D" = null ] && ok "a background shell with no description has none: its command text is never used" || bad "shell with no description shows: $D"
@@ -325,7 +327,7 @@ for id in "$F_RESULT" "$F_PROMPT" "$F_NEST" "$F_NOORIG" "$F_CHAN" "${BAD_AGENTS[
 [ -z "$leak" ] && ok "checkpoint lists no forged id and no id outside the harness's shapes" || bad "checkpoint lists:$leak"
 leak=""
 for pair in "${SECRETS[@]}"; do s="${pair#*|}"; has "$CK7" "$s" && leak="$leak '$s'"; done
-for s in SHELLSECRET0123456789abcdef shellpw9 SEKRETabc123SEKRETabc123 pw0rd 'deploy-hook --header'; do has "$CK7" "$s" && leak="$leak '$s'"; done
+for s in "$SHELL_TOK" shellpw9 SEKRETabc123SEKRETabc123 pw0rd 'deploy-hook --header'; do has "$CK7" "$s" && leak="$leak '$s'"; done
 [ -z "$leak" ] && ok "no secret and no command text reaches the checkpoint (a tracked file)" || bad "checkpoint carries:$leak"
 if [ "$HAS_LSOF" = 1 ]; then has "$OA7" "\`$S_CMD\` shell — - (" && ok "checkpoint: the no-description shell is listed with -" || bad "checkpoint line for the no-description shell: $(printf '%s' "$OA7" | grep "$S_CMD")"; fi
 [ "$(grep -c 'heimdall-auto-checkpoint:end' <<<"$CK7")" = 1 ] && ok "checkpoint: the auto block's end marker appears once (a description cannot forge a second)" || bad "end marker count: $(grep -c 'heimdall-auto-checkpoint:end' <<<"$CK7")"
