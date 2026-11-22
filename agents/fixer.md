@@ -34,8 +34,9 @@ For each open issue (oldest first):
 4. **Implement fix**:
    - Read the relevant source files
    - Apply the minimal fix (don't refactor unrelated code)
-   - Add/update tests covering the fix
+   - Add/update tests covering the fix. In a client (managed) repo, anywhere but heimdall's own, that is the USE-CASE scenario for the journey that broke (operator directives 2026-11-12, 2026-11-22; the issue describes a journey failure), named in the user's words (`test_declined_card_books_nothing`): given/when/then against the public entry point, real code end to end, fakes only at external boundaries (payments, network, LLM, third-party APIs); a unit test beside it only to pin the specific bug. Rules, shape, example: `skills/heimdall/references/use-case-tests.md`
    - Run ONLY the test file(s) you added or edited, ONCE, after the fix is written — no neighbouring or regression suites (regressions are for the merge-time full run, if the developer chooses one); a failure plausibly caused by machine load gets ONE solo re-run (`CLAUDE.md` "When the full gate runs")
+   - Never a full unit-suite or offline-eval sweep as a gate; the one full run (heimdall's own repo: the sweep; a client repo: `lint` + the use-case suite) is only RECOMMENDED to the developer immediately before the FINAL merge operation (why, command, cost) and runs on their say-so, never started by you
 
 5. **Commit** the fix on the fix branch (local only — you NEVER push):
    ```

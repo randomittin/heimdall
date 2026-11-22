@@ -3,14 +3,15 @@
 # test/sweep-advice.test.sh
 #
 # MERGE-TIME ADVICE. Operator directive 2026-11-12: "full test runs should be recommended to devs along with explanation and token usage -- plus should always be
-# suggested just before merge operations and not before." bin/heimdall-precheck-bash now asks bin/lib/hmd_sweep_advice.py, for a command that mentions merge, push
-# or pull (and git or gh), whether the command IS a merge -- a merge of a ref, a pull request merge, a pull on the default branch, a push to it -- and if so SAYS what
+# suggested just before merge operations and not before." Refined 2026-11-22: "only do the full sweep before final merge and not on every merge." bin/heimdall-precheck-bash
+# asks bin/lib/hmd_sweep_advice.py, for a command that mentions merge, push or pull (and git or gh), whether the command IS the FINAL merge -- a pull request merge, a pull on
+# the default branch, a push to it; NOT a local `git merge` of refs, an integration step inside a batch of agent worktree branches -- and if so SAYS what
 # a full test run would buy: why (what changed since the last green full record), what to run, what it costs (suites, wall clock, tokens, labelled estimates), and that
 # it is the developer's call. It never blocks, never speaks at any other moment, and fails open. This drives the REAL helper and hook against fixture repos and receipts
 # (a throwaway plugin root: the real hook and libs, a tracker that says nothing unless told to, gates that pass) and pins:
-#   * the forms that ARE a merge: advice with all four parts (Why, Run, Cost, Your call) as hook JSON -- systemMessage for the developer, hookSpecificOutput.additionalContext
-#     for the agent -- and never a permissionDecision; behind wrappers, chains, cd, -C, sh -c; and the forms that are NOT (text that only mentions one, an abort, merge-base,
-#     a push to another branch, a rebasing pull, a pull request merge for another repo): nothing at all
+#   * the forms that ARE the final merge: advice with all four parts (Why, Run, Cost, Your call) as hook JSON -- systemMessage for the developer, hookSpecificOutput.additionalContext
+#     for the agent -- and never a permissionDecision; behind wrappers, chains, cd, -C, sh -c; and the forms that are NOT (a LOCAL git merge of refs, however it is typed, the hook
+#     included; text that only mentions one, merge-base, a push to another branch, a rebasing pull, a pull request merge for another repo): nothing at all
 #   * the records: HEAD proven green says so and recommends nothing; a red record, no record, a dirty or incremental one, a foreign one, a sweep already running; a repo that
 #     declares its own checks gets its own command and its own receipt; a repo with neither gets lint plus the use-case suite
 #   * the cost, with its arithmetic, and every token figure labelled an estimate
@@ -229,56 +230,43 @@ group_silent() {  # group_silent <label> [cwd]; one command per line on stdin; e
 
 echo "-- 1. the helper's protocol: exit 3 + ONE line of hook JSON, exit 0 + ok, exit 4 + a reason --"
 receipt "$SWH" "$C1" 0 full true
-hv 'git merge feature'
-if [ "$HRC" = 3 ] && [ "$(printf '%s\n' "$HOUT" | wc -l | tr -d ' ')" = 1 ] && printf '%s\n' "$HOUT" | jq -e 'type == "object"' >/dev/null 2>&1; then ok "a merge: exit 3 and ONE line of JSON"; else bad "helper, merge: rc=$HRC out=$HOUT err=$HERR"; fi
+hv 'git push origin main'
+if [ "$HRC" = 3 ] && [ "$(printf '%s\n' "$HOUT" | wc -l | tr -d ' ')" = 1 ] && printf '%s\n' "$HOUT" | jq -e 'type == "object"' >/dev/null 2>&1; then ok "the final merge (a push to main): exit 3 and ONE line of JSON"; else bad "helper, final merge: rc=$HRC out=$HOUT err=$HERR"; fi
 hv 'git status && ls'
 if [ "$HRC" = 0 ] && [ "$HOUT" = ok ] && [ -z "$HERR" ]; then ok "an ordinary command: exit 0 and 'ok'"; else bad "helper, ordinary: rc=$HRC out=$HOUT"; fi
-hv 'echo "git merge feature'
+hv 'echo "git push origin main'
 if [ "$HRC" = 4 ] && [ "$(printf '%s\n' "$HOUT" | wc -l | tr -d ' ')" = 1 ] && printf '%s' "$HOUT" | grep -q 'unbalanced quote'; then ok "an unbalanced quote: exit 4 and the reason it could not be read"; else bad "helper, unbalanced: rc=$HRC out=$HOUT"; fi
 
-echo "-- 2. ADVICE: every way of typing a merge, with the records of the heimdall regime (last green full sweep at C1, so C2 and F1 are not covered) --"
+echo "-- 2. ADVICE: every way of typing the final merge, with the records of the heimdall regime (last green full sweep at C1, so C2 and F1 are not covered) --"
 FRAG_SW="since the last green full sweep (${C1:0:12}"
-group_advises "a merge of a ref, with the options that take a value and the ones that do not" "$FRAG_SW" <<'EOF'
-git merge feature
-git merge --no-ff feature
-git merge -m "land the feature" feature
-git merge --squash feature
-git merge --no-commit feature
-git merge -s ours feature
-git merge -X theirs feature
-git merge feature other
-git merge origin/feature
-git merge
-git merge --ff-only feature
-git merge --no-edit feature
+# (every form of a LOCAL git merge, which used to be advice here, is now pinned silent in section 3)
+group_advises "the final merge (a push to main) behind git's global options, wrappers, chains, subshells, shells and eval" "$FRAG_SW" <<'EOF'
+git -c user.name=x push origin main
+git --no-pager push origin main
+env FOO=1 git push origin main
+FOO=1 git push origin main
+time git push origin main
+nohup git push origin main &
+command git push origin main
+sudo -u bob git push origin main
+git status && git push origin main
+git fetch; git push origin main
+false || git push origin main
+(git push origin main)
+{ git push origin main; }
+if true; then git push origin main; fi
+x=$(git push origin main)
+sh -c "git push origin main"
+bash -lc 'git push origin main'
+eval "git push origin main"
+echo go | xargs git push origin main
+git push origin main 2>&1 | tail -3
 EOF
-group_advises "behind git's global options, wrappers, chains, subshells, shells and eval" "$FRAG_SW" <<'EOF'
-git -c user.name=x merge feature
-git --no-pager merge feature
-env FOO=1 git merge feature
-FOO=1 git merge feature
-time git merge feature
-nohup git merge feature &
-command git merge feature
-sudo -u bob git merge feature
-git status && git merge feature
-git fetch; git merge feature
-false || git merge feature
-(git merge feature)
-{ git merge feature; }
-if true; then git merge feature; fi
-x=$(git merge feature)
-sh -c "git merge feature"
-bash -lc 'git merge feature'
-eval "git merge feature"
-echo go | xargs git merge feature
-git merge feature 2>&1 | tail -3
-EOF
-hv $'echo start\ngit merge feature'
+hv $'echo start\ngit push origin main'
 if [ "$HRC" = 3 ]; then ok "after a newline"; else bad "after a newline: rc=$HRC $HOUT"; fi
-hv $'git \\\n  merge \\\n  feature'
+hv $'git \\\n  push \\\n  origin main'
 if [ "$HRC" = 3 ]; then ok "a continued line"; else bad "continued line: rc=$HRC $HOUT"; fi
-hv $'bash <<EOF\ngit merge feature\nEOF'
+hv $'bash <<EOF\ngit push origin main\nEOF'
 if [ "$HRC" = 3 ]; then ok "a heredoc fed to a shell"; else bad "heredoc fed to a shell: rc=$HRC $HOUT"; fi
 group_advises "pull request merges" "$FRAG_SW" <<'EOF'
 gh pr merge 12
@@ -308,6 +296,7 @@ git push --mirror origin
 git push --tags origin main
 git push origin HEAD:master
 git -C . push origin main
+git merge worktree-agent-abc123 && git push origin main
 EOF
 group_advises "a pull on the default branch (a merge into it, never a rebase)" "$FRAG_SW" <<'EOF'
 git pull
@@ -319,18 +308,62 @@ git pull --rebase=false
 git pull -s ours origin main
 EOF
 group_advises "the repo comes from -C, cd, a subshell: not the cwd" "$FRAG_SW" "$TMPROOT" <<EOF
-git -C $SW merge feature
 git -C $SW push origin main
-cd $SW && git merge feature
+cd $SW && git push origin main
 cd "$SW"; gh pr merge 12
-cd $SW/test && git merge feature
+cd $SW/test && git push origin main
 cd $SW && cd test && git push
-bash -c "cd $SW && git merge feature"
+bash -c "cd $SW && git push origin main"
 EOF
 N=$((N + 1)); hv 'git push origin trunk' "$UN"
 if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'no green record yet'; then ok "$N. the default branch is what origin/HEAD names (trunk), not only main and master"; else bad "$N. trunk push: rc=$HRC $HOUT $HERR"; fi
 
 echo "-- 3. SILENT: text that only mentions a merge, what is no merge, and the forms that go elsewhere (every one: exit 0, ok, nothing on stderr) --"
+# Operator directive 2026-11-22: "only do the full sweep before final merge and not on every merge". An orchestrator lands a batch of agent worktree branches with local
+# `git merge <branch>`: each one is an INTEGRATION step inside the batch, not the final merge, so it says nothing. The push that sends the batch to the default branch (and a
+# pull request merge, and a pull on the default branch) is the final merge: section 2 pins those forms as advice.
+group_silent "a LOCAL git merge of refs (an integration merge of agent worktree branches into a local branch, here main) is no final merge: no advice, however it is typed" <<'EOF'
+git merge worktree-agent-x
+git merge worktree-agent-abc123
+git merge --no-ff worktree-agent-abc123
+git merge -m "land the batch" worktree-agent-abc123 worktree-agent-def456
+git merge --squash feature
+git merge --no-commit feature
+git merge -s ours feature
+git merge -X theirs feature
+git merge feature other
+git merge origin/feature
+git merge
+git merge --ff-only feature
+git merge --no-edit feature
+git merge proven
+git -c user.name=x merge feature
+git --no-pager merge feature
+env FOO=1 git merge feature
+FOO=1 git merge feature
+time git merge feature
+command git merge feature
+sudo -u bob git merge feature
+git status && git merge worktree-agent-abc123
+git fetch; git merge worktree-agent-abc123
+false || git merge feature
+(git merge feature)
+{ git merge feature; }
+if true; then git merge feature; fi
+x=$(git merge feature)
+sh -c "git merge worktree-agent-abc123"
+bash -lc 'git merge feature'
+eval "git merge feature"
+echo go | xargs git merge feature
+git merge feature 2>&1 | tail -3
+EOF
+group_silent "a LOCAL git merge whose repo comes from -C, cd or a subshell (not the cwd) is no final merge either" "$TMPROOT" <<EOF
+git -C $SW merge worktree-agent-abc123
+cd $SW && git merge feature
+cd "$SW"; git merge worktree-agent-abc123
+cd $SW/test && git merge feature
+bash -c "cd $SW && git merge feature"
+EOF
 group_silent "text that only mentions a merge (echo, printf, grep, cat, a commit message, a script written to disk)" <<'EOF'
 echo "git merge feature"
 echo git push origin main
@@ -346,8 +379,8 @@ git add notes/merge.md
 vim notes/push.md
 echo "$(echo git pull)"
 EOF
-hv $'cat > go.sh <<\'EOF\'\ngit merge feature\nEOF'
-if [ "$HRC" = 0 ] && [ "$HOUT" = ok ]; then ok "a script that holds a merge written to disk (data fed to cat, not to a shell)"; else bad "script written to disk: rc=$HRC $HOUT"; fi
+hv $'cat > go.sh <<\'EOF\'\ngit push origin main\nEOF'
+if [ "$HRC" = 0 ] && [ "$HOUT" = ok ]; then ok "a script that holds the final merge written to disk (data fed to cat, not to a shell)"; else bad "script written to disk: rc=$HRC $HOUT"; fi
 hv $'git commit -m "$(cat <<\'EOF\'\nland: merge the feature\nEOF\n)"'
 if [ "$HRC" = 0 ] && [ "$HOUT" = ok ]; then ok "a heredoc commit message that mentions a merge"; else bad "heredoc commit message: rc=$HRC $HOUT"; fi
 group_silent "git commands that are not a merge or push, even when the word is in them" <<'EOF'
@@ -417,7 +450,9 @@ git pull origin main
 git pull --no-rebase
 EOF
 N=$((N + 1)); hv 'git merge main'
-if [ "$HRC" = 3 ]; then ok "$N. (control) a merge is a merge whichever branch it is typed on"; else bad "$N. merge on a feature branch: rc=$HRC $HOUT"; fi
+if [ "$HRC" = 0 ] && [ "$HOUT" = ok ] && [ -z "$HERR" ]; then ok "$N. a local merge is no final merge on a feature branch either"; else bad "$N. local merge on a feature branch: rc=$HRC $HOUT"; fi
+N=$((N + 1)); hv 'git push origin main'
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" "$FRAG_SW"; then ok "$N. (control) a push of main is the final merge whichever branch it is typed on"; else bad "$N. push of main from a feature branch: rc=$HRC $HOUT"; fi
 git -C "$SW" checkout -q main
 
 echo "-- 4. the records: HEAD proven green says so, recommends nothing, and is exact about WHAT is proven --"
@@ -425,8 +460,8 @@ receipt "$SWH" "$C3" 0 full true
 proves "a push to main at a HEAD the last full sweep covers" "${C3:0:12}" 'git push origin main'
 receipt "$SWH" "$C2" 0 full true
 proves "only the hooks' own journal commit came after the sweep (the push gate counts that fresh too)" "${C3:0:12}" 'git push origin main'
-proves "a merge of a branch that IS the proven commit (nothing new comes in)" "proven" 'git merge proven'
-advises "a merge whose INCOMING branch the sweep has not seen, although HEAD is proven" "feature" 'git merge feature'
+proves "a push of a branch that IS the proven commit (nothing new goes out)" "proven ${C3:0:12}" 'git push origin proven:main'
+advises "a push whose SOURCE branch the sweep has not seen, although HEAD is proven" "feature" 'git push origin feature:main'
 proves "a pull request merge at a proven HEAD" "${C3:0:12}" 'gh pr merge 12'
 proves "a pull at a proven HEAD with no upstream to bring anything" "${C3:0:12}" 'git pull'
 git -C "$SW" update-ref refs/remotes/origin/main "$F1"
@@ -436,7 +471,7 @@ advises "a pull whose upstream (origin/main) is ahead and unproven, at a proven 
 git -C "$SW" update-ref -d refs/remotes/origin/main; git -C "$SW" config --remove-section remote.origin; git -C "$SW" config --remove-section branch.main
 receipt "$SWH" "$C1" 0 full true
 advises "an OLDER green sweep with a real code commit since: the counts say how much" "2 commits and 1 file changed since the last green full sweep (${C1:0:12}" 'git push origin main'
-advises "the sweep's own number of files does not count the hooks' journal record" "1 file changed" 'git merge proven'
+advises "the sweep's own number of files does not count the hooks' journal record" "1 file changed" 'git push origin proven:main'
 receipt "$SWH" "$C3" 0 full false
 advises "a green receipt that recorded a DIRTY tree proves nothing" "no green record yet" 'git push origin main'
 receipt "$SWH" "$C3" 0 incremental true '{"base_full_sha": "x"}'
@@ -450,7 +485,7 @@ advises "a RED receipt at HEAD: no green record, and the way forward is --failed
 hv 'git push origin main'
 if printf '%s' "$HOUT" | jq -r .systemMessage | grep -q '^Run: bash test/run-all.sh --failed'; then ok "$N. after a red sweep the command to run is test/run-all.sh --failed, never a second full sweep"; else bad "red: the Run line is not --failed" "$(msg)"; fi
 receipt "$SWH" "$C1" 1 full false
-advises "a red receipt at an ANCESTOR of HEAD (the fix is committed, the red is still the last word)" "was red" 'git merge feature'
+advises "a red receipt at an ANCESTOR of HEAD (the fix is committed, the red is still the last word)" "was red" 'git push origin main'
 receipt "$SWH" "$CS" 1 full false
 advises "a red receipt of other history says nothing about this tree: no green record yet, and a plain full sweep" "no green record yet" 'git push origin main'
 hv 'git push origin main'
@@ -550,8 +585,8 @@ hv 'git push origin main' "$RC"
 if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'STALE' && msg | grep -q "1 commit and 1 file changed since the last recorded run (${R1:0:12}" && msg | grep -q '^Run: .*bin/heimdall-repo-checks run --repo' && msg | grep -q '^Cost: 2 checks (lint 12s, use-cases 1m35s)' && msg | grep -q '1m47s'; then ok "a commit after the run: STALE, how much changed since it, the runner command, and the checks with the seconds the receipt recorded (1m47s in all)"; else bad "repo-checks, stale: rc=$HRC" "$(msg)"; fi
 rc_run
 git -C "$RC" checkout -q -b side && printf 'side\n' >"$RC/s.txt" && git -C "$RC" add s.txt && git_q -C "$RC" commit -q -m "S side" && git -C "$RC" checkout -q main
-hv 'git merge side' "$RC"
-if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'side' && msg | grep -q '^Run: .*bin/heimdall-repo-checks run --repo'; then ok "a merge in a repo-checks repo: HEAD is proven but the receipt attests ONE commit and the branch coming in is another, so the runner command"; else bad "repo-checks, merge: rc=$HRC" "$(msg)"; fi
+hv 'git push origin side:main' "$RC"
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'side' && msg | grep -q '^Run: .*bin/heimdall-repo-checks run --repo'; then ok "a push of another branch to main in a repo-checks repo: HEAD is proven but the receipt attests ONE commit and the branch going out is another, so the runner command"; else bad "repo-checks, push of another branch: rc=$HRC" "$(msg)"; fi
 jq '.exit_code = 1 | .checks[1].exit_code = 1' "$RC/.heimdall/receipts/repo-checks.json" >"$TMPROOT/rcr.json" && mv "$TMPROOT/rcr.json" "$RC/.heimdall/receipts/repo-checks.json"
 hv 'git push origin main' "$RC"
 if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'RED - check(s) failed: use-cases'; then ok "a red receipt at HEAD: the runner's own words, RED - check(s) failed: use-cases"; else bad "repo-checks, red: rc=$HRC $(msg)"; fi
@@ -562,38 +597,40 @@ if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'use-case-tests.md' && msg | grep -q 'dec
 echo "-- 7. a repo hmd does not manage gets lint plus the use-case suite --"
 hv 'git push origin trunk' "$UN"
 if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'skills/heimdall/references/use-case-tests.md' && msg | grep -q '^Run: .*lint' && msg | grep -q 'no green record yet' && msg | grep -q '~910'; then ok "lint + the use-case suite, the pointer to use-case-tests.md, no green record yet, and the token estimate still there"; else bad "unmanaged: rc=$HRC" "$(msg)"; fi
-hv 'git merge trunk' "$UN"
-if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'use-case-tests.md'; then ok "a merge in an unmanaged repo"; else bad "unmanaged merge: rc=$HRC $(msg)"; fi
+hv 'gh pr merge 3' "$UN"
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'use-case-tests.md'; then ok "a pull request merge in an unmanaged repo"; else bad "unmanaged pr merge: rc=$HRC $(msg)"; fi
 
 echo "-- 8. what it cannot tell is exit 4 with a reason (the hook warns and allows), never a guess --"
-unread "an unbalanced quote that mentions a merge" 'unbalanced quote' 'echo "git merge feature'
-unread "a cd to a variable, then a merge: which repo is unknown" 'cannot be told' 'cd "$SOMEWHERE" && git merge feature'
-unread "cd - likewise" 'cannot be told' 'cd - && git merge feature'
-unread "the repository is not a git repository" 'rev-parse' 'git merge feature' "$NOGIT"
-unread "a directory that does not exist" 'does not exist' 'git -C /no/such/dir merge feature'
-unread "git's -C value in a variable" 'variable' 'git -C "$D" merge feature'
+unread "an unbalanced quote that mentions the final merge" 'unbalanced quote' 'echo "git push origin main'
+unread "a cd to a variable, then the final merge: which repo is unknown" 'cannot be told' 'cd "$SOMEWHERE" && git push origin main'
+unread "cd - likewise" 'cannot be told' 'cd - && git push origin main'
+unread "the repository is not a git repository" 'rev-parse' 'git push origin main' "$NOGIT"
+unread "a directory that does not exist" 'does not exist' 'git -C /no/such/dir push origin main'
+unread "git's -C value in a variable" 'variable' 'git -C "$D" push origin main'
 unread "ANSI-C quoting, which is not decoded" 'ANSI-C' $'echo $\'git merge x\''
-DEEP='git merge feature'
+DEEP='git push origin main'
 for i in 1 2 3 4 5 6 7 8 9 10; do DEEP="sh <<E$i"$'\n'"$DEEP"$'\n'"E$i"; done
 unread "shell strings nested ten deep (past the depth it reads)" 'nested more than 8 deep' "$DEEP"
 LONGCMD="$(python3 -I -c 'print("echo merge; " + "echo x; " * 3000)')"
 unread "a command that takes longer than HMD_SWEEP_ADVICE_TIMEOUT_S to read (1 ms here)" 'took longer' "$LONGCMD" "$SW" HMD_SWEEP_ADVICE_TIMEOUT_S=0.001
-N=$((N + 1)); hv 'git merge feature; echo "unbalanced'
-if [ "$HRC" = 3 ] && advice_ok "$HOUT" "feature"; then ok "$N. a merge it READ wins over a quote it could not close"; else bad "$N. read wins over unread: rc=$HRC $HOUT"; fi
-N=$((N + 1)); hv 'git merge nosuchbranch'
-if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'since the last'; then ok "$N. a ref git cannot place is not counted: HEAD alone is judged"; else bad "$N. unknown ref: rc=$HRC $HOUT $HERR"; fi
+N=$((N + 1)); hv 'git push origin main; echo "unbalanced'
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'bash test/run-all.sh'; then ok "$N. a final merge it READ wins over a quote it could not close"; else bad "$N. read wins over unread: rc=$HRC $HOUT"; fi
+N=$((N + 1)); hv 'git pull origin nosuchbranch'
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'since the last' && advice_ok "$HOUT" 'origin/nosuchbranch cannot be placed'; then ok "$N. a pulled branch git cannot place is not counted: HEAD alone is judged"; else bad "$N. unknown ref: rc=$HRC $HOUT $HERR"; fi
 
 echo "-- 9. through the REAL hook: one line of JSON on stdout, nothing else, exit 0 --"
 receipt "$SWH" "$C1" 0 full true
-run_hook 'git merge feature' "$PLUGIN"
+run_hook 'git pull' "$PLUGIN"
 N=$((N + 1))
-if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh' && [ ! -s "$TMPROOT/err" ]; then ok "$N. a merge: exit 0, advice on stdout as hook JSON, silent on stderr"; else bad "$N. hook, merge: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
+if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh' && [ ! -s "$TMPROOT/err" ]; then ok "$N. a pull on the default branch: exit 0, advice on stdout as hook JSON, silent on stderr"; else bad "$N. hook, pull: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
 N=$((N + 1))
 if jq -e '.hookSpecificOutput.additionalContext | contains("not a block") and contains("developer") and (contains("Do not start") or contains("do not start"))' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. the agent's context says it is advice, that the developer decides, and that the agent does not start the run itself"; else bad "$N. agent context" "$(jq -r .hookSpecificOutput.additionalContext "$TMPROOT/out" | head -c 400)"; fi
 run_hook 'gh pr merge 12 --squash' "$PLUGIN"
 N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh'; then ok "$N. a pull request merge through the hook"; else bad "$N. hook, pr merge: rc=$RC_" "$(head -c 300 "$TMPROOT/out")"; fi
 run_hook 'git push origin main' "$PLUGIN"
 N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh'; then ok "$N. a push to main: the push gates pass (fakes), THEN the advice: still one line of JSON"; else bad "$N. hook, push: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 300 "$TMPROOT/err")"; fi
+run_hook 'git merge worktree-agent-abc123' "$PLUGIN"
+N=$((N + 1)); if [ "$RC_" = 0 ] && [ ! -s "$TMPROOT/out" ] && [ ! -s "$TMPROOT/err" ]; then ok "$N. a LOCAL git merge of an agent branch (an integration merge, not the final one): exit 0, nothing on stdout, nothing on stderr, although the record calls for a full run"; else bad "$N. hook, local merge: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
 SILENT_BAD=""
 for form in 'ls -la' 'git status' 'git commit -m "merge fix"' 'echo "git push origin main"' 'git push origin feature' 'git merge --abort' 'git pull --rebase' 'npm run pull-translations' 'gh pr view 12' 'bash test/a.test.sh'; do
   run_hook "$form" "$PLUGIN"
@@ -602,7 +639,7 @@ done
 N=$((N + 1)); if [ -z "$SILENT_BAD" ]; then ok "$N. ordinary commands, mentions and non-merges print nothing on stdout: no suggestion before merge time"; else bad "$N. the hook spoke for a non-merge:$SILENT_BAD"; fi
 
 echo "-- 10. the tracker's output never corrupts the JSON; without advice it is untouched --"
-run_hook 'git merge feature' "$PLUGIN" TRACKER_SAYS="tracker says hi"
+run_hook 'gh pr merge 12' "$PLUGIN" TRACKER_SAYS="tracker says hi"
 N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh' && grep -q 'tracker says hi' "$TMPROOT/err" && ! grep -q 'tracker says hi' "$TMPROOT/out"; then ok "$N. with advice, stdout is JSON only and the tracker's words go to stderr"; else bad "$N. tracker with advice: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
 run_hook 'git status' "$PLUGIN" TRACKER_SAYS="tracker says hi"
 N=$((N + 1)); if [ "$RC_" = 0 ] && [ "$(cat "$TMPROOT/out")" = "$(printf 'tracker says hi\ntracker says hi')" ]; then ok "$N. without advice the tracker's output is exactly what it was (its stderr folded into stdout, as before)"; else bad "$N. tracker without advice: rc=$RC_" "stdout=$(head -c 200 "$TMPROOT/out")"; fi
@@ -610,45 +647,45 @@ N=$((N + 1)); if [ "$RC_" = 0 ] && [ "$(cat "$TMPROOT/out")" = "$(printf 'tracke
 echo "-- 11. HMD_SWEEP_ADVICE=off (the hook's OWN environment) silences it; anything else leaves it on --"
 OV_BAD=""
 for v in off OFF Off 0 false FALSE no No; do
-  rm -f "$MARK"; run_hook 'git merge feature' "$STUB_ADVICE" HMD_SWEEP_ADVICE="$v"
+  rm -f "$MARK"; run_hook 'gh pr merge 12' "$STUB_ADVICE" HMD_SWEEP_ADVICE="$v"
   { [ "$RC_" = 0 ] && [ ! -s "$TMPROOT/out" ] && [ ! -s "$TMPROOT/err" ] && [ ! -e "$MARK" ]; } || OV_BAD="$OV_BAD [$v: rc=$RC_ out=$(head -c 60 "$TMPROOT/out") ran=$([ -e "$MARK" ] && echo yes || echo no)]"
 done
 N=$((N + 1)); if [ -z "$OV_BAD" ]; then ok "$N. off, OFF, Off, 0, false, FALSE, no, No: silent, and the helper is never even started"; else bad "$N. override off:$OV_BAD"; fi
 OV_BAD=""
 for v in '' 1 on true yes offx ' off' 'off ' 00 nope; do
-  rm -f "$MARK"; run_hook 'git merge feature' "$STUB_ADVICE" HMD_SWEEP_ADVICE="$v"
+  rm -f "$MARK"; run_hook 'gh pr merge 12' "$STUB_ADVICE" HMD_SWEEP_ADVICE="$v"
   { [ "$RC_" = 0 ] && jq -e '.systemMessage | startswith("stub says")' "$TMPROOT/out" >/dev/null 2>&1 && [ -e "$MARK" ]; } || OV_BAD="$OV_BAD [$(printf '%s' "$v"): rc=$RC_ out=$(head -c 60 "$TMPROOT/out")]"
 done
 N=$((N + 1)); if [ -z "$OV_BAD" ]; then ok "$N. empty, 1, on, true, yes, offx, ' off', 'off ', 00, nope all leave it ON: a typo never switches it off"; else bad "$N. override other values:$OV_BAD"; fi
-rm -f "$MARK"; run_hook 'HMD_SWEEP_ADVICE=off git merge feature' "$STUB_ADVICE"
+rm -f "$MARK"; run_hook 'HMD_SWEEP_ADVICE=off gh pr merge 12' "$STUB_ADVICE"
 N=$((N + 1)); if [ "$RC_" = 0 ] && [ -e "$MARK" ]; then ok "$N. an INLINE HMD_SWEEP_ADVICE=off reaches the merge, not the hook that reads its own environment"; else bad "$N. inline override: rc=$RC_"; fi
 
 echo "-- 12. the guardrail switch (hmd guardrails off sweep-advice): only the lib's exit 1 is off, and a core row is never switchable --"
 mkdir -p "$TMPROOT/home/.heimdall"
 printf 'sweep-advice\n' >"$TMPROOT/home/.heimdall/guardrails-off"
-rm -f "$MARK"; run_hook 'git merge feature' "$STUB_ADVICE"
+rm -f "$MARK"; run_hook 'gh pr merge 12' "$STUB_ADVICE"
 N=$((N + 1)); if [ "$RC_" = 0 ] && [ ! -s "$TMPROOT/out" ] && [ ! -s "$TMPROOT/err" ] && [ ! -e "$MARK" ]; then ok "$N. sweep-advice in guardrails-off: silent, and the helper never starts"; else bad "$N. guardrails-off: rc=$RC_" "$(head -c 200 "$TMPROOT/out") $(head -c 200 "$TMPROOT/err")"; fi
-run_hook 'git merge feature' "$PLUGIN"
+run_hook 'gh pr merge 12' "$PLUGIN"
 N=$((N + 1)); if [ "$RC_" = 0 ] && [ ! -s "$TMPROOT/out" ] && [ ! -s "$TMPROOT/err" ]; then ok "$N. ...with the REAL helper too (nothing on stdout, nothing on stderr)"; else bad "$N. guardrails-off, real helper: rc=$RC_" "$(head -c 200 "$TMPROOT/out")"; fi
-run_hook 'git merge feature' "$CORED"
+run_hook 'gh pr merge 12' "$CORED"
 N=$((N + 1)); if [ "$RC_" = 0 ] && jq -e 'has("systemMessage")' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. a manifest that calls it core keeps it on (the tier is read from the manifest, not trusted from the file)"; else bad "$N. core tier: rc=$RC_" "$(head -c 200 "$TMPROOT/out")"; fi
 printf 'bash-gate-chain\nkill-guard\nsweep-guard\nci-waste-guard\nwait-guard\ndisk-floor\n' >"$TMPROOT/home/.heimdall/guardrails-off"
-run_hook 'git merge feature' "$PLUGIN"
+run_hook 'gh pr merge 12' "$PLUGIN"
 N=$((N + 1)); if [ "$RC_" = 0 ] && jq -e 'has("systemMessage")' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. other ids in the file (core and the other recommended guards) leave it on"; else bad "$N. other ids: rc=$RC_" "$(head -c 200 "$TMPROOT/out")"; fi
 printf 'sweep-advice\n' >"$TMPROOT/home/.heimdall/guardrails-off"
 for rc in 0 2 127; do
-  rm -f "$MARK"; run_hook 'git merge feature' "$LIBSTUB" STUB_RC=$rc
+  rm -f "$MARK"; run_hook 'gh pr merge 12' "$LIBSTUB" STUB_RC=$rc
   N=$((N + 1)); if [ "$RC_" = 0 ] && [ -e "$MARK" ]; then ok "$N. a lib that answers $rc leaves it on (only exactly 1 is off)"; else bad "$N. lib answers $rc: rc=$RC_ ran=$([ -e "$MARK" ] && echo yes || echo no)"; fi
 done
-rm -f "$MARK"; run_hook 'git merge feature' "$LIBSTUB" STUB_RC=1
+rm -f "$MARK"; run_hook 'gh pr merge 12' "$LIBSTUB" STUB_RC=1
 N=$((N + 1)); if [ "$RC_" = 0 ] && [ ! -e "$MARK" ] && [ ! -s "$TMPROOT/out" ]; then ok "$N. a lib that answers 1: off"; else bad "$N. lib answers 1: rc=$RC_"; fi
-run_hook 'git merge feature' "$NOLIB"
+run_hook 'gh pr merge 12' "$NOLIB"
 N=$((N + 1)); if [ "$RC_" = 0 ] && jq -e 'has("systemMessage")' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. no guardrail lib in the plugin root: any doubt keeps it on"; else bad "$N. no lib: rc=$RC_" "$(head -c 200 "$TMPROOT/out")"; fi
 rm -f "$TMPROOT/home/.heimdall/guardrails-off"
 
 echo "-- 13. FAILS OPEN: what the helper cannot do is one stderr line at most, and the command goes on --"
 fail_open() {  # fail_open <label> <plugin root> <fragment of the stderr line, or ''>
-  run_hook 'git merge feature' "$2"
+  run_hook 'gh pr merge 12' "$2"
   N=$((N + 1))
   local lines; lines="$(wc -l <"$TMPROOT/err" | tr -d ' ')"
   local said=1   # the stderr line holds the fragment, or (fragment -) there is no stderr at all
@@ -661,13 +698,13 @@ fail_open "a helper that exits 4: its reason is the warning" "$STUB_UNREAD" 'an 
 fail_open "a helper whose import is missing (no hmd_sweep_guard.py beside it)" "$NOGUARD" 'the helper itself failed'
 fail_open "no helper in the plugin root: silent, a plumbing gap (not even a warning)" "$NOHELPER" -
 fail_open "a helper that says nothing and exits 0: silent" "$STUB_SILENT" -
-run_hook 'git merge feature' "$PLUGIN" HMD_SWEEP_ADVICE_TIMEOUT_S=0.0000001
+run_hook 'gh pr merge 12' "$PLUGIN" HMD_SWEEP_ADVICE_TIMEOUT_S=0.0000001
 N=$((N + 1)); if [ "$RC_" = 0 ] && [ ! -s "$TMPROOT/out" ] && [ "$(wc -l <"$TMPROOT/err" | tr -d ' ')" -le 1 ]; then ok "$N. a timeout: an allow, one line at most"; else bad "$N. timeout: rc=$RC_" "$(head -c 200 "$TMPROOT/err")"; fi
-rm -f "$MARK"; run_hook 'git merge feature' "$STUB_ADVICE"
+rm -f "$MARK"; run_hook 'gh pr merge 12' "$STUB_ADVICE"
 N=$((N + 1)); if [ "$RC_" = 0 ] && jq -e '.systemMessage == "stub says \"hi\" \\ there %s"' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. a message with a quote, a backslash and a percent sign reaches stdout verbatim (printf '%s', never a format)"; else bad "$N. verbatim: rc=$RC_" "$(head -c 200 "$TMPROOT/out")"; fi
 
 echo "-- 14. the place in the chain: advice comes only for a command the gates let through --"
-run_hook 'git merge feature; sleep 600' "$PLUGIN"
+run_hook 'gh pr merge 12; sleep 600' "$PLUGIN"
 N=$((N + 1)); if [ "$RC_" = 2 ] && jq -e 'keys == ["error"] and (.error | startswith("BLOCKED: hmd wait guard"))' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. a command the wait guard denies prints ONLY the deny (no advice before it, none after)"; else bad "$N. deny wins: rc=$RC_" "$(head -c 300 "$TMPROOT/out")"; fi
 receipt "$SWH" "$C3" 1 full false
 run_hook 'bash test/run-all.sh; git push origin main' "$PLUGIN"
@@ -686,10 +723,10 @@ for form in 'git merge feature' 'git merge --abort' 'gh pr merge 12' 'git pull' 
   rm -f "$MARK"; run_hook "$form" "$STUB_OK"
   { [ "$RC_" = 0 ] && [ -e "$MARK" ]; } || PF_BAD="$PF_BAD [$form: rc=$RC_]"
 done
-N=$((N + 1)); if [ -z "$PF_BAD" ]; then ok "$N. a merge, an abort, a pull request merge, a pull, two pushes, two mentions and a commit message that names one: the helper is asked (it decides what is real)"; else bad "$N. pre-filter missed a trigger:$PF_BAD"; fi
+N=$((N + 1)); if [ -z "$PF_BAD" ]; then ok "$N. a local merge, an abort, a pull request merge, a pull, two pushes, two mentions and a commit message that names one: the helper is asked (it decides what is real)"; else bad "$N. pre-filter missed a trigger:$PF_BAD"; fi
 
 echo "-- 16. the REAL plugin root (the files as shipped), and the wiring --"
-run_hook 'git merge feature' "$REPO"
+run_hook 'gh pr merge 12' "$REPO"
 N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh'; then ok "$N. the shipped hook and libs give the advice"; else bad "$N. real root: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 300 "$TMPROOT/err")"; fi
 ROW="$(jq -c '[.guardrails[] | select(.id == "sweep-advice")]' "$MANIFEST" 2>/dev/null)"
 if [ "$(printf '%s' "$ROW" | jq 'length')" = 1 ] && printf '%s' "$ROW" | jq -e '.[0] | .kind == "guard" and .tier == "recommended" and .layer == "precheck-bash" and .hook == "bash-gate-chain" and .fails == "open" and .operator_env == "HMD_SWEEP_ADVICE=off" and .proof == "test/sweep-advice.test.sh"' >/dev/null 2>&1; then ok "guardrails.manifest.json has ONE sweep-advice row: a recommended guard in precheck-bash, fails open, override HMD_SWEEP_ADVICE=off, proven by this suite"; else bad "the manifest row" "$ROW"; fi

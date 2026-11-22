@@ -136,12 +136,15 @@ Always produce a structured plan:
 - **Patterns:** [existing exemplars to follow, with `file:line` references]
 - **Acceptance criteria** (EVERY item must be grep- or command-runnable, NOT prose):
   - [ ] `grep -q "export const X" src/foo.ts` exits 0
-  - [ ] `npm test -- --grep "X"` exits 0
+  - [ ] `npm run test:use-cases -- -t "book a cab"` exits 0 (one user journey's scenario; pytest: `pytest tests/use_cases -q -k test_book_a_cab`)
   - [ ] `test -f src/foo/Bar.tsx`
 - **Oracle gate** (REQUIRED on the final correctness wave's task; see Oracle-Gate Protocol): registry domain + `gate_type` + resolved `bin/oracle-select <domain>` command + `independent: true` + reference author (separate agent / external dataset).
 - **Verify:** [the single command the verifier agent runs to grade this task — for the correctness wave this IS the wired oracle gate command]
 - **Done when:** [one-line human-readable summary for the status report]
 - **Risks & Mitigation:** [bullet pairs — see Risk table below]
+
+**Criteria are user journeys** (operator directives 2026-11-12, 2026-11-22). In a client (managed) repo, anywhere but heimdall's own, every task's acceptance criteria and tests are USE-CASE scenarios: one per real user journey the task touches, given/when/then against the public entry point, real code end to end, fakes only at external boundaries (payments, network, LLM, third-party APIs), plus the touched files' own tests, run once; a unit test only to pin a specific bug. Rules, shape, example: `skills/heimdall/references/use-case-tests.md`.
+Never a full unit-suite or offline-eval sweep as a gate; the one full run (heimdall's own repo: the sweep; a client repo: `lint` + the use-case suite) is only RECOMMENDED to the developer immediately before the FINAL merge operation (why, command, cost) and runs on their say-so, never started unasked (`CLAUDE.md` "When the full gate runs").
 
 Write the full plan to `.planning/PLAN-<phase>.md`. Emit `.planning/waves.json` if total tasks > 10 (see Auto-emit rule below).
 
@@ -231,7 +234,7 @@ Format:
     {
       "id": 1,
       "tasks": [
-        { "id": "auth-api", "agent": "hmd:coder", "model": "sonnet", "effort": "default", "scope": "src/auth/api.ts", "skills": ["claude-api"], "acceptance": ["grep -q 'export const login' src/auth/api.ts", "npm test -- auth"], "prompt": "<self-contained spawn prompt>" },
+        { "id": "auth-api", "agent": "hmd:coder", "model": "sonnet", "effort": "default", "scope": "src/auth/api.ts", "skills": ["claude-api"], "acceptance": ["grep -q 'export const login' src/auth/api.ts", "npm run test:use-cases -- -t 'sign in'"], "prompt": "<self-contained spawn prompt>" },
         { "id": "auth-ui",  "agent": "hmd:coder", "model": "sonnet", "effort": "default", "scope": "src/auth/components/", "skills": ["ui-ux-pro-max"], "acceptance": ["test -f src/auth/components/LoginForm.tsx"], "prompt": "<self-contained spawn prompt>" }
       ]
     }
@@ -264,7 +267,7 @@ Do not rationalize skipping the design gate, runnable criteria, oracle wiring, o
 
 - Plans you emit MUST be directly executable by a coder agent with zero additional context.
 - Every acceptance criterion MUST be a runnable shell command (grep / curl / test command / file existence check), not English prose.
-- Test criteria are scoped to the task's OWN test file(s) (`npm test -- auth`), never a bare full-suite command per task; the plan's last step RECOMMENDS to the developer, on the frozen tree after the final wave and review and immediately before the merge operation, the ONE full sweep in heimdall's own repo and `lint` + the use-case suite in a client repo (why, command, cost: a recommendation they decide on, never an acceptance criterion and never run unasked), where each task's criteria name the user-journey scenarios its change must pass (one per real user journey it touches), not a unit-suite run (`skills/heimdall/references/use-case-tests.md`).
+- Test criteria are scoped to the task's OWN test file(s) (a journey's scenario: `npm run test:use-cases -- -t "sign in"`), never a bare full-suite command per task; the plan's last step RECOMMENDS to the developer, on the frozen tree after the final wave and review and immediately before the merge operation, the ONE full sweep in heimdall's own repo and `lint` + the use-case suite in a client repo (why, command, cost: a recommendation they decide on, never an acceptance criterion and never run unasked), where each task's criteria name the user-journey scenarios its change must pass (one per real user journey it touches), not a unit-suite run (`skills/heimdall/references/use-case-tests.md`).
 - Every PLAN file MUST end with an `## OUT OF SCOPE` section.
 - Two tasks in the same wave MUST touch disjoint files.
 - Sub-agents in your waves MUST be referenced as `hmd:<role>` (namespaced).
