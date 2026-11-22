@@ -132,7 +132,7 @@ its one definition: commit, tree, counts, time), and `heimdall-state check-quali
 receipt for HEAD IN PLACE of a green full-equivalent sweep receipt: either record passes a push, and
 the hooks' own journal and ledger commits after the run do not stale it. The full sweep
 (`bash test/run-all.sh`, with everything below about the cache, `--failed`, the freeze and the quiet
-gate) is required only for a release: `release/ship.sh` still demands its full-equivalent receipt,
+gate) is required only for a release: the release script still demands its full-equivalent receipt,
 unchanged, and the sweep is what is recommended to the developer immediately before a release. Every
 rule below about who may start a run, when it is recommended and how its output is read applies to both.
 
@@ -388,7 +388,7 @@ warning but isn't blocked; don't drop the gate altogether.* The gate is now chos
   passed, every mutant killed), `head_sha` a commit this checkout has and `tree_sha` its tree, and that
   commit is HEAD or only the hooks' own journal and ledger commits came after it. A missing, red, forged,
   stale, garbled, linked or unverifiable receipt blocks (the failure names `bash test/use-cases/run.sh`)
-  and leaves the sweep rule as it was; the state flags and the lint evidence still apply. `release/ship.sh`
+  and leaves the sweep rule as it was; the state flags and the lint evidence still apply. The release script
   is untouched: a release still needs the full sweep receipt. Proof: `test/sweep-receipt-gate.test.sh` (M, N)
   and `test/pre-push-quality-gate-blocking.test.sh` (2b-2e).
 - **(b) repo-checks.** A commit has `.heimdall/repo-checks.json` = `{"schema":1,"checks":[{"name","cmd"}]}`.
