@@ -71,3 +71,14 @@
 - MEDIUM: install.sh leaves tracked bin/edit-tracker.c and bin/parallelism-tracker.c modified in the clone (found by lean T1.4 install baseline).
 - LOW: hmd-statusline suite header/fixture copy differ from heimdall's cwd=/ fixture fix (3413b7e4); adopt statusline_sandbox payload rewrite at next pin bump.
 - MEDIUM: run-all suite_timeout() needs arms heimdall-push-gate-per-repo=400, heimdall-app=600, app-pair-confirm=450 (solo 175/261/205 s vs 180 default; '# budget:' headers are not read). Salt change → cold sweep; ride the next release batch. Interim: --timeout 600.
+
+## From lean-core review (2026-11-22, MEDIUM/LOW)
+- MED lean_backup.py:135,58 restore overwrites any ANTHROPIC_BASE_URL/HEADROOM_*/hmd-matching hook, incl. user-owned ones added after the backup; scope to values hmd wrote.
+- MED lean_backup.py:453 absent-at-backup files deleted on restore: module state created later is lost silently; warn or skip.
+- MED install.sh:1448 failed lean apply on upgrade leaves old sparse patterns over new code; "keeping the full tree" message false; disable sparse on failure.
+- MED install.sh:1465 a stopped --reset exits after fetch, skipping registration/hooks until next run.
+- LOW hmd --reinstall wipe lands a previously-full user on lean (marker + skills-config deleted).
+- LOW lean install omits skills/stacks and nothing writes packs/ yet: stack-pack finds no base packs until `hmd skills install stacks`.
+- LOW route guard sees only the installer's env; --reset from another terminal edits settings env a routed session may use (documented).
+- LOW docs/conversation-context.md referenced by heimdall/heimdall-lean prompts and SKILL.md no longer exists.
+- First-launch checklist: picking a skill in a non-project folder writes <cwd>/.planning/skills.lock.
