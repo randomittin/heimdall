@@ -40,15 +40,22 @@ app/
     __init__.py
     item_service.py   # Business logic; no direct HTTP types, no DB sessions leaked out
     user_service.py
+  clients/
+    __init__.py
+    payments.py       # One adapter per EXTERNAL system (payments, maps, email, LLM); the seam a fake replaces
   db.py               # Engine + SessionLocal + Base; get_db() dependency lives here
 alembic/
   env.py
   versions/           # Auto-generated migration scripts
 alembic.ini
 tests/
-  conftest.py         # pytest fixtures: TestClient, override_get_db, test DB setup
-  test_items.py       # One test file per router/feature area
-  test_users.py
+  use_cases/          # THE GATE: one scenario per user journey, entered through the HTTP route
+    conftest.py       # real app + disposable sqlite; fakes wired in via app.dependency_overrides
+    fakes/            # one fake per external system; implements the client's interface, records calls
+      payments.py
+    test_<journey>.py # test_book_a_cab, test_declined_card_books_nothing (the user's words)
+  conftest.py         # shared fixtures: TestClient, override_get_db, test DB setup
+  test_<module>.py    # optional: pins one specific bug; never a gate
 requirements.txt      # or pyproject.toml (poetry/uv)
 .env                  # DATABASE_URL and secrets — never committed
 ```
@@ -61,6 +68,10 @@ Rules for adding files:
   route signatures.
 - Pydantic schemas and SQLAlchemy models are kept in separate modules (`schemas/`
   vs `models/`) — never merge them.
+- A new user-facing capability → a scenario `test_<journey>` in `tests/use_cases/`,
+  not a new per-router test file.
+- A new external system (payments, maps, email, LLM) → one adapter in `clients/`
+  (injected with `Depends()`) and one fake in `tests/use_cases/fakes/`.
 
 ---
 
@@ -91,24 +102,42 @@ uvicorn app.main:app --reload
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Test
+### Test — the gate is the use-case suite
+
+The gate is `lint` + the use-case suite: one scenario per user journey, entered
+through the HTTP route a client calls, real code down to a real (disposable
+sqlite) database, fakes only at the external boundaries (payments, maps, email,
+OAuth, the LLM, the clock). See `skills/heimdall/references/use-case-tests.md`.
 
 ```bash
-# full suite
-pytest -q
+# use-case suite (the gate): pytest exits 5 when it collects nothing, so an empty suite FAILS
+pytest tests/use_cases -q
 
+# one journey, named in the user's words
+pytest tests/use_cases -q -k test_book_a_cab
+```
+
+Never add `|| true` or `--suppress-no-test-exit-code` to a gate: a use-case run
+that collects zero tests must fail.
+
+During work, run only the tests of the files you touched, once, after all
+changes are written. These pin a specific bug and are not a gate:
+
+```bash
 # single test file
 pytest -q tests/test_items.py
 
 # single test by name
 pytest -q -k "test_create_item_returns_201"
-
-# with coverage
-pytest -q --cov=app --cov-report=term-missing
 ```
 
-Tests use `httpx.AsyncClient` or `starlette.testclient.TestClient` (sync),
-never a live server. DB dependency is overridden via `app.dependency_overrides`.
+Do not gate on the whole suite (`pytest -q`) or on coverage (`--cov`): neither
+proves a journey works.
+
+Scenarios use `httpx.AsyncClient` or `starlette.testclient.TestClient` (sync),
+never a live server. The DB dependency is overridden with a disposable sqlite
+database (still a real one); each external-system client is overridden with its
+fake: `app.dependency_overrides[get_payments] = lambda: fake_payments`.
 
 ### Lint / Format
 
@@ -138,6 +167,19 @@ mypy app
 mypy --strict app
 ```
 
+### Gate declaration
+
+`.heimdall/repo-checks.json`, committed (each `cmd` runs with `bash -c` from the
+repo root). Append `&& mypy app` to `lint` when `mypy` is a dev dependency.
+Nothing else gates the repo: no full-suite or coverage check.
+
+```json
+{"schema":1,"checks":[
+  {"name":"lint","cmd":"ruff check . && ruff format --check ."},
+  {"name":"use-cases","cmd":"pytest tests/use_cases -q"}
+]}
+```
+
 ### Migrations (Alembic)
 
 ```bash
@@ -156,15 +198,30 @@ alembic downgrade -1
 ## Section 4 — Acceptance-Criteria Templates
 
 Drop these into a plan unchanged; each is a command a reviewer can run and read
-the exit code of.
+the exit code of. The gate is the first group: `lint` + `use-cases`.
 
-- `pytest -q` exits 0 — the full suite is green.
-- Every new endpoint has a `TestClient` (or `AsyncClient`) test that asserts
-  both the HTTP status code and the JSON response shape:
-  `grep -rl "def test_" tests/ | xargs grep -l "<endpoint_function_name>"` returns
-  the test file.
-- `ruff check .` exits 0 — no lint violations.
-- `ruff format --check .` exits 0 — code is formatted.
+### Gate: `lint` + `use-cases`
+
+- `ruff check . && ruff format --check .` exits 0 — the `lint` check: no lint
+  violations, code is formatted.
+- `pytest tests/use_cases -q` exits 0 and ends with `N passed`, N >= 1 — the
+  `use-cases` check (exit 5 means nothing was collected: a failure).
+- For each journey the plan names, `pytest tests/use_cases -q -k test_<journey>`
+  exits 0 — the scenario exists and passes (a missing one selects nothing, exit 5).
+- Scenarios enter through HTTP, never through the repo's internals:
+  `grep -rnE "from app\.(routers|services)|import app\.(routers|services)" tests/use_cases/test_*.py`
+  returns no lines.
+- Fakes sit only at external boundaries; the repo's own code is never patched:
+  `grep -rnE "(monkeypatch\.setattr|patch)\(['\"]?app\.(routers|services|models|schemas)" tests/use_cases/`
+  returns no lines.
+- No scenario is skipped or expected to fail:
+  `grep -rnE "mark\.(skip|xfail)|pytest\.(skip|xfail)|importorskip" tests/use_cases/`
+  returns no lines.
+- Each scenario asserts what the caller sees, not only that the call returned:
+  `grep -q "status_code\|\.json()" tests/use_cases/test_<journey>.py` exits 0.
+
+### Code shape and runtime
+
 - Request and response types are Pydantic `BaseModel` subclasses, not plain
   `dict`: `grep -rn "-> dict" app/routers/` returns no lines.
 - Every route function that returns a body has an explicit `response_model`

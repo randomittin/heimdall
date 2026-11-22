@@ -54,9 +54,13 @@ this file where they conflict.
 │   │       ├── application-prod.yml        # prod profile overrides
 │   │       └── db/migration/               # Flyway or Liquibase scripts (if present)
 │   └── test/
-│       └── java/com/example/app/          # mirrors main/ package layout exactly
-│           ├── controller/
-│           │   └── OrderControllerTest.java   # @WebMvcTest or @SpringBootTest slice
+│       └── java/com/example/app/
+│           ├── usecases/                       # THE GATE: one <Journey>JourneyTest per user journey
+│           │   ├── PlaceAnOrderJourneyTest.java    # @SpringBootTest(RANDOM_PORT): real HTTP, real beans, real (H2) database
+│           │   └── fakes/                      # one hand-written fake per external system, records what it was sent
+│           │       └── FakePaymentGateway.java
+│           ├── controller/                     # the rest mirrors main/: optional slice tests that pin one specific bug, never a gate
+│           │   └── OrderControllerTest.java    # @WebMvcTest slice
 │           ├── service/
 │           │   └── OrderServiceTest.java       # plain JUnit 5, no Spring context
 │           └── repository/
@@ -80,7 +84,9 @@ Build output lands in `target/` (never commit).
 | JPA entity | `model/` (or `model/entity/` in larger codebases) |
 | Response/request shape | `model/` (or `model/dto/`) — never reuse `@Entity` as DTO |
 | Cross-cutting config | `config/` — `@Configuration` class |
-| Integration test | `src/test/java/…` mirror of the tested class's package |
+| User journey (the gate) | `src/test/java/<base package>/usecases/<Journey>JourneyTest.java` — `@SpringBootTest(webEnvironment = RANDOM_PORT)`; fakes in `usecases/fakes/` |
+| External system client (payments, mail, maps) | an interface the app owns in `service/`; one hand-written fake of it in `usecases/fakes/` |
+| Test that pins one specific bug | `src/test/java/…` mirror of the tested class's package (never a gate) |
 
 ---
 
@@ -122,45 +128,72 @@ Violations are printed to stdout and also written to
 `build/reports/checkstyle/` (Gradle) or `target/checkstyle-result.xml` (Maven).
 The build fails on any violation — warnings are not silently tolerated.
 
-### Test
+### Test — the gate is the use-case suite
+
+The gate is `lint` + the use-case suite: one `<Journey>JourneyTest` per user
+journey, `@SpringBootTest(webEnvironment = RANDOM_PORT)`, real HTTP into real
+beans and a real (H2) database, fakes only at the external boundaries (payments,
+mail, maps, the clock). See `skills/heimdall/references/use-case-tests.md`.
 
 ```bash
-# Gradle — full suite
-./gradlew test
+# Gradle — the use-case suite (the gate). A --tests filter that matches nothing fails
+# the build ("No tests found for given includes"), so an empty suite FAILS.
+./gradlew test --tests '*JourneyTest'
 
-# Gradle — single test class
+# Gradle — one journey
+./gradlew test --tests '*PlaceAnOrderJourneyTest'
+
+# Maven — the use-case suite (the gate). A -Dtest pattern that matches nothing fails the build.
+./mvnw test -Dtest='*JourneyTest'
+
+# Maven — one journey
+./mvnw test -Dtest=PlaceAnOrderJourneyTest
+```
+
+During work, run only the class you touched, once. These pin a specific bug and
+are not a gate:
+
+```bash
+# Gradle — single test class / method
 ./gradlew test --tests 'com.example.app.controller.OrderControllerTest'
-
-# Gradle — single test method
 ./gradlew test --tests 'com.example.app.controller.OrderControllerTest.shouldReturn200WhenOrderFound'
 
-# Maven — full suite
-./mvnw test
-
-# Maven — single test class
+# Maven — single test class / method
 ./mvnw test -Dtest=OrderControllerTest
-
-# Maven — single test method
 ./mvnw test -Dtest=OrderControllerTest#shouldReturn200WhenOrderFound
 ```
+
+Do not gate on the whole suite (`./gradlew test` or `./mvnw test` with no filter,
+which `build` and `package` also run) or on coverage (JaCoCo thresholds).
 
 Test reports: `build/reports/tests/test/index.html` (Gradle) or
 `target/surefire-reports/` (Maven).
 
 ### Build (compile + package)
 
-```bash
-# Gradle
-./gradlew clean build
+`build` and `package` also run every test, so the build check excludes them; the
+journeys run separately, as the gate above.
 
-# Gradle — skip tests (only for packaging; never skip in CI)
+```bash
+# Gradle — compile and package
 ./gradlew clean build -x test
 
-# Maven
-./mvnw clean package
-
-# Maven — skip tests
+# Maven — compile and package
 ./mvnw clean package -DskipTests
+```
+
+### Gate declaration
+
+`.heimdall/repo-checks.json`, committed (each `cmd` runs with `bash -c` from the
+repo root; on Maven use `./mvnw checkstyle:check -DskipTests` and
+`./mvnw test -Dtest='*JourneyTest'`). Nothing else gates the repo: no full-suite or
+coverage check.
+
+```json
+{"schema":1,"checks":[
+  {"name":"lint","cmd":"./gradlew check -x test"},
+  {"name":"use-cases","cmd":"./gradlew test --tests '*JourneyTest'"}
+]}
 ```
 
 Output artifact: `build/libs/<name>-<version>.jar` (Gradle) or
@@ -189,58 +222,71 @@ java -jar build/libs/app-0.0.1-SNAPSHOT.jar --spring.profiles.active=dev
 
 ## Section 4 — Acceptance-Criteria Templates
 
-Drop these into a task plan verbatim; each is runnable by a reviewer.
+Drop these into a task plan verbatim; each is runnable by a reviewer. The gate is
+the first group: `lint` + `use-cases`.
 
-### Build and test
+### Gate: `lint` + `use-cases`
 
 ```bash
-# Full suite passes — exit 0 required
-./gradlew test
+# use-cases — every journey passes: exit 0 required. A filter that matches
+# nothing fails the build, so an empty suite fails.
+./gradlew test --tests '*JourneyTest'
 # Maven equivalent
-./mvnw test
+./mvnw test -Dtest='*JourneyTest'
 ```
-Proves: all unit and integration tests green.
+Proves: every user journey works through real HTTP, real beans and a real
+database (the `use-cases` check).
 
 ```bash
-# Full build compiles and packages — exit 0 required
-./gradlew clean build
+# each journey the plan names exists and passes — exit 0 required
+./gradlew test --tests '*<Journey>JourneyTest'
 # Maven equivalent
-./mvnw clean package
+./mvnw test -Dtest=<Journey>JourneyTest
 ```
-Proves: no compile errors, no test failures, no static-analysis violations.
-
-### Lint / style
+Proves: the scenario for that journey exists (a missing class matches nothing and
+fails the build) and passes.
 
 ```bash
-# Checkstyle + Spotless pass — exit 0, zero violations printed
+# lint — Checkstyle + Spotless pass: exit 0, zero violations printed
 ./gradlew check -x test
 # Maven equivalent
 ./mvnw checkstyle:check -DskipTests
 ```
 Proves: code style conforms to project standards.
 
-### Controller coverage
-
 ```bash
-# Every new @RestController class has a corresponding test file
-grep -rl '@RestController' src/main/java \
-  | sed 's|src/main/java/||; s|\.java$||' \
-  | while read cls; do
-      base=$(basename "$cls")
-      found=$(find src/test/java -name "${base}Test.java" | head -1)
-      if [ -z "$found" ]; then echo "MISSING TEST: $base"; fi
-    done
-# Must print nothing (no missing tests)
+# every journey runs the whole application, not a slice with mocked beans
+grep -rL '@SpringBootTest' src/test/java --include='*JourneyTest.java'
+# Must print nothing
 ```
-Proves: every new REST controller has a test class.
+Proves: journeys exercise the real controllers, services and repositories.
 
 ```bash
-# That test class uses @WebMvcTest or @SpringBootTest
-grep -rl '@WebMvcTest\|@SpringBootTest' src/test/java \
-  | xargs grep -l 'OrderController'
+# fakes only at external boundaries, no journey switched off
+grep -rn '@MockBean\|@SpyBean\|Mockito\|@Disabled' src/test/java/com/example/app/usecases
+# Must print nothing
+```
+Proves: external systems are replaced by hand-written fakes in `usecases/fakes/`
+(they implement the client interface and record what they were sent); the repo's
+own beans are never mocked, and no journey is switched off.
+
+```bash
+# a new endpoint is reached by a journey
+grep -rl '<route path>' src/test/java/com/example/app/usecases
 # Must return at least one file
 ```
-Proves: the controller is exercised via the Spring MVC layer.
+Proves: the endpoint is exercised by a user journey, not only by a per-class test.
+
+### Build
+
+```bash
+# Compiles and packages, tests excluded — exit 0 required
+./gradlew clean build -x test
+# Maven equivalent
+./mvnw clean package -DskipTests
+```
+Proves: no compile errors. Tests are the gate's job (the journeys above), not the
+build's.
 
 ### Constructor injection
 
@@ -348,7 +394,9 @@ transitively). Spring cannot satisfy both.
 `@Service` or `@Repository` bean.
 **Cause:** `@WebMvcTest` is a web-layer slice test; it does not load `@Service`
 or `@Repository` beans.
-**Fix:** declare the dependency as a `@MockBean` in the test class:
+**Fix:** declare the dependency as a `@MockBean` in the test class. This is for a
+slice test that pins one specific bug; a journey is a `@SpringBootTest` that never
+mocks the repo's own beans:
 
 ```java
 @WebMvcTest(OrderController.class)
