@@ -19,7 +19,7 @@ You execute all tasks in a single wave. Parallel where possible. Each task verif
 2. For each task in this wave:
    a. Read files listed in "Read first"
    b. Implement the action
-   c. Run the task's acceptance criteria ONCE, after its changes are written, on its own test file(s) only -- if ANY fail, fix and re-run only the failing criterion
+   c. Run the task's acceptance criteria (in a client repo: its user-journey scenarios) ONCE, after its changes are written, on its own test file(s) only -- if ANY fail, fix and re-run only the failing criterion
    d. Commit: `git add -A && git commit -m "task: [task name]"`
 3. Write results to `.planning/SUMMARY-{phase}-wave-{N}.md`
 
@@ -32,7 +32,8 @@ NEVER write stub, dummy, placeholder, shim, mock, TODO, or skeleton code. Every 
 - Each task = one atomic git commit
 - Acceptance criteria are BLOCKING. Task not done until ALL pass.
 - Criterion fails after 2 fix attempts? Report as blocked, move on.
-- Test once, at the end (`CLAUDE.md` "When the full gate runs"): a task's criteria run ONCE on its own test file(s) — no neighbouring suites, no re-running a child's file after it reports, no suite runs at integration. A failure plausibly caused by machine load gets ONE solo re-run. The full run is the developer's call at merge time: the orchestrator recommends it, nobody starts it unasked.
+- **Tests are user journeys** (operator directives 2026-11-12, 2026-11-22). In a client (managed) repo, anywhere but heimdall's own, a task's acceptance criteria and tests are USE-CASE scenarios: one per real user journey the task touches, given/when/then against the public entry point, real code end to end, fakes only at external boundaries (payments, network, LLM, third-party APIs), plus the touched files' own tests, run once; a unit test only to pin a specific bug. Put each task's journey scenario(s) into its criteria and into every child's spawn prompt; a task whose criteria name none gets the scenario for the journey it touches written first, never a unit test or a suite run in its place. Rules, shape, example: `skills/heimdall/references/use-case-tests.md`.
+- Test once, at the end (`CLAUDE.md` "When the full gate runs"): a task's criteria run ONCE on its own test file(s) — no neighbouring suites, no re-running a child's file after it reports, no suite runs at integration. A failure plausibly caused by machine load gets ONE solo re-run. Never a full unit-suite or offline-eval sweep as a gate; the one full run (heimdall's own repo: the sweep; a client repo: `lint` + the use-case suite) is only RECOMMENDED by the orchestrator to the developer immediately before the FINAL merge operation (why, command, cost) and runs on their say-so, never started unasked.
 - Write all files to the PROJECT directory, never to Heimdall plugin dir.
 
 ## Parallelism
