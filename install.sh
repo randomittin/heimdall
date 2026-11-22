@@ -1193,6 +1193,35 @@ main() {
     fi
     step_ok "Fetched Heimdall ($REF)"
   fi
+
+  # ── Install profile: lean or full (3.x lean-core plan, T3.4) ──────────────
+  # `lean` narrows the clone to what runs (git sparse-checkout, bin/lib/lean_sparse.sh: every object stays in .git, so what the tree lacks
+  # is one local `add` away); `full` is the whole tree, today's install. bin/lib/hmd_profile.py decides ONCE, on a fresh install (a runtime
+  # home that holds the setup marker or a grandfathered skills-config.json is `full`, anything else `lean`) and records it in the runtime
+  # home (INV-L2). A re-run re-applies the RECORDED profile and never decides again, so an upgrade cannot reset it (INV-L7). An install with
+  # no record (every install from before this step) reads as `full`: a re-run over it writes nothing and changes nothing (INV-L8). Lean
+  # never costs an install: the clone is whole when this starts and a failed apply leaves the tree as it was. It installs no proxy and
+  # routes no session (INV-L12). This runs BEFORE the export below: the runtime home is the launcher's rule (HEIMDALL_HOME, else
+  # ~/.heimdall) and that export points HEIMDALL_HOME at the installer's own telemetry store.
+  local RT_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+  local PROFILE_PY="$PLUGIN_DIR/bin/lib/hmd_profile.py"
+  local PROFILE_SPARSE="$PLUGIN_DIR/bin/lib/lean_sparse.sh"
+  if [ -f "$PROFILE_PY" ] && [ -f "$PROFILE_SPARSE" ] && command -v python3 >/dev/null 2>&1; then
+    if [ "$UPGRADING" -eq 0 ]; then
+      local PROFILE_MARKER="--marker-absent"
+      if [ -f "$RT_HOME/setup-done" ]; then PROFILE_MARKER="--marker-present"; fi
+      HEIMDALL_HOME="$RT_HOME" python3 -I "$PROFILE_PY" init "$PROFILE_MARKER" || true
+    fi
+    if [ "$(HEIMDALL_HOME="$RT_HOME" python3 -I "$PROFILE_PY" get || true)" = "lean" ]; then
+      step_begin "Applying lean profile"
+      if bash "$PROFILE_SPARSE" apply lean "$PLUGIN_DIR" >/dev/null; then
+        step_ok "Applying lean profile" "on-demand parts stay in git"
+      else
+        printf '  ⚠ hmd: lean profile not applied, keeping the full tree (the next install.sh run tries again)\n' >&2
+        step_ok "Applying lean profile" "skipped, full tree kept"
+      fi
+    fi
+  fi
   chmod +x "$PLUGIN_DIR/bin/"* 2>/dev/null || true
 
   # ── Telemetry world is live (wrapper just cloned) ─────────────────────────
