@@ -25,3 +25,4 @@
 10_update_lands_and_session_returns	bin/lib/hmd_supervise.sh	s/HMD_RESUME_SESSION_ID=/HMD_RESUME_SESSION_ID_OFF=/g	M10b-session-relaunched-without-resume
 08_pair_a_phone	bin/heimdall-relay-client	s/^        if self\._no_confirm and not self\._claim_is_mine(login):$/        if False:/	M08a-a-claim-for-another-account-pairs-the-phone
 08_pair_a_phone	bin/heimdall-relay-client	s/^                INBOX\.append(self\.root, text)$/                last = None/	M08b-pairing-leaves-no-notice-in-the-session
+08_pair_a_phone	bin/heimdall-app	s#^    rm -f "\$UI_OUT" 2>/dev/null || true$#    true#	M08c-connect-exits-without-removing-its-temp-files

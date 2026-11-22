@@ -767,6 +767,23 @@ CTL_DIR=""
 cleanup() {
   [ "$CLEANED_UP" = true ] && return 0
   CLEANED_UP=true
+  # The temp files go FIRST, before anything below that can take seconds or be cut short. Nothing in this function reads them (they are only where the ui and the
+  # client write, and a process keeps writing to a file that was unlinked). Removed last, they were lost whenever this function was abandoned half way: a signal
+  # of ANOTHER kind (INT or HUP over a TERM's teardown) runs its trap nested, this function returns at once for the flag and that trap's own `exit` ends the shell
+  # (a repeat of the same signal waits its turn and does no harm); a kill does the same. The pid that left looked exactly like a clean exit to `hmd app disconnect`,
+  # which waits on the pid, and the temp files stayed in TMPDIR.
+  if [ -n "$UI_OUT" ]; then
+    rm -f "$UI_OUT" 2>/dev/null || true
+  fi
+  if [ -n "$CLIENT_OUT" ]; then
+    rm -f "$CLIENT_OUT" 2>/dev/null || true
+  fi
+  if [ -n "$CLIENT_ERR" ]; then
+    rm -f "$CLIENT_ERR" 2>/dev/null || true
+  fi
+  if [ -n "$CTL_DIR" ]; then
+    rm -rf "$CTL_DIR" 2>/dev/null || true
+  fi
   local funnel_stop_rc=0
   if [ "$RELAY_MODE" = true ]; then
     # Relay's own analogue of the funnel-stop-and-verify branch below: TERM,
@@ -800,18 +817,6 @@ cleanup() {
   if [ "$STATE_WRITTEN" = true ] && [ -n "$STATE_REPO" ]; then
     _state_remove "$STATE_REPO" connect.json
     [ "$RELAY_MODE" = true ] && _state_remove "$STATE_REPO" relay.json
-  fi
-  if [ -n "$UI_OUT" ]; then
-    rm -f "$UI_OUT" 2>/dev/null || true
-  fi
-  if [ -n "$CLIENT_OUT" ]; then
-    rm -f "$CLIENT_OUT" 2>/dev/null || true
-  fi
-  if [ -n "$CLIENT_ERR" ]; then
-    rm -f "$CLIENT_ERR" 2>/dev/null || true
-  fi
-  if [ -n "$CTL_DIR" ]; then
-    rm -rf "$CTL_DIR" 2>/dev/null || true
   fi
   exec 3>&-  # the relay client's control pipe (closing an fd that was never opened is harmless)
   # N1: an explicit exit is the only way to change the process's final exit
