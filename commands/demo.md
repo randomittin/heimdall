@@ -62,33 +62,46 @@ demo.
 ## The canned task
 
 The scaffolded task (`<dir>/.heimdall-demo-task.md`) is a real, fully-specified
-build — not a vague "make an app". It is scoped to ~5 files with runnable
-acceptance criteria baked in, so the result is verifiable and impressive:
+build — not a vague "make an app". It is scoped to ~8 files with runnable
+acceptance criteria baked in, so the result is verifiable and impressive. It is
+accepted on its **user journeys**, not on unit tests: the managed-repo gate
+(`skills/heimdall/references/use-case-tests.md`), `lint` + a use-case suite.
 
 **A Todo full-stack app:**
 
-- **Backend** — Python 3 + FastAPI + Uvicorn (`app.py`), Pydantic models,
-  in-memory store. Five real endpoints:
-  - `GET /api/todos`, `POST /api/todos` (422 on empty title),
-    `PATCH /api/todos/{id}` (404 on unknown), `DELETE /api/todos/{id}` (204 / 404),
-    `GET /` (serves the HTML page).
+- **Backend** — Python 3 + FastAPI + Uvicorn (`app.py`, built by a `create_app()`
+  factory), Pydantic models, in-memory store. Five real endpoints:
+  - `GET /api/todos` (`?done=true|false` filters the list), `POST /api/todos` (422 on
+    empty title), `PATCH /api/todos/{id}` (404 on unknown), `DELETE /api/todos/{id}`
+    (204 / 404), `GET /` (serves the HTML page).
 - **Frontend** — one self-contained `index.html` (vanilla JS + fetch, no build
-  step): list / add / toggle-complete / delete.
-- **Tests** — `pytest` + FastAPI `TestClient` (`test_app.py`) covering every
-  acceptance criterion.
+  step): list / add / toggle-complete / filter / delete, with the control ids the
+  scenarios hold the page to.
+- **Use-case scenarios** — `tests/use_cases/` (`pytest` + FastAPI `TestClient`): one
+  scenario per user journey, given / when / then through the real routes and the
+  served page: open the app, create, complete, filter and delete a todo, plus the two
+  failure paths the API promises (blank title, unknown id). Fakes only at external
+  boundaries; this app has none, so the suite has none. The task describes the
+  scenarios; it ships no test code.
+- **Gate** — `.heimdall/repo-checks.json` declaring `lint` (`ruff check .`) and
+  `use-cases` (`pytest tests/use_cases -q`), plus a `pytest.ini` (`pythonpath = .`)
+  so that command finds `app.py`.
 - **Docs** — `README.md` with exact install / run / test commands.
 
 **Runnable acceptance criteria** (these ship in the task file):
 
 1. `pip install -r requirements.txt` succeeds.
-2. `pytest -q` → all tests pass, exit 0.
-3. `uvicorn app:app` boots and `GET /` returns the HTML page.
-4. `curl -s localhost:8000/api/todos` returns valid JSON.
-5. README documents the exact commands.
-6. Every endpoint fully implemented — no unfinished markers, no fake data.
+2. `pytest tests/use_cases -q` → all scenarios pass, exit 0 (exactly seven collected).
+3. `ruff check .` → exit 0.
+4. `.heimdall/repo-checks.json` declares exactly `lint`, then `use-cases`.
+5. `uvicorn app:app` boots and `GET /` returns the HTML page.
+6. `curl -s localhost:8000/api/todos` returns valid JSON.
+7. README documents the exact commands.
+8. Every endpoint fully implemented — no unfinished markers, no fake data.
 
 A matching plan seed (`<dir>/.planning/PLAN.md`) lays out three waves
-(backend core → frontend + tests → docs + verify) so Heimdall starts with momentum.
+(backend core → frontend + use-case scenarios → docs + verify) so Heimdall starts with
+momentum. `test/demo-scaffold-use-cases.test.sh` pins the task text.
 
 ## What the orchestrator should do
 
