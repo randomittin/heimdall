@@ -49,7 +49,13 @@ services/                   # API clients + data-fetching
   api.ts
 lib/                        # pure utilities (no RN imports)
   <util>.ts
-__tests__/                  # mirrors source tree; *.test.tsx
+__tests__/
+  use-cases/                # THE GATE: one file per user journey, driven through the real screens
+    <journey>.test.tsx      # it('search email by sender', ...)
+  <module>.test.tsx         # optional: pins one specific bug; never a gate
+test-support/
+  fakes/                    # one fake per external system (API, push, payments, location); NOT under
+                            # __tests__ (jest would run every file there as a test)
 app.json / app.config.ts    # Expo config (SDK version, plugins, scheme)
 babel.config.js             # must include expo preset first
 tsconfig.json               # "extends": "expo/tsconfig.base"
@@ -84,6 +90,9 @@ metro.config.js
 - Feature-scoped components go in `components/<FeatureName>/`.
 - Hooks that wrap a single external library go in `hooks/use<LibName>.ts`.
 - No business logic inside screen files — extract to hooks or services.
+- A new user-facing capability gets a journey file in `__tests__/use-cases/`
+  (`<journey>.test.tsx`), not a per-component test; an external system (API,
+  push, payments, location) gets one fake in `test-support/fakes/`.
 - Platform-specific variants use `.ios.tsx` / `.android.tsx` suffixes;
   the shared import resolves them automatically at bundle time.
 
@@ -145,17 +154,48 @@ The `tsconfig.json` must extend `expo/tsconfig.base` (Expo) or include
 `@tsconfig/react-native` (bare). Strict mode is expected; do not weaken
 `strict: true`.
 
-### Test
+### Test — the gate is the use-case suite
+
+The gate is `lint` + the use-case suite: one journey per file, driven through the
+app's real screens the way the user drives them (`@testing-library/react-native`
+on the real root: `renderRouter` from `expo-router/testing-library` for Expo
+Router, `<App />` for bare), with the real navigation, providers and store. Fakes
+only at the external boundaries: the API client or network, push, camera,
+location, payments, the clock. See `skills/heimdall/references/use-case-tests.md`.
 
 ```
-npx jest                            # full suite
+npm run test:use-cases                           # "test:use-cases": "jest __tests__/use-cases"
+npx jest __tests__/use-cases/book-a-cab          # one journey: select its file by path
+```
+
+Jest exits 1 ("No tests found") when the path matches no file; never add
+`--passWithNoTests`. Select a journey by its file path (one file per journey).
+A journey that needs native behaviour (deep links, permissions, push) runs on a
+simulator build with Maestro (`maestro test e2e/use-cases/<journey>.yaml`) or
+Detox, chained into the same `test:use-cases` script.
+
+During work, run only the tests of the files you touched, once. These pin a
+specific bug and are not a gate:
+
+```
 npx jest --testPathPattern="Button" # single file / pattern
-npx jest --watch                    # interactive watch mode
-npx jest --coverage                 # with coverage report
 ```
 
 Test runner is `jest-expo` (Expo) or `@react-native/jest-preset` (bare).
-Config lives in `jest.config.js` or the `jest` key in `package.json`.
+Config lives in `jest.config.js` or the `jest` key in `package.json`. Do not gate
+on the whole suite (`npx jest`) or on coverage (`--coverage`).
+
+### Gate declaration
+
+`.heimdall/repo-checks.json`, committed (each `cmd` runs with `bash -c` from the
+repo root). Nothing else gates the repo: no full-suite or coverage check.
+
+```json
+{"schema":1,"checks":[
+  {"name":"lint","cmd":"npx eslint . --max-warnings 0 && npx tsc --noEmit"},
+  {"name":"use-cases","cmd":"npm run test:use-cases"}
+]}
+```
 
 ### Build (EAS)
 
@@ -176,15 +216,32 @@ distributable without store submission.
 ## Section 4 — Acceptance-Criteria Templates
 
 Drop these into a task plan verbatim. Each is a copy-paste-runnable command
-with a checkable exit code or output.
+with a checkable exit code or output. The gate is the first group: `lint` +
+`use-cases`.
 
-- `npx tsc --noEmit` exits 0 — no TypeScript errors across the project.
-- `npx eslint . --max-warnings 0` exits 0 — lint clean, zero warnings.
-- `npx jest` exits 0 — full test suite passes.
-- `npx jest --coverage` prints coverage; statement coverage for the changed
-  module must be >= 80 % (visible in the printed table, not a separate CI step).
-- New screen has a `@testing-library/react-native` render test:
-  `grep -r "render(" __tests__/ | grep -i "<ScreenName>"` returns a match.
+### Gate: `lint` + `use-cases`
+
+- `npx eslint . --max-warnings 0 && npx tsc --noEmit` exits 0 — the `lint` check:
+  zero warnings, no TypeScript errors.
+- `npm run test:use-cases` exits 0 — the `use-cases` check: every journey passes
+  through the real screens. Jest exits 1 when no test file matches.
+- For each journey the plan names, `npx jest __tests__/use-cases/<journey>` exits
+  0 — the file exists and passes.
+- No journey is skipped or a todo:
+  `grep -rnE "(it|test|describe)\.(skip|todo)|(^|[^a-zA-Z])x(it|describe)\(" __tests__/use-cases/`
+  returns no lines.
+- Journeys render the root and act like the user, never a component or hook on
+  its own:
+  `grep -rnE "from ['\"](\.\./)+(components|hooks)/" __tests__/use-cases/*.test.tsx`
+  returns no lines.
+- The app's own code is never mocked (only external clients and native modules are):
+  `grep -rnE "jest\.mock\(['\"](\.\./)+(components|hooks|store|lib)/" __tests__/use-cases/`
+  returns no lines.
+- A new screen is reached by a journey:
+  `grep -rln "<ScreenName>\|<route path>" __tests__/use-cases/` returns a file.
+
+### Code shape and build
+
 - No inline styles where a `StyleSheet` is already defined in the file:
   `git diff --name-only HEAD | xargs grep -n "style={{" 2>/dev/null` returns
   no output for the changed files.

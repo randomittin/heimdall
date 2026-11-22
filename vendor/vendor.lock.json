@@ -4,9 +4,9 @@
     {
       "name": "hmd-skills",
       "repo": "git@github.com:randomittin/hmd-skills.git",
-      "tag": "v1.0.0",
-      "commit": "292abad36cfa1f8f4ae9c7ffccf97851ea4ae0eb",
-      "tree_sha256": "cab4e7e88295463401bda19a95ae358f6761e88084276b36d79bc46d412fcfb3",
+      "tag": "v1.0.1",
+      "commit": "a3d4b5dbe55e22ddc2e918de495d696af963f9e4",
+      "tree_sha256": "07e8decd5c109b4ebee70d1defbd2010411aaf3af60695084f69ca16c50e1400",
       "paths": [
         "skills/designmatch/SKILL.md",
         "skills/designmatch/assets/visual-qa.ts",

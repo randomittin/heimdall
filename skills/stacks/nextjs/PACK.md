@@ -48,6 +48,11 @@ App Router layout (Next.js 13+, default from Next 13.4 onward, standard in 14/15
 ├── hooks/                      # Custom React hooks (all "use client" consumers)
 ├── types/                      # Shared TypeScript types / zod schemas
 ├── public/                     # Static assets served at /
+├── e2e/
+│   ├── use-cases/              # THE GATE: one spec per user journey, driven through the browser
+│   │   └── <journey>.spec.ts   # test('a visitor orders coffee with oat milk', ...)
+│   └── fakes/                  # one fake server per external system (payments, maps, email, OAuth, LLM)
+├── playwright.config.ts        # testDir 'e2e', forbidOnly, webServer starts the real app
 ├── middleware.ts               # Edge middleware (runs before every matched request)
 ├── next.config.ts              # Next.js configuration (ts preferred in v15)
 ├── tsconfig.json
@@ -77,6 +82,11 @@ App Router layout (Next.js 13+, default from Next 13.4 onward, standard in 14/15
   imported by a file that has `"use client"` at its top.
 - Route handlers (`route.ts`) export named HTTP method functions: `GET`, `POST`,
   `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`.
+- Journeys live in `e2e/use-cases/`, not co-located: one spec per user journey,
+  titled in the user's words. A co-located `*.test.ts(x)` only pins one specific
+  bug and is never a gate.
+- An external system (payments, maps, email, OAuth, LLM) gets one client in `lib/`
+  (its base URL read from an env var) and one fake server in `e2e/fakes/`.
 
 ---
 
@@ -92,15 +102,20 @@ Assumes `npm`. Swap `npm run` for `yarn` or `pnpm run` if the project uses those
   `next lint --max-warnings 0` to treat warnings as errors.
 - **Typecheck:** `npx tsc --noEmit`
   — must exit 0 before any merge. Does not emit JS; only validates types.
-- **Test (unit/integration — vitest):** `npm test` or `npx vitest run`
-  — single file: `npx vitest run src/lib/utils.test.ts`
-  — single test: `npx vitest run -t "formats currency"`
-- **Test (unit/integration — jest):** `npm test` or `npx jest --passWithNoTests`
-  — single file: `npx jest app/api/orders/route.test.ts`
-  — single test: `npx jest -t "returns 400 when body is missing"`
-- **Test (e2e — Playwright):** `npx playwright test`
-  — single spec: `npx playwright test e2e/checkout.spec.ts`
-  — headed: `npx playwright test --headed`
+- **Test — use cases (the gate):** `npm run test:use-cases`
+  — the script is `"test:use-cases": "playwright test e2e/use-cases"`: the real app
+  (Playwright's `webServer` builds and starts it), a real browser, a real disposable
+  database, fakes only at external boundaries
+  — one journey: `npx playwright test e2e/use-cases -g "orders coffee with oat milk"`
+  — list the journeys without running them: `npx playwright test e2e/use-cases --list`
+  — an empty run: Playwright exits 1 ("No tests found"); never add `--pass-with-no-tests`
+  — headed (debugging): `npx playwright test e2e/use-cases --headed`
+- **Test — touched code (during work, NOT a gate):** run only the file you changed,
+  once, to pin a specific bug.
+  — vitest: `npx vitest run src/lib/utils.test.ts` (one case: `npx vitest run -t "formats currency"`)
+  — jest: `npx jest app/api/orders/route.test.ts` (one case: `npx jest -t "returns 400 when body is missing"`)
+  — never `--passWithNoTests` (it turns "no tests found" into a pass); do not gate on
+  `npm test` (the whole suite) or on coverage
 - **Build (production):** `npm run build`
   — runs `next build`; exits non-zero on any type error, lint error, or broken
   import. Must pass before deploy.
@@ -109,28 +124,56 @@ Assumes `npm`. Swap `npm run` for `yarn` or `pnpm run` if the project uses those
 - **Dev server:** `npm run dev`
   — starts Next.js dev server with Fast Refresh, usually on port 3000.
 
+### Gate declaration and Playwright config
+
+`.heimdall/repo-checks.json`, committed (each `cmd` runs with `bash -c` from the
+repo root). Nothing else gates the repo: no full-suite or coverage check.
+
+```json
+{"schema":1,"checks":[
+  {"name":"lint","cmd":"npm run lint && npx tsc --noEmit"},
+  {"name":"use-cases","cmd":"npm run test:use-cases"}
+]}
+```
+
+In `playwright.config.ts`: `testDir: 'e2e'`; `forbidOnly: true` (a stray `test.only`
+fails the run instead of shrinking it); `webServer` runs the real app
+(`npm run build && npm start`, or `npm run dev` for a faster local loop) plus, as
+extra entries, one fake server per external system from `e2e/fakes/` (the app's
+base-URL env var for that system points at it; browser-side third-party calls use
+`page.route`). A fake records what it was sent and can be told to fail.
+
 ---
 
 ## Section 4 — Acceptance-Criteria Templates
 
 Drop these into a plan's acceptance-criteria section. Each is a command a
-reviewer runs and reads the exit code of.
+reviewer runs and reads the exit code of. The gate is the first group: `lint` +
+`use-cases`.
+
+### Gate: `lint` + `use-cases`
+
+- `npm run lint && npx tsc --noEmit` exits 0 — the `lint` check: no lint errors,
+  no TypeScript errors (`next lint --max-warnings 0` to treat warnings as errors).
+- `npm run test:use-cases` exits 0 — the `use-cases` check: every journey spec
+  passes against the real, running app. Playwright exits 1 when it finds no tests.
+- For each journey the plan names,
+  `npx playwright test e2e/use-cases --list | grep -F "<journey title>"` prints a
+  line and `npx playwright test e2e/use-cases -g "<journey title>"` exits 0 — the
+  scenario exists and passes.
+- No spec is skipped, focused or marked fixme:
+  `grep -rnE "test\.(skip|only|fixme)|describe\.(skip|only)" e2e/use-cases/`
+  returns no lines.
+- Specs drive the browser, never an internal module:
+  `grep -rnE "from ['\"](@/|(\.\./)+)(app|lib|components|hooks)/" e2e/use-cases/`
+  returns no lines.
+- A new route `app/<path>/page.tsx` or handler `app/api/<resource>/route.ts` is
+  reached by a journey: `grep -rln "/<path>" e2e/use-cases/` returns a spec.
+
+### Build, code shape and runtime
 
 - `npm run build` exits 0 — production build compiles without errors or broken
   imports.
-- `npx tsc --noEmit` exits 0 — no TypeScript errors across the codebase.
-- `npm run lint` exits 0 (or `next lint --max-warnings 0` exits 0) — no lint
-  errors or warnings.
-- `npm test` exits 0 (or `npx vitest run` exits 0) — full unit/integration suite
-  is green.
-- `npx playwright test` exits 0 — all e2e specs pass against the running app.
-- New route `app/<path>/page.tsx` has a co-located or `__tests__/` test file:
-  `find . -path "*/app/<path>/*.test.*" -o -path "*/__tests__/*<name>*" | grep -q .`
-  returns 0.
-- New route handler `app/api/<resource>/route.ts` has a test covering each
-  exported HTTP method:
-  `grep -r "GET\|POST\|PUT\|DELETE" **/__tests__/*<resource>* || grep -r "GET\|POST\|PUT\|DELETE" app/api/<resource>/route.test.ts`
-  returns a match.
 - No server component imports a client-only API:
   `grep -rn "localStorage\|sessionStorage\|window\.\|document\." app/ | grep -v '"use client"' | grep -v node_modules`
   returns empty.

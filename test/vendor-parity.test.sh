@@ -5,13 +5,18 @@
 # (evals/split/baseline.json, written in W0 by another tool, bin/lib/split_baseline.py). INV-S1 and INV-S2 of .planning/split/INVARIANTS.md.
 #
 # T3.2 moved 41 recorded files out of heimdall: the 24 suites that call only the renderer, and the 17 files of conformance/statusline/ that are not a sigil
-# golden (test/heimdall-sigil-render.test.sh, an integration suite that stays, compares against those 9). They live in hmd-statusline at v1.0.0, history
-# included, and are neither in this tree nor in the lock; the recording keeps them, as the tree was before the split. So the recording is the whole of the
-# lock, the two core-only suites and the 41 moved paths, and each moved path must be GONE here and PRESENT in the tag.
+# golden (test/heimdall-sigil-render.test.sh, an integration suite that stays, compares against those 9). They live in hmd-statusline, in the tag the lock
+# pins for it (v1.0.0 when T3.2 moved them), history included, and are neither in this tree nor in the lock; the recording keeps them, as the tree was
+# before the split. So the recording is the whole of the lock, the two core-only suites and the 41 moved paths, and each moved path must be GONE here and
+# PRESENT in the tag.
+#
+# A bump of a pin that changes a mirrored file (hmd-skills v1.0.1 rewrote the four stack packs) re-records the baseline in the same commit as the lock
+# (`python3 -I bin/lib/split_baseline.py record`, docs/split-repos.md). This suite holds the lock, the recording and the tree to one another, so a bump that
+# forgets one of them is RED. The tag of each repository is read from the lock, never written in this suite: a bump edits the lock, not this file.
 #
 # `heimdall-vendor verify` alone says the mirror hashes to the lock: a lock and a mirror edited together would still pass it. So the claim is checked
 # three ways, each a GREEN control on the real tree next to RED mutations of one thing on a throwaway copy:
-#   A. the lock is the plan's pin (two repositories, the ssh URLs, tag v1.0.0, a commit and a tree_sha256 each) and `verify --all` is exit 0 on the real
+#   A. the lock is the plan's pin (two repositories, the ssh URLs, a release tag, a commit and a tree_sha256 each) and `verify --all` is exit 0 on the real
 #      tree; it is exit 1 for a flipped byte (same size), a dropped exec bit on hooks/statusline.sh, a deleted file, a flipped tree_sha256 and a path
 #      dropped from the lock.
 #   B. the mirror equals the recording byte for byte: every pinned path has the sha256 and exec bit the recording has (hashed here by shasum, not by the
@@ -20,9 +25,10 @@
 #      pinned again or restored in the tree, a recording that lost a moved path, a sigil golden dropped from the lock and a path the recording does not
 #      know pinned.
 #   C. the pin is the tag: when the local clones sit next to the heimdall checkout (HMD_SPLIT_REPOS_DIR overrides the directory), `verify --upstream
-#      --source` fetches v1.0.0 from each and wants the locked commit and tree_sha256, and the 41 moved paths are in the hmd-statusline tag at the
-#      recorded sha256 and exec bit (the deletion lost nothing); RED for a lock with another commit and for a recording hash that is not the tag's. A
-#      clone that is not there is a printed skip (CI has none): the pin is then checked offline by A and B only.
+#      --source` fetches the tag the lock pins from each and wants the locked commit and tree_sha256, and the 41 moved paths are in the hmd-statusline
+#      tag at the recorded sha256 and exec bit (the deletion lost nothing); RED for a lock with another commit and for a recording hash that is not the
+#      tag's. A clone that is not there, or that lacks the tag the lock pins, is a printed skip (CI has none): the pin is then checked offline by A and
+#      B only.
 # No network: every source is a local path and ssh is switched off.
 # cost: about 25 runs of the tool (python3), as many of jq, ~12 batch shasum calls and up to three local fetches of a tag: seconds solo.
 set -u
@@ -131,13 +137,17 @@ parity_problems() {
   done
   diff <(base_lines "$WORK/pp.lock" "$base") <(tree_lines "$tree" "$WORK/pp.lock") | grep '^[<>]' | sed 's/^/differs (< recording, > tree): /'
 }
-# moved_problems <clone> <baseline>: one line for each moved path that tag v1.0.0 of the clone does not carry at the recorded sha256 and exec bit
+# TAG_RE: a release tag, v<major>.<minor>.<patch>; a branch or any moving name is not one
+TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
+# lock_tag <lock> <repo name>: the release tag the lock pins for that repository (read from the lock: a bump edits the lock, never this suite); nothing when it pins none
+lock_tag() { jq -r --arg n "$2" --arg re "$TAG_RE" '.repos[] | select(.name == $n) | .tag | select(type == "string" and test($re))' "$1" 2>/dev/null; }
+# moved_problems <clone> <baseline> <tag>: one line for each moved path that <tag> of the clone does not carry at the recorded sha256 and exec bit
 moved_problems() {
-  local clone="$1" base="$2" err
+  local clone="$1" base="$2" tag="$3" err
   printf '%s\n' "$MOVED" > "$WORK/mv.list"
   rm -rf "$WORK/tag" "$WORK/tag.tar"; mkdir -p "$WORK/tag"
-  if ! err="$(git -C "$clone" archive --format=tar -o "$WORK/tag.tar" v1.0.0 -- $MOVED 2>&1)"; then
-    echo "tag v1.0.0 of $clone does not carry every moved path: $(head -2 <<<"$err")"; return
+  if ! err="$(git -C "$clone" archive --format=tar -o "$WORK/tag.tar" "$tag" -- $MOVED 2>&1)"; then
+    echo "tag $tag of $clone does not carry every moved path: $(head -2 <<<"$err")"; return
   fi
   tar -xf "$WORK/tag.tar" -C "$WORK/tag"
   diff <(base_lines "$WORK/mv.list" "$base") <(tree_lines "$WORK/tag" "$WORK/mv.list") | grep '^[<>]' | sed 's/^/differs (< recording, > tag): /'
@@ -150,16 +160,22 @@ fresh() { rm -rf "$M"; mkdir -p "$M"; (cd "$ROOT" && tar -cf - -T "$WORK/paths.l
 
 echo "== A) the lock is the plan's pin; verify --all is green on the real tree and RED when one thing moves =="
 check "the plan's accept: the lock lists two repositories" jq -e '.repos|length==2' "$LOCK"
-lock_shape() { jq -e '
+lock_shape() { jq -e --arg re "$TAG_RE" '
   .schema==1 and (.repos|map(.name)==["hmd-skills","hmd-statusline"])
   and (.repos|map(.repo)==["git@github.com:randomittin/hmd-skills.git","git@github.com:randomittin/hmd-statusline.git"])
-  and all(.repos[]; .tag=="v1.0.0" and (.commit|test("^[0-9a-f]{40}$")) and (.tree_sha256|test("^[0-9a-f]{64}$")))' "$1" >/dev/null 2>&1; }
-if lock_shape "$LOCK"; then ok "hmd-skills and hmd-statusline, the ssh URLs under randomittin, tag v1.0.0, a 40-hex commit and a 64-hex tree_sha256 each"
-else bad "the lock is not the plan's pin (names, repo URLs, tag v1.0.0, commit and tree_sha256 shapes)"; fi
+  and all(.repos[]; (.tag|type=="string" and test($re)) and (.commit|test("^[0-9a-f]{40}$")) and (.tree_sha256|test("^[0-9a-f]{64}$")))' "$1" >/dev/null 2>&1; }
+SKILLS_TAG="$(lock_tag "$LOCK" hmd-skills)"; STATUSLINE_TAG="$(lock_tag "$LOCK" hmd-statusline)"
+if lock_shape "$LOCK"; then ok "hmd-skills ($SKILLS_TAG) and hmd-statusline ($STATUSLINE_TAG), the ssh URLs under randomittin, a release tag, a 40-hex commit and a 64-hex tree_sha256 each"
+else bad "the lock is not the plan's pin (names, repo URLs, a vX.Y.Z tag each, commit and tree_sha256 shapes)"; fi
 jq 'del(.repos[1])' "$LOCK" > "$WORK/lock.one"
-jq '.repos[0].tag = "v1.0.1"' "$LOCK" > "$WORK/lock.tag"
-if ! lock_shape "$WORK/lock.one" && ! lock_shape "$WORK/lock.tag"; then ok "RED: the shape check fails for a lock with one repository and for a lock pinning another tag"
-else bad "the shape check accepts a lock with one repository or another tag"; fi
+jq '.repos[0].tag = "main"' "$LOCK" > "$WORK/lock.tag"
+if ! lock_shape "$WORK/lock.one" && ! lock_shape "$WORK/lock.tag"; then ok "RED: the shape check fails for a lock with one repository and for a lock pinning a branch (main), not a release tag"
+else bad "the shape check accepts a lock with one repository or a branch as the tag"; fi
+jq '.repos[1].tag = "v9.8.7"' "$LOCK" > "$WORK/lock.bump"
+if [ -n "$SKILLS_TAG" ] && [ -n "$STATUSLINE_TAG" ] && [ "$(lock_tag "$WORK/lock.bump" hmd-statusline)" = v9.8.7 ] \
+   && [ "$(lock_tag "$WORK/lock.bump" hmd-skills)" = "$SKILLS_TAG" ] && [ -z "$(lock_tag "$WORK/lock.tag" hmd-skills)" ]; then
+  ok "the tag this suite checks upstream is the lock's: a bumped lock names the bumped tag, for its own repository only, and a branch name is no tag"
+else bad "lock_tag does not follow the lock (the tag this suite checks upstream is read from it)"; fi
 
 run verify --all
 if [ "$RC" = 0 ] && contains "$OUT" "ok hmd-skills" && contains "$OUT" "ok hmd-statusline"; then ok "verify --all on the real tree: exit 0, both repositories ok ($NPATHS files)"
@@ -220,13 +236,15 @@ if [ -z "$REPOS_DIR" ] && command -v git >/dev/null 2>&1; then
 fi
 first_clone=""; statusline_clone=""
 for name in hmd-skills hmd-statusline; do
-  src="$REPOS_DIR/$name"
-  if [ -n "$REPOS_DIR" ] && git -C "$src" rev-parse -q --verify "refs/tags/v1.0.0" >/dev/null 2>&1; then
-    green "verify --upstream: tag v1.0.0 of $src is the locked commit and tree_sha256" "tag checked upstream" verify "$name" --upstream --source "$src" --lock "$LOCK"
+  src="$REPOS_DIR/$name"; tag="$(lock_tag "$LOCK" "$name")"
+  if [ -z "$tag" ]; then
+    echo "  skip $name: the lock pins no vX.Y.Z tag for it (section A is red)"
+  elif [ -n "$REPOS_DIR" ] && git -C "$src" rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
+    green "verify --upstream: tag $tag of $src is the locked commit and tree_sha256" "tag checked upstream" verify "$name" --upstream --source "$src" --lock "$LOCK"
     [ "$name" = hmd-skills ] && first_clone="$src"
     [ "$name" = hmd-statusline ] && statusline_clone="$src"
   else
-    echo "  skip $name: no clone with tag v1.0.0 at '$src' (HMD_SPLIT_REPOS_DIR names the directory that holds it)"
+    echo "  skip $name: no clone with tag $tag at '$src' (HMD_SPLIT_REPOS_DIR names the directory that holds it)"
   fi
 done
 if [ -n "$first_clone" ]; then
@@ -234,11 +252,11 @@ if [ -n "$first_clone" ]; then
   red "RED: a lock pinning another commit than the tag has" "the tag moved, or the lock is stale" verify hmd-skills --upstream --source "$first_clone" --lock "$WORK/lock.commit"
 fi
 if [ -n "$statusline_clone" ]; then
-  MP="$(moved_problems "$statusline_clone" "$BASE")"
-  if [ -z "$MP" ]; then ok "all $NMOVED moved paths are in tag v1.0.0 of $statusline_clone at the recorded sha256 and exec bit: the deletion lost nothing"
+  MP="$(moved_problems "$statusline_clone" "$BASE" "$STATUSLINE_TAG")"
+  if [ -z "$MP" ]; then ok "all $NMOVED moved paths are in tag $STATUSLINE_TAG of $statusline_clone at the recorded sha256 and exec bit: the deletion lost nothing"
   else bad "a moved path is not in the tag as recorded: $(head -3 <<<"$MP")"; fi
   jq '(.paths[] | select(.path == "test/heimdall-statusline-width.test.sh") | .sha256) |= '"$FLIP" "$BASE" > "$WORK/base.flipmoved"
-  names "RED: a recorded hash of a moved suite that is not the tag's is named" "$(moved_problems "$statusline_clone" "$WORK/base.flipmoved")" "test/heimdall-statusline-width.test.sh"
+  names "RED: a recorded hash of a moved suite that is not the tag's is named" "$(moved_problems "$statusline_clone" "$WORK/base.flipmoved" "$STATUSLINE_TAG")" "test/heimdall-statusline-width.test.sh"
 fi
 
 echo
