@@ -1,0 +1,26 @@
+# No `version` or `date-released` on purpose: the version of record is
+# .claude-plugin/plugin.json, a hand-typed copy here would be stale after the next
+# release, and bin/heimdall-render-version renders only md, txt, json, toml, html, js,
+# sh, yml and yaml files, so it would never reach a .cff file.
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "runhmd (hmd): a verification gate for AI coding agents"
+type: software
+authors:
+  - given-names: RJ
+    alias: randomittin
+repository-code: "https://github.com/randomittin/heimdall"
+repository-artifact: "https://www.npmjs.com/package/runhmd"
+url: "https://runheimdall.dev"
+license: MIT
+abstract: >-
+  hmd is a command-line test gate for AI coding agents that runs as git
+  pre-commit and pre-push hooks. It makes an agent's work pass a test the
+  agent did not write, and proves that test can fail, before the push lands.
+keywords:
+  - AI coding agents
+  - verification
+  - test gate
+  - mutation testing
+  - git hooks
+  - quality gates
