@@ -3,3 +3,6 @@
 04_attack_a_planted_bug	bin/lib/runhmd_attack.py	s/^    if args.yes:$/    if True:/	M04a-assume-consent-without-yes
 04_attack_a_planted_bug	bin/heimdall	s/^  attack)$/  attack-unrouted)/	M04b-attack-falls-through-to-a-claude-session
 04_attack_a_planted_bug	evals/oracles/attack/engine/battery.mjs	s#^export const CASES = \[\.\.\.duplicateCases(), \.\.\.readCases(), \.\.\.roundingCases()\];$#export const CASES = [...duplicateCases(), ...readCases(), ...roundingCases()].filter((c) => !/^duplicate\\.(retry-at|burst)/.test(c.id));#	M04c-engine-blind-to-the-retry-race
+05_receipt_round_trip	bin/lib/runhmd_receipt.py	s/^    if not _auth().verify_raw(public, SIGN_PREFIX + canonical(body), signature):$/    if False:/	M05a-signature-check-always-passes
+05_receipt_round_trip	bin/lib/runhmd_receipt.py	s/os.O_EXCL, 0o600)/os.O_EXCL, 0o644)/	M05b-secret-key-world-readable
+05_receipt_round_trip	bin/lib/runhmd_attack.py	s/^    p.add_argument("--receipt", action="store_true")$/    p.add_argument("--receipt", action="store_true", dest="receipt_unused")/	M05c-receipt-flag-ignored
