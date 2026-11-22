@@ -45,3 +45,6 @@ evals/benchmark/false-green/PREREG.lock.json:generic-api-key:90
 1c83dd4ace2d50118376c36ef3430733fe034ea1:test/lib/app_upgrade_paired_cases.py:generic-api-key:167
 1c83dd4ace2d50118376c36ef3430733fe034ea1:test/lib/app_upgrade_paired_cases.py:generic-api-key:209
 f048b72482ac04e94c8e52ce70cdbbc202274241:test/lib/app_upgrade_paired_cases.py:generic-api-key:306
+
+# 2026-11-23: fake bearer token in the checkpoint-redaction fixture (agents-orphans-finished.test.sh, 08515dda) — a test input proving the redactor strips it; not a credential.
+08515dda0dca2f31c5e42524e764b455e2e72215:test/agents-orphans-finished.test.sh:curl-auth-header:268

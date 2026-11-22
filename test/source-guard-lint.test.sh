@@ -213,8 +213,11 @@ assert_site GUARDED bin/heimdall-dream-permission 109
 assert_site GUARDED bin/heimdall-dream-permission 113
 assert_site GUARDED bin/heimdall-dream-notice 40
 assert_site GUARDED bin/heimdall-dream-notice 44
-assert_site GUARDED bin/heimdall 45
-assert_site GUARDED bin/heimdall 55
+# bin/heimdall moves often, so its two guarded sites are found by content, not pinned numbers.
+HM_SELECT_LINE=$(grep -n '^  \. "\$PLUGIN_DIR/bin/lib/select.sh" 2>/dev/null || true$' "$ROOT/bin/heimdall" | head -1 | cut -d: -f1)
+HM_REALHOME_LINE=$(grep -n '^  \. "\$PLUGIN_DIR/bin/lib/real-home.sh" 2>/dev/null || true$' "$ROOT/bin/heimdall" | head -1 | cut -d: -f1)
+assert_site GUARDED bin/heimdall "${HM_SELECT_LINE:-0}"
+assert_site GUARDED bin/heimdall "${HM_REALHOME_LINE:-0}"
 
 # NOT-AFF — the containing file never enables errexit (confirmed: only `set -uo
 # pipefail` / `set -u`), so §0's hazard never applies here regardless of shape; two of
