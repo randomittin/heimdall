@@ -16,6 +16,9 @@
 #   T5  opt-out   — HEIMDALL_NO_UPDATE_CHECK=1 suppresses the notice entirely
 #   T6  hmd update— a dev checkout (dirty / ahead of origin) prints the MANUAL step
 #                   (git pull / reinstall) instead of force-resetting the tree
+#   T6b hmd update— hmd's OWN runtime state at an installed clone's root (profile.json,
+#                   setup-done, skills-config.json, skills.lock, backups/) is not "local
+#                   changes": the guard's dirty_tree stays 0 (root-anchored .gitignore rules)
 #
 # The update functions are exercised via HEIMDALL_LIB_ONLY=1 (source bin/heimdall,
 # call the function directly) so NO real `claude` and NO real network are needed.
@@ -237,6 +240,72 @@ if grep -qi "development checkout" <<<"$OUT6" \
   fi
 else
   bad "T6 hmd update: expected manual-step message on a dev checkout, got: $OUT6"
+fi
+
+# ── T6b: hmd's own runtime state at an installed clone's root is NOT "local changes" ──
+# ~/.heimdall is BOTH the plugin clone and the runtime home ($HEIMDALL_HOME), so what hmd
+# writes at the home root lands in the clone's work tree. The guard above asks
+# `git status --porcelain`, which counts UNTRACKED files: every runtime file the repo's
+# .gitignore does not name makes an untouched install read as a contributor's checkout, and
+# `hmd update` then refuses to update it. The files come from the REAL writers (a renamed
+# file cannot hide behind a hand-picked list) and the verdict is the guard's OWN dirty_tree
+# line, lifted from the launcher. packs/ ($HEIMDALL_HOME/packs) is only READ by
+# bin/lib/skills_packs.py and written by nothing yet, so it is not part of this case.
+INST="$SCRATCH/instclone"
+mkdir -p "$INST/bin" "$SCRATCH/t6b-claude"
+git -C "$INST" init -q
+git -C "$INST" config user.email t@t.t; git -C "$INST" config user.name t
+git -C "$INST" config core.excludesFile /dev/null     # only the repo's own .gitignore decides
+cp "$REPO/.gitignore" "$INST/.gitignore"              # the ignore rules an installed clone carries
+cp "$HMD" "$INST/bin/heimdall"
+git -C "$INST" add -A; git -C "$INST" commit -qm "installed tree"
+GUARD_LINE="$(grep -m1 'status --porcelain' "$HMD" || true)"
+guard_dirty() {   # the guard's own dirty_tree computation on tree $1: prints 1 (dirty) or 0 (clean)
+  PLUGIN_DIR="$1" bash -c "dirty_tree=0
+$GUARD_LINE
+echo \$dirty_tree" 2>/dev/null
+}
+# control: the lifted line runs, and an untouched install is clean to it
+if [ -n "$GUARD_LINE" ] && [ "$(guard_dirty "$INST")" = "0" ]; then
+  ok "T6b control: an untouched installed clone is clean to the guard (its dirty_tree line was found and ran)"
+else
+  bad "T6b control: no 'status --porcelain' line in the launcher, or an untouched installed clone reads dirty"
+fi
+# anchoring: the same names BELOW the root stay visible to git, so the guard keeps its teeth
+mkdir -p "$INST/sub/backups"
+HIDDEN=""
+for n in profile.json setup-done skills-config.json skills.lock backups/x; do
+  : > "$INST/sub/$n"
+  git -C "$INST" check-ignore -q "sub/$n" && HIDDEN="$HIDDEN sub/$n"
+done
+if [ -z "$HIDDEN" ] && [ "$(guard_dirty "$INST")" = "1" ]; then
+  ok "T6b anchoring: the same names below the root are not ignored, and the guard still calls that dirty"
+else
+  bad "T6b anchoring: an unanchored rule hides a nested file (hidden:${HIDDEN:- none}) or the guard went blind"
+fi
+rm -rf "$INST/sub"
+# the real writers, each into the clone's root ($HEIMDALL_HOME = the clone, as for a real install)
+printf '{}\n' > "$SCRATCH/t6b-claude/settings.json"   # lean_backup copies the hmd slice of the user-level settings: an empty one, never the operator's
+T6B_ENV=(HEIMDALL_HOME="$INST" CLAUDE_CONFIG_DIR="$SCRATCH/t6b-claude" HMD_MODULES_STATE="$SCRATCH/t6b-modules")
+{
+  env "${T6B_ENV[@]}" python3 -I "$REPO/bin/lib/hmd_profile.py" set lean
+  env "${T6B_ENV[@]}" python3 -I "$REPO/bin/lib/skills_config.py" init --marker-absent
+  env "${T6B_ENV[@]}" python3 -I "$REPO/bin/lib/skills_lock.py" record --scope=machine --id=t6b-probe --state=installed --kind=plugin --ref=t6b-probe --version=1.0.0 --source=t6b --pin=none --via=first-run
+  env "${T6B_ENV[@]}" python3 -I "$REPO/bin/lib/lean_backup.py" backup
+  # shellcheck disable=SC2016  # the $0 is the inner bash's: the launcher path it was started with, so PLUGIN_DIR resolves to the clone
+  env "${T6B_ENV[@]}" HEIMDALL_LIB_ONLY=1 bash -c 'source "$0"; _write_setup_marker' "$INST/bin/heimdall"
+} >"$SCRATCH/t6b-writers.log" 2>&1
+MISSING=""
+for f in profile.json skills-config.json skills.lock setup-done backups; do [ -e "$INST/$f" ] || MISSING="$MISSING $f"; done
+if [ -z "$MISSING" ]; then
+  ok "T6b writers: the real writers put profile.json, skills-config.json, skills.lock, setup-done and backups/ at the clone's root"
+else
+  bad "T6b writers: not written at the clone's root:$MISSING ($(tail -n 3 "$SCRATCH/t6b-writers.log" | tr '\n' ' '))"
+fi
+if [ "$(guard_dirty "$INST")" = "0" ]; then
+  ok "T6b hmd update: an installed clone holding only hmd's runtime state is not a dev checkout (dirty_tree stays 0)"
+else
+  bad "T6b hmd update: hmd's runtime state reads as local changes: $(git -C "$INST" status --porcelain | tr '\n' ' ')"
 fi
 
 # ── T7: F1 cold-user onboarding orients a newcomer + points to the demo ───────
