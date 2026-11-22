@@ -14,14 +14,15 @@
 #                   the skill, so the manifest declares the two as one unit.
 #   mac-deep-clean, system-health, self-improve     on_demand_paths = their skill directory.
 # All five stay kind bundled, tier bundled, install false (nothing is installed: the bundled copy is still the fallback);
-# every path the manifest names exists in the tree; and the five are exactly the skills bin/lib/lean_sparse.sh leaves out of a
-# lean tree, each listed under skills/<id>: nothing is dropped without a route back, and the core skill (heimdall) has none.
+# every path the manifest names exists in the tree; and the five are the only entries that carry a route (a pack or on_demand_paths),
+# each listing skills/<id>, while the core skill (heimdall) carries none. bin/lib/lean_sparse.sh leaves out of a lean tree exactly the
+# paths these two fields name, on bundled entries (test/lean-sparse.test.sh proves it), so there is no second list here to agree with.
 #
 # Proven in this order (one in-process driver builds the stacks pack twice at most and checks every case; the CLI runs once):
 #   A. the real skills.manifest.json validates;
 #   B. every value above holds on the real manifest and the real tree;
-#   C. the suite can go RED: one-field breaks of the manifest, of the stacks source and of the lean list, each turning the check
-#      that guards it red (exemplar: test/skills-manifest-pack.test.sh, section F).
+#   C. the suite can go RED: one-field breaks of the manifest and of the stacks source, each turning the check that guards it red
+#      (exemplar: test/skills-manifest-pack.test.sh, section F).
 #
 # Hermetic: a throwaway WORK dir, no network, nothing outside it is written (the real tree is only read).
 # bash 3.2 compatible.
@@ -48,8 +49,8 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # ── the driver: the expected values, one check per property, the mutants; one TSV line per verdict ─────────────────────
-# usage: driver.py REPO WORK STACKS_SRC. A check returns None when the property holds, else why not; it may raise (a field a
-# mutant removed): that is a failed check, never a crash.
+# usage: driver.py REPO WORK STACKS_SRC. A check (doc, src) returns None when the property holds, else why not; it may raise (a
+# field a mutant removed): that is a failed check, never a crash.
 cat > "$WORK/driver.py" <<'PYEOF'
 import copy
 import hashlib
@@ -64,7 +65,6 @@ sys.path.insert(0, os.path.join(repo, "bin", "lib"))
 import skills_manifest as m
 
 BUILDER = os.path.join(repo, "bin", "heimdall-pack-build")
-LEAN_SPARSE = os.path.join(repo, "bin", "lib", "lean_sparse.sh")
 MANIFEST = os.path.join(repo, "skills.manifest.json")
 
 PACK_PATHS = ["skills/stacks"]
@@ -103,15 +103,6 @@ def built(src):
     return _BUILT[src]
 
 
-def lean_on_demand():
-    """The skill ids bin/lib/lean_sparse.sh leaves out of a lean tree: its LSP_ON_DEMAND line."""
-    with open(LEAN_SPARSE) as handle:
-        found = re.findall(r'^LSP_ON_DEMAND="([^"]*)"$', handle.read(), re.M)
-    if len(found) != 1:
-        raise RuntimeError('lean_sparse.sh has %d LSP_ON_DEMAND="..." lines, want exactly one' % len(found))
-    return found[0].split()
-
-
 def entry(doc, ident):
     for item in doc["entries"]:
         if item.get("id") == ident:
@@ -123,22 +114,22 @@ def paths_of(item):
     return list(item["pack"]["paths"] if "pack" in item else []) + list(item.get("on_demand_paths", []))
 
 
-def check_validates(doc, src, lean):
+def check_validates(doc, src):
     reasons = m.validate(doc)
     return "; ".join(reasons[:3]) if reasons else None
 
 
-def check_pack_name(doc, src, lean):
+def check_pack_name(doc, src):
     got, want = entry(doc, "stacks")["pack"]["name"], "@" + built(src)["id"]
     return None if got == want else "the manifest says %r, the build's hmd.skill.yaml says %r" % (got, want)
 
 
-def check_pack_version(doc, src, lean):
+def check_pack_version(doc, src):
     got, want = entry(doc, "stacks")["pack"]["version"], built(src)["version"]
     return None if got == want else "the manifest says %r, the build's hmd.skill.yaml says %r" % (got, want)
 
 
-def check_pack_sha256(doc, src, lean):
+def check_pack_sha256(doc, src):
     got = entry(doc, "stacks")["pack"]["sha256"]
     made = built(src)
     differ = [what for what, value in (("build", made["printed"]), ("hash", made["hashed"]), ("SHA256SUMS", made["sums"]))
@@ -149,19 +140,19 @@ def check_pack_sha256(doc, src, lean):
         % (got, made["printed"], ", ".join(differ))
 
 
-def check_pack_paths(doc, src, lean):
+def check_pack_paths(doc, src):
     got = entry(doc, "stacks")["pack"]["paths"]
     return None if got == PACK_PATHS else "pack.paths is %r, want %r" % (got, PACK_PATHS)
 
 
 def on_demand_check(ident):
-    def check(doc, src, lean):
+    def check(doc, src):
         got = entry(doc, ident).get("on_demand_paths")
         return None if got == ON_DEMAND[ident] else "on_demand_paths is %r, want %r" % (got, ON_DEMAND[ident])
     return check
 
 
-def check_stays_bundled(doc, src, lean):
+def check_stays_bundled(doc, src):
     wrong = []
     for ident in FIVE:
         item = entry(doc, ident)
@@ -171,17 +162,18 @@ def check_stays_bundled(doc, src, lean):
     return "; ".join(wrong) or None
 
 
-def check_paths_exist(doc, src, lean):
+def check_paths_exist(doc, src):
     missing = [path for item in doc["entries"] for path in paths_of(item) if not os.path.exists(os.path.join(repo, path))]
     return "named in the manifest, absent from the tree: %s" % ", ".join(missing) if missing else None
 
 
-def check_lean_sparse(doc, src, lean):
-    dropped = sorted(lean if lean is not None else lean_on_demand())
+def check_lean_cut(doc, src):
+    """What a lean tree leaves out is what these two fields name (bin/lib/lean_sparse.sh reads nothing else): the entries that
+    carry one are the five on-demand skills, each listing its own skill directory; the core skill and every other entry carry none."""
     routed = {item["id"]: paths_of(item) for item in doc["entries"] if "pack" in item or "on_demand_paths" in item}
     problems = []
-    if sorted(routed) != dropped:
-        problems.append("lean_sparse.sh leaves out %s, the manifest gives %s a route back" % (dropped, sorted(routed)))
+    if sorted(routed) != sorted(FIVE):
+        problems.append("the entries that name paths a lean tree leaves out are %s, want the five on-demand skills %s" % (sorted(routed), sorted(FIVE)))
     for ident in sorted(routed):
         if "skills/" + ident not in routed[ident]:
             problems.append("%s does not list skills/%s" % (ident, ident))
@@ -197,16 +189,16 @@ CHECKS = [
 ] + [("on-demand-" + ident, on_demand_check(ident)) for ident in sorted(ON_DEMAND)] + [
     ("stays-bundled", check_stays_bundled),
     ("paths-exist", check_paths_exist),
-    ("agree-with-lean-sparse", check_lean_sparse),
+    ("lean-cut-is-the-five", check_lean_cut),
 ]
 
 
-def verdicts(doc, src, lean=None):
+def verdicts(doc, src):
     """{check name: None when it holds, else why not}."""
     found = {}
     for name, check in CHECKS:
         try:
-            found[name] = check(doc, src, lean)
+            found[name] = check(doc, src)
         except Exception as exc:
             found[name] = "raised %s: %s" % (type(exc).__name__, exc)
     return found
@@ -221,7 +213,7 @@ for name, problem in verdicts(real, stacks_src).items():
     report("holds-" + name, problem)
 
 
-# Each mutant changes exactly one thing: a field of the manifest (code, run on a copy), the stacks source, or the lean list.
+# Each mutant changes exactly one thing: a field of the manifest (code, run on a copy) or the stacks source.
 def edited_source():
     """A copy of the stacks source with one byte added to one pack: the tree changed, the manifest did not."""
     target = os.path.join(work, "stacks-edited")
@@ -240,11 +232,10 @@ MUTANTS = [
     ("pack-path-typo", "paths-exist", 'E["stacks"]["pack"]["paths"] = ["skills/stack"]'),
     ("designmatch-command-dropped", "on-demand-designmatch", 'E["designmatch"]["on_demand_paths"] = ["skills/designmatch"]'),
     ("designmatch-command-renamed", "paths-exist", 'E["designmatch"]["on_demand_paths"][1] = "commands/design-match.md"'),
-    ("self-improve-without-a-route-back", "agree-with-lean-sparse", 'del E["self-improve"]["on_demand_paths"]'),
-    ("core-skill-made-on-demand", "agree-with-lean-sparse", 'E["heimdall"]["on_demand_paths"] = ["skills/heimdall"]'),
+    ("self-improve-without-a-route-back", "lean-cut-is-the-five", 'del E["self-improve"]["on_demand_paths"]'),
+    ("core-skill-made-on-demand", "lean-cut-is-the-five", 'E["heimdall"]["on_demand_paths"] = ["skills/heimdall"]'),
     ("tier-changed", "stays-bundled", 'E["mac-deep-clean"]["tier"] = "on_demand"'),
     ("stacks-source-edited", "stacks-pack-sha256", "SRC = edited_source()"),
-    ("lean-sparse-leaves-out-another-skill", "agree-with-lean-sparse", 'LEAN = lean_on_demand() + ["heimdall"]'),
 ]
 
 for name, expected, code in MUTANTS:
@@ -252,9 +243,9 @@ for name, expected, code in MUTANTS:
     try:
         doc = copy.deepcopy(real)
         scope = {"E": {item["id"]: item for item in doc["entries"]}, "SHA": entry(real, "stacks")["pack"]["sha256"],
-                 "SRC": stacks_src, "LEAN": None, "edited_source": edited_source, "lean_on_demand": lean_on_demand}
+                 "SRC": stacks_src, "edited_source": edited_source}
         exec(code, scope)
-        found = verdicts(doc, scope["SRC"], scope["LEAN"])
+        found = verdicts(doc, scope["SRC"])
     except Exception as exc:
         report(label, "the mutant could not be built: %s: %s" % (type(exc).__name__, exc))
         continue
@@ -280,12 +271,12 @@ if "$PY" -I -B "$WORK/driver.py" "$REPO" "$WORK" "$STACKS_SRC" >"$WORK/driver.ou
     esac
     if [ "$verdict" = ok ]; then ok "$name"; else bad "$name: $detail"; fi
   done <"$WORK/driver.out"
-  if [ "$CASES" -ge 25 ]; then ok "the driver ran $CASES cases (at least 25: a truncated table must not read as a pass)"; else bad "the driver ran only $CASES cases (want at least 25)"; fi
+  if [ "$CASES" -ge 24 ]; then ok "the driver ran $CASES cases (at least 24: a truncated table must not read as a pass)"; else bad "the driver ran only $CASES cases (want at least 24)"; fi
   echo "  falsifiability score $CAUGHT/$MUTANTS"
-  if [ "$MUTANTS" -ge 13 ] && [ "$CAUGHT" -eq "$MUTANTS" ]; then
-    ok "C: every mutant is caught (score $CAUGHT/$MUTANTS, at least 13)"
+  if [ "$MUTANTS" -ge 12 ] && [ "$CAUGHT" -eq "$MUTANTS" ]; then
+    ok "C: every mutant is caught (score $CAUGHT/$MUTANTS, at least 12)"
   else
-    bad "C: a mutant survived or could not be built (score $CAUGHT/$MUTANTS, want all and at least 13)"
+    bad "C: a mutant survived or could not be built (score $CAUGHT/$MUTANTS, want all and at least 12)"
   fi
 else
   bad "the case driver crashed: $(tail -n 5 "$WORK/driver.err")"

@@ -3,22 +3,29 @@
 # that makes an install lean. Invariants (.planning/lean-core/INVARIANTS.md): INV-L3, INV-L4, INV-L6, INV-L7, and INV-L10 for the data it must never touch.
 #
 #   A. THE LEAN SET, on a fixture clone (a local temp repository cloned with --depth 1 over file://, the way install.sh clones): the files on disk are EXACTLY the
-#      runtime list + the convention-loaded core - the on-demand skills (nothing missing, nothing extra); a name with glob characters is matched literally (its
+#      runtime list + the convention-loaded core - the cut (nothing missing, nothing extra). The cut is skills.manifest.json's at HEAD, not a list built into the
+#      library: the on_demand_paths and pack.paths of its bundled entries (the skill directories, and commands/designmatch.md: a file inside a core directory that
+#      the runtime list names too); another manifest cuts other paths, and a plugin entry's paths cut nothing. A name with glob characters is matched literally (its
 #      look-alike sibling stays out); a second apply changes nothing; an untracked file and a locally edited tracked file outside the set survive.
 #   B. INV-L6, `apply full`: the full tree back (every tracked file on disk, byte for byte, none skipped), idempotent; lean -> full -> lean lands on the same set;
 #      a clone that never was lean is not touched at all (.git/config included).
 #   C. INV-L4, `add`, WITH THE NETWORK CUT (origin deleted, its URL unreachable, every git transport refused): the path comes back from local objects and git never
 #      ran a fetch / pull / clone / ls-remote / remote helper (trace2); idempotent; a file works like a directory; a later `apply lean` (the upgrade, INV-L7) and a
-#      lean -> full -> lean keep what was added; on a full tree it says so and changes nothing.
+#      lean -> full -> lean keep what was added; on a full tree it says so and changes nothing. A cut path inside a core directory (commands/designmatch.md) comes
+#      back with `add`, and the cut paths below a directory that is added (commands, skills) come back with it.
 #   D. REFUSALS, each before anything is touched: not a repository, a subdirectory of one, a linked worktree, HEAD without the runtime list, a list line that
-#      escapes the tree, and `add` of a path that is absent, escapes the tree or carries pattern characters; usage errors exit 2.
+#      escapes the tree, a manifest the cut cannot be read from (missing, not strict JSON, no entries, a path that is not one literal tree path) or whose cut would
+#      take the core itself (skills/heimdall, a core directory, a directory above one, a core file), and `add` of a path that is absent, escapes the tree or
+#      carries pattern characters, or `add` when HEAD's manifest cannot be read (no record is written); usage errors exit 2.
 #   E. THIS REPOSITORY, lean: a clone of HEAD narrowed to the lean set keeps every bin/ file, every hook, the plugin manifest and the whole runtime list (INV-L3: the
-#      plan's "closure audit misses a path" risk), keeps the docs/ files the closure names, drops test/, .planning/ and the five on-demand skills, has every file
-#      a hook command names, comes back whole with `apply full`, and is smaller than the full tree.
-#   F. THE MUTANTS: the library with one behaviour broken (the on-demand cut, the glob escaping, the return to a full tree, an `add` that fetches) goes RED on
-#      the check that guards that behaviour.
+#      plan's "closure audit misses a path" risk), keeps the docs/ files the closure names, drops test/, .planning/, the five on-demand skills and
+#      commands/designmatch.md, has every file a hook command names, comes back whole with `apply full`, and is smaller than the full tree.
+#   F. THE MUTANTS: the library with one behaviour broken (the on-demand cut, the negation inside a core directory, the restore of an added directory, pack.paths,
+#      the core guard, the refusal of an unreadable manifest, the glob escaping, the return to a full tree, an `add` that fetches) goes RED on the check that guards
+#      that behaviour.
 #
-# budget: about 8 s solo (section E clones this repository's HEAD: the one slow step). Hermetic: HOME, the git config and every GIT_* variable are the test's own;
+# budget: 48 s measured on a busy machine (other agents running). About 45 fixture clones (each a git init, a commit and a clone) and section E's clone of this repository's HEAD
+# are the cost; the manifest cases added about ten of those clones. Hermetic: HOME, the git config and every GIT_* variable are the test's own;
 # nothing outside $T is read or written. bash 3.2 compatible.
 #
 # Usage:  bash test/lean-sparse.test.sh
@@ -41,6 +48,9 @@ export HOME="$T/home"; mkdir -p "$HOME"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
 export GIT_AUTHOR_NAME=lean-sparse-test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=lean-sparse-test GIT_COMMITTER_EMAIL=test@example.invalid
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+# The library reads the manifest with python3 on every apply and add, and a version-manager wrapper costs ~0.4 s a start: put the real interpreter, found once, first on PATH.
+PYREAL="$(python3 -I -c 'import sys; print(sys.executable)' 2>/dev/null)"
+if [ -x "${PYREAL:-}" ]; then mkdir -p "$T/pybin" && ln -s "$PYREAL" "$T/pybin/python3" && export PATH="$T/pybin:$PATH"; fi
 
 echo "lean-sparse (bin/lib/lean_sparse.sh: the lean set, apply full, add offline, refusals, this repository, mutants)"
 [ -f "$LIB" ] || { bad "bin/lib/lean_sparse.sh is missing"; printf '\nlean-sparse: %s passed, %s failed\n' "$PASS" "$FAIL"; exit 1; }
@@ -51,12 +61,14 @@ STD_LIST='VERSION
 bin/lib/lean_sparse.sh
 bin/lib/x.py
 bin/tool
+commands/designmatch.md
 data/odd [1] *.txt
 docs/samples/allow.json
 evals/oracles/registry.json
 hooks/h.sh
 hooks/hooks.json
 release/runtime-files.txt
+skills.manifest.json
 skills/designmatch/SKILL.md
 skills/heimdall/SKILL.md
 skills/mac-deep-clean/SKILL.md
@@ -64,7 +76,7 @@ skills/self-improve/SKILL.md
 skills/stacks/SKILL.md
 skills/stacks/fastapi/PACK.md
 skills/system-health/SKILL.md'
-# what a lean tree of the fixture holds: the list minus the on-demand skills, plus the core (.claude-plugin/ agents/ commands/ hooks/ skills/heimdall/ and three files)
+# what a lean tree of the fixture holds: the list minus the cut, plus the core (.claude-plugin/ agents/ commands/ hooks/ skills/heimdall/ and three files)
 LEAN_EXPECT='.claude-plugin/marketplace.json
 .claude-plugin/plugin.json
 .mcp.json
@@ -75,7 +87,6 @@ bin/lib/lean_sparse.sh
 bin/lib/x.py
 bin/tool
 commands/c.md
-commands/designmatch.md
 data/odd [1] *.txt
 docs/samples/allow.json
 evals/oracles/registry.json
@@ -83,12 +94,31 @@ hooks/h.sh
 hooks/hooks.json
 release/runtime-files.txt
 settings.json
+skills.manifest.json
 skills/heimdall/SKILL.md
 skills/heimdall/references/r.md'
 STACKS_FILES='skills/stacks/SKILL.md
 skills/stacks/fastapi/PACK.md'
+# every file the fixture's manifest cuts: the lean candidate is LEAN_EXPECT + CUT_FILES
+CUT_FILES='commands/designmatch.md
+skills/designmatch/SKILL.md
+skills/mac-deep-clean/SKILL.md
+skills/self-improve/SKILL.md
+skills/stacks/SKILL.md
+skills/stacks/fastapi/PACK.md
+skills/system-health/SKILL.md'
+# the fixture's manifest: the same cut the real one names, with only the fields the library reads (kind, on_demand_paths, pack.paths); the plugin entry is not bundled
+STD_MANIFEST='{"schema": 1, "marketplaces": {}, "entries": [
+  {"id": "heimdall", "kind": "bundled", "ref": "skills/heimdall"},
+  {"id": "stacks", "kind": "bundled", "ref": "skills/stacks", "pack": {"paths": ["skills/stacks"]}},
+  {"id": "designmatch", "kind": "bundled", "ref": "skills/designmatch", "on_demand_paths": ["skills/designmatch", "commands/designmatch.md"]},
+  {"id": "self-improve", "kind": "bundled", "ref": "skills/self-improve", "on_demand_paths": ["skills/self-improve"]},
+  {"id": "system-health", "kind": "bundled", "ref": "skills/system-health", "on_demand_paths": ["skills/system-health"]},
+  {"id": "mac-deep-clean", "kind": "bundled", "ref": "skills/mac-deep-clean", "on_demand_paths": ["skills/mac-deep-clean"]},
+  {"id": "a-plugin", "kind": "plugin", "ref": "a@m"}
+]}'
 
-mk_origin() {   # mk_origin DIR -- the fixture repository, one commit
+mk_origin() {   # mk_origin DIR [MANIFEST] -- the fixture repository, one commit; its skills.manifest.json is STD_MANIFEST unless MANIFEST is given
   local o="$1" f
   mkdir -p "$o" && git -C "$o" init -q || return 1
   for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json .mcp.json settings.json LICENSE README.md VERSION agents/a.md commands/c.md commands/designmatch.md \
@@ -98,12 +128,13 @@ mk_origin() {   # mk_origin DIR -- the fixture repository, one commit
     put "$o" "$f"
   done
   cp "$LIB" "$o/bin/lib/lean_sparse.sh"
+  printf '%s\n' "${2-$STD_MANIFEST}" > "$o/skills.manifest.json"
   mkdir -p "$o/release" && printf '%s\n' "$STD_LIST" > "$o/release/runtime-files.txt"
   git -C "$o" add -A >/dev/null && git -C "$o" commit -q -m fixture
 }
-new_clone() {   # new_clone NAME -- sets ORIGIN and CL: a fresh fixture origin and its depth-1 clone
+new_clone() {   # new_clone NAME [MANIFEST] -- sets ORIGIN and CL: a fresh fixture origin and its depth-1 clone
   ORIGIN="$T/$1.origin"; CL="$T/$1"
-  mk_origin "$ORIGIN" && git clone -q --depth 1 "file://$ORIGIN" "$CL" 2>"$T/clone.err" || { bad "the fixture clone $1 could not be made: $(head -c 200 "$T/clone.err")"; exit 1; }
+  mk_origin "$ORIGIN" ${2+"$2"} && git clone -q --depth 1 "file://$ORIGIN" "$CL" 2>"$T/clone.err" || { bad "the fixture clone $1 could not be made: $(head -c 200 "$T/clone.err")"; exit 1; }
 }
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -147,9 +178,25 @@ if [ -f "$CL/docs/samples/allow.json" ] && [ ! -e "$CL/docs/guide.md" ] && [ ! -
   ok "A: a docs/ file the list names stays; the rest of docs/, test/, .planning/ and the on-demand skills are gone"
 else bad "A: docs/, test/, .planning/ or an on-demand skill is wrong"; fi
 if [ -z "$(git -C "$CL" status --porcelain)" ]; then ok "A: git sees a clean tree (the skipped files are skipped, not deleted)"; else bad "A: git status is not clean: $(git -C "$CL" status --porcelain | head -3 | tr '\n' '|')"; fi
+if [ ! -e "$CL/commands/designmatch.md" ] && [ -f "$CL/commands/c.md" ] && [ -f "$CL/skills.manifest.json" ]; then
+  ok "A: the cut reaches into a core directory: commands/designmatch.md (named by the runtime list, inside commands/) is not on disk; commands/c.md and the manifest are"
+else bad "A: commands/designmatch.md is on disk, or commands/c.md or skills.manifest.json is not"; fi
 cp "$CL/.git/info/sparse-checkout" "$T/sf.first"
 run_lib apply lean "$CL"
 if [ "$RC" = 0 ] && set_is_lean "$CL" && cmp -s "$T/sf.first" "$CL/.git/info/sparse-checkout"; then ok "A: a second apply lean changes nothing (same files, same sparse file)"; else bad "A: the second apply changed something (rc=$RC): $(show_diff)"; fi
+
+# the cut is the manifest's, not a list built into the library: a manifest that names other paths cuts those and nothing else
+ALT_MANIFEST='{"entries": [
+  {"id": "p", "kind": "bundled", "pack": {"paths": ["skills/designmatch"]}, "on_demand_paths": ["bin/lib/x.py", "commands/c.md"]},
+  {"id": "q", "kind": "plugin", "on_demand_paths": ["bin/tool"]}
+]}'
+new_clone alt "$ALT_MANIFEST"
+run_lib apply lean "$CL"
+{ printf '%s\n' "$LEAN_EXPECT" "$CUT_FILES"; } | LC_ALL=C sort -u | grep -vxF -e bin/lib/x.py -e commands/c.md -e skills/designmatch/SKILL.md > "$T/want"
+ondisk "$CL" > "$T/disk"
+if [ "$RC" = 0 ] && cmp -s "$T/want" "$T/disk"; then
+  ok "A: another manifest, another cut: pack.paths (skills/designmatch) and on_demand_paths (bin/lib/x.py, commands/c.md) of a bundled entry are out, a plugin entry's on_demand_paths (bin/tool) cut nothing, the five standard skills it does not name stay"
+else bad "A: another manifest did not give its own cut (rc=$RC): $(show_diff)"; fi
 
 new_clone au
 mkdir -p "$CL/docs" "$CL/.planning/local"; printf 'my note\n' > "$CL/docs/user-note.txt"; printf 'ledger row\n' > "$CL/.planning/local/ledger.ndjson"
@@ -200,6 +247,22 @@ README.md"; then ok "C: INV-L7: a later apply lean (the upgrade) keeps what was 
 run_offline "$LIB" apply full "$CL"; run_offline "$LIB" apply lean "$CL"
 if [ "$RC" = 0 ] && set_is_lean "$CL" "$STACKS_FILES
 README.md"; then ok "C: lean -> full -> lean keeps what was added, still offline"; else bad "C: the round trip dropped an added path (rc=$RC): $(show_diff)"; fi
+new_clone cm
+run_lib apply lean "$CL"
+rm -rf "$ORIGIN"; git -C "$CL" remote set-url origin "https://127.0.0.1:9/never.git"
+run_offline "$LIB" add commands/designmatch.md "$CL"
+rc_is "C: add commands/designmatch.md exits 0 with origin deleted and every transport refused" 0
+if set_is_lean "$CL" commands/designmatch.md && [ "$(cat "$CL/commands/designmatch.md")" = "content of commands/designmatch.md" ] && no_transport_in_trace; then
+  ok "C: the cut command comes back from local objects, byte for byte, and nothing else moved (the cut skills are still out), no transport command ran"
+else bad "C: add commands/designmatch.md did not put back exactly that file, or git ran a transport: $(show_diff)"; fi
+run_offline "$LIB" apply lean "$CL"
+if [ "$RC" = 0 ] && set_is_lean "$CL" commands/designmatch.md; then ok "C: INV-L7: a later apply lean keeps the command that was added"; else bad "C: apply lean dropped the added command (rc=$RC): $(show_diff)"; fi
+new_clone ca
+run_lib apply lean "$CL"
+run_lib add commands "$CL"
+if [ "$RC" = 0 ] && set_is_lean "$CL" commands/designmatch.md; then ok "C: add of the directory above a cut path (commands) brings the cut path back with it"; else bad "C: add commands left the cut command out (rc=$RC): $(show_diff)"; fi
+run_lib add skills "$CL"
+if [ "$RC" = 0 ] && set_is_lean "$CL" "$CUT_FILES"; then ok "C: add skills brings every cut skill back"; else bad "C: add skills left a cut skill out (rc=$RC): $(show_diff)"; fi
 new_clone cf
 CFG_BEFORE="$(cat "$CL/.git/config")"
 run_lib add skills/stacks "$CL"
@@ -230,6 +293,37 @@ for p in '../x' '/etc/passwd' '*' '!x' '' 'a/../../b' 'skills/[s]tacks' 'skills/
 done
 run_lib add skills/nope "$CL"; ondisk "$CL" > "$T/after.set"
 if [ "$RC" = 3 ] && cmp -s "$T/before.set" "$T/after.set" && [ ! -e "$CL/.git/info/hmd-lean-on-demand" ]; then ok "D: add of a path HEAD does not track: refused (3), no record written"; else bad "D: add of an absent path rc=$RC"; fi
+new_clone ar
+run_lib apply lean "$CL"
+printf '%s\n' '{"entries": [' > "$CL/skills.manifest.json"; git -C "$CL" commit -q -am "broken manifest"
+ondisk "$CL" > "$T/before.set"
+run_lib add README.md "$CL"; ondisk "$CL" > "$T/after.set"
+if [ "$RC" = 3 ] && grep -q 'skills.manifest.json' "$T/err" && cmp -s "$T/before.set" "$T/after.set" && [ ! -e "$CL/.git/info/hmd-lean-on-demand" ]; then
+  ok "D: add when HEAD's manifest cannot be read: refused (3), says which file, the tree is as it was and no record is written"
+else bad "D: add with a broken manifest: rc=$RC, or the tree or the record moved"; fi
+# the manifest is where the cut comes from: one the cut cannot be read from, or one that would take the core itself, refuses the lean update before anything is written
+new_clone rm
+refuse_manifest() {   # refuse_manifest LABEL TEXT -- TEXT becomes the manifest at HEAD of the clone $CL: apply lean refuses (3), names the file, the tree stays the full one
+  printf '%s\n' "$2" > "$CL/skills.manifest.json"; git -C "$CL" commit -q -am "manifest: $1"
+  run_lib apply lean "$CL"
+  if [ "$RC" = 3 ] && grep -q 'skills.manifest.json' "$T/err" && sparse_off "$CL" && set_is_full "$CL"; then ok "D: a manifest that is $1: refused (3), says which file, the tree is as it was"; else bad "D: a manifest that is $1: rc=$RC (stderr=[$(head -c 200 "$T/err" | tr '\n' '|')])"; fi
+}
+refuse_manifest 'not strict JSON' '{"entries": ['
+refuse_manifest 'a JSON array' '[]'
+refuse_manifest 'without an entries array' '{"schema": 1}'
+refuse_manifest 'a duplicate key' '{"entries": [], "entries": []}'
+refuse_manifest 'an entry that is not an object' '{"entries": ["skills/stacks"]}'
+refuse_manifest 'naming a glob' '{"entries": [{"id": "x", "kind": "bundled", "on_demand_paths": ["skills/*"]}]}'
+refuse_manifest 'naming a path outside the tree' '{"entries": [{"id": "x", "kind": "bundled", "on_demand_paths": ["../outside"]}]}'
+refuse_manifest 'naming its paths as a string' '{"entries": [{"id": "x", "kind": "bundled", "on_demand_paths": "skills/stacks"}]}'
+refuse_manifest 'naming a pack path that is not a path' '{"entries": [{"id": "x", "kind": "bundled", "pack": {"paths": [7]}}]}'
+refuse_manifest 'cutting the core skill' '{"entries": [{"id": "x", "kind": "bundled", "on_demand_paths": ["skills/heimdall"]}]}'
+refuse_manifest 'cutting a core directory' '{"entries": [{"id": "x", "kind": "bundled", "on_demand_paths": ["commands"]}]}'
+refuse_manifest 'cutting the directory above a core one' '{"entries": [{"id": "x", "kind": "bundled", "pack": {"paths": ["skills"]}}]}'
+refuse_manifest 'cutting a core file' '{"entries": [{"id": "x", "kind": "bundled", "on_demand_paths": ["settings.json"]}]}'
+git -C "$CL" rm -q skills.manifest.json; git -C "$CL" commit -q -m "no manifest"
+run_lib apply lean "$CL"
+if [ "$RC" = 3 ] && grep -q 'skills.manifest.json' "$T/err" && sparse_off "$CL" && set_is_full "$CL"; then ok "D: HEAD without skills.manifest.json: refused (3), says which file, the tree is as it was"; else bad "D: no-manifest clone: rc=$RC"; fi
 for args in "" "apply" "apply bogus $CL" "apply lean" "add" "add a b c" "frobnicate"; do
   # shellcheck disable=SC2086  # the word list is the point
   run_lib $args
@@ -243,17 +337,18 @@ if git clone -q --depth 1 "file://$REPO" "$REAL" 2>"$T/real.err"; then
   run_lib apply lean "$REAL"
   rc_is "E: apply lean on a clone of this repository exits 0" 0
   ondisk "$REAL" > "$T/real.lean"
-  { grep '^bin/' "$T/real.tracked"; grep -E '^(hooks|\.claude-plugin|agents|commands|skills/heimdall)/' "$T/real.tracked"
+  { grep '^bin/' "$T/real.tracked"; grep -E '^(hooks|\.claude-plugin|agents|commands|skills/heimdall)/' "$T/real.tracked" | grep -vx 'commands/designmatch.md'
     grep -E '^(install\.sh|settings\.json|\.mcp\.json|LICENSE|release/runtime-files\.txt)$' "$T/real.tracked"; } | LC_ALL=C sort -u > "$T/real.core"
   MISSING="$(LC_ALL=C comm -23 "$T/real.core" "$T/real.lean" | head -3 | tr '\n' ' ')"
-  if [ -s "$T/real.core" ] && [ -z "$MISSING" ]; then ok "E: INV-L3: every bin/ file, hook, plugin file, agent, command, skills/heimdall file, install.sh, settings.json and .mcp.json is on disk ($(grep -c '' "$T/real.core") files)"; else bad "E: missing from the lean tree: $MISSING"; fi
-  grep -Ev '^skills/(stacks|designmatch|self-improve|system-health|mac-deep-clean)/' "$REAL/release/runtime-files.txt" | LC_ALL=C sort -u > "$T/real.list"
+  if [ -s "$T/real.core" ] && [ -z "$MISSING" ]; then ok "E: INV-L3: every bin/ file, hook, plugin file, agent, command (but the cut commands/designmatch.md), skills/heimdall file, install.sh, settings.json and .mcp.json is on disk ($(grep -c '' "$T/real.core") files)"; else bad "E: missing from the lean tree: $MISSING"; fi
+  grep -Ev '^(skills/(stacks|designmatch|self-improve|system-health|mac-deep-clean)/|commands/designmatch\.md$)' "$REAL/release/runtime-files.txt" | LC_ALL=C sort -u > "$T/real.list"
   LC_ALL=C comm -12 "$T/real.list" "$T/real.tracked" > "$T/real.list.tracked"
   MISSING="$(LC_ALL=C comm -23 "$T/real.list.tracked" "$T/real.lean" | head -3 | tr '\n' ' ')"
-  if [ -s "$T/real.list.tracked" ] && [ -z "$MISSING" ]; then ok "E: every tracked path of release/runtime-files.txt (minus the on-demand skills) is on disk ($(grep -c '' "$T/real.list.tracked") files)"; else bad "E: runtime list paths missing: $MISSING"; fi
+  if [ -s "$T/real.list.tracked" ] && [ -z "$MISSING" ]; then ok "E: every tracked path of release/runtime-files.txt (minus the cut) is on disk ($(grep -c '' "$T/real.list.tracked") files)"; else bad "E: runtime list paths missing: $MISSING"; fi
   if ! grep -Eq '^(test|\.planning)/' "$T/real.lean"; then ok "E: nothing under test/ or .planning/ is on disk"; else bad "E: test/ or .planning/ files on disk: $(grep -E '^(test|\.planning)/' "$T/real.lean" | head -2 | tr '\n' ' ')"; fi
-  GONE=""; for id in stacks designmatch self-improve system-health mac-deep-clean; do if [ -e "$REAL/skills/$id" ]; then GONE="$GONE $id"; fi; done
-  if [ -z "$GONE" ]; then ok "E: the five on-demand skill directories are gone"; else bad "E: on-demand skills still on disk:$GONE"; fi
+  # the real manifest's cut, written out here on purpose: a change to it has to be made twice (test/skills-manifest-pack-values.test.sh pins the manifest side)
+  GONE=""; for p in skills/stacks skills/designmatch skills/self-improve skills/system-health skills/mac-deep-clean commands/designmatch.md; do if [ -e "$REAL/$p" ]; then GONE="$GONE $p"; fi; done
+  if [ -z "$GONE" ] && [ -f "$REAL/commands/save.md" ]; then ok "E: the five on-demand skill directories and commands/designmatch.md are gone, the other commands stay (the cut is the real manifest's)"; else bad "E: cut paths still on disk:$GONE (or commands/save.md is gone)"; fi
   grep '^docs/' "$T/real.lean" > "$T/real.docs"; grep '^docs/' "$T/real.list.tracked" > "$T/real.docs.want"
   if [ -s "$T/real.docs.want" ] && cmp -s "$T/real.docs" "$T/real.docs.want"; then ok "E: of docs/, exactly the $(grep -c '' "$T/real.docs.want") files the closure names stay (companion_cc_login reads docs/samples/login/allowlist.json)"; else bad "E: docs/ on disk differs from the docs/ files the list names"; fi
   python3 -I - "$REAL/hooks/hooks.json" > "$T/hook.paths" <<'PY'
@@ -292,8 +387,10 @@ fi
 
 echo "-- F. the mutants: one behaviour broken, its check goes RED --"
 if mutant m1 's/^lsp_drop_on_demand() .*/lsp_drop_on_demand() { cat; }/'; then
-  new_clone m1; bash "$T/m1.sh" apply lean "$CL" >/dev/null 2>&1; RC=$?
-  if [ "$RC" = 0 ] && [ -f "$CL/skills/stacks/SKILL.md" ] && ! set_is_lean "$CL"; then ok "F: without the on-demand cut the on-demand skills stay on disk and the lean-set check goes RED"; else bad "F: the on-demand mutant was not caught (rc=$RC)"; fi
+  new_clone m1; bash "$T/m1.sh" apply lean "$CL" >/dev/null 2> "$T/err"; RC=$?
+  # without the cut the files the manifest names stay in the list while the negation takes commands/designmatch.md out: the library either leaves the skills on disk (rc 0) or
+  # its own post-check refuses the inconsistent update (rc 1, the full tree is put back); in both the cut skills are on disk and the lean-set check goes RED
+  if [ -f "$CL/skills/stacks/SKILL.md" ] && ! set_is_lean "$CL" && { [ "$RC" = 0 ] || grep -q 'missing after the update' "$T/err"; }; then ok "F: without the on-demand cut the on-demand skills stay on disk (rc=$RC) and the lean-set check goes RED"; else bad "F: the on-demand mutant was not caught (rc=$RC)"; fi
 fi
 if mutant m2 's/^lsp_escape() .*/lsp_escape() { cat; }/'; then
   new_clone m2; bash "$T/m2.sh" apply lean "$CL" >/dev/null 2> "$T/err"; RC=$?
@@ -307,6 +404,26 @@ if mutant m4 's/^  kind=/  lsp_git fetch -q origin 2>\/dev\/null; kind=/'; then
   new_clone m4; run_lib apply lean "$CL"; rm -rf "$ORIGIN"; git -C "$CL" remote set-url origin "https://127.0.0.1:9/never.git"
   run_offline "$T/m4.sh" add skills/stacks "$CL"
   if [ "$RC" = 0 ] && set_is_lean "$CL" "$STACKS_FILES" && ! no_transport_in_trace; then ok "F: an add that quietly runs a fetch still works offline, and only the trace check goes RED"; else bad "F: the fetching mutant was not caught (rc=$RC)"; fi
+fi
+if mutant m5 's/^    lsp_negations$/    :/'; then
+  new_clone m5; bash "$T/m5.sh" apply lean "$CL" >/dev/null 2>&1; RC=$?
+  if [ "$RC" = 0 ] && [ -f "$CL/commands/designmatch.md" ] && ! set_is_lean "$CL"; then ok "F: without the negation the cut command stays on disk (its core directory takes it) and the lean-set check goes RED"; else bad "F: the negation mutant was not caught (rc=$RC)"; fi
+fi
+if mutant m6 's/restored=1/restored=0/'; then
+  new_clone m6; bash "$T/m6.sh" apply lean "$CL" >/dev/null 2>&1; bash "$T/m6.sh" add commands "$CL" >/dev/null 2>&1
+  if [ ! -e "$CL/commands/designmatch.md" ]; then ok "F: an add of the directory above a cut path that does not lift the negation leaves the command out, and the ancestor check goes RED"; else bad "F: the restore mutant was not caught"; fi
+fi
+if mutant m7 's/^    cut += paths(pack.get.*$/    cut += []/'; then
+  new_clone m7; bash "$T/m7.sh" apply lean "$CL" >/dev/null 2>&1; RC=$?
+  if [ "$RC" = 0 ] && [ -f "$CL/skills/stacks/SKILL.md" ] && ! set_is_lean "$CL"; then ok "F: a library that ignores pack.paths leaves the pack on disk and the lean-set check goes RED"; else bad "F: the pack.paths mutant was not caught (rc=$RC)"; fi
+fi
+if mutant m8 's/^  lsp_check_cut "\$1"$/  :/'; then
+  new_clone m8 '{"entries": [{"id": "x", "kind": "bundled", "on_demand_paths": ["skills/heimdall"]}]}'; bash "$T/m8.sh" apply lean "$CL" >/dev/null 2>&1; RC=$?
+  if [ "$RC" = 0 ] && [ ! -e "$CL/skills/heimdall/SKILL.md" ]; then ok "F: without the core guard a manifest that names skills/heimdall strips the orchestrator skill out of the lean tree, and the refusal check goes RED"; else bad "F: the core-guard mutant was not caught (rc=$RC)"; fi
+fi
+if mutant m9 's/^    || lsp_die .*cannot be used.*$/    || :/'; then
+  new_clone m9 '{"entries": ['; bash "$T/m9.sh" apply lean "$CL" >/dev/null 2>&1; RC=$?
+  if [ "$RC" = 0 ] && ! sparse_off "$CL"; then ok "F: a manifest read that may fail goes on with an empty cut, and the refusal check goes RED"; else bad "F: the unreadable-manifest mutant was not caught (rc=$RC)"; fi
 fi
 
 printf '\nlean-sparse: %s passed, %s failed\n' "$PASS" "$FAIL"
