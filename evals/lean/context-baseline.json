@@ -1,21 +1,21 @@
 {
-  "digest": "8ac988ee649ed1bab75c4cfea9367b5fcb63680fb85a8940501ddb666e372fb5",
+  "digest": "aa96231d01359410e91e3c1b7e53a67f819b93ebd61c2299685658b8862f079a",
   "info": {
     "git_trees": {
-      "agents": "4e74779b290350c520e43612f7869543806d11fe",
+      "agents": "70c8dc13a56d397a89a4bf8355c4c7f4860d03ab",
       "commands": "100f7a1ca0d0cfdca442e4ae2bd28c5b43748652",
       "hooks": "ce216fd515e65bcd7bbf580bab06d84efc539249",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
-      "skills": "bae6f2b4ac2c306ddde62ce26fac19c51aa051e3"
+      "skills": "d77f31ec0b28c11e71bd5b787945b3b4623c2ed9"
     },
-    "recorded_utc": "2026-11-22T08:17:29Z",
+    "recorded_utc": "2026-11-22T09:16:00Z",
     "summary": {
-      "agents": 16,
-      "bytes": 578607,
+      "agents": 17,
+      "bytes": 648253,
       "commands": 20,
       "hooks_run": 17,
       "hooks_skipped": 7,
-      "skill_files": 36
+      "skill_files": 37
     },
     "tool": "bin/lib/lean_context_parity.py"
   },
@@ -82,6 +82,14 @@
           "sha256": "6b889a793be1ac81f52c3ceee2122f00f1aa78e94e52c1ecbe7ab8ddfefd3fb7"
         },
         "sha256": "9a687a9b60fd390eefd9c532ad487c1978c56612ad7bd8cb1689a69a2e49ab03"
+      },
+      "agents/heimdall-lean.md": {
+        "bytes": 29336,
+        "frontmatter": {
+          "bytes": 849,
+          "sha256": "c74165338b6d0b3a28e4731ea58de1584b2f33a02b23a2562cddc41354926078"
+        },
+        "sha256": "e507f04ee73590c476396d8a24973750a89f6c5ac4c0b78f6290e1345071411a"
       },
       "agents/heimdall.md": {
         "bytes": 67385,
@@ -410,6 +418,10 @@
       "skills/heimdall/references/journal.md": {
         "bytes": 9966,
         "sha256": "e8b075627463e4d059311b34cde6f839caa0c53dcc9e9e08dd17921b8017e48c"
+      },
+      "skills/heimdall/references/lean-procedures.md": {
+        "bytes": 40310,
+        "sha256": "2038933c990a25634da3d803dfbdd8d07f29ea1d4d71da52c0400cf44013310a"
       },
       "skills/heimdall/references/maintainer-guide.md": {
         "bytes": 10713,
