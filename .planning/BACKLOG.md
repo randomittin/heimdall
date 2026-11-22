@@ -71,3 +71,4 @@
 - MEDIUM: install.sh leaves tracked bin/edit-tracker.c and bin/parallelism-tracker.c modified in the clone (found by lean T1.4 install baseline).
 - LOW: hmd-statusline suite header/fixture copy differ from heimdall's cwd=/ fixture fix (3413b7e4); adopt statusline_sandbox payload rewrite at next pin bump.
 - MEDIUM: run-all suite_timeout() needs arms heimdall-push-gate-per-repo=400, heimdall-app=600, app-pair-confirm=450 (solo 175/261/205 s vs 180 default; '# budget:' headers are not read). Salt change → cold sweep; ride the next release batch. Interim: --timeout 600.
+- MEDIUM: hmd update dirty-tree guard (bin/heimdall:~3551) still reads an installed clone as dirty: .run-count/.unlock-* untracked, skill-restore/, install.sh chmod +x mode changes on bin/*.c. Fix: --untracked-files=no + ignore mode changes, or a runtime-state ignore list (found 2026-11-22, lean gitignore task).
