@@ -73,7 +73,7 @@
     "L1 assets+reviewers"
   ],
   "hard_constraints": [
-    "agent never pushes/publishes; RJ holds all credentials + does force-pushes",
+    "agent pushes heimdall, hmd-skills, hmd-statusline on a green push gate (operator grant 2026-11-22); never force-push or rewrite pushed history; npm publish + credentials stay with RJ",
     "public numbers trace to heimdall bench or commit sha; fable-5-pinned only",
     "verifier-surface changes re-trigger alarm suite; golden edits re-trigger BLIND-VERIFICATION; unverified goldens don't gate",
     "launches never batched; next at zero-or-answered queue",
