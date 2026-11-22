@@ -163,6 +163,7 @@ bin/heimdall-journal
 bin/heimdall-journal-hook
 bin/heimdall-land
 bin/heimdall-landmine-lint
+bin/heimdall-lean
 bin/heimdall-ledger
 bin/heimdall-ledger-mcp
 bin/heimdall-lintconfig-guard

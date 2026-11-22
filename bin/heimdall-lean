@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""heimdall-lean -- move this install between the lean and the full profile, and show what the move costs or saves.
+
+    heimdall-lean status    the recorded profile, what the tree on disk is, and the footprint now
+    heimdall-lean on        lean: narrow the clone to what runs (bin/lib/lean_sparse.sh apply lean) and record `lean`
+    heimdall-lean off       full: the whole tree again (git sparse-checkout disable, INV-L6) and record `full`
+    heimdall-lean -h | --help
+
+`on` and `off` print the footprint of bin/heimdall-footprint before and after the move: disk bytes and files, the bytes and estimated tokens a session is
+handed at its start, and the hooks registered. The saving is a number, not a claim. A session reads skills and commands when it starts, so the change
+reaches a session after a restart of Claude Code.
+
+This is a thin sequence over three helpers that have their own proofs: bin/lib/hmd_profile.py (the record, $HEIMDALL_HOME/profile.json),
+bin/lib/lean_sparse.sh (the sparse checkout of this clone: every git object stays, so lean off and `hmd skills install` need no network) and
+bin/heimdall-footprint (the meter). It operates on the clone this script lives in, and on nothing else.
+
+ORDER, so a failure never leaves the record and the tree at odds. `on` records `lean` FIRST: a profile.json that cannot be used stops it before the tree is
+touched, and if the sparse apply then fails the previous profile is put back. `off` restores the tree FIRST: it is the way out, so a profile.json that cannot
+be written still gets the full tree back, and the failure to record `full` is then said and exits 1.
+
+Both are idempotent: a second `on` re-derives the lean set (what `hmd skills install` put back stays), a second `off` changes nothing, and `off` on a
+clone that never was lean leaves its tracked files and .git/config as they were.
+
+INV-L12: lean keeps the `claude` wrapper (the hmd launcher) and installs and routes through nothing. This command never starts or stops a proxy, never runs
+`hmd headroom`, and writes nothing outside the clone and profile.json: no shell rc, no ~/.claude settings, no environment a session routes through. The
+untracked files beside the clone (ledger, receipts, memory, team, pairing, data/) are not touched either (INV-L10): sparse-checkout leaves them alone.
+
+Exit 0 done. 1 the move failed, or `off` could not record its profile (stderr says which, and what state the install is in). 2 usage. The footprint
+is information, never a gate: a meter that cannot answer prints n/a and a line on stderr, and the move still counts.
+"""
+import json
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+PROFILE_LIB = os.path.join(ROOT, "bin", "lib", "hmd_profile.py")
+SPARSE_LIB = os.path.join(ROOT, "bin", "lib", "lean_sparse.sh")
+FOOTPRINT = os.path.join(ROOT, "bin", "heimdall-footprint")
+GIT_TIMEOUT_S = 60
+FOOTPRINT_TIMEOUT_S = 120
+CHOICES = ("lean", "full")
+USAGE = "usage: heimdall-lean status | on | off\n"
+
+DISK_BYTES = ("disk", "total_bytes")
+DISK_FILES = ("disk", "total_files")
+ABSENT_FILES = ("disk", "absent_files")
+START_BYTES = ("context", "session_start_bytes")
+START_TOKENS = ("context", "session_start_tokens_est")
+HOOKS = ("hooks_total",)
+METRICS = (("disk bytes", DISK_BYTES), ("disk files", DISK_FILES), ("session start bytes", START_BYTES),
+           ("session start tokens", START_TOKENS), ("hooks registered", HOOKS))
+
+
+def say(line):
+    print(line)
+
+
+def warn(message):
+    sys.stderr.write("heimdall-lean: %s\n" % message)
+
+
+def helper(argv, capture=False):
+    """(exit status, stdout) of one helper program. Its stderr always reaches the operator; one that cannot start counts as failed."""
+    sys.stdout.flush()
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE if capture else None)
+    except OSError as exc:
+        warn("cannot run %s: %s" % (argv[0], exc))
+        return 1, ""
+    return proc.returncode, proc.stdout.decode("utf-8", "replace") if capture else ""
+
+
+def recorded_profile():
+    """The profile hmd_profile.py reads from the runtime home (`full` when nothing is recorded), or None when it cannot be asked."""
+    status, out = helper([sys.executable, "-I", PROFILE_LIB, "get"], capture=True)
+    return out.strip() if status == 0 and out.strip() in CHOICES else None
+
+
+def record_profile(value):
+    return helper([sys.executable, "-I", PROFILE_LIB, "set", value])[0] == 0
+
+
+def apply_tree(value):
+    return helper(["bash", SPARSE_LIB, "apply", value, ROOT])[0] == 0
+
+
+def git(*args):
+    env = {key: val for key, val in os.environ.items() if not key.startswith("GIT_")}   # no GIT_* variable may re-point git at another repository
+    return subprocess.run(["git", "-C", ROOT] + list(args), env=env, capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
+
+
+def tree_state():
+    """`lean` when a sparse checkout is on at ROOT, `full` when it is not, None when ROOT is not a git work tree."""
+    try:
+        if git("rev-parse", "--git-dir").returncode != 0:
+            return None
+        return "lean" if git("config", "--bool", "--get", "core.sparseCheckout").stdout.strip() == "true" else "full"
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def footprint():
+    """The report of bin/heimdall-footprint for this clone, or None with the reason on stderr: the table is information, never a gate."""
+    try:
+        proc = subprocess.run([sys.executable, FOOTPRINT, "--root", ROOT, "--json"], capture_output=True, timeout=FOOTPRINT_TIMEOUT_S)
+        if proc.returncode == 0:
+            report = json.loads(proc.stdout)
+            if isinstance(report, dict):
+                return report
+            reason = "its report is not a JSON object"
+        else:
+            reason = "heimdall-footprint exited %d: %s" % (proc.returncode, proc.stderr.decode("utf-8", "replace").strip())
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        reason = str(exc)
+    warn("the footprint is not available: %s" % reason)
+    return None
+
+
+def metric(report, path):
+    for key in path:
+        report = report.get(key) if isinstance(report, dict) else None
+    return report if isinstance(report, int) and not isinstance(report, bool) else None
+
+
+def number(value):
+    return "n/a" if value is None else format(value, ",")
+
+
+def table(before, after):
+    rows = ["  %-22s %14s %14s %14s" % ("", "before", "after", "change")]
+    for label, path in METRICS:
+        old, new = metric(before, path), metric(after, path)
+        change = "n/a" if old is None or new is None else (format(new - old, "+,") if new != old else "0")
+        rows.append("  %-22s %14s %14s %14s" % (label, number(old), number(new), change))
+    return "\n".join(rows)
+
+
+def show(headline, before):
+    after = footprint()
+    say(headline)
+    say(table(before, after))
+    say("Claude Code reads skills and commands when a session starts: restart it to load the change.")
+
+
+def cmd_status():
+    profile, tree, report = recorded_profile(), tree_state(), footprint()
+    if tree == "lean":
+        absent = metric(report, ABSENT_FILES)
+        tree_text = "lean (sparse checkout%s)" % ("" if absent is None else ", %s tracked paths not on disk" % format(absent, ","))
+    else:
+        tree_text = "full" if tree == "full" else "unknown: %s is not a git clone, and lean needs one" % ROOT
+    say("%-12s %s" % ("profile", profile or "unknown"))
+    say("%-12s %s" % ("tree", tree_text))
+    if report is not None:
+        say("%-12s %s B in %s files" % ("disk", number(metric(report, DISK_BYTES)), number(metric(report, DISK_FILES))))
+        say("%-12s %s B at session start (~%s tokens, an estimate)" % ("session", number(metric(report, START_BYTES)), number(metric(report, START_TOKENS))))
+        say("%-12s %s registered" % ("hooks", number(metric(report, HOOKS))))
+    if tree in CHOICES and profile in CHOICES and tree != profile:
+        say("note: the profile says %s but the tree is %s; `hmd lean %s` applies the profile" % (profile, tree, "on" if profile == "lean" else "off"))
+    return 0
+
+
+def cmd_on():
+    before = footprint()
+    previous = recorded_profile()
+    if not record_profile("lean"):
+        warn("the profile could not be recorded, so the tree was not touched")
+        return 1
+    if not apply_tree("lean"):
+        restored = previous is not None and record_profile(previous)
+        warn("lean was not applied%s" % ("; the recorded profile is %s again" % previous if restored else
+                                          ": put the recorded profile back by hand (python3 -I %s set lean|full)" % PROFILE_LIB))
+        return 1
+    show("heimdall-lean: lean is on (%s)" % ROOT, before)
+    return 0
+
+
+def cmd_off():
+    before = footprint()
+    if not apply_tree("full"):
+        warn("the full tree was not restored; the recorded profile is unchanged")
+        return 1
+    recorded = record_profile("full")
+    show("heimdall-lean: the full tree is back (%s)" % ROOT, before)
+    if not recorded:
+        warn("the profile could not be recorded as full: until `heimdall-lean off` succeeds, an upgrade may apply the recorded profile again")
+    return 0 if recorded else 1
+
+
+COMMANDS = {"status": cmd_status, "on": cmd_on, "off": cmd_off}
+
+
+def main(argv):
+    args = argv[1:]
+    if args in (["-h"], ["--help"]):
+        sys.stdout.write(__doc__)
+        return 0
+    if len(args) == 1 and args[0] in COMMANDS:
+        return COMMANDS[args[0]]()
+    sys.stderr.write(USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
