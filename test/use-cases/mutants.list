@@ -19,3 +19,5 @@
 07_push_blocked_until_checks_pass	bin/lib/hmd_repo_checks.py	s/stdin=subprocess.DEVNULL).returncode$/stdin=subprocess.DEVNULL).returncode * 0/	M07b-a-failing-check-is-recorded-as-passing
 11_start_and_join_a_team	bin/heimdall-team	s/^    write_team "\$SECRET" "join"$/    write_team "${SECRET}x" "join"/	M11a-join-stores-a-different-secret
 11_start_and_join_a_team	bin/heimdall-team	s/^os.chmod(path, 0o600)$/os.chmod(path, 0o644)/	M11b-team-secret-file-readable-by-everyone
+09_resume_a_session	bin/heimdall	s/^    \*) _heimdall_resume_attach_bg "\${2:-}" ;;$/    *) true ;;/	M09a-resume-never-reattaches-a-background-session
+09_resume_a_session	bin/heimdall	s/^    "\${RESUME_TARGET\[@]}" \\$/    \\/	M09b-resume-forgets-to-continue-the-last-conversation
