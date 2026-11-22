@@ -25,6 +25,7 @@ agents/database-architect.md
 agents/design.md
 agents/docs-writer.md
 agents/fixer.md
+agents/heimdall-lean.md
 agents/heimdall.md
 agents/incident-responder.md
 agents/lint-quality.md
@@ -1115,6 +1116,7 @@ skills/heimdall/references/git-workflow.md
 skills/heimdall/references/identity-and-ledger.md
 skills/heimdall/references/image-triage.md
 skills/heimdall/references/journal.md
+skills/heimdall/references/lean-procedures.md
 skills/heimdall/references/maintainer-guide.md
 skills/heimdall/references/planning-pipeline.md
 skills/heimdall/references/plugin-autoinstall.md
