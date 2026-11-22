@@ -1103,7 +1103,7 @@ lean_reset() {
   fi
   if [ -n "${HEIMDALL_HOME:-}" ]; then envp="HEIMDALL_HOME=$(printf '%q' "$rt") "; fi
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then envp="${envp}CLAUDE_CONFIG_DIR=$(printf '%q' "$CLAUDE_CONFIG_DIR") "; fi
-  undo="${envp}$(printf '%q' "$plugin/bin/heimdall-lean") off && ${envp}python3 -I $(printf '%q' "$backup") restore $(printf '%q' "$bdir") && rm -f $(printf '%q' "$record")"
+  undo="${envp}hmd lean restore $(printf '%q' "$bdir")"
   lean_reset_record "$record" "$bdir" || printf '  ⚠ hmd: could not write %s\n' "$record" >&2
 
   # 3/8 consent ask + grandfathered false: M1's `init` refuses to touch an existing file, so `set` is how a reset changes it

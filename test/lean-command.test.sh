@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # lean-command.test.sh -- proves bin/heimdall-lean (T4.1 of the 3.x lean-core plan, docs/superpowers/plans/2026-11-12-3x-lean-core.md): `hmd lean status|on|off`,
-# the one command that moves an install between the lean and the full profile and shows what the move costs. Invariants (.planning/lean-core/INVARIANTS.md):
-# INV-L6 (off restores the full tree, idempotent), INV-L12 (lean keeps the claude wrapper and never touches Headroom), and INV-L3 / INV-L10 for what a switch
-# must leave alone. The command is a thin sequence over three tested helpers (bin/lib/hmd_profile.py, bin/lib/lean_sparse.sh, bin/heimdall-footprint), so this
+# the one command that moves an install between the lean and the full profile and shows what the move costs, and (`restore DIR`) puts back the backup that
+# `install.sh --reset` took first. Invariants (.planning/lean-core/INVARIANTS.md): INV-L6 (off restores the full tree, idempotent), INV-L9 (restore returns the
+# backed-up files byte for byte, and a refused backup changes nothing), INV-L12 (lean keeps the claude wrapper and never touches Headroom), and INV-L3 / INV-L10
+# for what a switch must leave alone. The command is a thin sequence over three tested helpers (bin/lib/hmd_profile.py, bin/lib/lean_sparse.sh, bin/heimdall-footprint), so this
 # suite proves the sequence, the output and the failure behaviour, not the helpers again.
 #
 #   A. THE JOURNEY, every run inside a session routed through Headroom (ANTHROPIC_BASE_URL on its port, a shell rc that wraps `claude`, fake headroom / hmd / claude on
@@ -16,12 +17,17 @@
 #      BEFORE the tree is touched, while `off` still brings the full tree back (it is the way out) and then says the profile could not be recorded (exit 1).
 #   D. THE MUTANTS: the command with one behaviour broken (the tree step, the way back, the profile record, the put-back after a failed apply, the table, a call to
 #      `hmd headroom off`) goes RED on the check that guards that behaviour.
+#   E. RESTORE (INV-L9): `restore DIR` of the backup a reset took first puts skills-config.json and the settings.json slice back byte for byte, drops the profile record
+#      the backup did not have, brings the full tree back and removes the unfinished-reset record; the backup of a lean install gets its lean profile record AND its lean
+#      tree back; a second restore changes nothing; a tampered backup, and a directory that is no backup, are refused (exit 1) with the tree, the profile, the files and the
+#      record exactly as they were; four mutants of it (the helper skipped, the record kept, the refusal ignored, the tree not following the record) go RED.
 #
 # Hermetic: HOME, HEIMDALL_HOME and the git config are the test's own, the environment of every run is cleared (env -i), no network, nothing outside $T is read or
 # written. HMD_LEAN_BIN points the suite at another copy of the command. bash 3.2 compatible.
 #
-# budget: 90 -- measured 70 s with the machine under load (load average 22): 24 runs of the command, the dearest starting five python processes and a git
-# sparse-checkout, one fixture clone per scenario and per mutant. Nothing in it waits on a clock: no sleep, no timing assertion.
+# budget: 200 -- sections A-D measured 70 s with the machine under load (load average 22): 24 runs of the command, the dearest starting five python processes and a git
+# sparse-checkout, one fixture clone per scenario and per mutant; section E adds about 20 runs of the command (each a footprint meter before and after, a backup helper,
+# a git sparse-checkout) and one fixture per scenario and per mutant. Nothing in it waits on a clock: no sleep, no timing assertion.
 #
 # Usage:  bash test/lean-command.test.sh
 # shellcheck disable=SC2016  # the rc line and the shim bodies are single-quoted on purpose: their $-words are for the shell that sources / runs them later
@@ -44,7 +50,7 @@ trap 'exit 143' TERM
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
 export GIT_AUTHOR_NAME=lean-command-test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=lean-command-test GIT_COMMITTER_EMAIL=test@example.invalid
 
-echo "lean-command (bin/heimdall-lean: status, on, off, the footprint before and after, atomic failure, mutants)"
+echo "lean-command (bin/heimdall-lean: status, on, off, restore, the footprint before and after, atomic failure, mutants)"
 if [ ! -f "$CLI" ]; then bad "bin/heimdall-lean is missing: $CLI"; finish; exit 1; fi
 
 # ── the fixture: a tiny plugin laid out like this one, whose clone sits at ~/.heimdall the way install.sh puts it ──────────────────────────────────────────
@@ -59,13 +65,15 @@ mk_origin() {   # mk_origin DIR [nolist] -- the fixture repository, one commit; 
     put "$o" "$f"
   done
   printf '{"agent": "main"}\n' > "$o/settings.json"
+  # the on-demand cut: bin/lib/lean_sparse.sh takes it from skills.manifest.json at HEAD (a3e11d0e) and refuses to apply the lean set without one
+  printf '%s\n' '{"entries": [{"id": "on-demand", "kind": "bundled", "on_demand_paths": ["skills/stacks", "skills/designmatch", "skills/self-improve", "skills/system-health", "skills/mac-deep-clean"]}]}' > "$o/skills.manifest.json"
   printf '%s\n' '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}], "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "hooks/guard.sh"}, {"type": "command", "command": "true"}]}]}}' > "$o/hooks/hooks.json"
   mkdir -p "$o/bin/lib" "$o/release"
   cp "$CLI" "$o/bin/heimdall-lean"; cp "$REPO/bin/heimdall-footprint" "$o/bin/heimdall-footprint"
-  cp "$REPO/bin/lib/hmd_profile.py" "$REPO/bin/lib/lean_sparse.sh" "$o/bin/lib/"
+  cp "$REPO/bin/lib/hmd_profile.py" "$REPO/bin/lib/lean_sparse.sh" "$REPO/bin/lib/lean_backup.py" "$o/bin/lib/"
   chmod +x "$o/bin/heimdall" "$o/bin/heimdall-lean" "$o/bin/heimdall-footprint" "$o/hooks/guard.sh"
   if [ "${2:-}" != nolist ]; then
-    printf '%s\n' bin/heimdall bin/heimdall-footprint bin/heimdall-lean bin/lib/hmd_profile.py bin/lib/lean_sparse.sh hooks/guard.sh hooks/hooks.json \
+    printf '%s\n' bin/heimdall bin/heimdall-footprint bin/heimdall-lean bin/lib/hmd_profile.py bin/lib/lean_sparse.sh bin/lib/lean_backup.py hooks/guard.sh hooks/hooks.json \
       release/runtime-files.txt skills/heimdall/SKILL.md skills/stacks/SKILL.md skills/stacks/fastapi/PACK.md skills/designmatch/SKILL.md \
       skills/self-improve/SKILL.md skills/system-health/SKILL.md skills/mac-deep-clean/SKILL.md > "$o/release/runtime-files.txt"
   fi
@@ -156,13 +164,13 @@ FP0="$(fpnums "$CL")"
 if [ "$(printf '%s\n' "$FP0" | wc -w | tr -d ' ')" != 5 ]; then bad "A: the meter did not report the fixture: [$FP0]"; finish; exit 1; fi
 read -r B0 F0 SB0 _ H0 <<< "$FP0"
 
-for args in "" "bogus" "on now" "status -v" "--frobnicate"; do
+for args in "" "bogus" "on now" "status -v" "--frobnicate" "restore" "restore a b"; do
   # shellcheck disable=SC2086  # the word list is the point
   lean $args
   if [ "$RC" = 2 ] && [ ! -s "$T/out" ] && grep -q '^usage:' "$T/err"; then ok "A: usage error [$args] exits 2, usage line on stderr, nothing on stdout"; else bad "A: usage error [$args]: $(show_run)"; fi
 done
 lean --help
-if [ "$RC" = 0 ] && grep -q 'heimdall-lean status' "$T/out" && grep -q 'heimdall-lean on' "$T/out" && grep -q 'heimdall-lean off' "$T/out"; then ok "A: --help prints the three commands, exit 0"; else bad "A: --help: $(show_run)"; fi
+if [ "$RC" = 0 ] && grep -q 'heimdall-lean status' "$T/out" && grep -q 'heimdall-lean on' "$T/out" && grep -q 'heimdall-lean off' "$T/out" && grep -q 'heimdall-lean restore DIR' "$T/out"; then ok "A: --help prints the four commands, exit 0"; else bad "A: --help: $(show_run)"; fi
 if [ ! -e "$HH/profile.json" ] && [ "$(treehash "$CL")" = "$FRESH" ]; then ok "A: usage errors and --help wrote nothing"; else bad "A: a usage error or --help changed the install"; fi
 
 lean status
@@ -252,6 +260,90 @@ fi
 if mutant m6 '    previous = recorded_profile()' '    previous = recorded_profile(); subprocess.run(["hmd", "headroom", "off", "--next-session"])'; then
   rm -f "$T/shim.log"; mutant_install m6; lean on
   if ! no_shim_calls; then ok "D: an on that calls hmd headroom off is seen in the shim log: the INV-L12 check goes RED"; else bad "D: the headroom mutant was not caught"; fi
+fi
+
+echo "-- E. restore: hmd lean restore DIR undoes install.sh --reset (INV-L9) --"
+CFG_PRE='{"consent":"auto","grandfathered":true}'    # skills-config.json before the reset
+CFG_POST='{"consent":"ask","grandfathered":false}'   # ...and as the reset leaves it
+SET_PRE=$'{\n  "env": {\n    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"\n  },\n  "theme": "dark"\n}\n'      # the user settings before: the Headroom route, in a file with an indent
+SET_POST=$'{\n  "env": {},\n  "theme": "dark",\n  "agent": "hmd:heimdall-lean"\n}\n'                          # ...and after: the route switched off, the lean prompt selected
+printf '%s' "$SET_PRE" > "$T/settings.pre"; printf '%s' "$SET_POST" > "$T/settings.post"
+rm -f "$T/shim.log"
+
+backup_now() {   # the backup install.sh --reset takes first, by the real helper as it calls it: prints the backup dir
+  env -i HOME="$HOME_DIR" HEIMDALL_HOME="$HH" PATH="$PATH" python3 -I "$CL/bin/lib/lean_backup.py" backup
+}
+light_fixture() {   # light_fixture NAME [MUTANT] -- an install as it was before a reset, its backup (BK), then what a reset leaves in the files and the record (the tree stays full)
+  new_install "$1"
+  [ -z "${2:-}" ] || cp "$T/$2.py" "$CL/bin/heimdall-lean"
+  printf '%s' "$SET_PRE" > "$HOME_DIR/.claude/settings.json"; printf '%s\n' "$CFG_PRE" > "$HH/skills-config.json"
+  DATA_R="$(hash_of "$HH" ledger receipts memory data team.json)"
+  BK="$(backup_now)"
+  if [ ! -f "$BK/manifest.json" ]; then bad "E: the backup of $1 could not be taken"; finish; exit 1; fi
+  BASE_R="$(treehash "$CL")"
+  printf '%s\n' "$CFG_POST" > "$HH/skills-config.json"; printf '%s' "$SET_POST" > "$HOME_DIR/.claude/settings.json"
+  printf 'backup=%s\npending=lean-tree\n' "$BK" > "$HH/backups/lean-reset-pending"
+}
+reset_fixture() {   # reset_fixture NAME -- light_fixture plus the lean tree and the lean profile record the reset made (this very command's `on`: install.sh --reset runs the same helpers)
+  light_fixture "$1"
+  lean on
+  if [ "$RC" != 0 ] || ! is_lean "$CL"; then bad "E: the lean tree of $1 could not be made: $(show_run)"; finish; exit 1; fi
+}
+lean_record_case() {   # lean_record_case NAME [MUTANT] -- a LEAN install is backed up (its backup holds a lean profile record), switched off, then restored from that backup
+  new_install "$1"
+  [ -z "${2:-}" ] || cp "$T/$2.py" "$CL/bin/heimdall-lean"
+  printf '%s' "$SET_PRE" > "$HOME_DIR/.claude/settings.json"; printf '%s\n' "$CFG_PRE" > "$HH/skills-config.json"
+  lean on
+  BK="$(backup_now)"; cp "$HH/profile.json" "$T/profile.lean"
+  lean off
+  lean restore "$BK"
+}
+cfg_restored() { [ "$(cat "$HH/skills-config.json")" = "$CFG_PRE" ]; }
+lean_tree_on() { [ "$(git -C "$CL" config --bool --get core.sparseCheckout 2>/dev/null)" = true ]; }
+
+reset_fixture r1
+FPL="$(fpnums "$CL")"
+lean restore "$BK"
+FPF="$(fpnums "$CL")"
+if [ "$RC" = 0 ] && cfg_restored && cmp -s "$T/settings.pre" "$HOME_DIR/.claude/settings.json"; then ok "E: restore puts skills-config.json and the settings.json slice back byte for byte (the agent key goes, the route comes back)"; else bad "E: restore: $(show_run)"; fi
+if [ ! -e "$HH/profile.json" ] && [ "$(profile_get)" = full ]; then ok "E: the profile record the backup did not have is gone: the install reads full again"; else bad "E: profile.json is still there after the restore of a pre-lean backup"; fi
+if is_full "$CL" && [ "$(treehash "$CL")" = "$BASE_R" ]; then ok "E: the full tree is back and everything under the install is byte for byte what it was before the reset"; else bad "E: the tree after the restore is not the pre-reset tree"; fi
+if [ ! -e "$HH/backups/lean-reset-pending" ] && [ -f "$BK/manifest.json" ]; then ok "E: the unfinished-reset record is removed and the backup itself is kept"; else bad "E: the record or the backup: $(ls "$HH/backups" | tr '\n' ' ')"; fi
+if grep -q '^heimdall-lean: restored from .*: profile full, tree full' "$T/out" && expect_table "$FPL" "$FPF"; then ok "E: restore says what it did and prints the footprint before and after: the meter's own numbers"; else bad "E: the restore output: $(show_run)"; fi
+if [ "$(hash_of "$HH" ledger receipts memory data team.json)" = "$DATA_R" ] && [ "$(cat "$HOME_DIR/.zshrc")" = 'claude() { hmd route claude "$@"; }' ] && no_shim_calls; then ok "E: INV-L10 and INV-L12: user data and the shell rc are untouched, and headroom, hmd and claude were never run"; else bad "E: restore moved user data or the rc, or ran a route tool"; fi
+lean restore "$BK"
+if [ "$RC" = 0 ] && grep -q 'restored 0, removed 0' "$T/out" && cfg_restored && [ "$(treehash "$CL")" = "$BASE_R" ]; then ok "E: a second restore of the same backup changes nothing and still exits 0"; else bad "E: the second restore: $(show_run)"; fi
+
+lean_record_case r2
+if [ "$RC" = 0 ] && cmp -s "$T/profile.lean" "$HH/profile.json" && [ "$(profile_get)" = lean ] && is_lean "$CL" && grep -q '^heimdall-lean: restored from .*: profile lean, tree lean' "$T/out"; then
+  ok "E: the backup of a lean install brings back its lean profile record byte for byte AND its lean tree: the tree follows the restored record"
+else bad "E: the restore of a lean backup: $(show_run) profile=$(profile_get)"; fi
+
+reset_fixture r3
+printf 'x' >> "$BK/files/000"
+lean restore "$BK"
+if [ "$RC" = 1 ] && grep -q 'tampered or damaged' "$T/err" && grep -q 'was not restored' "$T/err" && ! grep -q 'restored from' "$T/out"; then ok "E: a tampered backup is refused: exit 1, the reason and 'was not restored' on stderr, nothing reported as done"; else bad "E: the tampered backup: $(show_run)"; fi
+if is_lean "$CL" && [ "$(profile_get)" = lean ] && [ "$(cat "$HH/skills-config.json")" = "$CFG_POST" ] && cmp -s "$T/settings.post" "$HOME_DIR/.claude/settings.json" && [ -f "$HH/backups/lean-reset-pending" ]; then
+  ok "E: ...and nothing changed: the lean tree, the lean profile, skills-config.json, settings.json and the unfinished-reset record are as the reset left them"
+else bad "E: a refused restore changed something"; fi
+lean restore "$T/not-a-backup"
+if [ "$RC" = 1 ] && grep -q 'not a backup directory' "$T/err" && is_lean "$CL" && [ -f "$HH/backups/lean-reset-pending" ] && no_shim_calls; then ok "E: a directory that is no backup is refused the same way and the tree stays lean"; else bad "E: a directory that is no backup: $(show_run)"; fi
+
+if mutant mr1 '    status, _ = helper([sys.executable, "-I", BACKUP_LIB, "restore", directory])' '    status = 0'; then
+  light_fixture mr1 mr1; lean restore "$BK"
+  if ! cfg_restored; then ok "E: a restore that never runs the backup helper leaves skills-config.json as the reset made it: the byte-for-byte check goes RED"; else bad "E: the helper-skipped mutant was not caught"; fi
+fi
+if mutant mr2 '    dropped = drop_pending_record()' '    dropped = True'; then
+  light_fixture mr2 mr2; lean restore "$BK"
+  if [ -e "$HH/backups/lean-reset-pending" ]; then ok "E: a restore that keeps the unfinished-reset record leaves it on disk: the record check goes RED"; else bad "E: the record mutant was not caught"; fi
+fi
+if mutant mr3 '    if status != 0:' '    if status < 0:'; then
+  light_fixture mr3 mr3; printf 'x' >> "$BK/files/000"; lean restore "$BK"
+  if [ "$RC" = 0 ] && [ ! -e "$HH/backups/lean-reset-pending" ]; then ok "E: a restore that ignores the helper's refusal exits 0 and drops the record over a tampered backup: the refusal check goes RED"; else bad "E: the refusal mutant was not caught: $(show_run)"; fi
+fi
+if mutant mr4 '    if not apply_tree(profile):' '    if not apply_tree("full"):'; then
+  lean_record_case mr4 mr4
+  if ! lean_tree_on; then ok "E: a restore that always applies the full tree loses the lean tree of a lean backup: the tree-follows-the-record check goes RED"; else bad "E: the tree-step mutant was not caught"; fi
 fi
 
 finish

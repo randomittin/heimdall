@@ -14,7 +14,7 @@
 # The Headroom CLI acts on launchd and is another subsystem: the release used here carries a recording stand-in at bin/heimdall-headroom, so the real one never runs.
 #
 # budget: 120 -- about 70 s solo: one existing install by the pinned installer, one real install.sh --reset (a local fetch, python and git starts, the doctor,
-# a sparse apply of ~2300 files, the fake claude), one `heimdall-lean off` undo. No sleep, no timing assertion.
+# a sparse apply of ~2300 files, the fake claude), one `hmd lean restore` undo. No sleep, no timing assertion.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../bin/lib/lean_install_fixture.sh
@@ -123,8 +123,8 @@ if ! grep -rqF "$UD_SECRET" "$CLONE/backups" 2>/dev/null; then uc_ok "a secret p
 
 # 3. the undo, as printed
 UNDO="$(sed -n 's/^   8\/8 to undo: //p' "$UC_ROOT/reset.out" | head -1)"
-uc_run "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh -- bash -c "$UNDO"
-uc_rc "3. the printed undo command runs" 0
+uc_run "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh PATH="$UC_HOME/.local/bin:$UC_PATH" -- bash -c "$UNDO"   # ~/.local/bin is where the installer put hmd, on the PATH of a real shell
+uc_rc "3. the printed undo command (hmd lean restore) runs" 0
 if [ "$(git -C "$CLONE" config --bool --get core.sparseCheckout 2>/dev/null || true)" != true ] && [ -d "$CLONE/test" ]; then uc_ok "the undo brought the full tree back"; else uc_bad "the undo did not bring the full tree back"; fi
 ud_manifest "$CLONE" > "$UC_ROOT/ud-after-undo.txt"
 ud_same "INV-L10 after the undo" "$UC_ROOT/ud-before.txt" "$UC_ROOT/ud-after-undo.txt"
