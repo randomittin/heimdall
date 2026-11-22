@@ -21,3 +21,5 @@
 11_start_and_join_a_team	bin/heimdall-team	s/^os.chmod(path, 0o600)$/os.chmod(path, 0o644)/	M11b-team-secret-file-readable-by-everyone
 09_resume_a_session	bin/heimdall	s/^    \*) _heimdall_resume_attach_bg "\${2:-}" ;;$/    *) true ;;/	M09a-resume-never-reattaches-a-background-session
 09_resume_a_session	bin/heimdall	s/^    "\${RESUME_TARGET\[@]}" \\$/    \\/	M09b-resume-forgets-to-continue-the-last-conversation
+10_update_lands_and_session_returns	bin/heimdall-autoupdate	s/^  if \[ "$vrc" -ne 0 \]; then$/  if false; then/	M10a-update-applied-without-checking-its-signature
+10_update_lands_and_session_returns	bin/lib/hmd_supervise.sh	s/HMD_RESUME_SESSION_ID=/HMD_RESUME_SESSION_ID_OFF=/g	M10b-session-relaunched-without-resume
