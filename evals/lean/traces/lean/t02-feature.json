@@ -1,0 +1,48 @@
+{
+  "task": "t02-feature",
+  "agent": "heimdall-lean",
+  "source": "recorded-fixture",
+  "prompt_sha256": "e507f04ee73590c476396d8a24973750a89f6c5ac4c0b78f6290e1345071411a",
+  "events": [
+    {
+      "kind": "spawn",
+      "name": "hmd:architect"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:coder"
+    },
+    {
+      "kind": "touch",
+      "name": "api/health.py"
+    },
+    {
+      "kind": "touch",
+      "name": "test/test_health.py"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:docs-writer"
+    },
+    {
+      "kind": "touch",
+      "name": "README.md"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:test-runner"
+    },
+    {
+      "kind": "gate",
+      "name": "lint"
+    },
+    {
+      "kind": "gate",
+      "name": "verify-edits --quick"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:reviewer"
+    }
+  ]
+}

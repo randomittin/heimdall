@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "gate_type": "differential",
+  "independent": true,
+  "description": "Fixed task set for the lean-prompt differential (lean-core plan T5.1). Each task is run through agent `heimdall` (reference) and `heimdall-lean`; the two whole traces (ordered spawn / gate / touch events) must be equal.",
+  "tasks": [
+    {"id": "t01-bugfix", "prompt": "Fix the off-by-one in src/pager.py and prove it with a test."},
+    {"id": "t02-feature", "prompt": "Add a /health endpoint to the todo API with a test and docs."},
+    {"id": "t03-refactor", "prompt": "Split utils.js into two focused modules, behaviour unchanged."},
+    {"id": "t04-security", "prompt": "Audit the login handler for injection and fix what you find."},
+    {"id": "t05-docs-only", "prompt": "Document the CLI flags in README.md."},
+    {"id": "t06-multi-file", "prompt": "Rename the Account model to Customer across api/, db/ and tests/."}
+  ]
+}

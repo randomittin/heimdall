@@ -1,0 +1,40 @@
+{
+  "task": "t04-security",
+  "agent": "heimdall",
+  "source": "recorded-fixture",
+  "prompt_sha256": "0df586298be287e5eb891e4ba6cdb54823aeae0f89200e3f84f09183feecd221",
+  "events": [
+    {
+      "kind": "spawn",
+      "name": "hmd:security-auditor"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:coder"
+    },
+    {
+      "kind": "touch",
+      "name": "auth/login.py"
+    },
+    {
+      "kind": "touch",
+      "name": "test/test_login.py"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:test-runner"
+    },
+    {
+      "kind": "gate",
+      "name": "lint"
+    },
+    {
+      "kind": "gate",
+      "name": "verify-edits --quick"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:reviewer"
+    }
+  ]
+}

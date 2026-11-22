@@ -1,0 +1,40 @@
+{
+  "task": "t03-refactor",
+  "agent": "heimdall",
+  "source": "recorded-fixture",
+  "prompt_sha256": "0df586298be287e5eb891e4ba6cdb54823aeae0f89200e3f84f09183feecd221",
+  "events": [
+    {
+      "kind": "spawn",
+      "name": "hmd:coder"
+    },
+    {
+      "kind": "touch",
+      "name": "utils.js"
+    },
+    {
+      "kind": "touch",
+      "name": "utils_a.js"
+    },
+    {
+      "kind": "touch",
+      "name": "utils_b.js"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:test-runner"
+    },
+    {
+      "kind": "gate",
+      "name": "lint"
+    },
+    {
+      "kind": "gate",
+      "name": "verify-edits --quick"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:reviewer"
+    }
+  ]
+}
