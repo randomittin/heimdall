@@ -13,3 +13,5 @@
 01_install_on_a_clean_machine	install.sh	s#if ln -s "\$src" "\$dst" 2>/dev/null; then#if false; then#	M01b-entry-points-are-copies-not-symlinks
 02_uninstall_leaves_nothing_behind	bin/heimdall	s/^_heimdall_remove_path_export() {$/_heimdall_remove_path_export() { return 0/	M02a-uninstall-leaves-the-path-export
 02_uninstall_leaves_nothing_behind	bin/heimdall	s/^_heimdall_remove_plugin() {$/_heimdall_remove_plugin() { return 0/	M02b-uninstall-leaves-the-install-tree
+03_first_launch_in_an_empty_folder	bin/heimdall	s#^  touch "\$SETUP_MARKER" 2>/dev/null || true$#  true#	M03a-setup-never-recorded-as-done
+03_first_launch_in_an_empty_folder	bin/lib/skills_consent.sh	s/^hmd_skills_consent() {$/hmd_skills_consent() { return 0/	M03b-skills-installed-without-asking
