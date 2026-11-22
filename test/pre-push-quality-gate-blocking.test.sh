@@ -116,6 +116,9 @@ chmod +x "$FAKE_PLUGIN/bin/heimdall-state"
 # hmd_repo_receipt). Not a fake either. heimdall-repo-checks and hmd_repo_checks.py are
 # left out on purpose: no case here declares checks of its own.
 cp "$REPO/bin/lib/hmd_push_target.py" "$REPO/bin/lib/hmd_repo_receipt.py" "$FAKE_PLUGIN/bin/lib/"
+# ...and the REAL use-case receipt checker heimdall-state asks (with the libs it imports): a push of heimdall's own repo passes on a green use-case
+# journey receipt too, in place of a full sweep receipt (operator decision 2026-11-22; cases 2b-2e)
+cp "$REPO/bin/lib/hmd_use_case_receipt.py" "$REPO/bin/lib/hmd_sweep_guard.py" "$REPO/bin/lib/hmd_kill_guard.py" "$REPO/bin/lib/hook-owned-path.sh" "$FAKE_PLUGIN/bin/lib/"
 
 # run_hook <cwd> <command-string>  -> sets RC / OUT / ERR
 run_hook() {
@@ -146,6 +149,20 @@ green_sweep_receipt() {  # green_sweep_receipt <repo>
   head="$(git -C "$1" rev-parse HEAD)"
   mkdir -p "$top/.heimdall/receipts"
   jq -n --arg r "$top" --arg h "$head" '{kind: "full", repo: $r, head_sha: $h, tree_clean: true, exit_code: 0}' > "$top/.heimdall/receipts/last-sweep.json"
+}
+
+# A use-case journey receipt for the repo's HEAD, as `bash test/use-cases/run.sh` writes one, built by hand; an optional jq filter mutates it.
+use_case_receipt() {  # use_case_receipt <repo> [jq filter]
+  local top head tree
+  top="$(git -C "$1" rev-parse --show-toplevel)"
+  head="$(git -C "$1" rev-parse HEAD)"
+  tree="$(git -C "$1" rev-parse 'HEAD^{tree}')"
+  mkdir -p "$top/.heimdall/receipts"
+  jq -n --arg h "$head" --arg t "$tree" '{schema: 1, head_sha: $h, tree_sha: $t, exit_code: 0, journeys: {total: 11, passed: 11}, mutants: {total: 25, killed: 25}, duration_s: 352, finished_at: "2026-11-22T12:00:00Z"}' \
+    | jq "${2:-.}" > "$top/.heimdall/receipts/use-cases.json"
+}
+clean_flags() {  # clean_flags <repo>: the four legacy state flags green (lint waived: this file is not about lint evidence)
+  ( cd "$1" && "$FAKE_PLUGIN/bin/heimdall-state" init >/dev/null 2>&1 && HMD_LINT_WAIVER="fixture: pre-push blocking is not about lint evidence" "$FAKE_PLUGIN/bin/heimdall-state" mark-clean >/dev/null 2>&1 )
 }
 
 printf '\npre-push quality gate — blocking behaviour\n'
@@ -200,6 +217,38 @@ if grep -q 'BLOCKED' <<<"$OUT"; then
   bad "clean gates => no BLOCKED verdict emitted" "stdout=$OUT"
 else
   ok "clean gates => no BLOCKED verdict emitted"
+fi
+
+# === CASE 2b-2e: heimdall's own repo passes a push on a green USE-CASE journey receipt in place of a full sweep (operator decision 2026-11-22, "B") ===
+# A push stands on EITHER record; a release (release/ship.sh) still needs the full sweep. Fail-closed on every other shape of the receipt.
+C="$(new_cwd 2b)"; clean_flags "$C"; use_case_receipt "$C"
+run_hook "$C" "git push origin main"
+if [ "$RC" = 0 ] && ! grep -q 'BLOCKED' <<<"$OUT" && grep -qi 'use-case journey receipt' <<<"$ERR"; then
+  ok "2b clean gates + a green use-case receipt for HEAD and NO sweep receipt => push PROCEEDS, and says it rests on the use-case receipt"
+else
+  bad "2b clean gates + a green use-case receipt and no sweep receipt => push PROCEEDS" "got exit $RC; stdout=$OUT; stderr=$ERR"
+fi
+C="$(new_cwd 2c)"; clean_flags "$C"; use_case_receipt "$C" '.mutants.killed = 24'
+run_hook "$C" "git push origin main"
+if [ "$RC" = 2 ] && printf '%s' "$OUT" | jq -e '.error | test("BLOCKED") and test("RED") and test("bash test/use-cases/run.sh")' >/dev/null 2>&1; then
+  ok "2c a use-case receipt with a surviving mutant is RED => push BLOCKED, naming bash test/use-cases/run.sh"
+else
+  bad "2c a RED use-case receipt => push BLOCKED, naming the runner" "got exit $RC; stdout=$OUT"
+fi
+C="$(new_cwd 2d)"; clean_flags "$C"; use_case_receipt "$C"
+( cd "$C" && echo "echo hi" > code.sh && git add code.sh && git -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m "code lands after the run" )
+run_hook "$C" "git push origin main"
+if [ "$RC" = 2 ] && printf '%s' "$OUT" | jq -e '.error | test("BLOCKED") and test("STALE: the use-case journey receipt") and test("code.sh")' >/dev/null 2>&1; then
+  ok "2d a code commit after the use-case run => the receipt is STALE => push BLOCKED, naming the path"
+else
+  bad "2d a stale use-case receipt => push BLOCKED" "got exit $RC; stdout=$OUT"
+fi
+C="$(new_cwd 2e)"; clean_flags "$C"
+run_hook "$C" "git push origin main"
+if [ "$RC" = 2 ] && printf '%s' "$OUT" | jq -e '.error | test("BLOCKED") and test("no sweep receipt") and test("bash test/use-cases/run.sh")' >/dev/null 2>&1; then
+  ok "2e neither receipt => push BLOCKED, and the message names bash test/use-cases/run.sh beside the missing sweep receipt"
+else
+  bad "2e neither receipt => push BLOCKED, naming the use-case runner" "got exit $RC; stdout=$OUT"
 fi
 
 # === CASE 3: NO verdict (absent state) -> must NOT block, but must be LOUD ===

@@ -123,6 +123,19 @@ while the tree stays unedited. Running it more often costs half an hour a pop
 and — worse — grades a tree that is still being edited, which attributes a verdict to a
 state of the code that never existed.
 
+**Heimdall's own repo: a push stands on the use-case journey receipt, the full sweep is for releases
+(operator decision 2026-11-22, "B").** What is recommended immediately before the final merge in THIS
+repo is `bash test/use-cases/run.sh` (the 11 journeys and their mutants, ~6 min), not the sweep. A
+green FULL run of it (no `--only`, no `--no-mutants`; every journey passed, every mutant killed) on a
+clean, committed tree writes `.heimdall/receipts/use-cases.json` (`bin/lib/hmd_use_case_receipt.py` is
+its one definition: commit, tree, counts, time), and `heimdall-state check-quality-gates` takes that
+receipt for HEAD IN PLACE of a green full-equivalent sweep receipt: either record passes a push, and
+the hooks' own journal and ledger commits after the run do not stale it. The full sweep
+(`bash test/run-all.sh`, with everything below about the cache, `--failed`, the freeze and the quiet
+gate) is required only for a release: the release script still demands its full-equivalent receipt,
+unchanged, and the sweep is what is recommended to the developer immediately before a release. Every
+rule below about who may start a run, when it is recommended and how its output is read applies to both.
+
 - **What the developer is shown (the recommendation).** Three things, every time: why (what
   the run proves for this merge), the command (`bash test/run-all.sh`; `--failed` after a
   red) and the cost: wall time (~45-60 min cold; a cached run costs what the change reaches)
@@ -242,7 +255,8 @@ state of the code that never existed.
 - **The `git push` hook stack is unchanged and stays.** It is a fail-closed backstop,
   not a duplicate of this rule: the merge-time recommendation is the developer's call,
   the pre-push gate is the machine's guarantee. In this repo a push still needs a green
-  full-equivalent receipt, so a developer who declined the run meets that gate at the push.
+  receipt, a use-case journey receipt or a full-equivalent sweep receipt, so a developer who
+  declined the run meets that gate at the push.
 - **Already machine-enforced, in part.** `bin/heimdall-conformance` reads the session
   transcript and fails `gate-runs-once` (two full-gate runs with no edit between them)
   and `gates-at-end` (the first full-gate run must come AFTER real work). It also fails
@@ -364,8 +378,19 @@ warning but isn't blocked; don't drop the gate altogether.* The gate is now chos
 - **(a) sweep.** Marker: a commit has `test/run-all.sh` as a regular file that names `last-sweep.json`
   (heimdall's own sweep regime; that script writes the receipt `check-quality-gates` reads). The marker
   is tracked code, never the receipt, so deleting a receipt cannot downgrade a repo, and another
-  project's `test/run-all.sh` is not mistaken for it. The old gate, unchanged and fail closed, now run
-  inside that repo (a cwd in a subdirectory reads the toplevel's state).
+  project's `test/run-all.sh` is not mistaken for it. The gate (`heimdall-state check-quality-gates`,
+  fail closed, run inside that repo: a cwd in a subdirectory reads the toplevel's state) passes its sweep
+  part on EITHER a green full-equivalent sweep receipt for HEAD (the old rule, unchanged) OR, since
+  2026-11-22 (operator decision "B": a push stands on the use-case journeys, a release on the full sweep),
+  a green use-case journey receipt: `.heimdall/receipts/use-cases.json`, written by `bash
+  test/use-cases/run.sh` after a green FULL run on a clean tree. `bin/lib/hmd_use_case_receipt.py`
+  re-derives it from git, never taking the file's word: the exact schema, a green run (every journey
+  passed, every mutant killed), `head_sha` a commit this checkout has and `tree_sha` its tree, and that
+  commit is HEAD or only the hooks' own journal and ledger commits came after it. A missing, red, forged,
+  stale, garbled, linked or unverifiable receipt blocks (the failure names `bash test/use-cases/run.sh`)
+  and leaves the sweep rule as it was; the state flags and the lint evidence still apply. The release script
+  is untouched: a release still needs the full sweep receipt. Proof: `test/sweep-receipt-gate.test.sh` (M, N)
+  and `test/pre-push-quality-gate-blocking.test.sh` (2b-2e).
 - **(b) repo-checks.** A commit has `.heimdall/repo-checks.json` = `{"schema":1,"checks":[{"name","cmd"}]}`.
   `bin/heimdall-repo-checks run [--repo PATH]` runs each check from the repo root, in order, and writes
   `<repo>/.heimdall/receipts/repo-checks.json` atomically. The gate passes ONLY on a receipt that is
@@ -499,7 +524,7 @@ through `bin/lib/hmd_wait_guard.py`:
 ## Sweep advice: a full test run is recommended at the final merge, never before (2026-11-12, refined 2026-11-22)
 Operator directive, 2026-11-12: *full test runs should be recommended to devs along with explanation and token usage, and always suggested just before merge operations and not before.* Refined 2026-11-22: *only do the full sweep before final merge and not on every merge.* The sweep guard says when a full run is pointless; this says when one is worth it, and it speaks at exactly one moment: the FINAL merge. `bin/heimdall-precheck-bash` asks `bin/lib/hmd_sweep_advice.py`, for a command that mentions merge, push or pull (and git or gh), whether the command IS the final merge: a pull request merge, a pull on the default branch (never a rebasing one), or a push to the default branch (main, master, or what origin/HEAD names). A local `git merge` of refs is NOT: integrating agent worktree branches that way is a step inside a batch and gets no advice, and the push that sends the batch to the default branch is the one that does. Text that only mentions one (echo, grep, a commit message), a merge-base and a push of another branch are not either, and nothing else ever triggers it.
 
-- **What it prints** (hook JSON on exit 0: `systemMessage` for the developer, `hookSpecificOutput.additionalContext` so the agent relays it, never a `permissionDecision`): *Why* (commits and files changed since the last green full record, the hooks' own journal and ledger records not counted, or "no green record yet" and the reason), *Run* (`bash test/run-all.sh`, `--failed` after a red sweep, for heimdall's own regime; `bin/heimdall-repo-checks run` for a repo that declares `.heimdall/repo-checks.json`; lint plus the use-case suite, `skills/heimdall/references/use-case-tests.md`, for any other repo), *Cost* (suites or checks, the last measured wall clock from the receipt, and tokens as labelled estimates: none when the developer runs it in a terminal, a 40-line summary tail times 91 B over 4 when an agent runs it in the background and reads only that, the whole output of (suites + 40) rows times 91 B over 4 when an agent reads all of it) and *Your call*: run it now, or merge without it. A commit the records already prove green gets one line, "already proven green ... nothing to run", and no recommendation.
+- **What it prints** (hook JSON on exit 0: `systemMessage` for the developer, `hookSpecificOutput.additionalContext` so the agent relays it, never a `permissionDecision`): *Why* (commits and files changed since the last green record, the hooks' own journal and ledger records not counted, or "no green record yet" and the reason), *Run* (`bash test/use-cases/run.sh` for heimdall's own regime: since 2026-11-22 a push stands on the use-case journey receipt, so that is the run recommended, and the full sweep is named only on a `Release:` line as a release's bar, never recommended for a push, whatever a red or running sweep says; `bin/heimdall-repo-checks run` for a repo that declares `.heimdall/repo-checks.json`; lint plus the use-case suite, `skills/heimdall/references/use-case-tests.md`, for any other repo), *Cost* (journeys and mutants, or suites or checks, the last measured wall clock from the receipt (about 6 minutes for the journeys when none is on record), and tokens as labelled estimates: none when the developer runs it in a terminal, a 40-line summary tail times 91 B over 4 when an agent runs it in the background and reads only that, the whole output of (suites + 40) rows times 91 B over 4 when an agent reads all of it) and *Your call*: run it now, or merge without it. A commit the records already prove green gets one line, "already proven green ... nothing to run", and no recommendation.
 - **It never blocks, and it speaks last.** The advice is computed after every other gate has let the command through and is the one JSON object on stdout, so a command a gate denies prints only its deny; the parallelism tracker's own output goes to stderr while advice is printed.
 - **Silence it.** `HMD_SWEEP_ADVICE=off` (also `0`, `false`, `no`) in the environment Claude Code runs in (read from the hook's OWN environment: an inline prefix reaches the command, not the hook), or `hmd guardrails off sweep-advice` (id `sweep-advice`, a recommended row of `guardrails.manifest.json`; only the lib's exit 1 means off). **Fails open**: a helper that is missing, crashes or times out (`HMD_SWEEP_ADVICE_TIMEOUT_S`, default 8), or a command it cannot read, is one stderr line at most. Best effort, a cost and discipline nudge, not a security boundary. Proof: `test/sweep-advice.test.sh`.
 

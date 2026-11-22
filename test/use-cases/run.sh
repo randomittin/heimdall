@@ -15,6 +15,10 @@
 #
 # mutants.list: one mutant per line, tab separated: <journey file name without .sh> <file in the tree> <sed expression> <mutant name>. Blank lines and # lines are skipped.
 # Keep the seds portable (BSD and GNU): no -E, \+ or \|; pick a delimiter the expression does not contain.
+# RECEIPT (bin/lib/hmd_use_case_receipt.py is its one definition). A FULL run -- no --only, no --no-mutants -- that is green (every journey passed, every mutant killed), started on a clean tree and still on the
+# commit it started on (or only the hooks' own journal and ledger records past it), writes ${HEIMDALL_HOME:-<repo>/.heimdall}/receipts/use-cases.json atomically: the commit and tree the journeys graded, the counts,
+# the time. heimdall's own push gate (`heimdall-state check-quality-gates`) takes a green receipt of HEAD in place of a full sweep (CLAUDE.md "Push gate"); a release still needs the sweep. Any other run writes
+# none and says why on stderr; the exit status is the run's own and does not depend on the receipt.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd -P)"
@@ -31,7 +35,7 @@ while [ "$#" -gt 0 ]; do
     --only) ONLY="${2:-}"; shift 2 ;;
     --no-mutants) RUN_MUTANTS=0; shift ;;
     --jobs) JOBS="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "use-cases: unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -64,6 +68,17 @@ if [ "${#JOURNEYS[@]}" -eq 0 ]; then
 fi
 
 for tool in git jq perl python3 shasum tar; do command -v "$tool" >/dev/null 2>&1 || { echo "use-cases: $tool is required" >&2; exit 2; }; done
+
+# The receipt at the end attests ONE commit, so note where the run starts BEFORE the snapshot is taken (it copies the files as they are on disk): HEAD, and whether the tree holds uncommitted code.
+RUN_T0="$(date +%s)"
+RC_LIB="$REPO/bin/lib/hmd_use_case_receipt.py"
+RC_HEAD0="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+RC_START_WHY=""
+if [ -r "$RC_LIB" ]; then
+  RC_START_WHY="$(python3 -I -S "$RC_LIB" clean --repo "$REPO" 2>&1)" || RC_START_WHY="${RC_START_WHY:-the receipt checker could not tell whether the tree is clean}"
+else
+  RC_START_WHY="bin/lib/hmd_use_case_receipt.py is missing"
+fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/use-cases.XXXXXX")" || exit 2
 WORK="$(cd "$WORK" && pwd -P)"
 cleanup() { [ "${UC_KEEP:-0}" = 1 ] && { echo "kept: $WORK" >&2; return 0; }; chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"; }
@@ -174,5 +189,19 @@ printf 'use-cases: %d journeys, %d passed, %d failed; mutants %d/%d killed' "${#
 [ "$ERRORS" -eq 0 ] || printf '; %d mutant(s) could not be built' "$ERRORS"
 [ "$TREE_BAD" -eq 0 ] || printf '; the shared tree was written to'
 printf '\n'
-if [ "$J_FAIL" -eq 0 ] && [ "$M_BAD" -eq 0 ] && [ "$ERRORS" -eq 0 ] && [ "$TREE_BAD" -eq 0 ]; then exit 0; fi
+GREEN=0
+if [ "$J_FAIL" -eq 0 ] && [ "$M_BAD" -eq 0 ] && [ "$ERRORS" -eq 0 ] && [ "$TREE_BAD" -eq 0 ]; then GREEN=1; fi
+
+# The receipt the push gate of hmd's own repo reads in place of a full sweep (see the header): only a FULL green run of one clean commit writes it, and every other run says why it did not.
+no_receipt() { echo "use-cases: no receipt written: $1" >&2; }
+if [ "$GREEN" -ne 1 ]; then no_receipt "the run was not green (a failed journey, a surviving mutant, a mutant that could not be built, or a write into the shared tree)"
+elif [ -n "$ONLY" ]; then no_receipt "--only ran a subset of the journeys, and a subset is not the proof the push gate asks for (run without --only)"
+elif [ "$RUN_MUTANTS" -ne 1 ]; then no_receipt "--no-mutants left the mutants out, so nothing showed that the journeys notice a break (run without --no-mutants)"
+elif [ -z "$RC_HEAD0" ]; then no_receipt "HEAD of $REPO names no commit, so there is nothing to attest"
+elif [ -n "$RC_START_WHY" ]; then no_receipt "$RC_START_WHY"
+elif RC_OUT="$(python3 -I -S "$RC_LIB" write --repo "$REPO" --started-head "$RC_HEAD0" --journeys-total "${#JOURNEYS[@]}" --journeys-passed "$J_PASS" \
+    --mutants-total "$((M_KILLED + M_BAD + ERRORS))" --mutants-killed "$M_KILLED" --duration-s "$(( $(date +%s) - RUN_T0 ))" 2>&1)"; then echo "$RC_OUT"
+else no_receipt "$RC_OUT"
+fi
+[ "$GREEN" -eq 1 ] && exit 0
 exit 1

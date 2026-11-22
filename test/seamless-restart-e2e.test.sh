@@ -11,6 +11,8 @@
 # The clock is virtual and the steps are counted, not timed. The real gate runs with its DEFAULT quiet window (300 s, the decided Q2); a wrapper hands it
 # HMD_RESTART_NOW = the real time + a skew the world driver adds in whole steps, so "the operator was away for five minutes" is ONE step, never 300 s of waiting.
 # Every assertion is an ordering or a count (events of the fake's log against the evaluations of the gate): a slow machine stretches a run, it cannot flip a verdict.
+# The journey's own skew is no exception: it is added when the gate's log shows `UNSAFE user-active` (the operator was seen typing), never at a wall-clock time, so the
+# five minutes cannot pass before the gate has looked (a 5 s timer did exactly that under a loaded sweep: solo it fired 0.3 s after the gate that deferred had read the clock).
 # A state only counts against a gate answer when it held through the whole evaluation (plus a margin), so the race windows of a live system are not judged.
 #
 # Cases (all start at once through a throttle, each in its own sandbox):
@@ -179,9 +181,14 @@ class World(object):
         self.last_exit = 0.0
         self.term_wait = None
         self.term_seen = None
+        self.skew_when_deferred = None
 
     def path(self, *parts):
         return os.path.join(self.sd, *parts)
+
+    def deferred_to_typing(self):
+        """Has the gate answered `UNSAFE user-active` in this run? Its log lines are `start end skew verdict [reason]`."""
+        return any(line.split()[3:5] == ["UNSAFE", "user-active"] for line in read_text(self.path("gate.log")).splitlines())
 
     def log(self, kind, state):
         row = {"ts": int(time.time() * 1000), "event": "world", "kind": kind, "state": state}
@@ -230,6 +237,8 @@ class World(object):
             self.log("exit", "typed")
         elif kind == "after-term":
             self.term_wait = float(arg)
+        elif kind == "skew-when-deferred":  # arm a skew that world_main adds once the gate has deferred to the typing operator, not at a time
+            self.skew_when_deferred = arg
 
     def stop_sweeper(self):
         if self.sweeper is not None:
@@ -260,12 +269,17 @@ def world_main(sd):
         return 0
     base = time.time()
     events = sorted(json.load(open(w.path("timeline.json"))), key=lambda e: e[0])
-    i, last_term_look = 0, 0.0
+    i, last_term_look, last_gate_look = 0, 0.0, 0.0
     while not finished() and time.time() < limit:
         t = time.time() - base
         while i < len(events) and events[i][0] <= t:
             w.apply(events[i][1], events[i][2])
             i += 1
+        if w.skew_when_deferred is not None and time.time() - last_gate_look >= 0.2:
+            last_gate_look = time.time()
+            if w.deferred_to_typing():
+                w.apply("skew", w.skew_when_deferred)
+                w.skew_when_deferred = None
         if w.term_wait is not None and w.term_seen is None and time.time() - last_term_look >= 0.2:
             last_term_look = time.time()
             if any(e.get("event") == "signal" and e.get("signal") == "TERM" for e in read_jsonl(w.path("claude.log"))):
@@ -687,7 +701,8 @@ scn_journey() {
 @1 sleep 4
 @1 exit 0
 EOF
-  printf '[[0.2, "plugin", "2.4.2"], [0.2, "claude-newest", "2.1.323"], [5.0, "skew", "400"], [40, "exit", ""]]\n' > "$1/timeline.json"
+  # the operator's five quiet minutes (skew 400) pass once the gate has deferred to the typing, never at a time: a slow machine would let them pass before the gate looked
+  printf '[[0.2, "plugin", "2.4.2"], [0.2, "claude-newest", "2.1.323"], [0.0, "skew-when-deferred", "400"], [40, "exit", ""]]\n' > "$1/timeline.json"
   SC_ENV=()
   SC_ARGV=()
 }
