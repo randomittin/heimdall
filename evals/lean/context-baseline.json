@@ -1,17 +1,17 @@
 {
-  "digest": "e5a088682fcd5630fe8bf039b929ec7963dc785c183bce0cc64b9124923886a7",
+  "digest": "8ac988ee649ed1bab75c4cfea9367b5fcb63680fb85a8940501ddb666e372fb5",
   "info": {
     "git_trees": {
-      "agents": "5a843fe44ebea61ca5eb44f78034c0709b5c5f56",
+      "agents": "4e74779b290350c520e43612f7869543806d11fe",
       "commands": "100f7a1ca0d0cfdca442e4ae2bd28c5b43748652",
       "hooks": "ce216fd515e65bcd7bbf580bab06d84efc539249",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
-      "skills": "f14249baa357d60d54e520716620ae5bc17c8d3f"
+      "skills": "bae6f2b4ac2c306ddde62ce26fac19c51aa051e3"
     },
-    "recorded_utc": "2026-11-22T05:56:34Z",
+    "recorded_utc": "2026-11-22T08:17:29Z",
     "summary": {
       "agents": 16,
-      "bytes": 577716,
+      "bytes": 578607,
       "commands": 20,
       "hooks_run": 17,
       "hooks_skipped": 7,
@@ -84,12 +84,12 @@
         "sha256": "9a687a9b60fd390eefd9c532ad487c1978c56612ad7bd8cb1689a69a2e49ab03"
       },
       "agents/heimdall.md": {
-        "bytes": 66838,
+        "bytes": 67385,
         "frontmatter": {
           "bytes": 844,
           "sha256": "f9a99e9021b557f8d615fcd9ae12fab3d3192d9a4caaecb0114675e751667cf6"
         },
-        "sha256": "ba05a466fa79fbe66075443a2368c1fe395757c8347453c5123ac8eb2826b5ab"
+        "sha256": "0df586298be287e5eb891e4ba6cdb54823aeae0f89200e3f84f09183feecd221"
       },
       "agents/incident-responder.md": {
         "bytes": 2963,
@@ -376,12 +376,12 @@
         "sha256": "ebfd93c4401c332fa54058f456bec5cf7a2aba08f1205d6ece6a07c8b6b8f655"
       },
       "skills/heimdall/SKILL.md": {
-        "bytes": 11433,
+        "bytes": 11777,
         "frontmatter": {
           "bytes": 593,
           "sha256": "20852633ca5061eeef3a1384a3f3831f7c49acd98c115730ff309bbbc44dc627"
         },
-        "sha256": "42f5e45e0dc3956d3022d128b55b302b5ea8e7022c93ae2b9a282b3afaac71da"
+        "sha256": "0bd1af8e6a9314248a949a70b784d20b75b4762bc4ae34204976c4fff3d21689"
       },
       "skills/heimdall/references/agent-templates.md": {
         "bytes": 17095,

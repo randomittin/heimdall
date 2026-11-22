@@ -420,6 +420,7 @@ bin/lib/hmd_sweep_live.sh
 bin/lib/hmd_tailscale.sh
 bin/lib/hmd_ui_procs.py
 bin/lib/hmd_update_pending.py
+bin/lib/hmd_use_case_receipt.py
 bin/lib/hmd_wait_guard.py
 bin/lib/holdout.py
 bin/lib/hook-enabled.sh
@@ -434,6 +435,7 @@ bin/lib/issue_loop.py
 bin/lib/issue_pr.py
 bin/lib/issue_queue.py
 bin/lib/land_consolidate.py
+bin/lib/lean_context_parity.py
 bin/lib/lean_install_fixture.sh
 bin/lib/liveness-subsystems.conf
 bin/lib/maintain_loop.py
@@ -480,6 +482,7 @@ bin/lib/skills_lock.py
 bin/lib/skills_manifest.py
 bin/lib/skills_render_doc.py
 bin/lib/skills_resolver.py
+bin/lib/skills_shadow.py
 bin/lib/split_baseline.py
 bin/lib/suite-cache.sh
 bin/lib/suite_closure.py
@@ -519,7 +522,26 @@ bin/stack-detect
 bin/stack-pack
 bin/summary-card
 bin/verify-edits
+commands/autocommit.md
+commands/autonomy.md
+commands/bench.md
+commands/continue.md
+commands/debloat.md
+commands/demo.md
+commands/designmatch.md
 commands/dream.md
+commands/fallback.md
+commands/feedback.md
+commands/invite.md
+commands/level.md
+commands/maintain-check.md
+commands/maintain.md
+commands/reflect.md
+commands/report-bug.md
+commands/save.md
+commands/status.md
+commands/switch-ai.md
+commands/team.md
 conformance/INDEX.json
 conformance/README.md
 conformance/_lib.sh
@@ -785,6 +807,7 @@ evals/corpus/exchange-queue-jump/expected.json
 evals/corpus/exchange-queue-jump/input.json
 evals/jev-ultrafast/bench.py
 evals/jev-ultrafast/run.sh
+evals/lean/context-baseline.json
 evals/live-isolation/LATEST.json
 evals/live-isolation/LATEST.md
 evals/oracles/BLIND-VERIFICATION.md
@@ -1061,6 +1084,7 @@ sentinels/sanity.sh
 sentinels/security.sh
 sentinels/spec-drift.sh
 sentinels/subagent-statusline.py
+settings.json
 skills-registry.json
 skills.manifest.json
 skills/designmatch/SKILL.md
