@@ -82,3 +82,4 @@
 - LOW route guard sees only the installer's env; --reset from another terminal edits settings env a routed session may use (documented).
 - LOW docs/conversation-context.md referenced by heimdall/heimdall-lean prompts and SKILL.md no longer exists.
 - First-launch checklist: picking a skill in a non-project folder writes <cwd>/.planning/skills.lock.
+- MED headroom off --backup-dir copies whole settings.json (may hold tokens) into the lean backup with its own mode; chmod 0600 or copy only the hmd slice.
