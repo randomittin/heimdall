@@ -440,6 +440,7 @@ bin/lib/lean_backup.py
 bin/lib/lean_context_parity.py
 bin/lib/lean_install_fixture.sh
 bin/lib/lean_route_guard.sh
+bin/lib/lean_sparse.sh
 bin/lib/liveness-subsystems.conf
 bin/lib/maintain_loop.py
 bin/lib/md_convert.py
