@@ -1152,12 +1152,14 @@ lean_reset() {
 
   # 7/8 Headroom off, for the NEXT session only: the Headroom CLI's own `off --next-session` (what `hmd headroom off --next-session` execs; called by path
   # so a dispatcher that predates its arm can never turn it into a task prompt). It changes configuration only and never stops the proxy; it is never
-  # reimplemented here, and an install without it gets one warning and no switch.
+  # reimplemented here, and an install without it gets one warning and no switch. Its own backup (CHANGES.txt: each change and its undo) is kept INSIDE the reset's
+  # backup, $bdir/headroom: a launchd job it disables is state no file of that backup holds, so `hmd lean restore` finds the record there and switches the job back on
+  # before it writes a Headroom route back (bin/lib/lean_backup.py); without that the login after an undo would route every claude session to a proxy that cannot start.
   if [ "$deferred" -eq 1 ]; then
     pending="$pending headroom-off"
     printf '   7/8 headroom: PENDING, this session is routed through Headroom (the next --reset switches it off for the session after)\n'
   elif [ -x "$headroom" ]; then
-    if HEIMDALL_HOME="$rt" "$headroom" off --next-session; then
+    if HEIMDALL_HOME="$rt" "$headroom" off --next-session --backup-dir "$bdir/headroom"; then
       printf '   7/8 headroom: off for the next session (hmd headroom off --next-session)\n'
     else
       rc=$?

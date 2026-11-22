@@ -78,7 +78,7 @@ Three ways back, from the smallest:
 
 ## Headroom and the route
 
-A lean install installs no proxy and routes no session through one; the hmd launcher is kept as it is (INV-L12). Headroom is off by default on a new install and a separate opt-in (`hmd headroom on`). `hmd lean on|off` never run `hmd headroom` and edit no settings or environment.
+A lean install installs no proxy and routes no session through one; the hmd launcher is kept as it is (INV-L12). Headroom is off by default on a new install and a separate opt-in (`hmd headroom on`). `hmd lean on|off` never run `hmd headroom` and edit no settings or environment. `hmd lean restore` is the one exception, and only to undo a reset: when the reset switched Headroom off, its own record is kept inside the backup (`<backup>/headroom/CHANGES.txt`) and the restore runs `hmd headroom on` (it re-enables the launchd job the reset disabled, which no backed-up file holds) before it writes the route back; if that fails the restore is refused, naming `hmd headroom on`, with every file as it was.
 
 `--reset` is the one place Headroom is switched off, and a live session may be routed through it right now, so the reset asks `bin/lib/lean_route_guard.sh check` first (INV-L11). The guard only reads (no socket, no write, no signal) and prints one line, `<verdict>: <reason>`:
 

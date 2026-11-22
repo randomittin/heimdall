@@ -32,6 +32,13 @@ backup (a backup that skips what it promised is not one) and the restore (it wil
 ATOMIC. `backup` builds the dir as .partial-* inside backups/ and renames it into place when complete: a crash leaves no half
 backup under a real name, and a failed run removes its partial dir. Two backups in the same second get -1, -2 suffixes.
 
+HEADROOM. `install.sh --reset` switches Headroom off for the next session with the Headroom CLI's own `off --next-session --backup-dir <backup>/headroom`. What that
+changes in files (the module's opt-out record, the proxy route in settings.json) is backed up above and comes back byte for byte; what it changes in launchd (the
+supervisor job is DISABLED) is in no file of this backup, so a restore that only wrote the route back would hand the next login a route to a proxy that never starts.
+When <backup>/headroom/CHANGES.txt exists (the CLI writes it only when it changed something) and the backup says the Headroom module is added, restore runs this
+install's `bin/heimdall-headroom on` after everything is verified and planned and BEFORE the first write, and refuses, with nothing written, when that fails: the message
+names `hmd headroom on`. `on` clears an opt-out and re-enables the job; it never starts or stops the proxy, and it adds the module only if it is not added.
+
 EXIT. 0 ok; 1 a refusal or a failure (nothing was written by restore; backup leaves no dir); 2 usage. stdlib only.
 """
 import contextlib
@@ -41,6 +48,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -56,6 +64,10 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 BLOB = re.compile(r"files/[0-9]{3,6}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 HMD_COMMAND = re.compile(r"heimdall|\bhmd\b", re.IGNORECASE)
+HEADROOM_CLI = ("bin", "heimdall-headroom")
+HEADROOM_RECORD = ("headroom", "CHANGES.txt")   # the CLI's own record, kept under <backup>/headroom by install.sh --reset and written only when it changed something
+HEADROOM_RECEIPT = "modules/headroom/receipt.json"
+HEADROOM_TIMEOUT_S = 120
 USAGE = (
     "usage:\n"
     "  lean_backup.py backup\n"
@@ -461,9 +473,39 @@ def plan_restore(directory, entries):
     return writes, removals, lines, unchanged
 
 
+def headroom_switched_off(directory, entries):
+    """True when the reset's `heimdall-headroom off --next-session` changed something (its record sits in DIR/headroom and is written only then) and the backup
+    restores the Headroom module as added: the one case in which a restored route needs a switch that no file of the backup holds, the launchd job."""
+    folder = os.path.join(directory, HEADROOM_RECORD[0])
+    record = os.path.join(directory, *HEADROOM_RECORD)
+    kept = os.path.isdir(folder) and not os.path.islink(folder) and os.path.isfile(record) and not os.path.islink(record)
+    return kept and any(e["id"] == HEADROOM_RECEIPT and e["state"] == "present" for e in entries)
+
+
+def reenable_headroom():
+    """Switch Headroom back on with this install's own CLI (`hmd headroom on`) and return the line to report. ValueError, naming `hmd headroom on`, when it cannot
+    be done: restore calls this before it writes anything, so a refusal leaves every file as it was."""
+    cli = os.path.join(plugin_dir(), *HEADROOM_CLI)
+    why = "the route this restore puts back would point at a proxy that cannot start; nothing of this backup was written: fix the cause, run `hmd headroom on`, then restore again"
+    if not os.access(cli, os.X_OK):
+        raise ValueError("the reset switched Headroom off, but %s is not in this install to switch it back on, and %s" % (cli, why))
+    try:
+        done = subprocess.run([cli, "on"], stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=HEADROOM_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("`hmd headroom on` did not run to the end (%s), and %s" % (exc, why)) from exc
+    if done.returncode != 0:
+        said = " ".join((done.stderr or done.stdout).split())[-300:]
+        raise ValueError("`hmd headroom on` exited %d (%s), and %s" % (done.returncode, said, why))
+    return "switched Headroom back on (hmd headroom on)"
+
+
 def cmd_restore(directory):
     entries = load_manifest(directory)
-    writes, removals, lines, unchanged = plan_restore(directory, entries)
+    writes, removals, lines, unchanged = plan_restore(directory, entries)   # the verification: a damaged backup is refused before Headroom is touched
+    if headroom_switched_off(directory, entries):
+        report = reenable_headroom()
+        writes, removals, lines, unchanged = plan_restore(directory, entries)   # again: `hmd headroom on` clears the opt-out record, which the backup also tracks
+        lines.insert(0, report)
     staged = []
     try:
         for target, data, mode in writes:

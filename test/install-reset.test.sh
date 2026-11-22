@@ -20,15 +20,21 @@
 #   4. an install without the Headroom CLI gets exactly one warning on stderr and no switch; everything else happens.
 #   5. the lean prompt is selected (agent hmd:heimdall-lean, in the USER settings, indent and other keys kept) only against a GREEN receipt that names the
 #      sha256 of that very prompt; a red receipt, a stale hash and a user's own `agent` each skip it with one line and change nothing.
+#   6. a launchd-managed Headroom (the module added, its supervisor plist in place, a Headroom route in the user's settings.json): the reset keeps the Headroom
+#      CLI's own backup INSIDE its backup (off --next-session --backup-dir <backup>/headroom), and the undo switches the job the reset disabled back on BEFORE it writes
+#      the route back, so the login after an undo never points claude at a proxy that cannot start; when the job cannot be enabled the undo is refused, names
+#      `hmd headroom on` and leaves every file as the reset left it, and run again once launchctl works it finishes.
 # The Headroom CLI is another subsystem and acts on launchd: the releases and clones used here carry a RECORDING stand-in at bin/heimdall-headroom (it logs
 # how it was called and changes nothing), so the real one is never run; one check pins that the real CLI still documents the `off [--next-session]` call.
+# Scenario 6 is the exception: it runs the REAL CLI against a recording launchctl (LAUNCHCTL, the CLI's own seam), so the real launchd is never called either.
 # Scenarios 1 and 2 run the real `install.sh --reset` (the flag parse and the call site), and 2 a plain `install.sh` between its two resets; 3-5 call the same
 # lean_reset function through the installer's HEIMDALL_INSTALL_SOURCE_ONLY seam, in a copy of the same existing install, so each costs seconds, not an installer run.
 #
-# budget: 260 -- about 110 s solo (109 s measured on 2026-11-22, before the undo ran through the launcher): one existing install by the pinned installer, three real
-# install.sh --reset runs and one plain install.sh re-run (a local fetch, python and git starts, the doctor, a sparse apply of ~2300 files, the fake claude), two
-# `hmd lean restore` undo runs (the printed command, through the installed launcher), and eight lean_reset calls through the seam. No sleep, no timing assertion:
-# the only clock is the hang watchdog of the harness.
+# budget: 260 -- about 110 s solo before scenario 6 (109 s measured on 2026-11-22, before the undo ran through the launcher), and scenario 6 adds one more real
+# install.sh --reset and three undo runs: one existing install by the pinned installer, four real install.sh --reset runs and one plain install.sh re-run (a local
+# fetch, python and git starts, the doctor, a sparse apply of ~2300 files, the fake claude), five `hmd lean restore` undo runs (the printed command, through the
+# installed launcher; one of them is refused before it writes), and eight lean_reset calls through the seam. No sleep, no timing assertion: the only clock is the
+# hang watchdog of the harness.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../bin/lib/lean_install_fixture.sh
@@ -153,10 +159,10 @@ if [ ! -e "$BASE_HOME/.heimdall/profile.json" ]; then uc_ok "the existing instal
 ir_missing "$BASE_HOME/.heimdall" > "$UC_ROOT/base-missing.txt"
 if [ ! -s "$UC_ROOT/base-missing.txt" ]; then uc_ok "the existing install is a full tree"; else uc_bad "the existing install is not a full tree"; fi
 # the contract with the Headroom CLI, read from the REAL one: `off [--next-session]` is what the reset calls
-if grep -Fq -- 'hmd headroom off [--next-session]' "$UC_TREE/bin/heimdall-headroom" && grep -Fq -- '--next-session changes configuration only' "$UC_TREE/bin/heimdall-headroom"; then
-  uc_ok "the real Headroom CLI documents off --next-session as a configuration-only switch"
+if grep -Fq -- 'hmd headroom off [--next-session] [--backup-dir DIR]' "$UC_TREE/bin/heimdall-headroom" && grep -Fq -- '--next-session changes configuration only' "$UC_TREE/bin/heimdall-headroom"; then
+  uc_ok "the real Headroom CLI documents off --next-session as a configuration-only switch, and --backup-dir for where its own backup goes"
 else
-  uc_bad "the real Headroom CLI no longer documents off [--next-session]: the reset's call would be wrong"
+  uc_bad "the real Headroom CLI no longer documents off [--next-session] [--backup-dir DIR]: the reset's call would be wrong"
 fi
 ir_release double "v$UC_VERSION-reset-double" ir_edit_double
 IR_DOUBLE="$IR_REL"; IR_DOUBLE_TAG="v$UC_VERSION-reset-double"
@@ -180,9 +186,9 @@ uc_has "8/8 the undo command is printed: the one short command, hmd lean restore
 uc_jq "consent is ask and the install is no longer grandfathered" '.consent == "ask" and .grandfathered == false' "$CLONE/skills-config.json"
 uc_jq "the lean profile is recorded in the runtime home" '.profile == "lean"' "$CLONE/profile.json"
 ir_is_lean "after the reset" "$CLONE"
-if [ "$(cat "$UC_ROOT/headroom.log")" = "off --next-session" ]; then uc_ok "the Headroom CLI was called once, with off --next-session"; else uc_bad "the Headroom CLI was not called exactly once with off --next-session" "$(head -c 200 "$UC_ROOT/headroom.log" | tr '\n' '|')"; fi
-if [ ! -e "$CLONE/backups/lean-reset-pending" ]; then uc_ok "nothing is pending: no unfinished-reset record"; else uc_bad "a finished reset left an unfinished-reset record"; fi
 HAPPY_BACKUP="$(ir_line '2\/8 backup' "$UC_ROOT/happy.out")"
+if [ "$(cat "$UC_ROOT/headroom.log")" = "off --next-session --backup-dir $HAPPY_BACKUP/headroom" ]; then uc_ok "the Headroom CLI was called once, with off --next-session and its own backup kept inside the reset's backup"; else uc_bad "the Headroom CLI was not called exactly once with off --next-session --backup-dir <the reset's backup>/headroom" "$(head -c 300 "$UC_ROOT/headroom.log" | tr '\n' '|')"; fi
+if [ ! -e "$CLONE/backups/lean-reset-pending" ]; then uc_ok "nothing is pending: no unfinished-reset record"; else uc_bad "a finished reset left an unfinished-reset record"; fi
 if [ -f "$HAPPY_BACKUP/manifest.json" ] && [ "$(ir_backups "$CLONE" | wc -l | tr -d ' ')" = 1 ]; then uc_ok "exactly one backup exists and the printed path is it"; else uc_bad "the backup is not where the output says: $HAPPY_BACKUP"; fi
 if [ "$(ir_mode "$HAPPY_BACKUP")" = 700 ] && [ "$(ir_mode "$CLONE/backups")" = 700 ]; then uc_ok "INV-L9: the backup directory is mode 0700"; else uc_bad "INV-L9: the backup directory is not 0700 ($(ir_mode "$HAPPY_BACKUP"))"; fi
 if [ "$(jq -r '.entries[] | select(.id == "home/skills-config.json") | .sha256' "$HAPPY_BACKUP/manifest.json")" = "$(ir_sha "$UC_ROOT/happy-skills-config.before")" ]; then
@@ -250,7 +256,7 @@ uc_has "5/8 the lean tree is applied" "$UC_ROOT/defer-next.out" '5/8 lean tree: 
 uc_has "7/8 Headroom is off for the next session" "$UC_ROOT/defer-next.out" '7/8 headroom: off for the next session'
 ir_is_lean "after the second run" "$CLONE"
 uc_jq "the lean profile is recorded in the runtime home once the tree is lean" '.profile == "lean"' "$CLONE/profile.json"
-if [ "$(cat "$UC_ROOT/headroom.log")" = "off --next-session" ]; then uc_ok "the Headroom CLI was called once, now"; else uc_bad "the Headroom CLI was not called exactly once" "$(head -c 200 "$UC_ROOT/headroom.log" | tr '\n' '|')"; fi
+if [ "$(cat "$UC_ROOT/headroom.log")" = "off --next-session --backup-dir $FIRST_BACKUP/headroom" ]; then uc_ok "the Headroom CLI was called once, now, with its backup inside the FIRST reset backup"; else uc_bad "the Headroom CLI was not called exactly once, with its backup inside the first reset backup" "$(head -c 300 "$UC_ROOT/headroom.log" | tr '\n' '|')"; fi
 if [ ! -e "$CLONE/backups/lean-reset-pending" ]; then uc_ok "the unfinished-reset record is gone"; else uc_bad "the record is still there after the reset finished"; fi
 if [ "$(ir_backups "$CLONE" | wc -l | tr -d ' ')" = 1 ]; then uc_ok "no second backup was taken"; else uc_bad "a second backup was taken over the half-reset install"; fi
 UNDO="$(ir_line '8\/8 to undo' "$UC_ROOT/defer-next.out")"
@@ -340,5 +346,72 @@ if [ "$PROMPT_LINE" = 'already selected' ]; then uc_ok "5e. a second run finds i
 uc_run "$UC_HOME" "$UC_WORK" -- python3 -I "$CLONE/bin/lib/lean_backup.py" restore "$GREEN_BACKUP"
 uc_rc "restoring the backup taken before the agent key was written runs" 0
 if cmp -s "$UC_ROOT/green-settings.before" "$UC_HOME/.claude/settings.json"; then uc_ok "INV-L9: the restore takes the agent key out again, settings.json is byte for byte what it was"; else uc_bad "INV-L9: settings.json is not what it was before the reset selected the prompt"; fi
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------
+# 6. a launchd-managed Headroom: the reset switches its job off for the next login, and the undo has to switch it back on. The REAL Headroom CLI runs here, against a
+#    RECORDING launchctl (LAUNCHCTL, the CLI's own seam: the real launchd is never called, and the job label is the test's own). Without the fix the undo wrote the
+#    loopback ANTHROPIC_BASE_URL route back into settings.json while the job stayed disabled: the next login pointed every claude session at a port nothing listens on.
+LD_JOB="dev.runheimdall.headroom.reset-test"
+LD_LC="$UC_ROOT/fake-launchctl"
+cat > "$LD_LC" <<'EOF'
+#!/usr/bin/env bash
+# a recording launchctl: the job is disabled while the file named by LC_DISABLED exists; LC_FAIL_ENABLE=1 makes `enable` fail
+echo "$*" >> "${LC_CALLS:?}"
+case "${1:-}" in
+  print-disabled) printf 'disabled services = {\n'
+                  if [ -f "${LC_DISABLED:?}" ]; then printf '\t"%s" => disabled\n' "${LC_LABEL:?}"; else printf '\t"%s" => enabled\n' "${LC_LABEL:?}"; fi
+                  printf '}\n' ;;
+  disable)        : > "${LC_DISABLED:?}" ;;
+  enable)         [ "${LC_FAIL_ENABLE:-0}" != 1 ] || exit 1
+                  rm -f "${LC_DISABLED:?}" ;;
+esac
+exit 0
+EOF
+chmod +x "$LD_LC"
+LD_CALLS="$UC_ROOT/lc.calls"; LD_DISABLED="$UC_ROOT/lc.disabled"
+LD_ENV=(LAUNCHCTL="$LD_LC" LC_CALLS="$LD_CALLS" LC_DISABLED="$LD_DISABLED" LC_LABEL="$LD_JOB" HMD_HEADROOM_SUPERVISOR_LABEL="$LD_JOB")
+ir_copy launchd
+mkdir -p "$CLONE/.heimdall/modules/headroom" "$UC_HOME/Library/LaunchAgents"
+printf '{}\n' > "$CLONE/.heimdall/modules/headroom/receipt.json"          # the module is added...
+printf '<plist/>\n' > "$UC_HOME/Library/LaunchAgents/$LD_JOB.plist"        # ...and supervised by launchd: the plist's existence is the opt-in
+: > "$LD_CALLS"; rm -f "$LD_DISABLED"
+printf '{\n  "theme": "dark",\n  "env": {\n    "ANTHROPIC_BASE_URL": "http://127.0.0.1:9"\n  }\n}\n' > "$UC_HOME/.claude/settings.json"
+cp "$UC_HOME/.claude/settings.json" "$UC_ROOT/launchd-settings.before"
+cp "$CLONE/skills-config.json" "$UC_ROOT/launchd-skills-config.before"
+ir_reset launchd "$UC_TREE" "$UC_REF" "${LD_ENV[@]}"
+uc_rc "6. install.sh --reset over a launchd-managed Headroom finishes" 0
+uc_has "7/8 the real Headroom CLI switched Headroom off for the next session" "$UC_ROOT/launchd.out" '7/8 headroom: off for the next session'
+LD_BACKUP="$(ir_line '2\/8 backup' "$UC_ROOT/launchd.out")"
+uc_has "the reset disabled the launchd job for the next login (launchctl disable gui/<uid>/<job>)" "$LD_CALLS" "^disable gui/[0-9]+/$LD_JOB\$"
+if [ -f "$LD_DISABLED" ]; then uc_ok "...and the job is disabled"; else uc_bad "...but the job is not disabled"; fi
+uc_jq "the Headroom CLI took the route out of settings.json" '.env.ANTHROPIC_BASE_URL == null and .theme == "dark"' "$UC_HOME/.claude/settings.json"
+if [ -f "$CLONE/.heimdall/modules/.modstate/headroom/optout.json" ]; then uc_ok "the module is opted out for the next session"; else uc_bad "the module is not opted out"; fi
+if [ -f "$LD_BACKUP/headroom/CHANGES.txt" ]; then uc_ok "the Headroom CLI's own record of what it changed (CHANGES.txt, the undo of each) is inside the reset's backup"; else uc_bad "no CHANGES.txt under $LD_BACKUP/headroom: the Headroom CLI's backup is somewhere the restore cannot find"; fi
+ir_is_lean "after the reset over launchd" "$CLONE"
+LD_UNDO="$(ir_line '8\/8 to undo' "$UC_ROOT/launchd.out")"
+cp "$UC_HOME/.claude/settings.json" "$UC_ROOT/launchd-settings.reset"
+cp "$CLONE/skills-config.json" "$UC_ROOT/launchd-skills-config.reset"
+# 6a. launchctl cannot enable the job: the undo must not put a route back that nothing will serve, so it is refused with every file as the reset left it
+uc_run "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh PATH="$UC_HOME/.local/bin:$UC_PATH" HEADROOM_PORT=9 "${LD_ENV[@]}" LC_FAIL_ENABLE=1 -- bash -c "$LD_UNDO"
+cp "$UC_ERR" "$UC_ROOT/launchd-undo1.err"
+if [ "$UC_RC" -eq 1 ]; then uc_ok "6a. the undo is refused (exit 1) while the launchd job cannot be enabled"; else uc_bad "6a. the undo was not refused (exit $UC_RC)" "$(head -c 300 "$UC_OUT" | LC_ALL=C tr '\n' ' ')"; fi
+uc_has "...and the refusal names what to run: hmd headroom on" "$UC_ROOT/launchd-undo1.err" 'hmd headroom on'
+if cmp -s "$UC_ROOT/launchd-settings.reset" "$UC_HOME/.claude/settings.json" && cmp -s "$UC_ROOT/launchd-skills-config.reset" "$CLONE/skills-config.json" && [ "$(ir_profile "$CLONE")" = lean ]; then
+  uc_ok "...with settings.json, skills-config.json and the profile exactly as the reset left them: no route was written toward a job that stays disabled"
+else
+  uc_bad "...but the refused undo changed settings.json, skills-config.json or the profile"
+fi
+ir_is_lean "after the refused undo" "$CLONE"
+if [ -f "$LD_DISABLED" ]; then uc_ok "...and the job is still disabled: nothing was started"; else uc_bad "the refused undo enabled the job"; fi
+# 6b. launchctl works: the undo switches the job back on and puts the route back
+uc_run "$UC_HOME" "$UC_WORK" SHELL=/bin/zsh PATH="$UC_HOME/.local/bin:$UC_PATH" HEADROOM_PORT=9 "${LD_ENV[@]}" -- bash -c "$LD_UNDO"
+cp "$UC_OUT" "$UC_ROOT/launchd-undo2.out"
+uc_rc "6b. the printed undo runs once launchctl works" 0
+if [ ! -f "$LD_DISABLED" ] && grep -Eq "^enable gui/[0-9]+/$LD_JOB\$" "$LD_CALLS"; then uc_ok "6b. the undo re-enabled the launchd job the reset disabled (launchctl enable gui/<uid>/<job>)"; else uc_bad "6b. the launchd job is still disabled after the undo: the route it put back points at a proxy that never starts" "$(tail -3 "$LD_CALLS" | LC_ALL=C tr '\n' '|')"; fi
+uc_jq "6b. ...and the Headroom route is back in settings.json" '.env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9" and .theme == "dark"' "$UC_HOME/.claude/settings.json"
+if [ "$(jq -S '{theme, env}' "$UC_ROOT/launchd-settings.before")" = "$(jq -S '{theme, env}' "$UC_HOME/.claude/settings.json")" ]; then uc_ok "...the user's theme and env say what they said before the reset (the installer's own statusline key is the installer's)"; else uc_bad "the user's theme and env are not what they were before the reset"; fi
+if [ ! -e "$CLONE/.heimdall/modules/.modstate/headroom/optout.json" ]; then uc_ok "...and the module is opted in again"; else uc_bad "the module is still opted out after the undo"; fi
+if cmp -s "$UC_ROOT/launchd-skills-config.before" "$CLONE/skills-config.json" && [ ! -e "$CLONE/profile.json" ]; then uc_ok "...skills-config.json is back byte for byte and the profile record is gone"; else uc_bad "the undo did not return skills-config.json and the profile record"; fi
+ir_is_full "after the undo over launchd" "$CLONE"
 
 uc_finish
