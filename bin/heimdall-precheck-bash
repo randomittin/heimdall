@@ -120,7 +120,7 @@ esac
 #      asks bin/lib/hmd_push_target.py which repositories the command pushes (cwd, `git -C <dir>`,
 #      `cd <dir> && ...`, subshells, wrappers, `sh -c`) and gives each the gate its class owes:
 #        sweep        a commit pushed (or its upstream) has test/run-all.sh naming last-sweep.json (heimdall's
-#                     own regime): the old gate, unchanged and fail-closed, now run INSIDE that repository (a
+#                     own regime): the old gate, fail-closed, now run INSIDE that repository (it passes its sweep part on a green sweep receipt OR, since 2026-11-22, on a green use-case journey receipt, bin/lib/hmd_use_case_receipt.py; a release still needs the sweep) (a
 #                     push of repo B no longer answers to repo A's state, and a cwd in a subdirectory reads
 #                     the toplevel's state);
 #        repo-checks  a commit pushed has .heimdall/repo-checks.json, the repo's own checks: pass ONLY on a

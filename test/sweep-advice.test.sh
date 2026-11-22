@@ -14,6 +14,8 @@
 #     included; text that only mentions one, merge-base, a push to another branch, a rebasing pull, a pull request merge for another repo): nothing at all
 #   * the records: HEAD proven green says so and recommends nothing; a red record, no record, a dirty or incremental one, a foreign one, a sweep already running; a repo that
 #     declares its own checks gets its own command and its own receipt; a repo with neither gets lint plus the use-case suite
+#   * heimdall's own regime (operator decision 2026-11-22, "B"): a push stands on a green use-case journey receipt (bash test/use-cases/run.sh) or a green full sweep, so the advice runs the first and names the full
+#     sweep only on its Release: line; a running or a red sweep changes nothing there
 #   * the cost, with its arithmetic, and every token figure labelled an estimate
 #   * HMD_SWEEP_ADVICE=off (read from the hook's own environment) and `hmd guardrails off sweep-advice` silence it; any doubt keeps it on
 #   * it FAILS OPEN: a helper that crashes, lies or is missing, a command or a record it cannot read, a timeout: one stderr line at most and the command goes on
@@ -25,7 +27,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOK="$REPO/bin/heimdall-precheck-bash"
 HELPER="$REPO/bin/lib/hmd_sweep_advice.py"
 MANIFEST="$REPO/guardrails.manifest.json"
-LIBS=(hmd_sweep_advice.py hmd_sweep_guard.py hmd_kill_guard.py hmd_push_target.py hmd_repo_receipt.py hmd_repo_checks.py hook-owned-path.sh hmd_guardrail_enabled.sh hmd_wait_guard.py hmd_ci_guard.py)
+LIBS=(hmd_sweep_advice.py hmd_sweep_guard.py hmd_kill_guard.py hmd_push_target.py hmd_repo_receipt.py hmd_repo_checks.py hook-owned-path.sh hmd_guardrail_enabled.sh hmd_wait_guard.py hmd_ci_guard.py hmd_use_case_receipt.py)
 PASS=0
 FAIL=0
 N=0
@@ -107,6 +109,9 @@ SW="$TMPROOT/sw"   # heimdall's own regime: test/run-all.sh names last-sweep.jso
 mkrepo "$SW" && mkdir -p "$SW/test"
 printf '#!/bin/sh\nRECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"\nexit 0\n' >"$SW/test/run-all.sh"; printf 'one\n' >"$SW/a.txt"
 printf '#!/bin/sh\nexit 0\n' >"$SW/test/a.test.sh"; printf '#!/bin/sh\nexit 0\n' >"$SW/test/b.test.sh"
+mkdir -p "$SW/test/use-cases/journeys"
+for j in 01_install 02_uninstall 03_launch; do printf '#!/bin/sh\nexit 0\n' >"$SW/test/use-cases/journeys/$j.sh"; done
+printf '# journey\tfile\tsed\tname\n01_install\tbin/x\ts/a/b/\tm1\n\n02_uninstall\tbin/y\ts/c/d/\tm2\n' >"$SW/test/use-cases/mutants.list"
 commit "$SW" "C1 base";   C1="$(git -C "$SW" rev-parse HEAD)"
 printf 'two\n' >"$SW/a.txt"; commit "$SW" "C2 code"; C2="$(git -C "$SW" rev-parse HEAD)"
 mkdir -p "$SW/.planning/journal"; printf 'entry\n' >"$SW/.planning/journal/2026-10-21-haid_t.md"; commit "$SW" "C3 journal"; C3="$(git -C "$SW" rev-parse HEAD)"
@@ -141,6 +146,12 @@ receipt_at() {  # receipt_at <file> <head_sha> <exit_code> <kind> <tree_clean> [
 receipt() {  # receipt <home dir> <head_sha> <exit_code> <kind> <tree_clean> [extra json object]: last-sweep.json of that home, as receipt_at writes it
   local home="$1"; shift
   receipt_at "$home/receipts/last-sweep.json" "$@"
+}
+uc_at() {  # uc_at <home dir> <commit of the SW fixture> [jq filter]: a use-case journey receipt for that commit as test/use-cases/run.sh writes one (11 journeys, 25 mutants, 352 s), by hand, optionally mutated
+  local home="$1" sha="$2" filter="${3:-.}"
+  mkdir -p "$home/receipts"
+  jq -n --arg h "$sha" --arg t "$(git -C "$SW" rev-parse "$sha^{tree}")" \
+    '{schema: 1, head_sha: $h, tree_sha: $t, exit_code: 0, journeys: {total: 11, passed: 11}, mutants: {total: 25, killed: 25}, duration_s: 352, finished_at: "2026-11-22T12:00:00Z"}' | jq "$filter" >"$home/receipts/use-cases.json"
 }
 sleep 300 &
 SLEEPER=$!
@@ -182,6 +193,10 @@ proven_ok() {  # proven_ok <stdout text> <fragment>: one line of hook JSON that 
     and (.hookSpecificOutput.additionalContext | contains("already proven green"))' >/dev/null 2>&1
 }
 msg() { printf '%s\n' "$HOUT" | jq -r '.systemMessage // empty' 2>/dev/null; }
+sweep_only_in_release() {  # the advice names the full sweep (run-all) on its Release: line and nowhere else
+  local hits; hits="$(msg | grep -n 'run-all')"
+  [ -n "$hits" ] && ! printf '%s\n' "$hits" | grep -qv '^[0-9]*:Release: '
+}
 
 advises() {  # advises <label> <fragment> <command> [cwd] [VAR=val ...]: the helper says exit 3 and advice with all four parts
   N=$((N + 1))
@@ -475,34 +490,42 @@ advises "the sweep's own number of files does not count the hooks' journal recor
 receipt "$SWH" "$C3" 0 full false
 advises "a green receipt that recorded a DIRTY tree proves nothing" "no green record yet" 'git push origin main'
 receipt "$SWH" "$C3" 0 incremental true '{"base_full_sha": "x"}'
-advises "a green INCREMENTAL receipt is not a full proof" "incremental" 'git push origin main'
+advises "a green INCREMENTAL receipt is not a full proof: the use-case run is still what to run" "bash test/use-cases/run.sh" 'git push origin main'
 receipt "$SWH" "$C3" 0 full true '{"cache": {"mode": "closure", "cold": false}, "full_equivalent": false}'
 advises "a cache-composed receipt that is not full-equivalent is not a proof either" "full-equivalent" 'git push origin main'
 receipt "$SWH" "$C3" 0 full true '{"cache": {"mode": "closure", "cold": false, "suites_fresh": 40, "suites_cached": 528}, "full_equivalent": true}'
 proves "a cache-composed receipt that IS full-equivalent counts" "${C3:0:12}" 'git push origin main'
 receipt "$SWH" "$C3" 1 full false
-advises "a RED receipt at HEAD: no green record, and the way forward is --failed" "was red" 'git push origin main'
+advises "a RED full sweep at HEAD no longer holds a push back: the advice is the use-case run" "bash test/use-cases/run.sh" 'git push origin main'
 hv 'git push origin main'
-if printf '%s' "$HOUT" | jq -r .systemMessage | grep -q '^Run: bash test/run-all.sh --failed'; then ok "$N. after a red sweep the command to run is test/run-all.sh --failed, never a second full sweep"; else bad "red: the Run line is not --failed" "$(msg)"; fi
+if msg | grep -q '^Run: bash test/use-cases/run.sh$' && ! msg | grep -qE 'was red|--failed'; then ok "$N. ...the Run line is the plain use-case runner (no --failed), and the red sweep is not what a push is told about"; else bad "red sweep: the Run line" "$(msg)"; fi
+if sweep_only_in_release; then ok "$N. ...the full sweep is named only on the Release: line (a release's bar, never a push's)"; else bad "the full sweep is named outside the Release line" "$(msg)"; fi
 receipt "$SWH" "$C1" 1 full false
-advises "a red receipt at an ANCESTOR of HEAD (the fix is committed, the red is still the last word)" "was red" 'git push origin main'
+advises "a red sweep at an ANCESTOR of HEAD says the same: the use-case run" "bash test/use-cases/run.sh" 'git push origin main'
 receipt "$SWH" "$CS" 1 full false
-advises "a red receipt of other history says nothing about this tree: no green record yet, and a plain full sweep" "no green record yet" 'git push origin main'
-hv 'git push origin main'
-if printf '%s' "$HOUT" | jq -r .systemMessage | grep -q '^Run: bash test/run-all.sh$'; then ok "$N. ...and the command is the plain bash test/run-all.sh"; else bad "other history: the Run line" "$(msg)"; fi
+advises "a red sweep of other history says nothing about this tree: no green record yet" "no green record yet" 'git push origin main'
 receipt "$SWH" "$C3" 0 aborted true
-advises "an ABORTED receipt is red even with an exit_code of 0" "was red" 'git push origin main'
+advises "an ABORTED sweep receipt is no proof even with an exit_code of 0" "bash test/use-cases/run.sh" 'git push origin main'
 rm -rf "$SWH/receipts"
-advises "no receipt at all: no green record yet, and the number of suites on disk" "no green record yet" 'git push origin main'
+advises "no receipt at all: no green record yet, and the reason is the use-case receipt that is missing" "there is no use-case journey receipt at $SWTOP/.heimdall/receipts/use-cases.json" 'git push origin main'
 hv 'git push origin main'
-if msg | grep -q '^Cost: 2 suites on disk (test/\*.test.sh), no run on record'; then ok "$N. ...the cost line then counts the suites it can see (test/*.test.sh: 2), with no wall clock on record"; else bad "no receipt: the Cost line" "$(msg)"; fi
-mkdir -p "$SWH/receipts"; printf 'not json at all\n' >"$SWH/receipts/last-sweep.json"
-advises "a receipt that is not JSON: no usable record, said so" "unreadable" 'git push origin main'
+if msg | grep -q '^Cost: 3 journeys and 2 mutants on disk (test/use-cases), no run on record here, so no measured wall clock (about 6 minutes when it was last measured'; then ok "$N. ...the cost line then counts what one run covers (test/use-cases: 3 journeys, 2 mutants), with no wall clock on record and the typical one said as such (about 6 minutes)"; else bad "no receipt: the Cost line" "$(msg)"; fi
+mkdir -p "$SWH/receipts"; printf 'not json at all\n' >"$SWH/receipts/use-cases.json"
+advises "a use-case receipt that is not JSON: no usable record, said so" "not valid JSON" 'git push origin main'
+uc_at "$SWH" "$C3" '.exit_code = 1'
+advises "a RED use-case receipt is no record, and the Why says it is RED" "RED" 'git push origin main'
+uc_at "$SWH" "$C3" '.head_sha = "2222222222222222222222222222222222222222"'
+advises "a use-case receipt for a commit this checkout does not have is no record" "does not have" 'git push origin main'
+uc_at "$SWH" "$C3" '.tree_sha = "1111111111111111111111111111111111111111"'
+advises "a use-case receipt whose tree sha is not its commit's tree is forged, and no record" "tree sha" 'git push origin main'
+rm -f "$SWH/receipts/use-cases.json"
 receipt "$SWH" "$C3" 0 full true '{"repo": "/somewhere/else"}'
-advises "a receipt recorded for ANOTHER checkout is not this tree's" "another checkout" 'git push origin main'
+advises "a sweep receipt recorded for ANOTHER checkout is not this tree's: no green record yet" "no green record yet" 'git push origin main'
 receipt "$SWH" "$C1" 0 full true
 printf 'pid=%s\nrepo=%s\nstarted=2026-11-12T00:00:00+0000\n' "$SLEEPER" "$SWTOP" >"$SWH/receipts/sweep.lock"
-advises "a sweep is ALREADY RUNNING (a live pid in the lock): wait for it, never start a second" "already running (pid $SLEEPER)" 'git push origin main'
+advises "a sweep that is RUNNING does not change the advice: the use-case run is not a sweep, so nothing waits for it" "bash test/use-cases/run.sh" 'git push origin main'
+hv 'git push origin main'
+if ! msg | grep -qE 'already running|wait:'; then ok "$N. ...and the advice does not say to wait"; else bad "a running sweep changed the advice" "$(msg)"; fi
 rm -f "$SWH/receipts/sweep.lock"
 HH="$TMPROOT/hh"; receipt "$HH" "$C3" 0 full true
 proves "HEIMDALL_HOME moves the receipts, as it does for the runner" "${C3:0:12}" 'git push origin main' "$SW" HEIMDALL_HOME="$HH"
@@ -523,20 +546,20 @@ receipt "$SWH" "$C2" 0 full true "$FLAKY_GREEN"
 hv 'git push origin main'
 WHY="$(msg | grep '^Why: ')"; COST="$(msg | grep '^Cost: ')"
 N=$((N + 1))
-if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'bash test/run-all.sh' && printf '%s' "$WHY" | grep -qF "since the last green full sweep (${C2:0:12}, 2026-11-12T13:20:31Z), which is not full-equivalent" && ! printf '%s' "$WHY" | grep -qF "${C1:0:12}"; then ok "$N. a NEWER green run in last-sweep.json (not full-equivalent: a suite passed only on its solo re-run) beats the older anchor as the baseline, and the Why says it is no proof"; else bad "$N. the Why does not measure from the newer green run" "$WHY"; fi
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'bash test/use-cases/run.sh' && printf '%s' "$WHY" | grep -qF "since the last green full sweep (${C2:0:12}, 2026-11-12T13:20:31Z), which is not full-equivalent" && ! printf '%s' "$WHY" | grep -qF "${C1:0:12}"; then ok "$N. a NEWER green run in last-sweep.json (not full-equivalent: a suite passed only on its solo re-run) beats the older anchor as the baseline, and the Why says it is no proof"; else bad "$N. the Why does not measure from the newer green run" "$WHY"; fi
 N=$((N + 1))
-if printf '%s' "$COST" | grep -qF '568 suites (568 fresh, 0 cached), 47m53s of machine time last run' && ! printf '%s' "$COST" | grep -qE '535 suites|8m12s'; then ok "$N. the suite count and the wall clock of the Cost come from that same receipt (47m53s, not the anchor's 8m12s)"; else bad "$N. the Cost is not from the baseline receipt" "$COST"; fi
+if printf '%s' "$COST" | grep -qF '3 journeys and 2 mutants on disk (test/use-cases)' && ! printf '%s' "$COST" | grep -q 'suite'; then ok "$N. the Cost is the use-case run's, not a full sweep's: journeys and mutants, no suite count and no sweep wall clock"; else bad "$N. the Cost still reads the sweep" "$COST"; fi
 receipt "$SWH" "$C2" 1 full true '{"suites_total": 111, "duration_s": 11}'
 hv 'git push origin main'
 WHY="$(msg | grep '^Why: ')"; COST="$(msg | grep '^Cost: ')"
 N=$((N + 1))
-if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'was red' && printf '%s' "$WHY" | grep -qF "since the last green full sweep (${C1:0:12}, 2026-10-21T07:21:09Z)" && printf '%s' "$COST" | grep -qF '535 suites (85 fresh, 450 cached), 8m12s of machine time last run' && ! printf '%s' "$COST" | grep -qF '111 suites'; then ok "$N. a RED last-sweep.json is no baseline: the Why and the Cost come from the older green anchor, and the red is still said"; else bad "$N. a red last-sweep.json was used as the baseline" "$WHY | $COST"; fi
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'bash test/use-cases/run.sh' && printf '%s' "$WHY" | grep -qF "since the last green full sweep (${C1:0:12}, 2026-10-21T07:21:09Z)" && ! printf '%s' "$WHY" | grep -q 'was red'; then ok "$N. a RED last-sweep.json is no baseline: the Why comes from the older green anchor, and the red is not what a push is told about"; else bad "$N. a red last-sweep.json was used as the baseline" "$WHY"; fi
 receipt "$SWH" "$C1" 0 full true '{"finished_at": "2026-10-01T00:00:00Z", "suites_total": 100, "duration_s": 59}'
 receipt_at "$RDIR/last-full-green.json" "$C1" 0 full true '{"suites_total": 535, "duration_s": 492}'
 hv 'git push origin main'
 WHY="$(msg | grep '^Why: ')"; COST="$(msg | grep '^Cost: ')"
 N=$((N + 1))
-if [ "$HRC" = 3 ] && printf '%s' "$WHY" | grep -qF "since the last green full sweep (${C1:0:12}, 2026-11-12T13:20:31Z)" && printf '%s' "$COST" | grep -qF '535 suites' && ! printf '%s' "$COST" | grep -qF '100 suites'; then ok "$N. two green sweeps of one commit: the NEWER by finished_at is the baseline, whichever file holds it"; else bad "$N. the older of two equal sweeps was the baseline" "$WHY | $COST"; fi
+if [ "$HRC" = 3 ] && printf '%s' "$WHY" | grep -qF "since the last green full sweep (${C1:0:12}, 2026-11-12T13:20:31Z)"; then ok "$N. two green sweeps of one commit: the NEWER by finished_at is the baseline, whichever file holds it"; else bad "$N. the older of two equal sweeps was the baseline" "$WHY"; fi
 rm -f "$RDIR/last-sweep.json"
 receipt_at "$RDIR/last-full-green.json" "$C1" 0 full true "$OLD_GREEN"
 receipt_at "$RDIR/full-green/$C3.json" "$C3" 0 full true '{"finished_at": "2026-10-25T09:00:00Z", "suites_total": 540}'
@@ -552,21 +575,41 @@ receipt "$SWH" "$C3" 0 full true "$FLAKY_GREEN"
 proves "a newer green run that is not full-equivalent never stands in for the proof: HEAD is proven by the anchor at the same commit, and the message names THAT sweep" "535 suites" 'git push origin main'
 rm -f "$RDIR/last-full-green.json"
 
-echo "-- 5. the cost: suites, wall clock, and tokens as LABELLED ESTIMATES with their arithmetic --"
+echo "-- 4c. the use-case journey receipt: the second record the push gate takes (operator decision 2026-11-22: a push stands on it, a release on the full sweep) --"
+rm -rf "$SWH/receipts"
+uc_at "$SWH" "$C3"
+proves "a green use-case receipt for HEAD proves it, with no sweep receipt at all" "the last use-case run (2026-11-22T12:00:00Z, 11 journeys, 25 mutants killed)" 'git push origin main'
+uc_at "$SWH" "$C2"
+proves "only the hooks' own journal commit came after the use-case run" "${C3:0:12}" 'git push origin main'
+receipt "$SWH" "$C3" 1 full false
+proves "a use-case receipt that covers HEAD beats a RED sweep receipt (either record is enough for the gate)" "use-case run" 'git push origin main'
+rm -f "$SWH/receipts/last-sweep.json"
+uc_at "$SWH" "$C1"
+advises "a use-case receipt for an OLDER code commit: the counts say how much came after it" "2 commits and 1 file changed since the last green use-case run (${C1:0:12}" 'git push origin main'
+hv 'git push origin main'
+if msg | grep -q '^Run: bash test/use-cases/run.sh$' && sweep_only_in_release; then ok "$N. ...Run is the use-case runner, and the full sweep appears only on the Release: line"; else bad "use-case advice: Run and Release" "$(msg)"; fi
+uc_at "$SWH" "$C3"
+run_hook 'git push origin main' "$PLUGIN"
+N=$((N + 1)); if [ "$RC_" = 0 ] && proven_ok "$(cat "$TMPROOT/out")" 'use-case run'; then ok "$N. through the REAL hook: a push at a HEAD the use-case receipt covers prints one line, 'already proven green', nothing to run"; else bad "$N. hook, use-case proof: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
+rm -rf "$SWH/receipts"
+
+echo "-- 5. the cost of the use-case run: journeys, mutants, wall clock, and tokens as LABELLED ESTIMATES with their arithmetic --"
 receipt "$SWH" "$C1" 0 full true
 hv 'git push origin main'
 COST="$(msg | grep '^Cost: ')"
-# 568 suites, 2873 s = 47m53s; a 40-line summary tail at 91 bytes a line is 3640 B = ~910 tokens; the whole output is (568 + 40) rows x 91 B = 55328 B = ~13.8k tokens
-if printf '%s' "$COST" | grep -q '568 suites' && printf '%s' "$COST" | grep -q '47m53s'; then ok "the suite count and the last measured wall clock come from the receipt (568 suites, 2873 s = 47m53s)"; else bad "cost: suites and wall clock" "$COST"; fi
-if printf '%s' "$COST" | grep -q '~910' && printf '%s' "$COST" | grep -q '~13.8k'; then ok "tokens: ~910 for a summary tail (40 lines x 91 B / 4), ~13.8k for all of it ((568 + 40) rows x 91 B / 4)"; else bad "cost: the token estimates" "$COST"; fi
+# 3 journeys + 2 mutants on disk = 5 rows; a 40-line summary tail at 91 bytes a line is 3640 B = ~910 tokens; the whole output is (5 + 40) rows x 91 B = 4095 B = ~1.0k tokens
+if printf '%s' "$COST" | grep -q '3 journeys and 2 mutants on disk (test/use-cases)' && printf '%s' "$COST" | grep -q 'about 6 minutes'; then ok "with no run on record: what one run covers is counted on disk (3 journeys, 2 mutants), and the typical wall clock is said as measured (about 6 minutes)"; else bad "cost: journeys, mutants and wall clock" "$COST"; fi
+if printf '%s' "$COST" | grep -q '~910' && printf '%s' "$COST" | grep -q '~1.0k'; then ok "tokens: ~910 for a summary tail (40 lines x 91 B / 4), ~1.0k for all of it ((5 + 40) rows x 91 B / 4)"; else bad "cost: the token estimates" "$COST"; fi
 if printf '%s' "$COST" | grep -qi 'estimate' && printf '%s' "$COST" | grep -q 'no model tokens\|0 model tokens\| 0 '; then ok "every token figure is labelled an estimate, and the machine time of a terminal run is said to cost no model tokens"; else bad "cost: labels" "$COST"; fi
-receipt "$SWH" "$C1" 0 full true '{"suites_total": 100, "duration_s": 59, "cache": {"cold": false, "suites_fresh": 7, "suites_cached": 93}}'
+uc_at "$SWH" "$C1"
 hv 'git push origin main'
 COST="$(msg | grep '^Cost: ')"
-if printf '%s' "$COST" | grep -q '100 suites' && printf '%s' "$COST" | grep -q '59s' && printf '%s' "$COST" | grep -q '7 fresh, 93 cached' && printf '%s' "$COST" | grep -q '~910' && printf '%s' "$COST" | grep -q '~3.2k'; then ok "100 suites, 59 s, 7 fresh and 93 cached; the whole output is (100 + 40) x 91 B / 4 = ~3.2k tokens"; else bad "cost: a second set of numbers" "$COST"; fi
-receipt "$SWH" "$C1" 0 full true '{"suites_total": 568, "duration_s": 7385}'
+# 11 journeys + 25 mutants = 36 rows: (36 + 40) rows x 91 B / 4 = 1729 tokens = ~1.7k
+if printf '%s' "$COST" | grep -q '^Cost: 11 journeys and 25 mutants, 5m52s of machine time last run (from the receipt)' && printf '%s' "$COST" | grep -q '~1.7k' && ! printf '%s' "$COST" | grep -q 'on disk'; then ok "a use-case receipt on file: its own counts and wall clock (11 journeys, 25 mutants, 352 s = 5m52s), tokens (36 + 40) x 91 B / 4 = ~1.7k"; else bad "cost: from the receipt" "$COST"; fi
+uc_at "$SWH" "$C1" '.duration_s = 7385'
 hv 'git push origin main'
 if msg | grep '^Cost: ' | grep -q '2h03m'; then ok "an hour or more is written 2h03m"; else bad "cost: hours" "$(msg | grep '^Cost: ')"; fi
+rm -f "$SWH/receipts/use-cases.json"
 
 echo "-- 6. a repo that declares its own checks gets its own command and its own receipt --"
 rc_run() {  # record the declared checks with the REAL runner, then give the two checks the seconds the cost line is to quote
@@ -614,7 +657,7 @@ unread "shell strings nested ten deep (past the depth it reads)" 'nested more th
 LONGCMD="$(python3 -I -c 'print("echo merge; " + "echo x; " * 3000)')"
 unread "a command that takes longer than HMD_SWEEP_ADVICE_TIMEOUT_S to read (1 ms here)" 'took longer' "$LONGCMD" "$SW" HMD_SWEEP_ADVICE_TIMEOUT_S=0.001
 N=$((N + 1)); hv 'git push origin main; echo "unbalanced'
-if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'bash test/run-all.sh'; then ok "$N. a final merge it READ wins over a quote it could not close"; else bad "$N. read wins over unread: rc=$HRC $HOUT"; fi
+if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'bash test/use-cases/run.sh'; then ok "$N. a final merge it READ wins over a quote it could not close"; else bad "$N. read wins over unread: rc=$HRC $HOUT"; fi
 N=$((N + 1)); hv 'git pull origin nosuchbranch'
 if [ "$HRC" = 3 ] && advice_ok "$HOUT" 'since the last' && advice_ok "$HOUT" 'origin/nosuchbranch cannot be placed'; then ok "$N. a pulled branch git cannot place is not counted: HEAD alone is judged"; else bad "$N. unknown ref: rc=$HRC $HOUT $HERR"; fi
 
@@ -622,13 +665,13 @@ echo "-- 9. through the REAL hook: one line of JSON on stdout, nothing else, exi
 receipt "$SWH" "$C1" 0 full true
 run_hook 'git pull' "$PLUGIN"
 N=$((N + 1))
-if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh' && [ ! -s "$TMPROOT/err" ]; then ok "$N. a pull on the default branch: exit 0, advice on stdout as hook JSON, silent on stderr"; else bad "$N. hook, pull: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
+if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/use-cases/run.sh' && [ ! -s "$TMPROOT/err" ]; then ok "$N. a pull on the default branch: exit 0, advice on stdout as hook JSON, silent on stderr"; else bad "$N. hook, pull: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
 N=$((N + 1))
 if jq -e '.hookSpecificOutput.additionalContext | contains("not a block") and contains("developer") and (contains("Do not start") or contains("do not start"))' "$TMPROOT/out" >/dev/null 2>&1; then ok "$N. the agent's context says it is advice, that the developer decides, and that the agent does not start the run itself"; else bad "$N. agent context" "$(jq -r .hookSpecificOutput.additionalContext "$TMPROOT/out" | head -c 400)"; fi
 run_hook 'gh pr merge 12 --squash' "$PLUGIN"
-N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh'; then ok "$N. a pull request merge through the hook"; else bad "$N. hook, pr merge: rc=$RC_" "$(head -c 300 "$TMPROOT/out")"; fi
+N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/use-cases/run.sh'; then ok "$N. a pull request merge through the hook"; else bad "$N. hook, pr merge: rc=$RC_" "$(head -c 300 "$TMPROOT/out")"; fi
 run_hook 'git push origin main' "$PLUGIN"
-N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh'; then ok "$N. a push to main: the push gates pass (fakes), THEN the advice: still one line of JSON"; else bad "$N. hook, push: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 300 "$TMPROOT/err")"; fi
+N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/use-cases/run.sh'; then ok "$N. a push to main: the push gates pass (fakes), THEN the advice: still one line of JSON"; else bad "$N. hook, push: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 300 "$TMPROOT/err")"; fi
 run_hook 'git merge worktree-agent-abc123' "$PLUGIN"
 N=$((N + 1)); if [ "$RC_" = 0 ] && [ ! -s "$TMPROOT/out" ] && [ ! -s "$TMPROOT/err" ]; then ok "$N. a LOCAL git merge of an agent branch (an integration merge, not the final one): exit 0, nothing on stdout, nothing on stderr, although the record calls for a full run"; else bad "$N. hook, local merge: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
 SILENT_BAD=""
@@ -640,7 +683,7 @@ N=$((N + 1)); if [ -z "$SILENT_BAD" ]; then ok "$N. ordinary commands, mentions 
 
 echo "-- 10. the tracker's output never corrupts the JSON; without advice it is untouched --"
 run_hook 'gh pr merge 12' "$PLUGIN" TRACKER_SAYS="tracker says hi"
-N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh' && grep -q 'tracker says hi' "$TMPROOT/err" && ! grep -q 'tracker says hi' "$TMPROOT/out"; then ok "$N. with advice, stdout is JSON only and the tracker's words go to stderr"; else bad "$N. tracker with advice: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
+N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/use-cases/run.sh' && grep -q 'tracker says hi' "$TMPROOT/err" && ! grep -q 'tracker says hi' "$TMPROOT/out"; then ok "$N. with advice, stdout is JSON only and the tracker's words go to stderr"; else bad "$N. tracker with advice: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 200 "$TMPROOT/err")"; fi
 run_hook 'git status' "$PLUGIN" TRACKER_SAYS="tracker says hi"
 N=$((N + 1)); if [ "$RC_" = 0 ] && [ "$(cat "$TMPROOT/out")" = "$(printf 'tracker says hi\ntracker says hi')" ]; then ok "$N. without advice the tracker's output is exactly what it was (its stderr folded into stdout, as before)"; else bad "$N. tracker without advice: rc=$RC_" "stdout=$(head -c 200 "$TMPROOT/out")"; fi
 
@@ -727,7 +770,7 @@ N=$((N + 1)); if [ -z "$PF_BAD" ]; then ok "$N. a local merge, an abort, a pull 
 
 echo "-- 16. the REAL plugin root (the files as shipped), and the wiring --"
 run_hook 'gh pr merge 12' "$REPO"
-N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/run-all.sh'; then ok "$N. the shipped hook and libs give the advice"; else bad "$N. real root: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 300 "$TMPROOT/err")"; fi
+N=$((N + 1)); if [ "$RC_" = 0 ] && advice_ok "$(cat "$TMPROOT/out")" 'bash test/use-cases/run.sh'; then ok "$N. the shipped hook and libs give the advice"; else bad "$N. real root: rc=$RC_" "stdout=$(head -c 300 "$TMPROOT/out") stderr=$(head -c 300 "$TMPROOT/err")"; fi
 ROW="$(jq -c '[.guardrails[] | select(.id == "sweep-advice")]' "$MANIFEST" 2>/dev/null)"
 if [ "$(printf '%s' "$ROW" | jq 'length')" = 1 ] && printf '%s' "$ROW" | jq -e '.[0] | .kind == "guard" and .tier == "recommended" and .layer == "precheck-bash" and .hook == "bash-gate-chain" and .fails == "open" and .operator_env == "HMD_SWEEP_ADVICE=off" and .proof == "test/sweep-advice.test.sh"' >/dev/null 2>&1; then ok "guardrails.manifest.json has ONE sweep-advice row: a recommended guard in precheck-bash, fails open, override HMD_SWEEP_ADVICE=off, proven by this suite"; else bad "the manifest row" "$ROW"; fi
 if grep -q 'HMD_SWEEP_ADVICE' "$HOOK" && grep -q 'hmd_sweep_advice.py' "$HOOK" && grep -q 'gp_guard_on sweep-advice' "$HOOK"; then ok "bin/heimdall-precheck-bash names the switch, the helper and asks the guardrail lib for sweep-advice"; else bad "the hook does not name HMD_SWEEP_ADVICE, hmd_sweep_advice.py and gp_guard_on sweep-advice"; fi

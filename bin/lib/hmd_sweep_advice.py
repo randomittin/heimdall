@@ -23,17 +23,17 @@ message, a script written to disk) is no merge, as it is no sweep to the sweep g
   the subject the commits that stand to land: HEAD, plus what a pull brings in (the branch it names, else the upstream), or, for a push, the commits it sends.
               A ref that cannot be placed in this checkout is said so, and it keeps the commits from being called proven
   its class   read from the commit like the push gate does (bin/lib/hmd_push_target.py commit_class):
-              sweep        test/run-all.sh names last-sweep.json: heimdall's own regime. The records are receipts/last-sweep.json, last-full-green.json (the anchor)
-                           and the archive receipts/full-green/<head_sha>.json (in $HEIMDALL_HOME/receipts, else <repo>/.heimdall/receipts, as the runner works
-                           them out). A PROOF is a green full receipt of a clean tree that is full-equivalent and recorded for this checkout; a commit is covered by
-                           it when it is the receipt's own, or only the hooks' own journal and ledger records came after it. Only a proof says "already proven".
-                           The Why and the Cost measure from the NEWEST green full run among the records (the one that leaves the fewest commits uncovered, then
-                           the latest finished_at): a proof, or a green full run of a clean tree that is NOT full-equivalent. That second kind is why last-sweep.json
-                           is read at all: test/run-all.sh moves the anchor and writes the archive only for a full-equivalent green (its anchor block, after the
-                           receipt is written), so a green sweep in which one suite passed only on its solo re-run (no cache record for it, full_equivalent=false)
-                           lives in last-sweep.json alone and the anchor lags behind it BY DESIGN, not by a runner bug -- measuring from the anchor alone said "202
-                           commits since" and 8m12s when the run that had just finished took 47m53s. `bash test/run-all.sh --failed` completes such a receipt.
-                           Run: bash test/run-all.sh, or --failed after a red sweep, or wait for the one already running
+              sweep        test/run-all.sh names last-sweep.json: heimdall's own regime. Operator decision 2026-11-22 ("B"): a PUSH stands on EITHER of the two records the push gate
+                           (bin/heimdall-state check-quality-gates) takes: a green use-case journey receipt (bash test/use-cases/run.sh writes receipts/use-cases.json; bin/lib/hmd_use_case_receipt.py
+                           is its one definition and re-derives the commit and the tree from git), or a green full sweep (receipts/last-sweep.json, last-full-green.json, the anchor, and the archive
+                           receipts/full-green/<head_sha>.json, in $HEIMDALL_HOME/receipts, else <repo>/.heimdall/receipts, as the runner works them out: a green full receipt of a clean tree that is
+                           full-equivalent and recorded for this checkout). A commit is covered by a record when it is the record's own, or only the hooks' own journal and ledger records came after
+                           it. Only a proof says "already proven". What to RUN is the use-case run (bash test/use-cases/run.sh, about 6 minutes for its journeys and their mutants); the full sweep is a
+                           RELEASE's bar (release/ship.sh) and is named on the Release: line only, never recommended for a push, so a red or a running sweep changes nothing here. The Why and the
+                           Cost measure from the NEWEST green record among those on file (the one that leaves the fewest commits uncovered, then the latest finished_at): a use-case receipt, a
+                           full-sweep proof, or a green full run of a clean tree that is NOT full-equivalent. That last kind is why last-sweep.json is read at all: test/run-all.sh moves the anchor
+                           and writes the archive only for a full-equivalent green (its anchor block, after the receipt is written), so a green sweep in which one suite passed only on its solo re-run
+                           (no cache record for it, full_equivalent=false) lives in last-sweep.json alone and the anchor lags behind it BY DESIGN, not by a runner bug
               repo-checks  .heimdall/repo-checks.json is declared: its own receipt (bin/lib/hmd_repo_receipt.py) must be green and current for the commit, and it
                            attests ONE commit. Run: bin/heimdall-repo-checks run --repo <repo>
               unmanaged    neither (or a declaration that cannot be used): lint plus the use-case suite, skills/heimdall/references/use-case-tests.md
@@ -67,6 +67,7 @@ import hmd_kill_guard as kg  # noqa: E402  (the shell reader: lex, unwrap, opaqu
 import hmd_sweep_guard as sg  # noqa: E402  (the records: receipts, the hooks' own paths, ancestry; and the Unread that means "could not tell")
 import hmd_push_target as pt  # noqa: E402  (git's global options, and the class of a commit)
 import hmd_repo_receipt as rr  # noqa: E402  (a repo's own receipt: the facts it binds to, and the one definition of "green and current")
+import hmd_use_case_receipt as ucr  # noqa: E402  (heimdall's own use-case journey receipt: the push gate's second record, and the one definition of it)
 
 PLUGIN = os.path.normpath(os.path.join(HERE, os.pardir, os.pardir))
 MAX_DEPTH = kg.MAX_DEPTH  # shell strings (sh -c, eval, heredocs) read inside shell strings
@@ -89,6 +90,9 @@ NAME_OK = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 FULL_GREEN_KEEP = 20  # how many receipts/full-green/<head_sha>.json the runner keeps (test/run-all.sh FULL_GREEN_KEEP, newest by modification time): the most of them this reads
 STAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")  # a receipt's finished_at, `date -u '+%Y-%m-%dT%H:%M:%SZ'`: stamps of this form sort as text
 NOT_FULL_EQUIVALENT = "not full-equivalent (a suite has no cache record, e.g. one that passed only on its solo re-run), so the push gate takes it for no proof"
+TYPICAL_RUN = "about 6 minutes"  # one whole run of the use-case runner (every journey, then every mutant, three at a time) as measured on 2026-11-22; the wall clock of a receipt on file replaces it
+TYPICAL_ON = "2026-11-22"
+RELEASE_NOTE = ("this is the bar for a push. A release (release/ship.sh) is another one: it needs a green full sweep, bash test/run-all.sh; nothing here asks for that before a push.")
 
 U_DEEP = sg.U_DEEP
 U_TIMEOUT = "reading the command and the records took longer than %gs (HMD_SWEEP_ADVICE_TIMEOUT_S), so no advice was given"
@@ -475,13 +479,21 @@ def counted(top, base, shas):
     return "%s and %s changed" % (plural(found[0], "commit"), plural(found[1], "file"))
 
 
-def suites_on_disk(top):
+def journeys_on_disk(top):
+    """The journeys of test/use-cases/journeys, counted on disk."""
     try:
-        return len([n for n in os.listdir(os.path.join(top, "test")) if n.endswith(".test.sh")])
+        return len([n for n in os.listdir(os.path.join(top, "test", "use-cases", "journeys")) if n.endswith(".sh")])
     except OSError:
         return 0
 
 
+def mutants_on_disk(top):
+    """The mutants of test/use-cases/mutants.list, counted on disk (a blank line and a # line are none)."""
+    try:
+        with open(os.path.join(top, "test", "use-cases", "mutants.list"), "r", errors="replace") as handle:
+            return len([line for line in handle if line.strip() and not line.lstrip().startswith("#")])
+    except OSError:
+        return 0
 def load_receipt(rdir, name, top):
     """(the receipt, None), or (None, the sentence for why there is none): missing, unreadable, or recorded for another checkout."""
     try:
@@ -560,72 +572,75 @@ def covered(top, receipt, sha, owned):
         return False
 
 
-def cost_sweep(top, receipt):
-    """The Cost line for the heimdall regime: suites, the wall clock of the receipt, the token estimates; the suites on disk when there is no run on record."""
-    total = receipt.get("suites_total") if receipt else None
-    if isinstance(total, int) and not isinstance(total, bool) and total > 0:
-        where = ""
-        cache = receipt.get("cache")
-        if isinstance(cache, dict) and isinstance(cache.get("suites_cached"), int) and isinstance(cache.get("suites_fresh"), int):
-            where = " (%d fresh, %d cached)" % (cache["suites_fresh"], cache["suites_cached"])
-        secs = receipt.get("duration_s")
-        if isinstance(secs, (int, float)) and not isinstance(secs, bool) and secs >= 0:
-            took = "%s of machine time last run (from the receipt)" % fmt_secs(secs)
-        else:
-            took = "no wall clock on the receipt"
-        return "%s%s, %s. %s" % (plural(total, "suite"), where, took, tokens_text(total))
-    rows = suites_on_disk(top)
-    return "%s on disk (test/*.test.sh), no run on record, so no measured wall clock. %s" % (plural(rows, "suite"), tokens_text(rows))
+def cost_use_cases(top, receipt):
+    """The Cost line for the heimdall regime: what one run of the use-case runner covers (journeys and mutants), the wall clock of the last run from its receipt (or the typical one when
+    none is on record, then what is on disk), and the token estimates."""
+    if receipt:
+        journeys, mutants = receipt["journeys"]["total"], receipt["mutants"]["total"]
+        covers_ = "%s and %s" % (plural(journeys, "journey"), plural(mutants, "mutant"))
+        took = "%s of machine time last run (from the receipt)" % fmt_secs(receipt["duration_s"])
+    else:
+        journeys, mutants = journeys_on_disk(top), mutants_on_disk(top)
+        covers_ = "%s and %s on disk (test/use-cases)" % (plural(journeys, "journey"), plural(mutants, "mutant"))
+        took = "no run on record here, so no measured wall clock (%s when it was last measured, %s)" % (TYPICAL_RUN, TYPICAL_ON)
+    return "%s, %s. %s" % (covers_, took, tokens_text(journeys + mutants))
+
+
+def use_case_record(top):
+    """(the receipt, None) for a green use-case journey receipt that is genuinely this checkout's (the schema, a green run, a commit and tree as git says), else (None, why it is none)."""
+    receipt, why = ucr.read(top)
+    if receipt is None:
+        return None, why
+    problem = ucr.record_problem(top, receipt)
+    return (None, problem) if problem else (receipt, None)
+
+
+def proven_by(receipt, kind):
+    """What the 'already proven' line names: the use-case run, or the full sweep."""
+    if kind == "use-cases":
+        return "the last use-case run (%s, %s, %s killed)" % (receipt["finished_at"], plural(receipt["journeys"]["total"], "journey"), plural(receipt["mutants"]["total"], "mutant"))
+    suites = receipt.get("suites_total")
+    count = ", %s" % plural(suites, "suite") if isinstance(suites, int) and not isinstance(suites, bool) else ""
+    return "the last full sweep (%s%s)" % (receipt.get("finished_at", "time unknown"), count)
 
 
 def assess_sweep(top, subs, head):
-    """The finding for a repo in heimdall's own regime."""
+    """The finding for a repo in heimdall's own regime. A push stands on EITHER record the push gate takes -- a green use-case journey receipt (bash test/use-cases/run.sh) or a green full
+    sweep -- so what is recommended is the first; the full sweep is a release's bar, said on the Release: line and nowhere else (operator decision 2026-11-22)."""
     home = os.environ.get("HEIMDALL_HOME", "")
     rdir = os.path.join(home or os.path.join(top, ".heimdall"), "receipts")
     owned = owned_shape()[0]
-    last, why_last = load_receipt(rdir, "last-sweep.json", top)
+    last = load_receipt(rdir, "last-sweep.json", top)[0]
+    uc, why_uc = use_case_record(top)
+    records = green_sweeps(rdir, top, last) + ([(uc, "use-cases")] if uc is not None else [])
+    records.sort(key=lambda f: finished(f[0]), reverse=True)  # newest first; records of equal time keep the order they were found in
     shas = subs.shas()
-    scored = [(r, kind, [sha for sha in shas if not covered(top, r, sha, owned)]) for r, kind in green_sweeps(rdir, top, last)]  # (receipt, kind, what it leaves uncovered), newest first
-    baseline = min(scored, key=lambda s: len(s[2]), default=None)  # what the Why and the Cost measure from: the newest of the green sweeps that leave the fewest commits uncovered
-    proof = min((s for s in scored if s[1] == "proof"), key=lambda s: len(s[2]), default=None)  # what may say "proven": a full-equivalent sweep, never a green one that is not
-    red = None
+    scored = [(r, kind, [sha for sha in shas if not covered(top, r, sha, owned)]) for r, kind in records]  # (record, kind, what it leaves uncovered), newest first
+    baseline = min(scored, key=lambda s: len(s[2]), default=None)  # what the Why measures from: the newest of the records that leave the fewest commits uncovered
+    red = False  # a red last sweep at an ancestor of HEAD voids a full sweep's "proven" (the gate reads last-sweep.json); it never voids a use-case receipt: either record is enough for the gate
     if last is not None and receipt_kind(last)[0] == "red":
         try:
-            if sg.ancestor(top, last["head_sha"], head):
-                red = "the last sweep (%s, %s) was red" % (last["head_sha"][:12], last.get("finished_at", "time unknown"))
+            red = sg.ancestor(top, last["head_sha"], head)
         except sg.Unread:
-            red = None
+            red = False
+    proof = min((s for s in scored if s[1] == "use-cases" or (s[1] == "proof" and not red)), key=lambda s: len(s[2]), default=None)  # what may say "proven": never a green sweep that is not full-equivalent
     unplaced = ("; %s cannot be placed in this checkout, so what it brings is not counted" % ", ".join(subs.unplaced)) if subs.unplaced else ""
-    if proof is not None and not proof[2] and not subs.unplaced and not red:
-        suites = proof[0].get("suites_total")
-        count = ", %s" % plural(suites, "suite") if isinstance(suites, int) and not isinstance(suites, bool) else ""
-        return {"proven": True, "what": subs.describe(), "by": "the last full sweep (%s%s)" % (proof[0].get("finished_at", "time unknown"), count)}
+    if proof is not None and not proof[2] and not subs.unplaced:
+        return {"proven": True, "what": subs.describe(), "by": proven_by(proof[0], proof[1])}
     if baseline is not None:
         base, kind, left = baseline
-        why = "%s since the last green full sweep (%s, %s)" % (counted(top, base["head_sha"], left or shas), base["head_sha"][:12], base.get("finished_at", "time unknown"))
-        if kind != "proof":
+        why = "%s since the last green %s (%s, %s)" % (counted(top, base["head_sha"], left or shas), "use-case run" if kind == "use-cases" else "full sweep",
+                                                       base["head_sha"][:12], base.get("finished_at", "time unknown"))
+        if kind == "green":
             why += ", which is " + NOT_FULL_EQUIVALENT
         if left:
             why += "; not covered: %s" % subs.describe(left)
-        if red:
-            why = red + "; " + why
         why += unplaced
-    elif last is None:
-        why = "no green record yet: " + why_last
     else:
-        kind, reason = receipt_kind(last)
-        if kind == "red":
-            reason = red or "the last sweep (%s, %s) was red, in other history than this checkout's" % (last["head_sha"][:12], last.get("finished_at", "time unknown"))
-        why = "no green record yet: " + reason + unplaced
-    pid = sg.running(rdir)
-    if pid:
-        run, where = "wait: a sweep is already running (pid %d); a second one is refused until it ends" % pid, None
-    else:
-        run, where = ("bash test/run-all.sh --failed" if red else "bash test/run-all.sh"), "(in %s, on the tree you are about to land)" % top
-    basis = baseline[0] if baseline is not None else last
-    return {"proven": False, "why": why, "run": run, "where": where, "cost": cost_sweep(top, basis)}
-
-
+        why = "no green record yet: %s%s" % (why_uc, unplaced)
+    return {"proven": False, "run_noun": "use-case journey run", "why": why, "run": ucr.RUNNER, "release": RELEASE_NOTE,
+            "where": "(in %s, on a clean, committed tree: a green full run writes .heimdall/receipts/%s for the commit it ran on, and the push gate takes that receipt in place of a full sweep)" % (top, ucr.NAME),
+            "cost": cost_use_cases(top, uc)}
 def declared_checks(facts):
     """(the declared checks, None) or (None, why the declaration cannot be used)."""
     if facts.state != "ok":
@@ -711,10 +726,13 @@ def compose(op, found):
     if found["proven"]:
         text = "%s: %s already proven green by %s; nothing to run before this %s." % (lead, found["what"], found["by"], noun)
     else:
-        lines = ["%s: a full test run before this %s is worth considering." % (lead, noun), "Why: " + found["why"], "Run: " + found["run"]]
+        lines = ["%s: a %s before this %s is worth considering." % (lead, found.get("run_noun", "full test run"), noun), "Why: " + found["why"], "Run: " + found["run"]]
         if found.get("where"):
             lines.append("  " + found["where"])
-        lines += ["Cost: " + found["cost"], "Your call: run it now, or merge without it. This note shows only at the final merge (a push to the default branch, a pull request merge, a pull on it) and never blocks anything."]
+        lines.append("Cost: " + found["cost"])
+        if found.get("release"):
+            lines.append("Release: " + found["release"])
+        lines.append("Your call: run it now, or merge without it. This note shows only at the final merge (a push to the default branch, a pull request merge, a pull on it) and never blocks anything.")
         text = "\n".join(lines)
     context = ("hmd merge-time advice: a recommendation from the hmd hook, not a block; the developer decides. Tell the developer about it in your next message, in a line "
                "or two (why, what to run, what it costs), and let them choose between running it now and going ahead without it. Do not start the full test run yourself "
