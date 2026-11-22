@@ -13,14 +13,14 @@
 # THE LEAN SET is derived from HEAD of the clone, never from the work tree:
 #     release/runtime-files.txt       what the code can reach (bin/heimdall-runtime-closure). "Reachable", not "lean": it names skills/ whole.
 #   + the convention-loaded core      Claude Code reads these by name and no file names them: .claude-plugin/ agents/ commands/ hooks/ skills/heimdall/ and
-#                                     settings.json, .mcp.json (the heimdall-ledger MCP server), LICENSE (a lean tree is still a copy of the software)
+#                                     settings.json, .mcp.json (the heimdall-ledger MCP server), LICENSE, and docs/superpowers/specs/2026-04-06-superx-design.md (the prompt and skill name it)
 #   - the on-demand cut               skills.manifest.json names it: every on_demand_paths entry and every pack.paths entry of a kind "bundled" entry (today the five
 #                                     skill directories and commands/designmatch.md). The manifest is the one place that lists them, so the lean tree and the
 #                                     manifest cannot drift apart. A cut path inside a core directory is negated after that directory's pattern. A manifest that
 #                                     cannot be read, names a path that is not one literal tree path, or would take the core itself (a core directory or file, or a
 #                                     directory above one) refuses the update before anything is written.
 #   + what `add` recorded             .git/info/hmd-lean-on-demand, one path per line (a re-apply, an upgrade, lean off then on: all keep it)
-# test/ and docs/ are out because nothing reachable names them. The few docs/ files the closure DOES name stay: bin/lib/companion_cc_login.py reads
+# test/ and docs/ are out because nothing reachable names them; the design spec above and the docs/ files the closure DOES name stay: bin/lib/companion_cc_login.py reads
 # docs/samples/login/allowlist.json at run time, and without it every login URL is refused. .planning/ is never runtime.
 #
 # NEVER DISCARDS WORK. git keeps a locally modified file the lean set would drop (it warns) and never touches an untracked file, so ledger, receipts,
@@ -38,7 +38,7 @@ LSP_LIST="release/runtime-files.txt"
 LSP_MANIFEST="skills.manifest.json"
 LSP_RECORD="info/hmd-lean-on-demand"
 LSP_CORE_DIRS=".claude-plugin agents commands hooks skills/heimdall"
-LSP_CORE_FILES="settings.json .mcp.json LICENSE"
+LSP_CORE_FILES="settings.json .mcp.json LICENSE docs/superpowers/specs/2026-04-06-superx-design.md"
 LSP_CUT=""   # the cut, on one line (a cut path has no space); set by lsp_inputs
 
 # A stray GIT_* variable (this runs from installers and hooks) could point git at another repository; lazy fetch off makes "no network" a hard failure.

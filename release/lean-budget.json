@@ -2,8 +2,8 @@
   "max": {
     "context": {
       "agents": {
-        "count": 16,
-        "frontmatter_bytes": 6019
+        "count": 17,
+        "frontmatter_bytes": 6860
       },
       "caveman": {
         "per_prompt_bytes": 126,
@@ -14,9 +14,9 @@
         "frontmatter_bytes": 7469
       },
       "main_prompt": {
-        "bytes": 66838
+        "bytes": 67385
       },
-      "session_start_bytes": 85886,
+      "session_start_bytes": 87274,
       "skills": {
         "count": 6,
         "frontmatter_bytes": 2892
@@ -80,6 +80,6 @@
     },
     "hooks_total": 56
   },
-  "note": "Ceilings for bin/heimdall-footprint --check: a measured number above its ceiling fails. Initial values are the measured session-start context and hook counts of this repo on 2026-11-22 (main 42d66592), nothing lowered yet. Disk is not budgeted on purpose: tracked bytes in a dev checkout grow with every test, doc and hook-written journal commit, so a disk ceiling would turn red on unrelated work. The lean wave adds disk ceilings and checks them against a lean install tree with --root; a later wave lowers the numbers below.",
+  "note": "Ceilings for bin/heimdall-footprint --check on the FULL tree: a measured number above its ceiling fails. They are the numbers measured on 2026-11-22 after the lean-core merge (17 agents, heimdall-lean among them; the main prompt agents/heimdall.md at 67,385 B; 56 hooks), exact and not rounded, so a hook, a skill or a byte of prompt added later fails the check until this file is raised on purpose. Disk is not budgeted here on purpose: tracked bytes in a dev checkout grow with every test, doc and hook-written journal commit, so a disk ceiling would turn red on unrelated work. A lean install tree has its own budget in the same schema, release/lean-install-budget.json, checked with --root DIR --budget FILE (the lean-core doc under docs/, section 'Measure it').",
   "schema": 1
 }

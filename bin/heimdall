@@ -4162,6 +4162,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall --reinstall      Nuke and re-clone from GitHub (fixes zombie states)"
   echo "  heimdall reinstall --reset  Switch this install to lean in place (backup first, your data stays)"
   echo "  heimdall lean <status|on|off>  Lean profile: smaller install tree and prompt (off restores the full tree)"
+  echo "  heimdall lean restore <dir>  Undo reinstall --reset from the backup directory it printed"
   echo "  heimdall --uninstall      Remove heimdall completely (add --yes for non-interactive)"
   echo "  heimdall --help           Show this help"
   echo "  heimdall team             Team status (solo/shared, owner, how to grow)"

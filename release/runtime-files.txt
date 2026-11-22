@@ -596,6 +596,7 @@ docs/schemas/guardrails.manifest.v1.json
 docs/schemas/runhmd.receipt.v1.json
 docs/schemas/runhmd.verdict.v1.json
 docs/superpowers/plans/2026-11-22-split-skills-statusline-repos.md
+docs/superpowers/specs/2026-04-06-superx-design.md
 evals/benchmark/BENCHMARKS.template.md
 evals/benchmark/README.md
 evals/benchmark/README.p3.md
@@ -817,6 +818,8 @@ evals/corpus/exchange-queue-jump/input.json
 evals/jev-ultrafast/bench.py
 evals/jev-ultrafast/run.sh
 evals/lean/context-baseline.json
+evals/lean/prompt-parity.receipt.json
+evals/lean/prompt-parity.sh
 evals/live-isolation/LATEST.json
 evals/live-isolation/LATEST.md
 evals/oracles/BLIND-VERIFICATION.md
@@ -1066,6 +1069,7 @@ relay/src/types.ts
 release/HOSTING.md
 release/heimdall-signing.pub
 release/lean-budget.json
+release/lean-install-budget.json
 release/publish-checklist.md
 release/runtime-files.txt
 release/ship.sh
