@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+r"""heimdall-runtime-closure -- the tracked files an INSTALLED hmd can touch at run time, found statically; every other tracked file is non-runtime.
+
+WHY. The lean profile (docs/superpowers/plans/2026-11-12-3x-lean-core.md) installs by sparse checkout. A file the code needs and the checkout lacks is a run-time
+break; a file nothing needs is dead weight (test/ alone is 40% of a fresh install). This tool is the audit that tells the two apart, and release/runtime-files.txt
+is its committed answer: sorted tracked paths, one per line, no comments, so `git sparse-checkout set --stdin` and `xargs` read it as it is. `check` keeps that
+file true (test/lean-runtime-closure.test.sh runs it); regenerate it with
+    bin/heimdall-runtime-closure list > release/runtime-files.txt
+
+WHAT THE ANSWER IS. "Reachable from the code", nothing more. Claude Code loads agents/ commands/ skills/ .claude-plugin/ and settings.json by CONVENTION, and no file
+names them; the lean profile's own core list carries those, and its on-demand skills are carved out of this list there. A directory this tool keeps because the code
+names it (skills/ for `hmd skills`, evals/corpus for `hmd corpus`) stays in the list until a later task cuts it on purpose.
+
+THE GRAPH. Read from the git INDEX (`git ls-files --stage`), never the work tree: what is staged is what the next commit ships, and a clean tree reads the same as HEAD.
+  roots     every tracked file under bin/, hooks/hooks.json, install.sh, and release/runtime-files.txt itself (the lean sparse apply reads it from the checkout it
+            applies to, so the list names itself: it is kept even before it is tracked, which is what makes it a fixed point).
+  edge      A -> B when A names B. The reader is bin/lib/suite_closure.py's (imported, not copied): whole-token path suffixes, `. file` / `source` / `$PLUGIN_DIR/path` /
+            `"$HERE/../x"`, a bare code name matching one file, Python `import` / `from ... import` (also inside `python3 -c` and heredocs), JS `require`. Text a shell
+            file only PRINTS is no edge (its display scanner), nor is a comment, nor a Python docstring or bare string statement (this tool tokenizes Python itself, so a
+            trailing `# see relay/src/x.ts` names nothing).
+  json      a manifest is read as data: a string that IS a tracked path (`"skills/stacks"`, `"bin/heimdall-x"`, `"VERSION"`) is an edge, and every string is also read
+            as shell text (hooks.json commands are shell). Markdown and other prose are leaves: a prompt names files for a model, not for the code.
+  directory a directory is followed only when the reference is ANCHORED: written under a plugin-root variable (`"$PLUGIN_DIR"/evals/corpus`, `${HERE}/..`, `$BIN_DIR/../sentinels`)
+            or relative (`../x`, `./x`). A bare `docs/analysis/` in a string is prose. A directory built from a variable (`"$PLUGIN_DIR/modules/$id/manifest.json"`,
+            `"$PLUGIN_DIR"/skills/*`) is named by its literal prefix, so the WHOLE directory is kept: an unknown dynamic path stays INCLUDED, never dropped. What a
+            directory pulls in is scanned only when it is code. A path built from nothing literal (`"$dir/$file"`) names nothing and adds nothing; the smoke test of the
+            lean tree is what catches that, not this tool.
+  policy    two trees are never runtime payload, whoever names them: test/ (verification: the code that mentions test/run-all.sh addresses the TARGET repo's suite,
+            never its own) and .planning/ (per-project state the hooks write into the repo they run in). `explain` shows what named them.
+
+Commands (exit 0 ok, 1 `check` found drift, 2 usage or a repository it cannot read):
+  list                  the runtime files, sorted, one per line (the format of release/runtime-files.txt)
+  non-runtime           every other tracked file
+  check [--list FILE]   FILE (default: release/runtime-files.txt) equals `list`; else it names every missing and extra path
+  explain PATH          why PATH is runtime (the chain from a root) or why it is not
+  stats                 counts and bytes, runtime against tracked, by top-level directory
+Options:  --repo DIR (default: the repository of the current directory)
+
+Python 3.7+, standard library plus bin/lib/suite_closure.py. A cooperating-agent audit, not a security boundary.
+"""
+import argparse
+import collections
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tokenize
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "lib"))
+import suite_closure as sc          # noqa: E402  the tree index, the path resolver and the display-text scanner this tool shares with the test cache
+
+LIST_PATH = "release/runtime-files.txt"
+ROOT_DIR = "bin/"
+ROOT_FILES = ("hooks/hooks.json", "install.sh")
+# trees that are never runtime payload, with the reason `explain` prints
+POLICY = (("test/", "verification, not runtime: the code that names test/... addresses the target repo's own suite"),
+          (".planning/", "per-project state the hooks write into the repo they run in, not plugin payload"))
+# variables that name the plugin root or the running script's own directory: a directory written under one of them is the real one. suite_closure's list, minus the
+# test-directory names (a suite's), plus the names the hooks and installers use for the plugin root and for bin/
+ANCHOR_VARS = frozenset(sc.DIR_VARS - {"TEST_DIR", "TESTS_DIR", "SUITE_DIR"}) | frozenset(
+    ["HMDP", "HMD_HOME", "HEIMDALL_HOME", "HEIMDALL_ROOT", "HEIMDALL_DIR", "BIN_DIR", "BINDIR", "PLUGIN_BIN", "LIB_DIR", "LIBDIR", "SENTINELS_DIR"])
+JSON_SUFFIX = ".json"
+# Python builds a path out of separate literals: os.path.join(PLUGIN_DIR, "fixtures", "attack"), ROOT / "evals" / "caveman". The tokens of such a line are bare words, so the
+# literals are joined here, and the variable in front of them (if any) is the anchor.
+PY_LIT = r"""(?:"[^"\n]*"|'[^'\n]*')"""
+PY_JOIN_RE = re.compile(r"(?:([A-Za-z_][\w.]*)\s*,\s*)?(" + PY_LIT + r"(?:\s*,\s*" + PY_LIT + r")+)")
+PY_SLASH_RE = re.compile(r"([A-Za-z_][\w.]*)\s*((?:/\s*" + PY_LIT + r")+)")
+
+
+def is_anchor(var):
+    """True when the variable `var` can name the plugin root or the running script's directory: suffix-insensitive to case and a leading underscore (`_REPO_ROOT`, `repo`)."""
+    return var is not None and var.lstrip("_").upper() in ANCHOR_VARS
+
+
+def python_joined_paths(line):
+    """[(anchor variable or None, "a/b/c")] for the paths `line` builds from separate string literals (os.path.join(X, "a", "b"), X / "a" / "b")."""
+    out = []
+    for m in PY_JOIN_RE.finditer(line):
+        lits = [t.strip()[1:-1] for t in m.group(2).split(",")]
+        out.append((m.group(1), "/".join(l.strip("/") for l in lits if l)))
+    for m in PY_SLASH_RE.finditer(line):
+        lits = [t.strip()[1:-1] for t in m.group(2).split("/") if t.strip()]
+        out.append((m.group(1), "/".join(l.strip("/") for l in lits if l)))
+    return out
+
+
+class Fail(Exception):
+    """A usage error or a repository this tool cannot read: the message goes to stderr, the exit status is 2."""
+
+
+class IndexGraph(sc.Graph):
+    """suite_closure's tree index (nodes, by_suffix, dir_files, dir_suffix, last_names) and path resolver (_resolve), over the INDEX instead of a commit.
+    The only place this tool touches suite_closure's internals: a hook-owned journal file stays a node (it is simply never named), and the test hints are no input."""
+
+    def _read_tree(self):
+        out = self.repo.git(["ls-files", "--stage", "-z", "--full-name"]).stdout
+        for rec in out.split(b"\0"):
+            if not rec:
+                continue
+            meta, _, raw = rec.partition(b"\t")
+            fields = meta.decode("ascii", "replace").split(" ")
+            if len(fields) != 3 or fields[2] != "0":
+                raise Fail("the index holds an unmerged or unreadable entry (%s): resolve it first" % raw.decode("utf-8", "replace"))
+            path = raw.decode("utf-8", "surrogateescape")
+            self.nodes[path] = sc.Node(path, fields[1], fields[0], sc.classify(path, fields[0]))
+
+    def _load_hints(self, hints_path):
+        self.hints = {}
+
+
+def python_logical_lines(text):
+    """One string per logical line of the Python source `text`, comments dropped and bare string statements (docstrings, prose) dropped; None when it does not tokenize."""
+    lines, current, only_strings = [], [], True
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            kind = tok.type
+            if kind in (tokenize.COMMENT, tokenize.NL, tokenize.INDENT, tokenize.DEDENT):
+                continue
+            if kind in (tokenize.NEWLINE, tokenize.ENDMARKER):
+                if current and not only_strings:
+                    lines.append(" ".join(current))
+                current, only_strings = [], True
+                continue
+            current.append(tok.string)
+            if kind != tokenize.STRING:
+                only_strings = False
+    except (tokenize.TokenError, SyntaxError, ValueError):
+        return None
+    return lines
+
+
+def json_strings(text):
+    """Every string of the JSON document `text`, keys included, or None when it is not JSON (the caller then reads it as text)."""
+    try:
+        doc = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    out, stack = [], [doc]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            out.extend(k for k in item if isinstance(k, str))
+            stack.extend(item.values())
+    return out
+
+
+def code_lines(path, text):
+    """(the lines of `path` that can name a file, whether it is Python): shell without its display-only text and comments, Python tokenized, other code without comment lines."""
+    kind = sc.language(path, text.encode("utf-8", "surrogateescape"))
+    if kind == "shell":
+        text = sc.drop_display_text(text)
+    if kind == "python":
+        lines = python_logical_lines(text)
+        if lines is not None:
+            return lines, True
+    c_style = os.path.splitext(path)[1].lower() in sc.C_STYLE
+    lines = [line for line in text.split("\n") if line.strip() and not sc.is_comment(line.strip(), c_style)]
+    if kind == "python":
+        lines, _ = sc.strip_docstrings(lines)
+    return lines, kind == "python"
+
+
+class Closure(object):
+    """The runtime closure of the index of one repository: `included` {path: (named by, how)} and `refused` {policy path: the files that name it}."""
+
+    def __init__(self, repo):
+        self.repo = repo
+        self.g = IndexGraph(repo, "INDEX", edges=False)
+        self.included, self.refused, self.ambiguous = {}, collections.defaultdict(set), set()
+        self.blobs = sc.Blobs(repo)
+        try:
+            self._run()
+        finally:
+            self.blobs.close()
+
+    # -- the walk ---------------------------------------------------------------------------------------------------
+    def _run(self):
+        queue = collections.deque()
+        for path in sorted(self.g.nodes):
+            if path.startswith(ROOT_DIR) or path in ROOT_FILES:
+                self._add(path, None, "root", queue)
+        self.included.setdefault(LIST_PATH, (None, "root"))
+        while queue:
+            path = queue.popleft()
+            files, dirs, imports = self._refs(path)
+            for target in sorted(files | imports):
+                self._add(target, path, "named", queue)
+            for target in sorted(dirs):
+                for member in self.g.dir_files[target]:
+                    self._add(member, path, "in %s/" % target, queue)
+
+    def _add(self, path, via, how, queue):
+        reason = self._policy(path)
+        if reason is not None:
+            if via is not None:
+                self.refused[path].add(via)
+            return
+        if path in self.included:
+            return
+        self.included[path] = (via, how)
+        node = self.g.nodes.get(path)
+        if node is not None and (node.kind == "code" or (path.endswith(JSON_SUFFIX) and not how.startswith("in "))):
+            queue.append(path)
+
+    @staticmethod
+    def _policy(path):
+        for prefix, reason in POLICY:
+            if path.startswith(prefix):
+                return reason
+        return None
+
+    # -- what one file names ----------------------------------------------------------------------------------------
+    def _refs(self, path):
+        """(files it names, directories it names under an anchor, modules it imports) -- all tracked paths."""
+        node = self.g.nodes[path]
+        data = self.blobs.get(node.oid)
+        if len(data) > sc.MAX_SCAN or b"\0" in data[:8192]:
+            return set(), set(), set()
+        text = data.decode("utf-8", "replace")
+        files, dirs, imports = set(), set(), set()
+        code_python = False
+        if path.endswith(JSON_SUFFIX):
+            strings = json_strings(text)
+            if strings is not None:
+                for value in strings:
+                    self._exact(value, files, dirs)
+                lines = strings
+            else:
+                lines = text.split("\n")
+        else:
+            lines, code_python = code_lines(path, text)
+            imports = self.g._imports(path, lines)
+        seen = set()
+        for line in lines:
+            if code_python:
+                for var, joined in python_joined_paths(line):
+                    files |= self.g._resolve(joined, "code", var, False)[0]
+                    dirs |= self._anchored_dirs(joined, var, path)
+            for m in sc.TOK_RE.finditer(line):
+                raw, glob = m.group(1), m.group(2)
+                if len(raw) < 2 and not glob:
+                    continue
+                if not glob and raw.rstrip("./").rsplit("/", 1)[-1] not in self.g.last_names:
+                    continue
+                glued = None
+                if m.start() > 0 and line[m.start() - 1] in "\"'})":
+                    var = sc.VAR_BEFORE_RE.search(line[:m.start()])
+                    glued = var.group(1) if var else ""
+                cmdpos = False
+                if sc.PLAIN_TAIL_RE.search(raw):
+                    start = max(0, m.start() - 40)
+                    before = ("\0" if start else "") + line[start:m.start()]
+                    if "/" in raw:
+                        before = sc.VAR_OPEN_RE.sub("", before)
+                    cmdpos = sc.CMD_BEFORE_RE.search(before) is not None
+                key = (raw, glued, cmdpos)
+                if key in seen:
+                    continue
+                seen.add(key)
+                files |= self.g._resolve(raw, "code", glued, cmdpos)[0]
+                dirs |= self._anchored_dirs(raw, glued, path)
+        files.discard(path)
+        return files, dirs, imports
+
+    def _exact(self, value, files, dirs):
+        """A JSON string that IS a tracked path is an edge: a file by any spelling, a directory only when it has a `/` (a bare `skills` is a word, not a path)."""
+        text = value[2:] if value.startswith("./") else value
+        bare = text.rstrip("/")
+        if not bare or "\n" in bare:
+            return
+        if bare in self.g.nodes:
+            files.add(bare)
+        elif bare in self.g.dir_files and "/" in text:
+            dirs.add(bare)
+
+    def _anchored_dirs(self, raw, glued, src):
+        """The directories the token `raw` names when it is written under a plugin-root variable or relatively, else none."""
+        tok = raw.rstrip(".")
+        parts = [p for p in tok.split("/") if p and p != "."]
+        dotdot = ".." in parts
+        if dotdot:
+            parts = parts[len(parts) - parts[::-1].index(".."):]
+        if not parts:
+            return set()
+        under_var = is_anchor(parts[0]) and glued is None
+        if not (dotdot or is_anchor(glued) or under_var):             # `./x` is relative to the cwd, which is the user's project, not the plugin
+            return set()
+        if under_var:
+            parts = parts[1:]
+        for i in range(len(parts)):
+            suffix = "/".join(parts[i:])
+            found = self.g.dir_suffix.get(suffix)
+            if found:
+                top = src.split("/")[0]
+                chosen = [d for d in found if d == suffix] or [d for d in found if d.split("/")[0] == top]
+                if not chosen:                                          # a bare name (`src`, `schema`) that several unrelated directories carry: say so, follow none
+                    self.ambiguous.add((src, suffix))
+                return set(d for d in chosen if self._policy(d + "/") is None)
+        return set()
+
+    # -- answers ----------------------------------------------------------------------------------------------------
+    def runtime(self):
+        return sorted(self.included)
+
+    def non_runtime(self):
+        return sorted(p for p in self.g.nodes if p not in self.included)
+
+    def chain(self, path):
+        out = []
+        while path is not None:
+            via, how = self.included[path]
+            out.append((path, how))
+            path = via
+        return out
+
+    def sizes(self):
+        oids = [(p, n.oid) for p, n in self.g.nodes.items() if n.mode != "160000"]
+        done = subprocess.run(["git", "cat-file", "--batch-check=%(objectname) %(objectsize)"], cwd=self.repo.top, env=self.repo.env,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, input="\n".join(o for _, o in oids).encode("ascii") + b"\n", timeout=300)
+        by_oid = {}
+        for row in done.stdout.decode("ascii", "replace").splitlines():
+            fields = row.split(" ")
+            if len(fields) == 2 and fields[1].isdigit():
+                by_oid[fields[0]] = int(fields[1])
+        return dict((p, by_oid.get(o, 0)) for p, o in oids)
+
+
+# -- commands ---------------------------------------------------------------------------------------------------------
+
+def cmd_list(closure, args):
+    sys.stdout.write("".join(p + "\n" for p in closure.runtime()))
+    return 0
+
+
+def cmd_non_runtime(closure, args):
+    sys.stdout.write("".join(p + "\n" for p in closure.non_runtime()))
+    return 0
+
+
+def cmd_check(closure, args):
+    path = args.list or os.path.join(closure.repo.top, LIST_PATH)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            recorded = [line.rstrip("\n") for line in fh]
+    except OSError as exc:
+        raise Fail("cannot read %s: %s" % (path, exc))
+    current, have = closure.runtime(), set(recorded)
+    missing = [p for p in current if p not in have]
+    extra = [p for p in recorded if p not in closure.included]
+    if not missing and not extra and recorded == current:
+        return 0
+    sys.stdout.write("%s is out of date: %d missing, %d extra%s\n" % (path, len(missing), len(extra), "" if missing or extra else ", same paths in another order or with repeats"))
+    for p in missing:
+        sys.stdout.write("  missing  %s   (%s)\n" % (p, " <- ".join("%s [%s]" % c for c in closure.chain(p)[:3])))
+    for p in extra:
+        sys.stdout.write("  extra    %s   (nothing reachable from the code names it)\n" % p)
+    sys.stdout.write("regenerate: bin/heimdall-runtime-closure list > %s\n" % LIST_PATH)
+    return 1
+
+
+def cmd_explain(closure, args):
+    path = args.path[2:] if args.path.startswith("./") else args.path
+    if path in closure.included:
+        sys.stdout.write("%s: runtime\n" % path)
+        for name, how in closure.chain(path):
+            sys.stdout.write("  %s [%s]\n" % (name, "root: bin/, hooks/hooks.json, install.sh or the list itself" if how == "root" else how))
+        return 0
+    reason = closure._policy(path)
+    if reason is not None:
+        sys.stdout.write("%s: non-runtime by policy -- %s\n" % (path, reason))
+        named = sorted(closure.refused.get(path, ()))
+        sys.stdout.write("  named by: %s\n" % (", ".join(named[:8]) + (" ..." if len(named) > 8 else "") if named else "(nothing)"))
+        return 0
+    if path in closure.g.nodes:
+        sys.stdout.write("%s: non-runtime -- nothing reachable from bin/, hooks/hooks.json or install.sh names it\n" % path)
+        return 0
+    sys.stdout.write("%s: not a tracked path\n" % path)
+    return 2
+
+
+def cmd_stats(closure, args):
+    sizes = closure.sizes()
+    total, runtime = len(closure.g.nodes), [p for p in closure.included if p in closure.g.nodes]
+    tracked_bytes, runtime_bytes = sum(sizes.values()), sum(sizes.get(p, 0) for p in runtime)
+    sys.stdout.write("tracked files   %6d  %12d bytes\n" % (total, tracked_bytes))
+    sys.stdout.write("runtime files   %6d  %12d bytes  (%.1f%% of the files, %.1f%% of the bytes)\n"
+                     % (len(runtime), runtime_bytes, 100.0 * len(runtime) / max(total, 1), 100.0 * runtime_bytes / max(tracked_bytes, 1)))
+    sys.stdout.write("non-runtime     %6d  %12d bytes\n" % (total - len(runtime), tracked_bytes - runtime_bytes))
+    top = collections.defaultdict(lambda: [0, 0, 0, 0])
+    for p in closure.g.nodes:
+        row = top[p.split("/")[0] if "/" in p else "(root files)"]
+        row[0] += 1
+        row[1] += sizes.get(p, 0)
+        if p in closure.included:
+            row[2] += 1
+            row[3] += sizes.get(p, 0)
+    sys.stdout.write("\n%-16s %6s %12s  %6s %12s\n" % ("top level", "files", "bytes", "kept", "kept bytes"))
+    for name, row in sorted(top.items(), key=lambda kv: -kv[1][1]):
+        sys.stdout.write("%-16s %6d %12d  %6d %12d\n" % ((name,) + tuple(row)))
+    for prefix, reason in POLICY:
+        named = sorted(p for p in closure.refused if p.startswith(prefix))
+        sys.stdout.write("\npolicy %s: %d path(s) named by code and left out (%s)\n" % (prefix, len(named), reason))
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="heimdall-runtime-closure", description="The tracked files an installed hmd can touch at run time (rules: see the header of this file).")
+    parser.add_argument("--repo", default=".", help="a directory inside the repository to read (default: the current directory)")
+    sub = parser.add_subparsers(dest="command", metavar="{list,non-runtime,check,explain,stats}")
+    sub.required = True
+    sub.add_parser("list", help="the runtime files, one per line (the format of %s)" % LIST_PATH).set_defaults(run=cmd_list)
+    sub.add_parser("non-runtime", help="every other tracked file").set_defaults(run=cmd_non_runtime)
+    check = sub.add_parser("check", help="the recorded list equals the computed one; exit 1 and name the difference if not")
+    check.add_argument("--list", help="the list to compare (default: %s of the repository)" % LIST_PATH)
+    check.set_defaults(run=cmd_check)
+    explain = sub.add_parser("explain", help="why a path is runtime, or why it is not")
+    explain.add_argument("path")
+    explain.set_defaults(run=cmd_explain)
+    sub.add_parser("stats", help="counts and bytes, runtime against tracked").set_defaults(run=cmd_stats)
+    return parser
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    try:
+        closure = Closure(sc.Repo(args.repo))
+        return args.run(closure, args)
+    except (Fail, sc.Fail) as exc:
+        sys.stderr.write("heimdall-runtime-closure: %s\n" % exc)
+        return 2
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
