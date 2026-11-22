@@ -9,6 +9,8 @@
 #   A. the recording is the plan's inventory: 101 paths in four groups (skills 21, statusline runtime 18, conformance 26, suites 36) whose byte totals
 #      are the numbers the plan measured (skills 163,291 B; hooks 2,775; bin 63,077; sentinels 323,741), every suite of the 36 has a host-call row,
 #      and the host calls are the real ones (agent-pool.json is a data file, not a call of bin/agent-pool; prose "heimdall" is not bin/heimdall).
+#      One figure moved after the plan measured it: hmd-skills v1.0.1 rewrote the four stack packs (51,336 B then, 62,765 B now, re-recorded), so the skills
+#      total is held as the 17 files the plan measured and the four packs apart.
 #      The recording stays whole after T3.2 moved 41 of those files out of heimdall (24 renderer-only suites, 17 conformance files that are not a sigil
 #      golden; they live in hmd-statusline at v1.0.0): it is the record of the tree BEFORE the split, so all 41 are still in it.
 #   B. the renders were not made up: the 21 recorded density and sigil renders are, byte for byte, the goldens committed under conformance/statusline.
@@ -89,7 +91,10 @@ jqok "101 paths: skills 21, statusline-runtime 18, statusline-conformance 26, st
    and ([.paths[]|select(.group=="statusline-conformance")]|length)==26 and ([.paths[]|select(.group=="statusline-tests")]|length)==36'
 jqok "every path appears once, with a sha256 and a positive byte count" \
   'all(.paths[]; (.sha256|test("^[0-9a-f]{64}$")) and .bytes>0) and ((.paths|map(.path)|unique|length)==(.paths|length))'
-jqok "skills total 163291 bytes (plan 1a)" '[.paths[]|select(.group=="skills")|.bytes]|add==163291'
+jqok "skills: the 17 files the plan measured and hmd-skills v1.0.1 left alone total 111955 bytes (plan 1a: 163291, less the four stack packs' 51336)" \
+  '[.paths[]|select(.group=="skills" and (.path|test("^skills/stacks/[a-z-]+/PACK\\.md$")|not))|.bytes]|add==111955'
+jqok "skills: the four stack packs hmd-skills v1.0.1 rewrote total 62765 bytes (51336 in the plan's tree), the skills group 174720" \
+  '([.paths[]|select(.path|test("^skills/stacks/[a-z-]+/PACK\\.md$"))|.bytes]|add)==62765 and ([.paths[]|select(.group=="skills")|.bytes]|add)==174720'
 jqok "hooks 2775, the five bin files 63077, the seven measured sentinels 323741 bytes (plan 1b)" \
   '([.paths[]|select(.path|startswith("hooks/"))|.bytes]|add)==2775
    and ([.paths[]|select(.group=="statusline-runtime" and (.path|startswith("bin/")))|.bytes]|add)==63077
