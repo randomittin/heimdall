@@ -9,3 +9,5 @@
 06_init_a_repo_then_try_to_commit_a_stub	bin/lib/heimdall-stub-patterns.sh	s/^HEIMDALL_STUB_RE_TODO=.*$/HEIMDALL_STUB_RE_TODO='NEVER-MATCHES-xq7'/	M06a-stub-marker-pattern-never-matches
 06_init_a_repo_then_try_to_commit_a_stub	bin/heimdall-init	s/^git -C "$REPO" config core.hooksPath "$HOOKS_REL"$/true/	M06b-init-never-wires-the-hooks
 06_init_a_repo_then_try_to_commit_a_stub	bin/heimdall-init	s/318965969+runhmd/111111111+runhmd/	M06c-trailer-names-the-wrong-account
+01_install_on_a_clean_machine	install.sh	s#^  } >> "\$profile"$#  } >> /dev/null#	M01a-installer-never-writes-the-path-line
+01_install_on_a_clean_machine	install.sh	s#if ln -s "\$src" "\$dst" 2>/dev/null; then#if false; then#	M01b-entry-points-are-copies-not-symlinks
