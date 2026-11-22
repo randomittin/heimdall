@@ -12,6 +12,7 @@
 #
 # Engines reused: test/install-stranger.test.sh sections 7a-7k (uninstall completeness, statusline splice).
 # Mutants (test/use-cases/mutants.list): the PATH export is never removed, the install tree is never removed.
+# shellcheck disable=SC2088  # the ~ in the check names is prose for the user's home, never a path this script expands
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib.sh
@@ -61,7 +62,7 @@ uc_lacks "…no PATH export for ~/.local/bin is left in it" "$UC_HOME/.zshrc" '\
 if [ "$(jq -S . "$UC_HOME/.claude/settings.json" 2>/dev/null)" = "$SETTINGS_BEFORE" ]; then uc_ok "settings.json is what it was before the install (statusLine entries gone, their keys kept)"; else uc_bad "settings.json differs from before the install" "$(head -c 300 "$UC_HOME/.claude/settings.json" | LC_ALL=C tr '\n' ' ')"; fi
 BACKUP="$(find "$UC_HOME/.claude" -name 'settings.json.heimdall-uninstall-*.bak' | head -1)"
 if [ -n "$BACKUP" ]; then uc_ok "the backup the uninstall announced exists"; else uc_bad "no settings.json.heimdall-uninstall-*.bak was left"; fi
-uc_has "…and the output names it" "$UC_OUT" 'backup .*settings\.json\.heimdall-uninstall-[0-9]+\.bak'
+uc_has "…and the output names it" "$UC_OUT" 'backup.*settings\.json\.heimdall-uninstall-[0-9]+\.bak'
 if [ -n "$BACKUP" ]; then uc_jq "…and it holds the file as the install left it (with the statusLine)" '.statusLine.command != null and .theme == "dark"' "$BACKUP"; fi
 
 # 6. nothing else
