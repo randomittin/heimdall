@@ -1,0 +1,40 @@
+{
+  "task": "t04-security",
+  "agent": "heimdall-lean",
+  "source": "fixture",
+  "prompt_sha256": "@SHA@",
+  "events": [
+    {
+      "kind": "spawn",
+      "name": "hmd:security-auditor"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:coder"
+    },
+    {
+      "kind": "touch",
+      "name": "auth/login.py"
+    },
+    {
+      "kind": "touch",
+      "name": "test/test_login.py"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:test-runner"
+    },
+    {
+      "kind": "gate",
+      "name": "lint"
+    },
+    {
+      "kind": "gate",
+      "name": "verify-edits --quick"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:reviewer"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "gate_type": "differential",
+  "independent": true,
+  "lean_prompt_sha256": "e507f04ee73590c476396d8a24973750a89f6c5ac4c0b78f6290e1345071411a",
+  "problems": [],
+  "tasks": 0,
+  "unverified_reasons": [
+    "no traces recorded: run prompt-parity.sh --record (live, spends budget)"
+  ],
+  "verdict": "unverified"
+}

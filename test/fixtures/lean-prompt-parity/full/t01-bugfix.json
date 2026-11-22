@@ -1,0 +1,36 @@
+{
+  "task": "t01-bugfix",
+  "agent": "heimdall",
+  "source": "fixture",
+  "prompt_sha256": "@SHA@",
+  "events": [
+    {
+      "kind": "spawn",
+      "name": "hmd:coder"
+    },
+    {
+      "kind": "touch",
+      "name": "src/pager.py"
+    },
+    {
+      "kind": "touch",
+      "name": "test/test_pager.py"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:test-runner"
+    },
+    {
+      "kind": "gate",
+      "name": "lint"
+    },
+    {
+      "kind": "gate",
+      "name": "verify-edits --quick"
+    },
+    {
+      "kind": "spawn",
+      "name": "hmd:reviewer"
+    }
+  ]
+}

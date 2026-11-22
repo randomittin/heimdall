@@ -965,12 +965,15 @@ install_hmd_plugin() {
 # sparse-checkout and the one-key `set` helpers leave alone (INV-L10); `hmd --reinstall`, which wipes that directory, is not how this works.
 # lean_reset only SEQUENCES helpers that carry their own proofs:
 #   1 route guard   2 backup   3 consent ask + not grandfathered   4 profile lean   5 lean tree   6 lean prompt   7 Headroom off   8 the undo command
-# Steps 5 and 7 are the two a live session can feel. When THIS session is routed through Headroom (the guard says defer, INV-L11) they are left for
-# the next run: named on stdout, recorded in <runtime home>/backups/lean-reset-pending, never skipped silently. The next `--reset` finishes them and
-# keeps that FIRST backup, so the printed undo still returns the install to what it was before the reset began. A guard that cannot tell (refuse), a
-# library this release lacks, or a backup that fails stops before anything changes. A failed 3 or 4 stops the reset (the install would be half
-# converted) and prints the undo. A failed 5, 6 or 7 warns and the install carries on: lean never costs an install. The `claude` wrapper (the hmd
-# launcher) is kept and no proxy is installed or routed (INV-L12); Headroom is only ever switched OFF, by its own CLI, and never for the live session.
+# Steps 5 and 7 are the two a live session can feel, and step 4 travels with step 5: a plain `install.sh` run applies the RECORDED profile (T3.4,
+# INV-L7), so a `lean` recorded beside a full tree would narrow that tree under the live session on the next plain run, earlier than "next session".
+# When THIS session is routed through Headroom (the guard says defer, INV-L11) steps 4, 5 and 7 are left for the next run: named on stdout, recorded
+# in <runtime home>/backups/lean-reset-pending, never skipped silently, and no profile is recorded until the tree step runs (the install reads `full`,
+# which a plain run leaves alone: INV-L8). The next `--reset` records the profile and applies the tree together and keeps that FIRST backup, so the
+# printed undo still returns the install to what it was before the reset began. A guard that cannot tell (refuse), a library this release lacks, or a
+# backup that fails stops before anything changes. A failed 3 or 4 stops the reset (the install would be half converted) and prints the undo. A failed
+# 5, 6 or 7 warns and the install carries on: lean never costs an install. The `claude` wrapper (the hmd launcher) is kept and no proxy is installed
+# or routed (INV-L12); Headroom is only ever switched OFF, by its own CLI, and never for the live session.
 
 # lean_reset_record RECORD BACKUP [STEP...] -- the unfinished-reset record: the backup to keep and the steps still pending, one key=value per line
 lean_reset_record() {
@@ -1064,7 +1067,7 @@ say("selected")
 PY
 }
 
-# lean_reset PLUGIN_DIR RUNTIME_HOME -- 0 = done (step 5 and 7 may be pending), 1 = stopped (the reason is on stderr, the install is not left half converted)
+# lean_reset PLUGIN_DIR RUNTIME_HOME -- 0 = done (steps 4, 5 and 7 may be pending), 1 = stopped (the reason is on stderr, the install is not left half converted)
 lean_reset() {
   local plugin="$1" rt="$2"
   local lib="$1/bin/lib" headroom="$1/bin/heimdall-headroom" record="$2/backups/lean-reset-pending"
@@ -1076,7 +1079,7 @@ lean_reset() {
     [ -f "$f" ] || { printf '  ✗ hmd: --reset needs %s and this release does not ship it (nothing was changed)\n' "${f#"$plugin"/}" >&2; return 1; }
   done
 
-  # 1/8 route guard: exit 0 + `ok:` proceeds, 10 + `defer:` leaves steps 5 and 7 for the next run, anything else (11 refuse, a crash, a verdict that
+  # 1/8 route guard: exit 0 + `ok:` proceeds, 10 + `defer:` leaves steps 4, 5 and 7 for the next run, anything else (11 refuse, a crash, a verdict that
   # does not match its exit status) fails closed before a byte changes
   g_out="$(bash "$guard" check)" && g_rc=0 || g_rc=$?
   case "$g_rc:$g_out" in
@@ -1111,8 +1114,13 @@ lean_reset() {
     return 1
   fi
 
-  # 4/8 profile lean: recorded before the tree changes, as `hmd lean on` does
-  if HEIMDALL_HOME="$rt" python3 -I "$profile" set lean; then
+  # 4/8 profile lean: recorded before the tree changes, as `hmd lean on` does. Not while the guard defers: the recorded profile is what a plain install.sh
+  # run re-applies (T3.4, INV-L7), so `lean` on record beside a full tree would narrow it under this session on the next plain run. The next --reset records
+  # it together with the tree, and until then the install reads `full`.
+  if [ "$deferred" -eq 1 ]; then
+    pending="$pending lean-profile"
+    printf '   4/8 profile: PENDING, this session is routed through Headroom (the next --reset records lean and applies the tree together)\n'
+  elif HEIMDALL_HOME="$rt" python3 -I "$profile" set lean; then
     printf '   4/8 profile: lean\n'
   else
     printf '  ✗ hmd: --reset could not record the lean profile and stopped there; to go back: %s\n' "$undo" >&2

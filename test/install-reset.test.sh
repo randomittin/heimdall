@@ -11,22 +11,24 @@
 #      FIRST, switches Headroom off for the next session through the Headroom CLI's `off --next-session`, leaves the shell rc and the `claude` wrapper alone
 #      (INV-L12), skips the lean prompt with ONE line while no green prompt-parity receipt ships with the release, and prints the undo command, which works:
 #      run as printed it returns skills-config.json byte for byte, drops the profile record and brings the full tree back (INV-L9).
-#   2. when the session is routed through Headroom (the guard says defer, INV-L11) the lean tree and the Headroom switch are PENDING: named on stdout and
-#      recorded, the headroom CLI is not called, the route the session reads (settings env) is not edited; the next `--reset`, with no route, finishes both and
-#      keeps the FIRST backup, so the undo still returns the install to what it was before the reset began.
+#   2. when the session is routed through Headroom (the guard says defer, INV-L11) the lean profile, the lean tree and the Headroom switch are PENDING: named
+#      on stdout and recorded, the headroom CLI is not called, the route the session reads (settings env) is not edited. The profile is held back WITH the
+#      tree: a plain `install.sh` run in that same session re-applies the RECORDED profile (T3.4, INV-L7), so a `lean` recorded now would hand the live session
+#      its lean tree before the next one; with none recorded the plain run changes nothing. The next `--reset`, with no route, records the profile, applies the
+#      tree and switches Headroom off together, and keeps the FIRST backup, so the undo still returns the install to what it was before the reset began.
 #   3. a guard that cannot tell (a route that is not a host and port) refuses: nothing changes, no backup, exit 1.
 #   4. an install without the Headroom CLI gets exactly one warning on stderr and no switch; everything else happens.
 #   5. the lean prompt is selected (agent hmd:heimdall-lean, in the USER settings, indent and other keys kept) only against a GREEN receipt that names the
 #      sha256 of that very prompt; a red receipt, a stale hash and a user's own `agent` each skip it with one line and change nothing.
 # The Headroom CLI is another subsystem and acts on launchd: the releases and clones used here carry a RECORDING stand-in at bin/heimdall-headroom (it logs
 # how it was called and changes nothing), so the real one is never run; one check pins that the real CLI still documents the `off [--next-session]` call.
-# Scenarios 1 and 2 run the real `install.sh --reset` (the flag parse and the call site); 3-5 call the same lean_reset function through the installer's
-# HEIMDALL_INSTALL_SOURCE_ONLY seam, in a copy of the same existing install, so each costs seconds, not an installer run.
+# Scenarios 1 and 2 run the real `install.sh --reset` (the flag parse and the call site), and 2 a plain `install.sh` between its two resets; 3-5 call the same
+# lean_reset function through the installer's HEIMDALL_INSTALL_SOURCE_ONLY seam, in a copy of the same existing install, so each costs seconds, not an installer run.
 #
-# budget: 260 -- about 190 s solo: one existing install by the pinned installer, three real install.sh --reset runs (a local fetch, python and git starts, the
-# doctor, a sparse apply of ~2300 files, the fake claude), two `hmd lean restore` undo runs (the printed command, through the installed launcher), and eight
-# lean_reset calls through the seam. No sleep, no timing
-# assertion: the only clock is the hang watchdog of the harness.
+# budget: 260 -- about 110 s solo (109 s measured on 2026-11-22, before the undo ran through the launcher): one existing install by the pinned installer, three real
+# install.sh --reset runs and one plain install.sh re-run (a local fetch, python and git starts, the doctor, a sparse apply of ~2300 files, the fake claude), two
+# `hmd lean restore` undo runs (the printed command, through the installed launcher), and eight lean_reset calls through the seam. No sleep, no timing assertion:
+# the only clock is the hang watchdog of the harness.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../bin/lib/lean_install_fixture.sh
@@ -87,6 +89,17 @@ ir_reset() {
   cp "$UC_ERR" "$UC_ROOT/$name.err"
 }
 
+# ir_plain NAME REL TAG [VAR=val...] -- the real install.sh of the tree under test WITHOUT the flag (the plain re-run: T3.4 applies the recorded profile, INV-L7) over the
+# current copy, at release REL and TAG; output kept in $UC_ROOT/NAME.out/.err
+ir_plain() {
+  local name="$1" rel="$2" tag="$3"
+  shift 3
+  uc_run "$UC_HOME" "$UC_WORK" HEIMDALL_REPO="$rel" HEIMDALL_REF="$tag" SHELL=/bin/zsh IR_HEADROOM_LOG="$UC_ROOT/headroom.log" HEADROOM_PORT=9 "$@" \
+    -- bash "$UC_TREE/install.sh"
+  cp "$UC_OUT" "$UC_ROOT/$name.out"
+  cp "$UC_ERR" "$UC_ROOT/$name.err"
+}
+
 # ir_call [VAR=val...] -- lean_reset of the tree's install.sh against the current copy, through the source-only seam; prints `lean_reset: <status>` on stdout
 ir_call() {
   uc_run "$UC_HOME" "$UC_WORK" HEIMDALL_INSTALL_SOURCE_ONLY=1 IR_HEADROOM_LOG="$UC_ROOT/headroom.log" HEADROOM_PORT=9 "$@" \
@@ -119,6 +132,7 @@ ir_backups() { ls -1 "$1/backups" 2>/dev/null | grep -v -e '^lean-reset-pending$
 ir_sha() { shasum -a 256 < "$1" | cut -c1-64; }
 ir_mode() { perl -e 'printf "%o\n", (stat $ARGV[0])[2] & 07777' "$1"; }
 ir_line() { sed -n "s/^   $1: //p" "$2" | head -1; }   # NAME FILE -- the text after "   N/8 key: " of a step line
+ir_profile() { HEIMDALL_HOME="$1" "$UC_PY" -I "$1/bin/lib/hmd_profile.py" get 2>/dev/null; }   # CLONE -- the profile the install reads: full when none is recorded
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------
 # 0. the existing install: made by the install.sh the baseline names (it predates the lean profile), then the launcher's first run (marker + grandfathering)
@@ -194,34 +208,48 @@ if cmp -s "$UC_ROOT/happy-zshrc.before" "$UC_HOME/.zshrc"; then uc_ok "the .zshr
 if [ -f "$HAPPY_BACKUP/manifest.json" ]; then uc_ok "the backup itself is kept after the undo"; else uc_bad "the undo removed the backup"; fi
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------
-# 2. a session routed through Headroom: steps 5 and 7 are pending, never silently skipped; the next run finishes them and keeps the first backup
+# 2. a session routed through Headroom: steps 4, 5 and 7 are pending, never silently skipped, and a plain install.sh run in between applies nothing; the next
+#    --reset finishes them together and keeps the first backup
 ir_copy defer
 cp "$CLONE/skills-config.json" "$UC_ROOT/defer-skills-config.before"
 ir_reset defer "$IR_DOUBLE" "$IR_DOUBLE_TAG" ANTHROPIC_BASE_URL=http://127.0.0.1:9
 uc_rc "2. install.sh --reset inside a session routed through Headroom finishes" 0
 uc_has "1/8 the route guard says defer" "$UC_ROOT/defer.out" '1/8 route guard: defer:'
 uc_has "3/8 consent is still changed" "$UC_ROOT/defer.out" '3/8 consent: ask, not grandfathered'
-uc_has "4/8 the profile is still recorded" "$UC_ROOT/defer.out" '4/8 profile: lean'
+uc_has "4/8 the profile is named as PENDING: it is recorded with the lean tree" "$UC_ROOT/defer.out" '4/8 profile: PENDING'
 uc_has "5/8 the lean tree is named as PENDING" "$UC_ROOT/defer.out" '5/8 lean tree: PENDING'
 uc_has "7/8 the Headroom switch is named as PENDING" "$UC_ROOT/defer.out" '7/8 headroom: PENDING'
-uc_has "both pending steps are listed together with where they are noted" "$UC_ROOT/defer.out" 'unfinished: lean-tree headroom-off \(noted in .*lean-reset-pending'
+uc_has "the three pending steps are listed together with where they are noted" "$UC_ROOT/defer.out" 'unfinished: lean-profile lean-tree headroom-off \(noted in .*lean-reset-pending'
 ir_is_full "while pending" "$CLONE"
+if [ "$(ir_profile "$CLONE")" = full ]; then uc_ok "while pending the install still reads as the full profile: lean is not recorded ahead of its tree"; else uc_bad "lean was recorded while the tree is still full" "the profile reads: $(ir_profile "$CLONE")"; fi
 if [ ! -s "$UC_ROOT/headroom.log" ]; then uc_ok "INV-L11: the Headroom CLI was not called for the live session"; else uc_bad "INV-L11: the Headroom CLI was called while the session is routed" "$(head -c 200 "$UC_ROOT/headroom.log")"; fi
 uc_jq "INV-L11: the route the session reads (settings env) is not edited" '.env.ANTHROPIC_BASE_URL == "http://127.0.0.1:9"' "$UC_HOME/.claude/settings.json"
 uc_jq "consent is ask and the install is not grandfathered" '.consent == "ask" and .grandfathered == false' "$CLONE/skills-config.json"
 uc_has "the record names the backup" "$CLONE/backups/lean-reset-pending" '^backup=.*/backups/'
+uc_has "the record names the lean profile" "$CLONE/backups/lean-reset-pending" '^pending=lean-profile$'
 uc_has "the record names the lean tree" "$CLONE/backups/lean-reset-pending" '^pending=lean-tree$'
 uc_has "the record names the Headroom switch" "$CLONE/backups/lean-reset-pending" '^pending=headroom-off$'
 FIRST_BACKUP="$(sed -n 's/^backup=//p' "$CLONE/backups/lean-reset-pending")"
 if [ -f "$FIRST_BACKUP/manifest.json" ] && [ "$(ir_backups "$CLONE" | wc -l | tr -d ' ')" = 1 ]; then uc_ok "one backup exists and the record points at it"; else uc_bad "the record's backup is not the one backup taken"; fi
+# a plain install.sh run in that same live session. Its T3.4 block re-applies the RECORDED profile (INV-L7): had the deferred reset recorded `lean`, this run would
+# narrow the tree under the live session, a session earlier than the one the guard protects. The profile is recorded WITH the tree, so there is nothing to apply
+cp "$CLONE/backups/lean-reset-pending" "$UC_ROOT/defer-record.before"
+ir_plain defer-plain "$IR_DOUBLE" "$IR_DOUBLE_TAG" ANTHROPIC_BASE_URL=http://127.0.0.1:9
+uc_rc "a plain install.sh re-run inside the same live session finishes" 0
+ir_is_full "after the plain re-run in the live session" "$CLONE"
+if [ "$(ir_profile "$CLONE")" = full ]; then uc_ok "...and the profile still reads full: no lean was recorded ahead of its tree"; else uc_bad "the plain re-run found a recorded profile" "the profile reads: $(ir_profile "$CLONE")"; fi
+if cmp -s "$UC_ROOT/defer-record.before" "$CLONE/backups/lean-reset-pending"; then uc_ok "the unfinished-reset record is as the reset left it"; else uc_bad "the plain re-run changed the unfinished-reset record"; fi
+if [ ! -s "$UC_ROOT/headroom.log" ]; then uc_ok "INV-L11: the plain re-run did not call the Headroom CLI either"; else uc_bad "INV-L11: the plain re-run called the Headroom CLI" "$(head -c 200 "$UC_ROOT/headroom.log")"; fi
 # the next session: no route, the same command
 ir_reset defer-next "$IR_DOUBLE" "$IR_DOUBLE_TAG"
 uc_rc "the next --reset, with no route, finishes" 0
 uc_has "1/8 the route guard says ok now" "$UC_ROOT/defer-next.out" '1/8 route guard: ok:'
 uc_has "2/8 it keeps the backup of the unfinished reset" "$UC_ROOT/defer-next.out" "2/8 backup: kept from the unfinished reset: $FIRST_BACKUP"
+uc_has "4/8 the profile is recorded now, with the tree" "$UC_ROOT/defer-next.out" '4/8 profile: lean'
 uc_has "5/8 the lean tree is applied" "$UC_ROOT/defer-next.out" '5/8 lean tree: applied'
 uc_has "7/8 Headroom is off for the next session" "$UC_ROOT/defer-next.out" '7/8 headroom: off for the next session'
 ir_is_lean "after the second run" "$CLONE"
+uc_jq "the lean profile is recorded in the runtime home once the tree is lean" '.profile == "lean"' "$CLONE/profile.json"
 if [ "$(cat "$UC_ROOT/headroom.log")" = "off --next-session" ]; then uc_ok "the Headroom CLI was called once, now"; else uc_bad "the Headroom CLI was not called exactly once" "$(head -c 200 "$UC_ROOT/headroom.log" | tr '\n' '|')"; fi
 if [ ! -e "$CLONE/backups/lean-reset-pending" ]; then uc_ok "the unfinished-reset record is gone"; else uc_bad "the record is still there after the reset finished"; fi
 if [ "$(ir_backups "$CLONE" | wc -l | tr -d ' ')" = 1 ]; then uc_ok "no second backup was taken"; else uc_bad "a second backup was taken over the half-reset install"; fi
