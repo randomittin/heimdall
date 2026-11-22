@@ -484,6 +484,7 @@ bin/lib/skills_config.py
 bin/lib/skills_consent.sh
 bin/lib/skills_lock.py
 bin/lib/skills_manifest.py
+bin/lib/skills_packs.py
 bin/lib/skills_render_doc.py
 bin/lib/skills_resolver.py
 bin/lib/skills_shadow.py
