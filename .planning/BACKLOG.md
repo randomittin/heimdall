@@ -87,3 +87,4 @@
 - [ ] MEDIUM test/no-auto-merge.test.sh fails on main (pre-existing, 8/9): unclassified hits in agents/heimdall-lean.md and skills/heimdall/references/lean-procedures.md:70 (lean-core). Found 2026-11-23.
 - [ ] LOW bin/heimdall:5443 still says "Never retry same tier" — reword for the effort ladder (2026-11-23).
 - [ ] LOW lean_context_parity counts gitignored untracked files (two empty Sept-21 *.tmp in skills/designmatch/.heimdall/ turned check red); measure tracked+unignored only (2026-11-23).
+- [ ] LOW bin/designmatch on a lean install prints no `hmd skills install designmatch` hint (commands/designmatch.md is cut from lean by design) (2026-11-23).
