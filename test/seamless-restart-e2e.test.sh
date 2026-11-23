@@ -13,6 +13,12 @@
 # Every assertion is an ordering or a count (events of the fake's log against the evaluations of the gate): a slow machine stretches a run, it cannot flip a verdict.
 # The journey's own skew is no exception: it is added when the gate's log shows `UNSAFE user-active` (the operator was seen typing), never at a wall-clock time, so the
 # five minutes cannot pass before the gate has looked (a 5 s timer did exactly that under a loaded sweep: solo it fired 0.3 s after the gate that deferred had read the clock).
+# Nor is the seeds' /exit. A wall-clock /exit (6-11 s) raced the decision, which needs at least three gate answers (settling, SAFE, SAFE a recheck later): under a loaded sweep
+# one answer took 1-2 s instead of 0.3 s, the user always quit first, 2 of 50 seeds restarted and the vacuity guard fired (every odd verdict of that run, no-update and
+# signal-unreadable, was the gate reading a session file the quitting claude had just removed). Every generated script now ends with a marker the fake logs
+# (`set waitingFor=e2e-end`) and the world driver types /exit once all its events are applied, the last claude has run its script to the end and is not being ended, and the request
+# is gone or the gate has given the same non-settling UNSAFE twice since (nothing is left that could change its answer: only the settle window passes by itself). One seed in
+# five (seed % 5 == 0) keeps the wall-clock /exit, the race with the TERM it was meant to hit; the others restart whenever their final state allows it, at any speed.
 # A state only counts against a gate answer when it held through the whole evaluation (plus a margin), so the race windows of a live system are not judged.
 #
 # Cases (all start at once through a throttle, each in its own sandbox):
@@ -100,6 +106,8 @@ EPS = 0.35  # a state must have held this long before, and after, a gate evaluat
 NON_IDLE = ("busy", "waiting", "shell")
 UPDATED = re.compile(r"^\[heimdall\] updated (.*) - resumed(?: \(parked agents ended: .*\))?$", re.M)
 LIVE_REASONS = ("not-idle", "settling", "agents-live", "sweep-running", "task-live", "user-active", "install-running")
+SCRIPT_END = "e2e-end"  # the last step of every generated script (`set waitingFor=e2e-end`): the fake logs it, so the world driver can tell the script has run to its end
+RACE_EVERY = 5  # one seed in this many (seed % RACE_EVERY == 0) keeps the wall-clock /exit: the user quitting wherever the launcher's decision is
 
 
 def read_jsonl(path):
@@ -182,6 +190,7 @@ class World(object):
         self.term_wait = None
         self.term_seen = None
         self.skew_when_deferred = None
+        self.exit_when_settled = False
 
     def path(self, *parts):
         return os.path.join(self.sd, *parts)
@@ -189,6 +198,37 @@ class World(object):
     def deferred_to_typing(self):
         """Has the gate answered `UNSAFE user-active` in this run? Its log lines are `start end skew verdict [reason]`."""
         return any(line.split()[3:5] == ["UNSAFE", "user-active"] for line in read_text(self.path("gate.log")).splitlines())
+
+    def answers_since(self, since):
+        """What the gate answered to the evaluations that began at or after the epoch second `since`: SAFE, or the reason token of the UNSAFE."""
+        answers = []
+        for line in read_text(self.path("gate.log")).splitlines():
+            p = line.split()
+            if len(p) >= 4 and re.match(r"^[0-9]+\.[0-9]+$", p[0]) and float(p[0]) >= since:
+                answers.append(p[4] if p[3] == "UNSAFE" and len(p) > 4 else p[3])
+        return answers
+
+    def settled(self, applied_at):
+        """Has the launcher nothing left to decide? Everything the world does is done (`applied_at`: when its last event was applied), the last claude has run its
+        script to the end and is not being ended (a TERM was delivered: its relaunch is next), and the request is gone or the gate has said the same thing twice to
+        evaluations that began after all of that: no step is left that could change what it reads, and only the settle window ever passes by itself."""
+        if applied_at is None:
+            return False
+        events = read_jsonl(self.path("claude.log"))
+        starts = [e for e in events if e.get("event") == "start"]
+        if not starts:
+            return False
+        pid = starts[-1]["pid"]
+        if any(e.get("event") == "signal" and e.get("pid") == pid for e in events):
+            return False
+        ended = [e["ts"] / 1000.0 for e in events if e.get("event") == "status" and e.get("pid") == pid and e.get("waitingFor") == SCRIPT_END]
+        if not ended:
+            return False
+        request_dir = starts[-1].get("env", {}).get("HMD_RESTART_DIR")
+        if request_dir and not os.path.exists(os.path.join(request_dir, "req.json")):
+            return True
+        answers = self.answers_since(max(applied_at, ended[0]))
+        return len(answers) >= 2 and answers[-1] == answers[-2] and answers[-1] not in ("SAFE", "settling")
 
     def log(self, kind, state):
         row = {"ts": int(time.time() * 1000), "event": "world", "kind": kind, "state": state}
@@ -239,6 +279,8 @@ class World(object):
             self.term_wait = float(arg)
         elif kind == "skew-when-deferred":  # arm a skew that world_main adds once the gate has deferred to the typing operator, not at a time
             self.skew_when_deferred = arg
+        elif kind == "exit-when-settled":  # arm the user's /exit, which world_main types once the launcher has nothing left to decide, not at a time
+            self.exit_when_settled = True
 
     def stop_sweeper(self):
         if self.sweeper is not None:
@@ -269,17 +311,23 @@ def world_main(sd):
         return 0
     base = time.time()
     events = sorted(json.load(open(w.path("timeline.json"))), key=lambda e: e[0])
-    i, last_term_look, last_gate_look = 0, 0.0, 0.0
+    i, last_term_look, last_gate_look, last_settle_look, applied_at = 0, 0.0, 0.0, 0.0, None
     while not finished() and time.time() < limit:
         t = time.time() - base
         while i < len(events) and events[i][0] <= t:
             w.apply(events[i][1], events[i][2])
             i += 1
+        if applied_at is None and i == len(events):
+            applied_at = time.time()
         if w.skew_when_deferred is not None and time.time() - last_gate_look >= 0.2:
             last_gate_look = time.time()
             if w.deferred_to_typing():
                 w.apply("skew", w.skew_when_deferred)
                 w.skew_when_deferred = None
+        if w.exit_when_settled and not w.exiting and time.time() - last_settle_look >= 0.2:
+            last_settle_look = time.time()
+            if w.settled(applied_at):
+                w.apply("exit", "")
         if w.term_wait is not None and w.term_seen is None and time.time() - last_term_look >= 0.2:
             last_term_look = time.time()
             if any(e.get("event") == "signal" and e.get("signal") == "TERM" for e in read_jsonl(w.path("claude.log"))):
@@ -338,7 +386,10 @@ def gen_main(seed, sd):
     t_end = min(round(last + u(2.0, 6.0), 2), 11.0)
     if r.random() < 0.5:
         ext.append([u(1.5, max(2.0, t_end - 2.0)), "skew", "400"])
-    ext.append([t_end, "exit", ""])
+    if seed % RACE_EVERY == 0:
+        ext.append([t_end, "exit", ""])
+    else:
+        ext.append([0.0, "exit-when-settled", ""])
     lines = ["@0 set status=idle sessionId=%s version=2.1.322" % sid]
     prev = 0.0
     for at, step in sorted(fake, key=lambda x: x[0]):
@@ -346,9 +397,11 @@ def gen_main(seed, sd):
             lines.append("@0 sleep %.2f" % (at - prev))
             prev = at
         lines.append("@0 " + step)
+    lines.append("@0 set waitingFor=" + SCRIPT_END)
     lines.append("@1 set status=idle version=%s" % ("2.1.323" if takes else "2.1.322"))
     if not takes:
         lines += ["@1 sleep 0.5", "@1 set status=busy", "@1 sleep 0.4", "@1 stop-hook", "@1 set status=idle"]
+    lines.append("@1 set waitingFor=" + SCRIPT_END)
     with open(os.path.join(sd, "script"), "w") as f:
         f.write("\n".join(lines) + "\n")
     with open(os.path.join(sd, "timeline.json"), "w") as f:
