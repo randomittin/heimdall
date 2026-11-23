@@ -26,6 +26,12 @@ strict: git that exits non-zero, times out, prints something it does not print, 
 submodule or a directory, an exception anywhere (no answer at all: the hook runs the strict gate on the cwd). A repository that declares its
 own checks keeps owing the receipt under uncertainty, for commits nobody can list, so it is refused until the command is restated.
 
+A push whose repository cannot be PLACED at all -- a variable, substitution, glob or brace in -C / --git-dir / --work-tree, option words held in a variable,
+a directory the shell is in that cannot be followed (a cd to a variable, a conditional or looped cd, source, CDPATH, env -C) -- has no gate to run, and grading
+the cwd's repository for it grades ANOTHER one (2026-11-23: a loop over two repositories pushed one whose own checks were red, past the green gate of the cwd).
+The plan is then ONE row, `unplaceable<TAB>base<TAB>the push and why<TAB>-`, which the hook always denies; a literal target is still graded exactly, in a loop too.
+A variable in an option that does not name the repository (-c's value) leaves the repository placed and the push uncertain, so strict.
+
 WHICH REPOSITORY IS ASKED OF GIT, NOT READ OFF THE COMMAND. Every push found is rebuilt as the exact `git <global options> rev-parse`
 call, started in the directory the shell would be in, with the same GIT_* environment, and git answers with the git directory the push
 would operate on (`-C` accumulates the way git accumulates it, `--git-dir`, `GIT_DIR`, `-c core.worktree`, discovery from a subdirectory
@@ -108,6 +114,8 @@ REDIRS = ("<<<", "<<-", "<<", "<&", "<>", ">>", ">&", ">|", "<", ">")
 # git's global options. The ones that take a separate argument; the ones that decide WHICH repository are handed to git as they are.
 GIT_VALUE_OPTS = frozenset(("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"))
 GIT_WHICH_OPTS = frozenset(("-C", "-c", "--git-dir", "--work-tree"))
+GIT_REPO_OPTS = GIT_WHICH_OPTS - {"-c"}    # the ones that NAME the repository: a value this cannot read leaves it unknown (-c's value only leaves the push configuration unread)
+UNPLACEABLE = "unplaceable"                # the row class of a push whose repository cannot be placed: no gate can be run for it, so the hook always denies it
 GIT_FLAGS = frozenset(("-p", "--paginate", "-P", "--no-pager", "--bare", "--no-replace-objects", "--literal-pathspecs",
                        "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks", "--no-advice",
                        "--no-lazy-fetch"))
@@ -243,6 +251,12 @@ def push_dirs(push):
 
 def git(args, cwd, env):
     return rr.run_git(args, cwd, env, GIT_TIMEOUT)
+
+
+def one_line(text, limit=None):
+    """`text` as ONE line (the plan is tab-separated lines: no tab, newline or carriage return may ride in a column), cut to `limit` characters when one is given."""
+    text = re.sub(r"[\t\r\n]", " ", text)
+    return text if limit is None or len(text) <= limit else text[:limit - 3] + "..."
 
 
 class Word(object):
@@ -582,6 +596,7 @@ class Push(object):
 class Resolver(object):
     def __init__(self):
         self.targets = []        # one Push per push whose directory and options could be read
+        self.lost = []           # one line per push whose repository could not be placed: its words and why
         self.complete = True     # False once anything could not be read or modelled exactly
         self.cond = 0            # open if / while / until / for / select / case
         self.brace = 0           # open { ... } groups
@@ -931,22 +946,25 @@ class Resolver(object):
         genv = dict(state[2])
         genv.update(env)
         opts, k, known = [], 0, cwd is not None
+        placed = known                   # the repository itself is named; `known` also needs every other option read (a -c value this cannot read leaves it placed)
         while k < len(args):
             w = args[k]
             t = w.text
             if w.dyn:
                 self.complete = False
-                known = False
+                known = placed = False
                 k += 1
             elif t in GIT_VALUE_OPTS:
                 value = args[k + 1] if k + 1 < len(args) else None
                 if value is None or value.dyn:
                     known = False
+                    placed = placed and t not in GIT_REPO_OPTS
                 elif t in GIT_WHICH_OPTS:
                     text = value.text
                     if value.tilde and t != "-c":
                         text = os.path.expanduser(text)
-                        known = known and not text.startswith("~")
+                        if text.startswith("~"):
+                            known = placed = False
                     opts += [t, text]
                 k += 2
             elif t.startswith(GIT_ATTACHED):
@@ -959,7 +977,7 @@ class Resolver(object):
                 k += 1
             elif t.startswith("-"):
                 self.complete = False    # a global option this does not know: it may take a value, and shift the subcommand
-                known = False
+                known = placed = False
                 k += 1
             else:
                 break
@@ -971,14 +989,20 @@ class Resolver(object):
         if sub.dyn:
             self.complete = False
         elif sub.text == "push":
-            if known:
+            if placed:
                 push = Push(cwd, opts, genv, args[k + 1:])
                 self.targets.append(push)
                 walked, named = push_dirs(push)
                 for place in walked + named:
                     see(place)
+                if not known:
+                    self.complete = False    # a value this could not read (-c's): the push may see other configuration than the gate reads
             else:
                 self.complete = False
+                why = ("the directory it runs in cannot be followed (a cd to a variable, a conditional or looped cd, source, CDPATH, env -C)" if cwd is None else
+                       "a git option names the repository in words that cannot be read (a variable, substitution, glob or brace in -C, --git-dir or --work-tree, "
+                       "option words held in a variable, or an option this does not know)")
+                self.lost.append("%s: %s" % (one_line("git " + " ".join(w.text for w in args[:k + 1]), 120), why))
         elif sub.text not in GIT_BUILTINS:
             self.complete = False        # an alias, or an external subcommand: either may be a push
 
@@ -1275,6 +1299,10 @@ def plan(text, base):
     see(base)
     found = Resolver()
     found.read(text, ((base, (), ()),), 0)
+    if found.lost:
+        # a push whose repository cannot be placed has no gate to run, and the gate of the directory the shell is in grades ANOTHER repository: one row, which the hook
+        # always denies, whatever else the command holds (the others would never run: a deny is final)
+        return [(UNPLACEABLE, one_line(base), found.lost[0], "")]
     uncertain = not found.targets or not found.complete
     rows = {}            # (class, directory) -> [the commits the pushes there send (a list, None when they cannot be listed), strict fallback?, git dir]
 
