@@ -20,7 +20,9 @@
 #   H  the suite can go RED: one-line breaks of a copy of the module, each caught by the check that guards it
 #
 # The manifest is the test's own: the real one with `pack` and `on_demand_paths` set on five bundled entries (the real values are another task's), so nothing here
-# depends on them. HERMETIC: HOME, HEIMDALL_HOME, the project and the plugin clone are throwaway directories; the clone is a depth-1 clone of a fixture repository
+# depends on them. It is committed INTO the fixture repository: the lean cut is read from the manifest at HEAD (bin/lib/lean_sparse.sh refuses a clone whose HEAD has
+# none), and the fixture's runtime list names it so it stays on disk, where the CLI looks. HERMETIC: HOME, HEIMDALL_HOME, the project and the plugin clone are throwaway
+# directories; the clone is a depth-1 clone of a fixture repository
 # whose origin URL is unreachable, and every CLI call runs with every git transport refused and git's own trace on (the method of test/lean-sparse.test.sh), so a
 # network use is a failure. `claude` is a PATH fake that logs its calls: none is expected. Nothing outside $TMP is touched. EXIT: 0 = every assertion passes; 1 = any FAIL.
 # shellcheck disable=SC2016,SC2086  # single quotes hold literal python for the child process; the NAME=value and file lists are split on purpose
@@ -29,7 +31,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIBDIR="$REPO/bin/lib"
 LOCKPY="$LIBDIR/skills_lock.py"
-LIBS="skills_cli_install.py skills_config.py skills_lock.py skills_manifest.py skills_resolver.py skills_consent.sh select.sh install-receipt.sh lean_sparse.sh"
+LIBS="skills_cli_install.py hmd_profile.py skills_config.py skills_lock.py skills_manifest.py skills_resolver.py skills_consent.sh select.sh install-receipt.sh lean_sparse.sh"
 
 PASS=0
 FAIL=0
@@ -80,31 +82,26 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_
 
 # ── the fixture: a tiny plugin laid out like this one ────────────────────────────────────────────────────────────
 put() { mkdir -p "$(dirname "$1/$2")"; printf 'content of %s\n' "$2" > "$1/$2"; }   # put DIR PATH
-mk_origin() {   # mk_origin DIR -- the fixture repository, one commit: a runtime list that names the on-demand skills (the lean cut drops them), docs/ and test/ outside it
+mk_origin() {   # mk_origin DIR -- the fixture repository, one commit: the fixture manifest (the lean cut is read from HEAD's), a runtime list that names it and the on-demand skills (the cut drops those), docs/ and test/ outside it
   local o="$1" f
   mkdir -p "$o" && git -C "$o" init -q || return 1
   for f in .claude-plugin/plugin.json .mcp.json settings.json LICENSE agents/a.md commands/c.md hooks/hooks.json bin/tool skills/heimdall/SKILL.md \
            skills/stacks/SKILL.md skills/stacks/fastapi/PACK.md skills/designmatch/SKILL.md skills/system-health/SKILL.md docs/guide.md test/run.test.sh; do
     put "$o" "$f"
   done
+  cp "$FIXTURE_MANIFEST" "$o/skills.manifest.json" || return 1
   mkdir -p "$o/release"
-  printf '%s\n' bin/tool release/runtime-files.txt skills/heimdall/SKILL.md skills/stacks/SKILL.md skills/stacks/fastapi/PACK.md \
+  printf '%s\n' bin/tool release/runtime-files.txt skills.manifest.json skills/heimdall/SKILL.md skills/stacks/SKILL.md skills/stacks/fastapi/PACK.md \
     skills/designmatch/SKILL.md skills/system-health/SKILL.md > "$o/release/runtime-files.txt"
   git -C "$o" add -A >/dev/null && git -C "$o" commit -q -m fixture
 }
 # what a lean tree of the fixture holds: the list minus the on-demand skills, plus the convention-loaded core
-LEAN_FILES=".claude-plugin/plugin.json .mcp.json LICENSE agents/a.md bin/tool commands/c.md hooks/hooks.json release/runtime-files.txt settings.json skills/heimdall/SKILL.md"
+LEAN_FILES=".claude-plugin/plugin.json .mcp.json LICENSE agents/a.md bin/tool commands/c.md hooks/hooks.json release/runtime-files.txt settings.json skills.manifest.json skills/heimdall/SKILL.md"
 STACKS_FILES="skills/stacks/SKILL.md skills/stacks/fastapi/PACK.md"
 PACK_SHA="$(python3 -I -c 'import hashlib; print(hashlib.sha256(b"fixture stacks pack").hexdigest())')"
 
-ORIGIN="$TMP/origin"; BASE="$TMP/base"
-if ! { mk_origin "$ORIGIN" && git clone -q --depth 1 "file://$ORIGIN" "$BASE" 2> "$TMP/clone.err"; }; then
-  echo "FATAL: the fixture clone could not be made: $(head -c 300 "$TMP/clone.err")"
-  exit 1
-fi
-# The libraries and the manifest sit in the clone UNTRACKED (a sparse checkout never touches an untracked file), the way the CLI finds them: two levels up.
-mkdir -p "$BASE/bin/lib"
-for f in $LIBS; do cp "$LIBDIR/$f" "$BASE/bin/lib/$f"; done
+# The fixture manifest, built and validated BEFORE the repository: mk_origin commits it. bin/lib/lean_sparse.sh takes the lean cut from the manifest at HEAD and refuses a clone whose HEAD has none.
+FIXTURE_MANIFEST="$TMP/fixture.skills.manifest.json"
 python3 -I -c 'import json, sys
 doc = json.load(open(sys.argv[1]))
 by_id = {entry["id"]: entry for entry in doc["entries"]}
@@ -115,10 +112,22 @@ by_id["stacks"]["pack"] = {"name": "@runhmd/stacks", "version": "1.0.0", "sha256
 by_id["designmatch"]["on_demand_paths"] = ["skills/designmatch", "docs/guide.md"]
 by_id["system-health"]["on_demand_paths"] = ["skills/system-health"]
 by_id["mac-deep-clean"]["on_demand_paths"] = ["skills/system-health", "skills/mac-deep-clean"]
-json.dump(doc, open(sys.argv[2], "w"), indent=2)' "$REPO/skills.manifest.json" "$BASE/skills.manifest.json" "$PACK_SHA" \
+json.dump(doc, open(sys.argv[2], "w"), indent=2)' "$REPO/skills.manifest.json" "$FIXTURE_MANIFEST" "$PACK_SHA" \
   || { echo "FATAL: cannot build the fixture manifest"; exit 1; }
-python3 -I "$LIBDIR/skills_manifest.py" validate "$BASE/skills.manifest.json" > /dev/null 2> "$TMP/validate.err" \
+python3 -I "$LIBDIR/skills_manifest.py" validate "$FIXTURE_MANIFEST" > /dev/null 2> "$TMP/validate.err" \
   || { echo "FATAL: the fixture manifest is not valid: $(head -c 300 "$TMP/validate.err")"; exit 1; }
+
+ORIGIN="$TMP/origin"; BASE="$TMP/base"
+if ! { mk_origin "$ORIGIN" && git clone -q --depth 1 "file://$ORIGIN" "$BASE" 2> "$TMP/clone.err"; }; then
+  echo "FATAL: the fixture clone could not be made: $(head -c 300 "$TMP/clone.err")"
+  exit 1
+fi
+# The libraries sit in the clone UNTRACKED (a sparse checkout never touches an untracked file), the way the CLI finds them: two levels below the manifest.
+mkdir -p "$BASE/bin/lib"
+for f in $LIBS; do cp "$LIBDIR/$f" "$BASE/bin/lib/$f"; done
+# The copy must stand on its own: a library the module imports that LIBS lacks would fail every case below with a traceback and make every H break look caught.
+python3 -I -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import skills_cli_install' "$BASE/bin/lib" 2> "$TMP/import.err" \
+  || { echo "FATAL: the fixture copy of the module cannot be imported (a library it needs is not in LIBS): $(tail -n 1 "$TMP/import.err")"; exit 1; }
 bash "$BASE/bin/lib/lean_sparse.sh" apply lean "$BASE" > /dev/null 2> "$TMP/apply.err" || { echo "FATAL: the fixture clone cannot be made lean: $(head -c 300 "$TMP/apply.err")"; exit 1; }
 git -C "$BASE" remote set-url origin "https://127.0.0.1:9/never.git"
 

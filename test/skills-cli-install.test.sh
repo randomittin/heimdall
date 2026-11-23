@@ -105,9 +105,12 @@ chmod +x "$TMP/fakebin/claude" "$TMP/fakebin/git"
 # A sandbox copy of the libraries beside a manifest with one community entry that needs an explicit yes every time
 # (INV-S9, manifest rule SM6): the CLI, the consent gate and the lock all find the manifest two levels above their own file.
 SBX="$TMP/sbx"; mkdir -p "$SBX/bin/lib"
-for f in skills_cli_install.py skills_config.py skills_lock.py skills_manifest.py skills_resolver.py skills_consent.sh select.sh install-receipt.sh; do
+for f in skills_cli_install.py hmd_profile.py skills_config.py skills_lock.py skills_manifest.py skills_resolver.py skills_consent.sh select.sh install-receipt.sh; do
   cp "$REPO/bin/lib/$f" "$SBX/bin/lib/$f"
 done
+# The copy must stand on its own: a library the module imports that this list lacks would fail every sandbox case with a traceback and make every H break look caught.
+python3 -I -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import skills_cli_install' "$SBX/bin/lib" 2> "$TMP/sbx-import.err" \
+  || { echo "FATAL: the sandbox copy of the module cannot be imported (a library it needs is not in the copy list): $(tail -n 1 "$TMP/sbx-import.err")"; exit 1; }
 python3 -I -c 'import copy, json, sys
 doc = json.load(open(sys.argv[1]))
 extra = copy.deepcopy(next(e for e in doc["entries"] if e["id"] == "slack"))
