@@ -1,14 +1,12 @@
 # Project Conventions (managed by heimdall)
 
+Long form of the rules below (history, mechanics, proofs), moved verbatim: `docs/rules/README.md`.
+
 ## Parallelism (MANDATORY)
-- 2+ independent tool calls → send ALL in ONE message (batch Read, Write, Edit, Bash)
-- 2+ independent tasks → spawn ALL agents in ONE message with `run_in_background: true`
-- Task touches 2+ independent files → one agent per file, ALL spawned together
-- NEVER: spawn agent → wait → spawn another agent for independent work
-- NEVER: read file → read next file → read next file (batch all reads in one message)
-- NEVER: pass `name:` to Agent unless you will `SendMessage` it — `name:` → mailbox-resident agent, never self-terminates, never returns a result (measured 0/43 named completed vs 59/66 unnamed)
-- Identify a spawn's work via `description:`, never `name:` (R13)
-- The `PreToolUse` `Agent` hook WARNS on `name:` (stderr, exit 0) — it does not block. Name one → you own its lifecycle: collect via `SendMessage`, close with `TaskStop`, sweep leaks with `bin/heimdall-agents orphans`
+- 2+ independent tool calls → ONE message (batch Read, Write, Edit, Bash); NEVER read file → read next file → read next file
+- 2+ independent tasks → spawn ALL agents in ONE message, `run_in_background: true`; 2+ independent files → one agent per file, ALL together; NEVER spawn agent → wait → spawn another for independent work
+- NEVER pass `name:` to Agent unless you will `SendMessage` it: a named agent is mailbox-resident, never self-terminates, never returns a result. Identify a spawn via `description:` (R13)
+- The `PreToolUse` `Agent` hook WARNS on `name:` (stderr, exit 0), never blocks. Name one → you own it: collect via `SendMessage`, close with `TaskStop`, sweep leaks with `bin/heimdall-agents orphans`
 
 ## Rules
 - All code, configs, docs go in this project directory
@@ -17,83 +15,11 @@
 - Acceptance criteria must be runnable (grep, curl, test commands)
 
 ## Commit attribution
-Every commit produced through hmd carries:
+Every commit produced through hmd carries (hmd is the constant identity):
 
     Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>
 
-hmd is the constant identity — the model underneath varies (Claude today,
-something else tomorrow, a different tool on a teammate's machine) and none of
-that changes who gated the work. The trailer records the layer that held the
-line, not the one that typed. Rendered through the real `runhmd` GitHub machine
-account (id `318965969`) rather than a plain-text address, so it links: see
-"GitHub account, not a plain-text address" below. The display name is `runhmd`,
-not `hmd` — only the email drives GitHub's account match, so the name is purely
-cosmetic, but matching it to the account's actual login means nobody reading
-history has to wonder why the visible name and the linked handle disagree.
-
-**The model's own `Co-Authored-By` is stripped, not kept alongside it** (owner
-directive, 2026-08-20). This reverses what used to be written here: "keep the
-model's own trailer alongside it… dropping the model would be the same overclaim
-this repo exists to prevent." The repo owner — the one human accountable for
-every push (see the identity gate below) — asked for commits to show their own
-identity and hmd's, and nothing else. hmd is what gated the work, so hmd is the
-trailer that stays; a doc asserting the old behavior while the hook does the new
-one is exactly the drift this repo keeps getting bitten by, so the paragraph is
-rewritten here rather than left stale beside the new code.
-
-The trailer is a TRAILER, deliberately. Author and committer stay human, because
-`heimdall-selfscan`'s identity gate allowlists `%ae`/`%ce` and a human is the one
-accountable for a push — "a human always gates the merge" has to remain literally
-true. Trailers sit outside that gate, so this adds no allowlist surface. The gate
-reads only the author/committer EMAIL, never the display name — changing
-`user.name` (e.g. to a GitHub username) has zero effect on it.
-
-**Mechanically enforced, not just documented.** A generated `prepare-commit-msg`
-git hook (`.heimdall/hooks/prepare-commit-msg`, emitted by `hmd init` from
-`bin/heimdall-init`) appends the hmd trailer to every commit message that doesn't
-already carry it, and strips two things first, unconditionally, before deciding
-whether to add: any Anthropic/model `Co-Authored-By` line, and any trailer still
-using the OLD `hmd@runheimdall.dev` address retired on 2026-08-20. The Anthropic
-strip matches by email DOMAIN (`@anthropic.com`), never the model's display name
-— that name changes every release ("Claude Opus 5 (1M context)", "Claude
-Sonnet 5", …) but the address stays `noreply@anthropic.com` regardless, so
-domain-matching never lags a new model name and never risks catching a real
-human co-author. The old-address strip matches the exact retired email, bounded
-to the `<...>` field rather than the whole domain — unlike anthropic.com,
-`@runheimdall.dev` is also the human owner's own author/committer address and
-could plausibly host a real teammate's address too, so only the one retired
-local part (`hmd@`) is matched, never the domain. Together the two strips mean a
-message can never end up with an old-address trailer, a stray model trailer, and
-the current trailer all at once — every rename and every model swap normalizes
-to exactly one hmd line, it never stacks. This is the one client-side hook `git
-commit --no-verify` does NOT skip — verified empirically, not assumed — which is
-why prose alone (agents were told to add this trailer in their spawn prompts and
-still routinely didn't: 55/81 commits since 2026-08-18 had it, 26 did not) isn't
-enough on its own and this now lives in a hook too. Append-and-strip, all
-idempotent: never duplicates the hmd trailer, never leaves a stray model or
-old-address trailer behind, and fails OPEN on anything malformed or unwritable —
-an attribution trailer is bookkeeping, not a correctness gate, and must never be
-the reason a commit is lost. History before this hook existed was NOT rewritten
-(~195 unpushed commits at the time — that would have changed every SHA); this
-is enforced going forward only, and the same applies to the address rename
-itself — commits already made with the old address keep it. See
-`test/prepare-commit-msg-trailer.test.sh` (the proof).
-
-**GitHub account, not a plain-text address** (owner directive, 2026-08-20 —
-supersedes the "GitHub rendering limitation" this section used to document under
-the retired `hmd@runheimdall.dev` address). GitHub only links a `Co-Authored-By`
-to an account when the email is verified as belonging to that account; no
-GitHub account ever had `hmd@runheimdall.dev` (verified: `gh api
-"search/users?q=hmd@runheimdall.dev+in:email"` → `total_count: 0`), so it always
-rendered as plain text, with no avatar — and that would have stayed true
-regardless of whether the domain itself could receive mail, since GitHub's
-account-email verification is the only thing that matters here, not general
-deliverability. The owner created a real GitHub account for this instead
-(`runhmd`, id `318965969`, type `User`) and the trailer now uses that account's
-own GitHub-minted `<id>+<login>@users.noreply.github.com` form — an address
-GitHub itself issues and already recognizes for that account, so it needs no
-mail delivery or separate verification step and is guaranteed to render as a
-linked co-author with an avatar.
+The model's own `Co-Authored-By` (any `@anthropic.com`) is stripped, not kept alongside (owner directive 2026-08-20). It is a TRAILER: author/committer stay human (the identity gate; "a human always gates the merge"). The generated `prepare-commit-msg` hook (`.heimdall/hooks/prepare-commit-msg`) strips model trailers and the retired `hmd@runheimdall.dev` one, appends the hmd trailer if absent, runs even under `--no-verify`, is idempotent, fails OPEN. `runhmd` is a real GitHub account (id `318965969`): its noreply form links with an avatar. Proof `test/prepare-commit-msg-trailer.test.sh`.
 
 ## Quality Gates (enforced before git push)
 - All tests passing
@@ -102,444 +28,52 @@ linked co-author with an avatar.
 - No untested changes
 - Canonical checklist agents cross-check: `skills/heimdall/references/definition-of-done.md`
 
-## When the full gate runs — recommended to the developer just before the final merge, never started by an agent
-Test once, at the end — operator directive 2026-10-08: avoid over-testing the same
-stuff; save testing for the end. Refined by the operator on 2026-11-12, verbatim: *"full
-test runs should be recommended to devs along with explanation and token usage -- plus
-should always be suggested just before merge operations and not before."* And on
-2026-11-22, verbatim: *"only do the full sweep before final merge and not on every
-merge."* So the full sweep (`bash test/run-all.sh`, ~524 suites, ~45-60 min cold) is a
-RECOMMENDATION to the developer, made at exactly one moment: immediately before the FINAL
-merge, on the final frozen tree. "Merge operation" in these docs means that: a push to the
-default branch, a PR merge or a pull into the default branch. Integrating agent worktree
-branches into a local branch with a local `git merge` is a step inside a batch, not the
-final merge, and gets no recommendation. The developer decides. An agent NEVER starts it on its own initiative: not after an agent's
-branch is merged, not before a checkpoint, a `/hmd:save` or a demo, not at session start,
-not after each file edit, not at mid-work checkpoints (`wip:` auto-commits, a save of
-unfinished work), not "to be safe", not "whenever it feels done". It runs only when the
-developer says so in that session, and silence is a no. During work the rule is unchanged:
-only the tests of the files you touched, once. One run covers a whole batch of merges
-while the tree stays unedited. Running it more often costs half an hour a pop
-and — worse — grades a tree that is still being edited, which attributes a verdict to a
-state of the code that never existed.
+## Hook guards
+Disk floor, sweep guard, CI waste guard, wait guard, sweep advice: PreToolUse hooks that FAIL OPEN (helper missing, crash, timeout, unreadable command = one stderr line + allow); cost guards, not security boundaries. Operator overrides go in the environment Claude Code runs in (a hook reads its OWN environment; an inline prefix reaches the command, not the hook); `*_ALLOW` lifts only on exactly `1`.
 
-**Heimdall's own repo: a push stands on the use-case journey receipt, the full sweep is for releases
-(operator decision 2026-11-22, "B").** What is recommended immediately before the final merge in THIS
-repo is `bash test/use-cases/run.sh` (the 11 journeys and their mutants, ~6 min), not the sweep. A
-green FULL run of it (no `--only`, no `--no-mutants`; every journey passed, every mutant killed) on a
-clean, committed tree writes `.heimdall/receipts/use-cases.json` (`bin/lib/hmd_use_case_receipt.py` is
-its one definition: commit, tree, counts, time), and `heimdall-state check-quality-gates` takes that
-receipt for HEAD IN PLACE of a green full-equivalent sweep receipt: either record passes a push, and
-the hooks' own journal and ledger commits after the run do not stale it. The full sweep
-(`bash test/run-all.sh`, with everything below about the cache, `--failed`, the freeze and the quiet
-gate) is required only for a release: the release script still demands its full-equivalent receipt,
-unchanged, and the sweep is what is recommended to the developer immediately before a release. Every
-rule below about who may start a run, when it is recommended and how its output is read applies to both.
+## When the full gate runs — never started by an agent
+Test once, at the end (operator 2026-10-08: avoid over-testing the same stuff). Operator 2026-11-12, verbatim: *"full test runs should be recommended to devs along with explanation and token usage -- plus should always be suggested just before merge operations and not before."* 2026-11-22: *"only do the full sweep before final merge and not on every merge."*
+- **Your own suite only, once.** Run `bash test/<one>.test.sh` for ONLY the test file(s) you add or edit, ONCE, after ALL changes are written: no neighbouring/"regression" suites, no baseline sweep. Once = once per tree state (the TDD RED run and a break-it-go-RED check run different trees). A failure plausibly caused by machine load gets ONE solo re-run, then it is real: fix or report. Regressions elsewhere belong to the merge-time run, if the developer chooses one.
+- **Never start the full sweep** (`bash test/run-all.sh`, 45-60 min cold): not after a branch merge or an edit, at a checkpoint, `/hmd:save`, demo or session start, or "to be safe". The orchestrator RECOMMENDS it (why, command, cost) at exactly one moment, immediately before the FINAL merge (push to the default branch, PR merge, pull into it), on the frozen tree (a verdict over a moving tree is not a verdict), never while a fix can still land; it runs only when the developer says so in that session (silence is a no). A local `git merge` of agent branches is integration, not the final merge. Procedure: `agents/heimdall.md` §6c.
+- **Heimdall's own repo (operator decision 2026-11-22, "B")**: recommend `bash test/use-cases/run.sh`; its green receipt (`.heimdall/receipts/use-cases.json`, `bin/lib/hmd_use_case_receipt.py`) stands in for the full sweep at a push. The full sweep is for releases.
+- **Batch before you sweep (operator directive 2026-10-11).** Collect every pending agent result and
+  merge them ALL, so ONE recommendation covers the batch and ONE sweep grades it; never merge between a green sweep and its push; never start a second sweep while one runs
+  (merging agent fixes one at a time staled the last green receipt every time). The orchestrator re-runs no suite per merge.
+- **After a red**: fix, commit, `bash test/run-all.sh --failed`; never a second full sweep.
+- **Disk floor (operator directive 2026-10-14), enforced by hooks**: agent spawns and runs of `*.test.sh`/`test/run-all.sh` are DENIED below `HMD_MIN_FREE_PCT` free disk (default 10; 0 = off); `test/run-all.sh` also refuses to start below `HMD_TEST_MIN_FREE_GB` (default 5). One definition: `bin/lib/hmd_disk_floor.sh`. Proof `test/disk-floor.test.sh`.
+- **The `git push` hook stack is unchanged and stays**: a fail-closed backstop, not a duplicate of this rule.
+- **Machine-enforced in part**: `bin/heimdall-conformance` fails `gate-runs-once`, `gates-at-end`, `sweep-staled-by-merge`, `sweeps-overlap` on the session transcript, and is authoritative over this text.
+Full text (quiet gate, cache, run order, measured cases): `docs/rules/full-gate.md`.
 
-- **What the developer is shown (the recommendation).** Three things, every time: why (what
-  the run proves for this merge), the command (`bash test/run-all.sh`; `--failed` after a
-  red) and the cost: wall time (~45-60 min cold; a cached run costs what the change reaches)
-  and tokens (an estimate: an agent that reads only the summary spends few, one that streams
-  the per-suite output spends many). `bin/lib/hmd_sweep_advice.py` prints it when the final
-  merge is about to run (a push to the default branch, a PR merge, a pull into it; never a
-  local `git merge`); it only advises, never denies, and `HMD_SWEEP_ADVICE=off` in the
-  environment Claude Code runs in turns it off. An orchestrator does not rely on it: it puts
-  the same three things to the developer itself, right before the final merge, and waits.
-  Not before: a recommendation at a checkpoint, a save, a demo or mid-work is noise the
-  developer learns to ignore.
-- **When the developer says yes.** Run it ONCE, on the frozen tree, in the background
-  (`run_in_background`; wait for the completion notification, never a poll loop: "Wait guard"
-  below) with nothing editing, and read only its summary: the lines after the dashed rule at
-  the end (the pass/fail counts and `sweep kind`) and, on a red, the names in the receipt's
-  `non_green_suites`, never the per-suite stream. The mechanics below (freeze, quiet gate,
-  disk floor, cache, `--failed`) apply to a run once it is chosen.
-- **Freeze the tree first.** `run-all.sh` reads the working tree as it finds it. No
-  edits, and no agents editing, while it runs. A verdict over a moving tree is not a
-  verdict.
-- **Quiet gate (`--wait-quiet`, opt-in).** Use it on a shared, busy machine to start
-  the sweep on a settled box. It is relative and bounded: it waits until the 15-min load
-  average is below `HMD_QUIET_FACTOR` (default 1.5) × CPU count on 3 consecutive 30 s
-  checks, and gives up after `HMD_QUIET_MAX_WAIT_S` (default 1200 s). Do not use an
-  absolute load threshold to block a sweep; it can stay high for hours and defer the run
-  forever. On a shared busy machine, lower `--jobs` instead of waiting. When the bound
-  passes, the sweep runs anyway with half the jobs and `HMD_TEST_REDUCED_PARALLELISM=1`.
-- **Disk floor — 10% free, enforced by hooks (operator directive 2026-10-14).**
-  Agent spawns, test runs and single test files all stop below a floor of free disk: a
-  full disk fails in ways that look like bugs, and the dev machine was at 7.1% free
-  (16.4 GB of 228 GB) while agents ran suites that write fixtures, clones and temp data.
-  One definition, `bin/lib/hmd_disk_floor.sh`: the free percent of the volume holding
-  TMPDIR and of the one holding the repo (`df -Pk`, Available ÷ size — not df's own
-  Capacity column, which on APFS leaves out every other volume of the container),
-  against `HMD_MIN_FREE_PCT` (default 10; the operator runs 7 for now; 0 turns it off; a
-  typo such as `7%` is the default, said on stderr, never a silent off). Three
-  enforcement points: **(1)** the Agent hook (`bin/heimdall-precheck-agent`) DENIES a
-  spawn, ahead of the in-process cap so a refused spawn stakes no lease; **(2)** the Bash
-  hook (`bin/heimdall-precheck-bash`) DENIES a command that RUNS a `*.test.sh` or
-  `test/run-all.sh` (`bash test/x.test.sh`, `./test/x.test.sh`, `cd d && bash x.test.sh`,
-  an env prefix, `time`/`timeout`, `sh -c` — never `bash -n`, `cat`, `grep`, `git add` or a
-  commit message that only mentions one): one central check, no test file edited;
-  **(3)** `test/run-all.sh` REFUSES to start (exit 5, nothing left behind) beside its
-  absolute floor `HMD_TEST_MIN_FREE_GB` (default 5; whichever is stricter refuses), and
-  asks again before every suite and every solo re-run: once a floor is crossed mid-sweep
-  it launches nothing more, the unstarted suites are `REFUSED` (a table row,
-  `suites_refused` and `disk_floor` in the receipt, and in `non_green_suites` so the next
-  incremental sweep carries them forward) and the run is red (exit 1) — a sweep cut short
-  never reads as a sweep that passed. Set the override in the environment Claude Code
-  runs in: a hook reads its own environment, so an inline `HMD_MIN_FREE_PCT=5 bash
-  test/x.test.sh` reaches the test but not the hook that has already said no. A df that
-  cannot answer warns and allows — this is a resource guard, not a security gate. A suite
-  that drives the REAL spawn hook pins `HMD_MIN_FREE_PCT=0` (as `agent-name-gate` pins
-  `HMD_CTX_GATE_OFF=1`) so it never depends on the disk it runs on. `bin/heimdall-disk-floor
-  check` shows where you stand. Proof: `test/disk-floor.test.sh`.
-- **Recommend it, and start a chosen run, only when no follow-up fix is still possible.** A
-  sweep begun while a reviewer, verifier or agent can still hand back a change is spent the
-  moment that change lands: its receipt is stale and every suite that change reaches runs
-  again.
-- **Batch before you sweep (operator directive 2026-10-11).** Collect every pending
-  agent result and merge them ALL, so ONE recommendation covers the batch and, on the
-  developer's yes, ONE sweep grades it. Never merge anything between a
-  green sweep and its push. If new work arrives after a sweep started, queue it for
-  the next batch instead of merging. A failing suite gets fixed, and the fix rides the
-  next batch (`--failed`, below); a small follow-up batch costs what it reaches, since the
-  sweep is cached (below). Never start a second sweep while one runs. Measured 2026-10-11:
-  ~9 full sweeps (~70 min each) in one day — merging agent fixes one at a time staled the
-  last green receipt every time, two sweeps overlapped, one wait sat for hours on an
-  absolute load threshold, and whole sweeps were re-run to tell load flakes from real
-  failures (re-run the one failing suite solo instead).
-- **The sweep is cached: it re-runs what a change can reach (2026-10-20).** `bash
-  test/run-all.sh` serves a suite from `.heimdall/receipts/suite-cache/` (a `CACHED` row,
-  counted green) while its closure hash (every tracked file it can read, found statically
-  by `bin/heimdall-suite-closure`) and the runner salt (`run-all.sh` minus comments, its
-  guard libs, the engine, tool versions) are unchanged and the entry is under 7 days old.
-  max(20, 10%) of the hits re-run anyway (seeded by HEAD and the salt); an audited suite
-  that fails with an unchanged closure is `CLOSURE UNSOUND`: red run, cache purged. Each
-  green is stored the moment it finishes, so a red, stopped or cancelled run keeps what it
-  proved. The receipt stays `kind:"full"` plus a `cache` block and `full_equivalent`; the
-  push gate and the release script re-derive it (`bin/heimdall-suite-closure
-  verify-receipt`), never on the flag's word. `--cold` (or `HMD_COLD=1`) ignores the cache
-  and runs every suite: an x.y.0 release needs that cold receipt, a patch release takes a
-  cache-composed one, and the first sweep after a runner change is cold by itself.
-  `--no-cache` skips it (legacy receipt). It is also off, said on the `cache:` line, for a
-  dirty tree, `--filter` and an incremental `--since-green` (the older textual selection,
-  still there; the cache is what follow-up batches use).
-- **After a red: `--failed`, never a second full sweep.** Fix, commit (a dirty tree turns
-  the cache off and `--failed` refuses, exit 2), then `bash test/run-all.sh --failed`: it
-  re-runs the last receipt's non-green suites, every suite whose closure the fix moved and
-  the audit sample, serves the rest from the cache, and composes a gate-grade receipt
-  (`amended_from`, `amended`). A test-only fix re-runs that suite and the sample, not the
-  sweep. Not combinable with `--cold`, `--no-cache`, `--since-green` or `--filter`.
-- **Order, `--fail-fast`, keep-awake.** Suites start failed-last-time first, then
-  changed-closure, then new, then slowest-first. `--fail-fast` stops starting suites once
-  a red is confirmed by its solo re-run, so a red shows in minutes, not at the end; a run
-  it stops early writes `kind:"aborted"`, which the push gate and the release script refuse
-  by name, so after one: fix, commit, `--failed`. On macOS the runner holds `caffeinate -i
-  -w <its pid>` for the whole sweep, so the machine cannot idle to sleep mid-run
-  (`HMD_NO_CAFFEINATE=1` opts out).
-- **Per-suite runs: your own suite only, once.** An agent runs
-  `bash test/<one>.test.sh` for ONLY the test file(s) it adds or edits, ONCE, after
-  ALL its changes are written — no neighbouring or "regression" suites, no baseline
-  sweep. Once means once per state of the tree: a re-run needs an edit that targets
-  the failure (the TDD RED run and a break-it-and-watch-it-go-RED check each run a
-  different tree), while a second run of an unchanged tree is the waste. A failure
-  plausibly caused by machine load (timeout, port clash, agents running alongside)
-  gets ONE solo re-run, then it is real: fix it or report it. Regressions elsewhere
-  are for the merge-time full run, if the developer chooses one.
-- **The orchestrator does not re-run suites per merge, and does not start the sweep
-  itself.** It takes each agent's reported run as given, integrates (a local `git merge`
-  of each agent branch: no recommendation, no run) and, immediately before the final
-  merge, recommends the one full run to the developer; only the developer's yes starts it.
-- **Measured, 2026-10-08 chat-replies wave:** three coder agents hit their 50-turn
-  limit mid-regression after running 10–25 neighbouring suites each, one suite was
-  re-run three times under load, and the orchestrator re-ran the same suites after
-  merging, then cancelled a full sweep when fixes landed.
-- **The `git push` hook stack is unchanged and stays.** It is a fail-closed backstop,
-  not a duplicate of this rule: the merge-time recommendation is the developer's call,
-  the pre-push gate is the machine's guarantee. In this repo a push still needs a green
-  receipt, a use-case journey receipt or a full-equivalent sweep receipt, so a developer who
-  declined the run meets that gate at the push.
-- **Already machine-enforced, in part.** `bin/heimdall-conformance` reads the session
-  transcript and fails `gate-runs-once` (two full-gate runs with no edit between them)
-  and `gates-at-end` (the first full-gate run must come AFTER real work). It also fails
-  `sweep-staled-by-merge` (a green sweep, then a merge or commit of real work before
-  the push, then another sweep) and `sweeps-overlap` (two full-gate runs whose
-  start/end intervals overlap). Those grade the runs that happen: they read tool calls,
-  not the developer's yes, so "an agent starts no full run unasked" is held by this text
-  and the merge-time advice (which recommends and never blocks), not by a check. This
-  section is the human-readable statement of the rules the enforcer does check — if the
-  two ever disagree, the enforcer is authoritative and this text is the bug.
+## Release convergence: one review, one sweep, then ship
+Operator 2026-10-21: *fix the too-much-testing and reiterating loop; deliver well, not over-tested.*
+- **One review round per release**, of the release diff, after the batch is merged and before the sweep. Fixes are proven by their own RED→GREEN test, never re-reviewed.
+- **Only BLOCKER/HIGH block a release.** MEDIUM/LOW → `.planning/BACKLOG.md`, riding the next release. A finding born of this release's own fix, or from a background security review, is triaged the same way (HIGH → fix in this batch). Never chain an agent per finding; scope a fix agent to its finding (no "while you're there" exploration, no new candidate-defect lists unless asked).
+- **One sweep, last, the developer's call**: land every fix, recommend ONE full sweep on the frozen tree (the release script still needs its receipt), run it on their yes, ship. A red suite after it: fix, commit, `run-all.sh --failed`. Green, reviewed once and HIGH-free ships.
+- **Sweep guard** (hook): `bin/heimdall-precheck-bash` DENIES a FULL `test/run-all.sh` (no `--failed`/`--since-green`/`--filter`/`--dry-run`) while a sweep runs, after a red/aborted last receipt at HEAD or an ancestor, or when a green full receipt already covers HEAD. Override `HMD_SWEEP_ALLOW=1`. Lib `bin/lib/hmd_sweep_guard.py`; proof `test/sweep-guard.test.sh`.
 
-## Release convergence: one review, one sweep, then ship (2026-10-21)
-Operator directive, 2026-10-21: *fix the too-much-testing and reiterating loop; deliver well, not
-over-tested.* Measured on 2026-10-20/21: one release batch went fix → automated security finding on the
-fix → fix → finding on that fix → ... (five rounds in one evening), each round re-reached ~500 suites
-through a hub file, and a full review then opened a sixth round. The loop, not any single test, is
-what ate the day. The rules:
+## Pre-commit vs pre-push
+- The stub-scan and the oracle-falsifiability + corpus-regression gates stay at pre-commit ON PURPOSE, not an oversight to "fix" by moving them to push: agents commit with `--no-verify`, so the native hook serves a human or non-Claude-Code tool committing directly, and the stub-scan is near-free exactly at that moment.
+- The PreToolUse `git push` chain defers, loudly, to the native `.heimdall/hooks/pre-push` when `core.hooksPath` = `.heimdall/hooks` and it is executable, so those gates run once per push, not twice; unwired, the inline check still runs. `HMD_SKIP=1` is the native hook's OWN bypass and never reaches the PreToolUse layer: the dedup excludes it on purpose. Proof `test/pre-push-gate-dedup.test.sh`.
 
-- **One review round per release.** Review the release diff ONCE, after the batch is merged and before
-  the sweep. Fixes to its findings are proven by their own RED→GREEN test; they are NOT re-reviewed.
-  No second review of the fixes, no re-review of the whole diff.
-- **Only BLOCKER/HIGH block a release.** MEDIUM/LOW findings go to `.planning/BACKLOG.md` and ride the
-  next release, unless the fix is already written and tested. A finding that only exists because of a
-  fix made this release is triaged the same way; it does not restart the cycle unless it is HIGH.
-- **Background security-review findings** on hmd's own commits follow the same triage: HIGH → fix in
-  this batch, otherwise backlog with one line. Never chain an agent per finding.
-- **One sweep, last, and the developer's call.** Land every fix of the round, then recommend ONE full
-  sweep on the frozen tree to the developer (why, command, cost: "When the full gate runs"), run it on
-  their yes, then ship. The release script's receipt requirement stays: a release still needs the
-  green receipt it checks, but the run behind it happens because the developer chose it at merge or
-  release time, never because an agent started it to satisfy the script.
-  A red suite after it: fix, commit, `run-all.sh --failed` (never a second full sweep).
-- **Scope a fix agent to its finding.** No "while you're there" exploration, no listing of new
-  candidate defects unless asked: a list becomes the next round.
-- **Done means delivered.** A release that is green, reviewed once and HIGH-free ships; the backlog is
-  where the rest of the perfection lives.
-- **Enforced by the Bash hook, not by prose (`bin/lib/hmd_sweep_guard.py`, 2026-10-21).** The sweep rules
-  did not hold as text, so `bin/heimdall-precheck-bash` DENIES a FULL `test/run-all.sh` (no `--failed`,
-  `--since-green`, `--filter` or `--dry-run`) in three cases, checked in this order: a sweep is running
-  (`receipts/sweep.lock` names a live pid: `a sweep is already running (pid N)`); the last receipt is red or
-  aborted and its `head_sha` is HEAD or an ancestor of it (`last sweep was red at <sha>; fix, commit, then:
-  bash test/run-all.sh --failed`); a green full receipt already covers HEAD, the same commit or only the
-  hooks' own journal and ledger commits after it, tree clean (`already proven green at HEAD; nothing to
-  re-test`). `--failed`, `--since-green`, `--filter`, a single suite and `--cold` while the cache is cold
-  anyway (the salt changed: no suite-cache entry carries it) always go through. It runs after the CI waste
-  guard and the disk floor, finds a real run with the kill guard's lexer (text that only mentions
-  `run-all.sh` is no run), takes the repo from the script's own location, costs every other command one
-  `case`, and FAILS OPEN like the CI waste guard (a missing or garbled receipt, a git failure or a timeout
-  is one stderr line and an allow). The operator override is `HMD_SWEEP_ALLOW=1` in the environment Claude
-  Code runs in (an inline prefix reaches the sweep, not the hook). Once a run is chosen, this guard still
-  applies to it exactly as above; it recommends and starts nothing, so it neither replaces nor depends on
-  the merge-time advice. Best effort, not a security boundary.
-  Proof: `test/sweep-guard.test.sh`.
+## Push gate: each repo's own checks, not heimdall's
+Operator rule, verbatim: *run each repo's own checks, not heimdall's; a repo with its own record of passing checks passes on that record; a repo hmd doesn't manage gets a warning but isn't blocked; don't drop the gate altogether.* `bin/heimdall-precheck-bash` picks the gate per repo pushed (`bin/lib/hmd_push_target.py` asks git which repo; the class is read from the COMMITS, strictest wins): (a) `test/run-all.sh` naming `last-sweep.json` (heimdall's own regime): `heimdall-state check-quality-gates` needs a green full-equivalent sweep receipt or a green use-case journey receipt for HEAD; (b) `.heimdall/repo-checks.json`: `bin/heimdall-repo-checks run` writes the receipt, and the gate passes ONLY on a green one bound to the commit, tree and declaration of EVERY commit the push sends; (c) neither: one `WARNING` on stderr, exit 0. Fail closed: anything not modelled exactly, a resolver timeout or crash and any error path give the strict class or a block, never the warning. A cooperating-agent control, not a security boundary. Detail, proofs: `docs/rules/push-gates.md`.
 
-## Pre-commit vs pre-push: what stays at commit, what dedups at push
-Two things are easy to conflate and must not be: the ~1600s full sweep above (never
-auto-run, gated by the enforcer) and the small, real per-gate checks below (auto-run by
-design, on every commit/push). "Checks run too often" is only a defect in the second
-group, and only where the SAME check fires twice for one action.
+## CI waste guard (2026-10-19)
+Operator rule: *a flaky failure is a defect: fix it or report it, never re-roll CI.* The Bash hook (`bin/heimdall-precheck-bash`, FIRST in its chain) denies, via `bin/lib/hmd_ci_guard.py`: `git commit --allow-empty`; `gh run rerun` (any flags), `gh workflow run`, and a `gh api` POST (explicit, or implied by a body flag) to an endpoint ending `/rerun`, `/rerun-failed-jobs`, `/dispatches` or `/rerequest`. Read-only gh (list, view, watch, download, cancel, GETs) stays allowed; text that merely mentions a form is not one. Override `HMD_CI_RERUN_ALLOW=1`. Instead: fix the flake (a test must not depend on the wall-clock speed of a shared runner: count steps, not seconds, or mark it local-only) or report it. Proof `test/ci-waste-guard.test.sh`.
 
-- **The stub-scan and the oracle-falsifiability + corpus-regression gates stay at
-  pre-commit, on purpose — this is a deliberate divergence from "only run just before
-  push".** Agents commit with `--no-verify`, so the native pre-commit hook never fires
-  for agent-driven commits; it exists for a human or a non-Claude-Code tool committing
-  directly, who never goes through the PreToolUse layer at all and may never even
-  `git push` this branch. Deferring these checks to push would mean a broken commit
-  sits in history with the author having already lost the context they had at commit
-  time — for the stub-scan that cost is especially stark, since it is diff-scoped and
-  near-free precisely because it runs at the moment the bad line is introduced. This is
-  tested, documented behavior (`test/heimdall-init.test.sh`'s staged-bad-domain case,
-  `test/gate-receipt-truth.test.sh` Section A) — not an oversight to "fix" by moving it.
-- **The oracle + corpus gates WERE genuinely duplicated at push, and that is fixed.**
-  Both the native `.heimdall/hooks/pre-push` hook (`bin/heimdall-gate-run --phase
-  pre-push`) and the Claude-Code PreToolUse `git push` chain ran the identical
-  falsify-per-domain loop and `bin/corpus run` — back to back, on every agent-issued
-  push, for the same result. Measured against this repo's own oracle corpus: one pass
-  costs on the order of a minute; paying it twice per push was pure waste, and the real
-  substance behind "checks running all the time". The PreToolUse chain now checks
-  whether the native hook is actually wired (`core.hooksPath` = `.heimdall/hooks` and
-  `.heimdall/hooks/pre-push` is executable) and, if so, defers to it — loudly, on
-  stderr, never silently — instead of re-running the same work. If the native hook is
-  NOT wired (a fresh `git worktree add`, before `hmd init` has materialized
-  `.heimdall/hooks` there, runs with none), coverage is unchanged: the inline check
-  still runs. `HMD_SKIP=1` cannot be used to make the PreToolUse layer defer on the
-  assumption the native hook will cover it, since `HMD_SKIP` is that native hook's OWN
-  bypass and has never reached the PreToolUse layer — widening its reach silently would
-  be a real gate weakening, so the dedup guard explicitly excludes it.
-  See `hooks/hooks.json` (the guard) and `test/pre-push-gate-dedup.test.sh` (the proof).
+## Wait guard (2026-11-10)
+Agents "went stale after 1-2 h" in foreground poll loops on jobs they had backgrounded themselves. The Bash hook denies, via `bin/lib/hmd_wait_guard.py`: a loop (`until`/`while`/`for`, also in `sh -c`/`eval`) whose condition or body runs `sleep`; a `while`/`until` polling `pgrep` or `kill -0`; a standalone `sleep` or an interpreter one-liner alarm of 60 s or more; `tail -f`/`-F`/`--follow`. Allowed: any call with `run_in_background: true`, text that merely mentions a form, `sleep` under 60 s outside a loop. Instead: run the job with `run_in_background` and wait for its completion notification; bound a long command with the Bash `timeout`; never poll your own job. Override `HMD_WAIT_ALLOW=1`. Proof `test/wait-guard.test.sh`.
 
-## Push gate: each repo's own checks, not heimdall's (2026-10-13)
-The PreToolUse push chain (`bin/heimdall-precheck-bash`) used to run heimdall's sweep gate
-(`heimdall-state check-quality-gates`: the state booleans, the lint receipt and
-`.heimdall/receipts/last-sweep.json`) in the session's cwd for ANY push, so a push of another repo
-(the site, with six gates of its own) was blocked for lacking a receipt only heimdall's
-`test/run-all.sh` can write. Operator rule, verbatim: *run each repo's own checks, not heimdall's; a
-repo with its own record of passing checks passes on that record; a repo hmd doesn't manage gets a
-warning but isn't blocked; don't drop the gate altogether.* The gate is now chosen per repo pushed:
+## Sweep advice
+`bin/heimdall-precheck-bash` asks `bin/lib/hmd_sweep_advice.py` whether a merge/push/pull command IS the final merge (a PR merge, a pull or push on the default branch; never a local `git merge` of refs or a push of another branch). If so it prints why / run / cost / your call: never a deny, and last, after every other gate. Silence: `HMD_SWEEP_ADVICE=off` or `hmd guardrails off sweep-advice`. Proof `test/sweep-advice.test.sh`.
 
-- **Which repo.** `bin/lib/hmd_push_target.py` reads the command the way a shell does (the cwd,
-  `git -C <dir>` chains, `cd <dir> && ...`, subshells, wrappers, `sh -c`, `export GIT_DIR=...`) and
-  asks **git itself** which git directory each push operates on: the same options and `GIT_*`
-  environment go to `git rev-parse`, and the work tree root it finds is checked from the other end.
-  `--work-tree` / `GIT_WORK_TREE` cannot point a push at a decoy, and a subdirectory or linked
-  worktree of heimdall is heimdall. That (git directory, work tree) pair is resolved ONCE (2026-10-14)
-  and is the one every stage reads: the class and the refspec sources are read with `GIT_DIR` and
-  `GIT_WORK_TREE` pinned to it, each resolver row carries it (`class<TAB>work tree<TAB>extra<TAB>git dir`),
-  the hook hands it to `heimdall-repo-checks status --git-dir` (which verifies it from both ends, reads git
-  with the pair pinned and the receipt inside that work tree) and runs `heimdall-state` in that work tree
-  with the same two variables exported. Nothing re-derives "the repository" from a path, so the stages
-  cannot end up looking at different ones. A `GIT_*` variable the resolver does not reproduce
-  (`GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_NAMESPACE`, `GIT_INDEX_FILE`, ...) would give the push
-  another view of the refs than the gate reads, so it makes the command uncertain; the transport and
-  identity ones (`GIT_SSH_COMMAND`, `GIT_TERMINAL_PROMPT`, `GIT_TRACE*`, ...) keep the class.
-- **The class is read from the COMMITS, not the work tree.** The commits inspected are HEAD, its
-  upstream (`@{upstream}`, `@{push}`), `origin/HEAD`, `origin/<branch>` and whatever the push names
-  (refspecs, `--all`, `--mirror`, `--tags`), read with `git ls-tree` / `git cat-file`; the STRICTEST
-  class over them wins. An uncommitted marker edit, deletion or new file on disk changes nothing, and a
-  pushed commit that drops a marker cannot downgrade a repo whose upstream still has it.
-- **(a) sweep.** Marker: a commit has `test/run-all.sh` as a regular file that names `last-sweep.json`
-  (heimdall's own sweep regime; that script writes the receipt `check-quality-gates` reads). The marker
-  is tracked code, never the receipt, so deleting a receipt cannot downgrade a repo, and another
-  project's `test/run-all.sh` is not mistaken for it. The gate (`heimdall-state check-quality-gates`,
-  fail closed, run inside that repo: a cwd in a subdirectory reads the toplevel's state) passes its sweep
-  part on EITHER a green full-equivalent sweep receipt for HEAD (the old rule, unchanged) OR, since
-  2026-11-22 (operator decision "B": a push stands on the use-case journeys, a release on the full sweep),
-  a green use-case journey receipt: `.heimdall/receipts/use-cases.json`, written by `bash
-  test/use-cases/run.sh` after a green FULL run on a clean tree. `bin/lib/hmd_use_case_receipt.py`
-  re-derives it from git, never taking the file's word: the exact schema, a green run (every journey
-  passed, every mutant killed), `head_sha` a commit this checkout has and `tree_sha` its tree, and that
-  commit is HEAD or only the hooks' own journal and ledger commits came after it. A missing, red, forged,
-  stale, garbled, linked or unverifiable receipt blocks (the failure names `bash test/use-cases/run.sh`)
-  and leaves the sweep rule as it was; the state flags and the lint evidence still apply. The release script
-  is untouched: a release still needs the full sweep receipt. Proof: `test/sweep-receipt-gate.test.sh` (M, N)
-  and `test/pre-push-quality-gate-blocking.test.sh` (2b-2e).
-- **(b) repo-checks.** A commit has `.heimdall/repo-checks.json` = `{"schema":1,"checks":[{"name","cmd"}]}`.
-  `bin/heimdall-repo-checks run [--repo PATH]` runs each check from the repo root, in order, and writes
-  `<repo>/.heimdall/receipts/repo-checks.json` atomically. The gate passes ONLY on a receipt that is
-  green, recorded on a tree with no uncommitted tracked changes, bound to the commit (`head_sha`), its
-  tree (`tree_sha`) and the declaration's committed bytes (`decl_sha256`) (all three recomputed by the
-  gate from git objects), listing exactly the declared checks, **and for the commit the push sends**: the
-  resolver resolves each refspec's source with git (`origin other`, `HEAD~1:main`, `<sha>:main`, a tag;
-  HEAD for a bare push) and hands the ids to `status --pushes`, and EVERY one must be the receipt's
-  `head_sha`. `--all`, `--mirror`, `--tags`, a wildcard refspec, an option it cannot read (`--repo`) and
-  push configuration that picks the refs (`push.default=matching`, any `remote.<name>.push`) cannot be
-  tied to one receipt and block; a ref that names no commit makes the whole push the strict class. A
-  push that sends no commit (`:branch`, `--delete`) needs only the current receipt. Stale, red, dirty,
-  missing, mismatched, malformed, invalid, or an absent runner blocks, and the block names the runner
-  command (`status [--repo PATH] [--pushes IDS]` prints the verdict). The hook reads the receipt and
-  never re-runs a repo's commands. Track `repo-checks.json`, gitignore `.heimdall/receipts/`. The
-  receipt's fields, types and formats are defined ONCE, in `bin/lib/hmd_repo_receipt.py`, which `run`
-  builds the receipt with and `status` verifies it against (the test walks that definition: a receipt
-  `run` writes passes, every field mutated alone fails).
-- **(c) unmanaged.** One `WARNING` line on stderr, exit 0, and only when the command was understood
-  EXACTLY, git resolved the repo, and no commit inspected has either marker.
-- **A resolver that cannot answer is graded against EVERY candidate (2026-10-14).** A timeout
-  (`HMD_PUSH_TARGET_TIMEOUT_S`), a crash or a missing file never falls back to ONE repository: the strict
-  gate runs against the session's cwd, the payload's cwd and each `-C` / `cd` / `--git-dir` / `--work-tree`
-  directory the parser had reached (the resolver prints them itself when it fails, without asking git; the
-  hook adds the two cwds when it gets nothing at all), and the push is blocked unless all of them pass. A
-  push git names but whose repository cannot be placed (a dotfiles layout: `--git-dir=X --work-tree=Y` with
-  no link back from Y) is graded on those directories too, not only on the cwd's. A gate directory the
-  hook cannot enter blocks (a candidate that does not exist is skipped: nothing can be pushed from it). The
-  receipt is read as one regular file inside the repository (no link in `.heimdall` or `receipts` is
-  followed, at most 1 MiB, one commit named once and used throughout), never as whatever a path leads to.
-- **Fail closed.** Any construct not modelled exactly makes the whole command uncertain, and then EVERY
-  repo involved (the resolved ones and the cwd one) gets class (a), never a warning. Followed exactly:
-  quotes, `~`, `;` `&&` `||` `|` `&`, subshells, `$( )` and backticks, `cd`/`pushd`/`popd` as a SET of
-  possible states (an `&&`/`||` runs its right side only on success/failure; a `cd` into an existing
-  directory cannot fail; both outcomes of `test -d X && cd X` are gated; the last element of a pipeline
-  may run in the current shell, as in zsh, so both outcomes are gated), `eval` (runs in the current
-  shell), `sh -c`, here-strings, heredocs and pipes fed to a shell, `env`/`sudo`/`command`/`exec`/
-  `time`/`nohup`/`xargs`, `export GIT_DIR=...`. Flagged: a dynamic `cd`, `cd -`, CDPATH, a `cd` inside
-  if/while/for/case or `{ }`, a builtin (`cd`, `export`, `eval`, ...) behind a wrapper that starts a
-  process (`env cd X`, `xargs cd X`, `sudo cd X`: it does not run in this shell), `env` with any option
-  (`-u`, `-i`, `-C`, `-S`), an assignment to `HOME`, `CDPATH`, `PWD`, `OLDPWD`, `BASH_ENV` or `ENV`, a
-  function, `source`, `alias`, a script piped to a shell, an expansion that hides a substitution, a
-  heredoc body the shell expands, `find -exec` and other commands whose arguments name git and push,
-  `xargs` handing over the subcommand, `sudo -D`/`-i`, a git option or subcommand it does not know (an
-  alias may be a push), an unmodelled `GIT_*` variable, a cwd that is not a repo, a marker that cannot be
-  inspected (a link, a submodule, a directory, a failing git). Proof: every command of a corpus is RUN
-  by real bash (and zsh) with a git that records where it was started, and the repositories the pushes
-  really went to are compared with the resolver's answer.
-- **Every error path is strict.** git that exits non-zero, times out, answers with something it does
-  not print, or cannot place a ref; a marker that is a link, a submodule or a directory; a resolver that
-  crashes, times out or names a class nobody knows; a receipt or declaration that is unreadable, the
-  wrong type or nested past the parser's limit: each is the strict class or a block, never the
-  unmanaged warning and never a pass. The test forces each (a `git` on PATH that fails, prints
-  nonsense or hangs at each call the resolver makes; corrupt receipts and declarations). A resolver
-  that is missing or crashes means the old sweep gate on the cwd. Best effort, said plainly: shell
-  cannot be read completely (a script can push), so the native hook (`core.hooksPath`) stays the hard
-  backstop.
-- **A cooperating-agent control, not a security boundary.** Like `last-sweep.json`, the repo-checks
-  receipt is a plain local file: the binding catches stale, copied, mismatched and
-  hand-edited-by-accident receipts, not someone who can write the file and its hashes.
-- **Not relaxed.** The push-range secret scan, the full-history self-scan, the oracle and corpus
-  stages, the commit secret gate, git-guard and the kill guard are not part of this rule: they run as
-  before and still read the session's cwd repo. Proof: `test/heimdall-push-gate-per-repo.test.sh`
-  (classes, forged receipts, fail-closed, a differential against git itself) and
-  `test/heimdall-push-gate-target-repo.test.sh` (the operator's case: the session is in heimdall and
-  the push goes to X by `cd X && ...`, by `-C X`, or from X itself, each graded on X's own record).
-
-## CI waste guard: never pay to re-roll a flaky result (2026-10-19)
-In a client repo an hmd agent worked around a flaky test by pushing an EMPTY commit to retrigger CI and by
-re-running the workflow twice: every attempt spent GitHub Actions minutes and the flake was still there.
-Operator rule: *a flaky failure is a defect: fix it or report it, never re-roll CI.* The Bash hook
-(`bin/heimdall-precheck-bash`, FIRST in its chain, so a refused command never reaches git-guard or the
-secret scan) now denies, through `bin/lib/hmd_ci_guard.py`:
-
-- **Empty commits.** `git commit --allow-empty`, wherever the flag sits among the commit's options and
-  behind any of git's global options (`-C d`, `-c k=v`, `--git-dir`, ...). `--allow-empty-message`,
-  `--no-allow-empty`, and a `-m` value or a path that merely spells the flag are not it.
-- **CI re-runs and re-dispatches.** `gh run rerun` (any flags: `--failed`, `--job`, `-R`),
-  `gh workflow run`, and a `gh api` POST (`-X POST`, `--method POST`, the POST gh makes by itself once
-  `-f`, `-F`, `--field`, `--raw-field` or `--input` gives it a body, or a method that cannot be told) to an
-  endpoint ending `/rerun`, `/rerun-failed-jobs`, `/dispatches` or `/rerequest`.
-  `gh run list|view|watch|download|cancel`, `gh workflow list|view|enable|disable` and a GET of those
-  endpoints stay allowed.
-- **Read like a shell, never by grepping text.** The helper reuses the kill guard's lexer
-  (`bin/lib/hmd_kill_guard.py`: quotes, `env`/`nice`/`timeout`/`sudo`/`xargs`, chains, pipes, subshells,
-  loops, `sh -c`, `eval`, heredocs fed to a shell) and the git option table of
-  `bin/lib/hmd_push_target.py`, so text that only MENTIONS a form (echo, grep, a commit message or its
-  heredoc, a gh field value) is not a form. A pre-filter starts python only for a command that mentions
-  `allow-empty`, `rerun`, `rerequest`, `dispatches` or `workflow ... run`; every other command pays one
-  `tr` and one `case`.
-- **Operator override: `HMD_CI_RERUN_ALLOW=1`**, set in the environment Claude Code runs in. The hook reads
-  ITS OWN environment, so an inline `HMD_CI_RERUN_ALLOW=1 git commit --allow-empty ...` reaches git but not
-  the hook that has already said no (the same as `HMD_MIN_FREE_PCT`); only exactly `1` lifts it, and nothing
-  of the guard runs then.
-- **Fails OPEN, on purpose.** A cost guard, not a security gate: the disk floor's convention, not the kill
-  guard's. A helper that is missing, crashes or times out (`HMD_CI_GUARD_TIMEOUT_S`, default 5), or a
-  command it cannot read (an unbalanced quote, an expanded heredoc, nesting past 8), is one line on stderr
-  and an allow; a form it DID read wins over what it could not. Best effort, said plainly: git and gh are the
-  two tools it reads (curl against the API, a git or gh alias, a script on disk are not), and like the push gate's
-  receipt it is a cooperating-agent control, not a security boundary.
-- **What to do instead** (also in `skills/heimdall/references/definition-of-done.md`, `agents/coder.md` and
-  `agents/fixer.md`): fix the flake (a test must not depend on the wall-clock speed of a shared runner:
-  count steps, not seconds, or mark it local-only) or report it. Proof: `test/ci-waste-guard.test.sh`.
-
-## Wait guard: never wait in the foreground for your own job (2026-11-10)
-General-purpose and hmd:coder agents "went stale after 1-2 h". They were not hung: they sat inside their own shell.
-Across all 2102 subagent transcripts (`docs/analysis/2026-11-10-stale-general-purpose-agents.md`) foreground poll loops
-(`until grep -q DONE f; do sleep 30; done`, `perl -e 'alarm 595; sleep 595'`, `while pgrep -f job; do sleep 5; done`)
-took 167.8 h of general-purpose and 113.6 h of hmd:coder Bash time: a loop waiting for a job the agent itself put in the
-background, cut at the 10-minute Bash cap and re-issued, its context growing with every poll until the turn cap or a stall.
-The Bash hook (`bin/heimdall-precheck-bash`, after the CI waste guard, the disk floor and the sweep guard) now denies,
-through `bin/lib/hmd_wait_guard.py`:
-
-- **A loop that sleeps.** `until`/`while`/`for` whose condition or body runs `sleep` (any duration), also behind
-  `env`/`timeout`/`nohup`, in a substitution, `sh -c` or `eval`. **A process poll:** a `while`/`until` whose condition is
-  `pgrep` or `kill -0`, with a sleep or without.
-- **A long sleep.** A standalone `sleep` of 60 s or more (`1m`, `infinity`), or an interpreter one-liner that sleeps with
-  an alarm or for 60 s or more (`perl -e 'alarm 595; sleep 595'`). **`tail -f` / `tail -F`** (and `--follow`).
-- **Allowed.** Any call with `run_in_background: true` (read from the payload's `tool_input`), text that only MENTIONS a
-  form (echo, grep, a commit message or its heredoc), `sleep` under 60 s outside a loop, loops without `sleep`, `tail`
-  without a follow flag.
-- **What to do instead.** Run the job with `run_in_background` and wait for its completion notification (or the Monitor
-  tool); bound a long command with the Bash `timeout`. Never poll your own job.
-- **Operator override: `HMD_WAIT_ALLOW=1`**, set in the environment Claude Code runs in. The hook reads ITS OWN
-  environment, so an inline prefix reaches the command, not the hook that has already said no; only exactly `1` lifts it.
-- **Fails OPEN, on purpose.** A cost guard, not a security gate (the CI waste guard's convention): a helper that is
-  missing, crashes or times out (`HMD_WAIT_GUARD_TIMEOUT_S`, default 5), or a command it cannot read, is one line on
-  stderr and an allow. Best effort, said plainly: a wait inside a script file or a python loop is not read, and a loop
-  sent to the background with `&` is held like any other (use `run_in_background`). Proof: `test/wait-guard.test.sh`.
-
-## Sweep advice: a full test run is recommended at the final merge, never before (2026-11-12, refined 2026-11-22)
-Operator directive, 2026-11-12: *full test runs should be recommended to devs along with explanation and token usage, and always suggested just before merge operations and not before.* Refined 2026-11-22: *only do the full sweep before final merge and not on every merge.* The sweep guard says when a full run is pointless; this says when one is worth it, and it speaks at exactly one moment: the FINAL merge. `bin/heimdall-precheck-bash` asks `bin/lib/hmd_sweep_advice.py`, for a command that mentions merge, push or pull (and git or gh), whether the command IS the final merge: a pull request merge, a pull on the default branch (never a rebasing one), or a push to the default branch (main, master, or what origin/HEAD names). A local `git merge` of refs is NOT: integrating agent worktree branches that way is a step inside a batch and gets no advice, and the push that sends the batch to the default branch is the one that does. Text that only mentions one (echo, grep, a commit message), a merge-base and a push of another branch are not either, and nothing else ever triggers it.
-
-- **What it prints** (hook JSON on exit 0: `systemMessage` for the developer, `hookSpecificOutput.additionalContext` so the agent relays it, never a `permissionDecision`): *Why* (commits and files changed since the last green record, the hooks' own journal and ledger records not counted, or "no green record yet" and the reason), *Run* (`bash test/use-cases/run.sh` for heimdall's own regime: since 2026-11-22 a push stands on the use-case journey receipt, so that is the run recommended, and the full sweep is named only on a `Release:` line as a release's bar, never recommended for a push, whatever a red or running sweep says; `bin/heimdall-repo-checks run` for a repo that declares `.heimdall/repo-checks.json`; lint plus the use-case suite, `skills/heimdall/references/use-case-tests.md`, for any other repo), *Cost* (journeys and mutants, or suites or checks, the last measured wall clock from the receipt (about 6 minutes for the journeys when none is on record), and tokens as labelled estimates: none when the developer runs it in a terminal, a 40-line summary tail times 91 B over 4 when an agent runs it in the background and reads only that, the whole output of (suites + 40) rows times 91 B over 4 when an agent reads all of it) and *Your call*: run it now, or merge without it. A commit the records already prove green gets one line, "already proven green ... nothing to run", and no recommendation.
-- **It never blocks, and it speaks last.** The advice is computed after every other gate has let the command through and is the one JSON object on stdout, so a command a gate denies prints only its deny; the parallelism tracker's own output goes to stderr while advice is printed.
-- **Silence it.** `HMD_SWEEP_ADVICE=off` (also `0`, `false`, `no`) in the environment Claude Code runs in (read from the hook's OWN environment: an inline prefix reaches the command, not the hook), or `hmd guardrails off sweep-advice` (id `sweep-advice`, a recommended row of `guardrails.manifest.json`; only the lib's exit 1 means off). **Fails open**: a helper that is missing, crashes or times out (`HMD_SWEEP_ADVICE_TIMEOUT_S`, default 8), or a command it cannot read, is one stderr line at most. Best effort, a cost and discipline nudge, not a security boundary. Proof: `test/sweep-advice.test.sh`.
-
-## Model routing (2026-08-11 directive)
-- **Main Claude Code agent: never pinned.** It runs on the user's own default. hmd
-  does not hardcode opus — or anything else — for the main agent.
-- **Default coding tier: `sonnet`.** The bare alias, so Claude Code resolves the
-  current generation (Sonnet 5 today, its successor tomorrow, with nothing to edit).
-- **opus is retained only for adjudication**: `reviewer`, `verifier`,
-  `security-auditor`. Judging work is where the extra capability pays for itself.
-- **Fable 5 is escalation-only** — for a task *looping on bad output*, after sonnet
-  and opus have both failed at the same step. It is not a routing default. It is also
-  NOT ZDR (30-day retention), so client repos need `repo-policy allow_non_zdr_models`.
-- Never write a full pinned model id into an operational spawn. The tier alias is the
-  contract; `HEIMDALL_MODEL_<TIER>=<full-id>` exists solely for bench reproducibility.
+## Model routing (2026-08-11)
+- **Main Claude Code agent: never pinned.** It runs on the user's own default; hmd does not hardcode opus — or anything else — for the main agent.
+- **Default coding tier: `sonnet`.** The bare alias, so Claude Code resolves the current generation.
+- **opus is retained only for adjudication**: `reviewer`, `verifier`, `security-auditor`. Judging work is where the extra capability pays for itself.
+- **Fable 5 is escalation-only** — for a task *looping on bad output*, after sonnet and opus have both failed at the same step. It is not a routing default. It is NOT ZDR (30-day retention), so client repos need `repo-policy allow_non_zdr_models`.
+- Never write a full pinned model id into an operational spawn. The tier alias is the contract; `HEIMDALL_MODEL_<TIER>=<full-id>` exists solely for bench reproducibility.
 
 ## Code Quality — Zero Tolerance
 - NEVER write stub, dummy, placeholder, shim, mock, TODO, or skeleton code
@@ -553,17 +87,10 @@ Operator directive, 2026-11-12: *full test runs should be recommended to devs al
 - Name things clearly — a reader should understand without context
 
 ## Edit Verification
-- All Write/Edit ops auto-logged by `edit-tracker` (PostToolUse hook)
-- Run `verify-edits` to check all session edits: file existence, stub detection, git diff
-- Run `verify-edits --quick` for fast check, `--diff` for full diffs, `--json` for structured output
-- `edit-tracker summary` shows files edited + operation counts
-- `edit-tracker paths` lists unique edited file paths
-- SessionEnd auto-runs `verify-edits --quick`
+- All Write/Edit ops auto-logged by `edit-tracker` (PostToolUse hook); `edit-tracker summary|paths` list what was edited
+- `verify-edits` checks all session edits (file existence, stub detection, git diff): `--quick`, `--diff`, `--json`; SessionEnd auto-runs `--quick`
 
 ## Token Efficiency
 - Caveman compression active: terse output, abbreviations, arrows for causality
-- The LEVEL is owned by hmd directly as of 2026-08-30 (`bin/heimdall-caveman`, wired as `hmd caveman get|set|rules`) — ownership moved in-house from the external caveman plugin (github.com/juliusbrussee/caveman, MIT) so compression no longer hard-depends on that plugin being installed. A one-time migration reads the plugin's old `.caveman-active` flag if hmd has no state of its own yet; after that hmd's own `$HEIMDALL_HOME/caveman-level` is authoritative and is never overwritten by a later plugin-flag change
-- Collapsed to a SINGLE settable level, `ultra`, on 2026-09-01: hmd's audience is assumed technical — a fixed assumption baked into the level, not a setup question; no code asks one, so the gentler `lite`/`full` tiers had no separate audience of their own. `get`/`set`/the stored state file are ultra-only now; a stored or requested legacy `lite`/`full` value is accepted and mapped forward to `ultra` with a stderr notice — never a hard error, since a legacy value must never wedge the tool or emit nothing. `rules lite`/`rules full` still render by explicit name only, kept solely for `heimdall-caveman-eval`'s existing committed comparison — neither is an operator-facing level any more. The `diff` subcommand was retired alongside this: its only non-degenerate use (comparing two different real levels) no longer exists with one level
-- This ownership move is not cosmetic: the plugin has been observed, first-hand on this repo's own session (2026-08-30), silently rewriting its OWN flag file back to its default (`full`) on session restart — an operator who set `ultra` got `full` back with no notice, which would also silently invalidate a compliance measurement taken afterward. hmd's stored level is immune (a different file, never written by the plugin), but every `hmd caveman get` (and therefore `rules` with no explicit level) also re-checks the plugin's live flag on every call and prints a one-line divergence warning to stderr — never stdout — when the two disagree; hmd's stored value always wins
-- This is a change of WHO SETS the level, not of WHETHER a hook can prove compliance — a SessionStart/UserPromptSubmit hook can only inject instruction text, never verify the model followed it. Measured on this repo's own session while the plugin was active at `full`: 3.25% of prose chars were still caveman-targeted filler. Read-back audit: `hmd caveman-audit <session.jsonl>` (measures, never gates)
+- The LEVEL is owned by hmd (`bin/heimdall-caveman`, `hmd caveman get|set|rules`), not the external caveman plugin: one settable level, `ultra`; hmd's stored `$HEIMDALL_HOME/caveman-level` is authoritative. A hook can only inject instruction text, never prove compliance; `hmd caveman-audit <session.jsonl>` measures, never gates
 - Drop articles, filler, hedging — code and paths stay exact
