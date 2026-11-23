@@ -200,7 +200,7 @@ def execute(job, args, state):
         work = make_workdir(task_dir, args.tmp_root)
         tag = f"{job['task']}.{job['arm']}.r{job['rep']}.a{attempt}"
         raw = args.streams_dir / f"{tag}.jsonl"
-        prompt_file = work.parent / f"{work.name}.prompt"
+        prompt_file = args.streams_dir / f"{tag}.prompt"
         prompt_file.write_text(prompt)
         cmd = claude_cmd(args.claude, args.model, job["arm"], args.budget_usd)
         t0, timed_out = time.monotonic(), False
@@ -241,8 +241,7 @@ def execute(job, args, state):
         with open(raw, "rb") as src, gzip.open(f"{raw}.gz", "wb") as dst:
             shutil.copyfileobj(src, dst)
         os.remove(raw)
-        for leftover in (prompt_file,):
-            leftover.unlink(missing_ok=True)
+        prompt_file.unlink(missing_ok=True)
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
         with state["lock"]:
