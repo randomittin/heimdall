@@ -12,6 +12,7 @@ transcript; the disk floor and the account's 5-hour usage window are checked bet
 """
 import argparse
 import gzip
+import hashlib
 import json
 import os
 import random
@@ -71,6 +72,15 @@ def build_schedule(task_ids, reps, seed):
             for arm in (ARMS[first], ARMS[1 - first]):
                 jobs.append({"task": task, "rep": rep, "arm": arm})
     return jobs
+
+
+def fixture_sha(task_dir):
+    """Content hash of a whole task dir (relative paths + bytes, no caches). Every row carries it, so a
+    fixture edited while the study runs is detected by analyze.py instead of silently mixing versions."""
+    digest = hashlib.sha256()
+    for path in sorted(p for p in Path(task_dir).rglob("*") if p.is_file() and "__pycache__" not in p.parts):
+        digest.update(str(path.relative_to(task_dir)).encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
 
 
 def git(cwd, *args):
@@ -197,6 +207,7 @@ def execute(job, args, state):
             state["stop"].set()
             state["why"] = f"free disk below {args.min_free_pct}%"
             return
+        sha_before = fixture_sha(task_dir)
         work = make_workdir(task_dir, args.tmp_root)
         tag = f"{job['task']}.{job['arm']}.r{job['rep']}.a{attempt}"
         raw = args.streams_dir / f"{tag}.jsonl"
@@ -236,6 +247,7 @@ def execute(job, args, state):
             "difficulty": task.get("difficulty"), "rep": job["rep"], "arm": job["arm"],
             "effort": job["arm"], "model_requested": args.model, "attempt": attempt, "counted": final,
             "pass": rc == 0 and not reason, "accept_rc": rc, "accept_tail": tail,
+            "fixture_sha": sha_before, "fixture_stable": fixture_sha(task_dir) == sha_before,
             "timed_out": timed_out, "exit_code": proc.returncode, "wall_s": round(wall, 1),
             "infra_failure": bool(reason), "infra_reason": reason,
             "files_changed": len(changed),

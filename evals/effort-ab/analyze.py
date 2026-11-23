@@ -18,6 +18,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from run import fixture_sha  # noqa: E402  (one definition of the fixture hash)
+
 HIGH, MED = "high", "medium"
 MIN_DROP = 0.15
 
@@ -75,7 +78,22 @@ def sign_test(per_task):
     return {"medium_lower": lower, "medium_higher": higher, "p_two_sided": min(1.0, 2 * tail)}
 
 
-def analyse(counted, attempts, expected):
+def changed_fixtures(counted, tasks_dir):
+    """Tasks whose fixture differed between runs, changed during a run, or differs from the dir now."""
+    seen, bad = {}, set()
+    for (task, _arm, _rep), row in counted.items():
+        if row.get("fixture_sha"):
+            seen.setdefault(task, set()).add(row["fixture_sha"])
+            if row.get("fixture_stable") is False:
+                bad.add(task)
+    for task, shas in seen.items():
+        current = tasks_dir / task
+        if len(shas) > 1 or (current.is_dir() and fixture_sha(current) not in shas):
+            bad.add(task)
+    return sorted(bad)
+
+
+def analyse(counted, attempts, expected, tasks_dir=HERE / "tasks"):
     tasks = sorted({k[0] for k in counted})
     by_arm = {a: [r for k, r in counted.items() if k[1] == a] for a in (HIGH, MED)}
     per_task = []
