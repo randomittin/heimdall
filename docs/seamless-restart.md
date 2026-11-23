@@ -88,7 +88,8 @@ every assertion counts events, never seconds.
 - **50 seeded interleavings** of Stop, keystroke, live child, sweep, live agents, installer, `/clear`, `/exit` and time passing, with the invariants: the TERM follows
   two SAFE answers and none was given while busy, with live work or inside the quiet window (I1); at most one relaunch per target version (I2); every relaunch is
   `--resume <the session id at TERM time>` (I3); the launcher's status is the last child's (I4); only the fake claude gets a TERM and only the launcher a USR1 (I5);
-  the line is printed once per relaunch (I6).
+  the line is printed once per relaunch (I6). The user's `/exit` is typed once the launcher has nothing left to decide (all but every fifth seed, which quits at a
+  wall-clock time, the race with the TERM), so a loaded machine cannot make the user quit before the decision is made.
 - **10 mutants** (`test/fixtures/fake-claude/mutants.list`), each a one-line `sed` of a copy of the real file: restart while busy, with live work, inside the quiet
   window, without `--resume`, with a stale session id, with `SIGKILL`, without the marker, on the `-p` path, without the terminal restore, and twice for one version.
   All ten must go red.
