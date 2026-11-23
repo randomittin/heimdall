@@ -1,0 +1,85 @@
+diff --git a/semver.py b/semver.py
+index 128c84a..07c94c6 100644
+--- a/semver.py
++++ b/semver.py
+@@ -46,23 +46,64 @@ about a.
+ """
+ 
+ 
+-def compare(a, b):
+-    """Return -1, 0 or 1 when version a has lower, equal or higher precedence than b.
++_DIGITS = frozenset("0123456789")
++_IDCHARS = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-")
+ 
+-    The result is exactly one of the ints -1, 0, 1.
+-    Raises ValueError if a or b is not a valid version string.
+-    """
+-    raise NotImplementedError
+ 
++def _parse(v):
++    if not isinstance(v, str):
++        raise ValueError("invalid version: %r" % (v,))
++    err = ValueError("invalid version: %r" % (v,))
++    rest, plus, build = v.partition("+")
++    if plus:
++        for ident in build.split("."):
++            if not ident or not set(ident) <= _IDCHARS:
++                raise err
++    core, dash, pre = rest.partition("-")
++    parts = core.split(".")
++    if len(parts) != 3:
++        raise err
++    nums = []
++    for part in parts:
++        if not part or not set(part) <= _DIGITS or (len(part) > 1 and part[0] == "0"):
++            raise err
++        nums.append(int(part))
++    pre_ids = []
++    if dash:
++        for ident in pre.split("."):
++            if not ident or not set(ident) <= _IDCHARS:
++                raise err
++            if set(ident) <= _DIGITS:
++                if len(ident) > 1 and ident[0] == "0":
++                    raise err
++                pre_ids.append((0, int(ident), ""))
++            else:
++                pre_ids.append((1, 0, ident))
++    return tuple(nums), dash != "", pre_ids
++
++
++def _key(parsed):
++    nums, has_pre, ids = parsed
++    # no prerelease ranks higher than any prerelease
++    return (nums, 0 if has_pre else 1, ids)
+ 
+-def max_version(versions):
+-    """Return the highest-precedence entry of ``versions``.
+ 
+-    ``versions`` is any iterable of version strings (consume it only once).
+-    The result is the ORIGINAL string, not a normalised one. When several
+-    entries share the highest precedence (they differ only in build metadata)
+-    return the first of them. Every entry is validated: an invalid entry
+-    raises ValueError wherever it sits, even when it is the only entry. An
+-    empty iterable raises ValueError.
+-    """
+-    raise NotImplementedError
++def compare(a, b):
++    """Return -1, 0 or 1 when version a has lower, equal or higher precedence than b."""
++    pa = _parse(a)
++    pb = _parse(b)
++    ka, kb = _key(pa), _key(pb)
++    return (ka > kb) - (ka < kb)
++
++
++def max_version(versions):
++    """Return the original string of the highest-precedence entry (first on ties)."""
++    best = None
++    best_key = None
++    for v in versions:
++        k = _key(_parse(v))
++        if best_key is None or k > best_key:
++            best, best_key = v, k
++    if best_key is None:
++        raise ValueError("no versions given: %r" % (versions,))
++    return best

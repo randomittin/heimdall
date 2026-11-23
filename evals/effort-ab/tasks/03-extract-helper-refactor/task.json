@@ -1,0 +1,7 @@
+{
+  "id": "03-extract-helper-refactor",
+  "title": "Extract one validation helper (refactor, tests unchanged)",
+  "difficulty": "easy",
+  "lang": "python",
+  "prompt": "Refactor `orders.py`. Its three public functions, `create_order`, `update_quantity` and `split_order`, each repeat the same inline validation block (\"the value must be a positive integer\": `bool` is rejected even though it is an `int`, and a failure raises `ValueError(\"<name> must be a positive integer\")`, where `<name>` is the name of the argument being checked). Move that validation logic into exactly ONE helper function and make every validation site call it.\n\nRequirements:\n- The helper is a module-level `def` in `orders.py` (do not add new modules). The message literal `must be a positive integer` and the type/range test may exist only inside that helper; every validation site, including both of `create_order`'s, calls it, so the helper is called from at least three places.\n- Observable behaviour must not change at all: the same public signatures and return values, the same exception types and messages, and the same order of checks (for example which argument is validated first, and that validation happens before the other arguments are used).\n- Do not edit anything under `tests/` (not even whitespace); those tests must stay green.\n- Do not add or change features.\n\nRun the existing tests (all of them pass today and must still pass): `python3 -m unittest discover -s tests -v`"
+}

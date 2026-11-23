@@ -1,0 +1,45 @@
+diff --git a/summarize.sh b/summarize.sh
+index d86fb18..f58e113 100755
+--- a/summarize.sh
++++ b/summarize.sh
+@@ -1,17 +1,25 @@
+ #!/usr/bin/env bash
+-# summarize.sh -- top client IPs in a web server access log.
+-#
++# summarize.sh -- top client IPs (by 2xx/3xx request count) in an access log.
+ # Usage: bash summarize.sh <logfile> [N]
+-#
+-# Reads an Apache/nginx common (or combined) log format file, one request per
+-# line, e.g.
+-#   203.0.113.7 - - [10/Oct/2023:13:55:36 +0000] "GET /index.html HTTP/1.1" 200 2326
+-#
+-# Prints the top N (default 3) client IPs by number of successful (2xx/3xx)
+-# requests, one per line as "<count> <ip>", highest count first, ties broken by
+-# ip in plain string order.  See the task description for the full rules.
+-#
+-# NOT IMPLEMENTED YET.
+-
+-echo "summarize.sh: not implemented yet" >&2
+-exit 1
++f=$1
++n=${2:-3}
++if [ ! -f "$f" ]; then
++  echo "error: no such file: $f" >&2
++  exit 2
++fi
++LC_ALL=C awk '
++{
++  if (!match($0, /^[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]? /)) next
++  ip = substr($0, 1, RLENGTH - 1)
++  q1 = index($0, "\"")
++  if (!q1) next
++  rest = substr($0, q1 + 1)
++  q2 = index(rest, "\"")
++  if (!q2) next
++  rest = substr(rest, q2 + 1)
++  sub(/^[ \t]+/, "", rest)
++  split(rest, t, /[ \t]+/)
++  if (t[1] ~ /^[23][0-9][0-9]$/) c[ip]++
++}
++END { for (i in c) print c[i] " " i }
++' "$f" | LC_ALL=C sort -k1,1nr -k2,2 | head -n "$n"

@@ -10,6 +10,7 @@
 | [token-spend-forensics.md](token-spend-forensics.md) | Where the token spend actually goes, measured from session transcripts; causes ranked by cost. Re-runnable via [`token-spend-forensics.py`](token-spend-forensics.py). | Current (tracked) — **row 3 refuted 2026-08-08** |
 | [2026-08-08-security-review-tier-decision.md](2026-08-08-security-review-tier-decision.md) | Why the `security-guidance` reviewer stays on opus: the $57.73 was mis-attributed to the Stop hook and the prescribed fix saved $0. Pins the tier so it is not re-litigated. Guarded by `test/security-review-tier.test.sh`. | Current (tracked) |
 | [2026-09-07-cost-forensics-tool.md](2026-09-07-cost-forensics-tool.md) | Productionizes this repo's n=1 token/cost analyses into a zero-config, read-only tool (`bin/heimdall-cost-forensics`) any Claude Code user can run against their own transcripts. Sanity-checked against this repo's own known figures. Guarded by `test/heimdall-cost-forensics.test.sh`. | Current (tracked) |
+| [2026-11-23-effort-ab.md](2026-11-23-effort-ab.md) | Pre-registered A/B of coding-agent thinking effort (medium vs high): frozen design, runner and fixtures in `evals/effort-ab/`, paired results and the GO/NO-GO verdict for lever 3 of the token-utilization audit. Guarded by `test/effort-ab.test.sh`. | Current (tracked, force-added) |
 
 ## Local-only (gitignored — generated, not committed)
 

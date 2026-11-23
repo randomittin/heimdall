@@ -1,0 +1,97 @@
+diff --git a/semver.py b/semver.py
+index 128c84a..387dce0 100644
+--- a/semver.py
++++ b/semver.py
+@@ -46,23 +46,76 @@ about a.
+ """
+ 
+ 
+-def compare(a, b):
+-    """Return -1, 0 or 1 when version a has lower, equal or higher precedence than b.
++import re as _re
++
++_NUM = r"(?:0|[1-9][0-9]*)"
++_PRE_ID = r"(?:[0-9]+|[0-9A-Za-z-]+)"
++_RE = _re.compile(
++    r"(%s)\.(%s)\.(%s)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
++    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?" % (_NUM, _NUM, _NUM),
++    _re.ASCII,
++)
++
++
++def _parse(v):
++    if not isinstance(v, str):
++        raise ValueError("invalid version: %r" % (v,))
++    m = _RE.fullmatch(v)
++    if m is None:
++        raise ValueError("invalid version: %r" % (v,))
++    pre = m.group(4)
++    ids = None
++    if pre is not None:
++        ids = pre.split(".")
++        for i in ids:
++            if i.isdigit() and len(i) > 1 and i[0] == "0":
++                raise ValueError("invalid version: %r" % (v,))
++    return m.group(1, 2, 3), ids
++
+ 
+-    The result is exactly one of the ints -1, 0, 1.
+-    Raises ValueError if a or b is not a valid version string.
+-    """
+-    raise NotImplementedError
++def _cmp_num(x, y):
++    # digit strings without leading zeros; avoids int size limits
++    if len(x) != len(y):
++        return -1 if len(x) < len(y) else 1
++    return (x > y) - (x < y)
++
++
++def _cmp_parsed(pa, pb):
++    for x, y in zip(pa[0], pb[0]):
++        c = _cmp_num(x, y)
++        if c:
++            return c
++    ia, ib = pa[1], pb[1]
++    if ia is None or ib is None:
++        return (ia is None) - (ib is None)
++    for x, y in zip(ia, ib):
++        xn, yn = x.isdigit(), y.isdigit()
++        if xn and yn:
++            c = _cmp_num(x.lstrip("0") or "0", y.lstrip("0") or "0")
++        elif xn != yn:
++            c = -1 if xn else 1
++        else:
++            c = (x > y) - (x < y)
++        if c:
++            return c
++    return (len(ia) > len(ib)) - (len(ia) < len(ib))
++
++
++def compare(a, b):
++    """Return -1, 0 or 1 when version a has lower, equal or higher precedence than b."""
++    pa = _parse(a)
++    pb = _parse(b)
++    return _cmp_parsed(pa, pb)
+ 
+ 
+ def max_version(versions):
+-    """Return the highest-precedence entry of ``versions``.
+-
+-    ``versions`` is any iterable of version strings (consume it only once).
+-    The result is the ORIGINAL string, not a normalised one. When several
+-    entries share the highest precedence (they differ only in build metadata)
+-    return the first of them. Every entry is validated: an invalid entry
+-    raises ValueError wherever it sits, even when it is the only entry. An
+-    empty iterable raises ValueError.
+-    """
+-    raise NotImplementedError
++    """Return the original string of the highest-precedence entry (first on ties)."""
++    best = None
++    bp = None
++    for v in versions:
++        p = _parse(v)
++        if bp is None or _cmp_parsed(p, bp) > 0:
++            best, bp = v, p
++    if bp is None:
++        raise ValueError("no versions given")
++    return best

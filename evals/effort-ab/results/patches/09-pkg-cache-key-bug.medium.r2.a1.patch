@@ -1,0 +1,80 @@
+diff --git a/catalog/client.py b/catalog/client.py
+index 4e7ab71..eea0278 100644
+--- a/catalog/client.py
++++ b/catalog/client.py
+@@ -1,4 +1,6 @@
+ """Catalog API client with a read-through cache."""
++import copy
++
+ from .cache import Cache
+ from .keys import build_key
+ 
+@@ -40,17 +42,17 @@ class CatalogClient:
+         * The caller's params mapping and the values inside it are never
+           modified.
+         """
+-        if params is None:
+-            params = {}
+-        params.update(extra)
+-        for name in [name for name, value in params.items() if value is None]:
+-            del params[name]
+-        params.setdefault("limit", DEFAULT_LIMIT)
+-        params.setdefault("page", DEFAULT_PAGE)
+-        key = build_key(ENDPOINT, params)
++        query = {}
++        if params is not None:
++            query.update(params)
++        query.update(extra)
++        query = {k: v for k, v in query.items() if v is not None}
++        query.setdefault("limit", DEFAULT_LIMIT)
++        query.setdefault("page", DEFAULT_PAGE)
++        key = build_key(ENDPOINT, query)
+         hit, value = self.cache.lookup(key)
+         if hit:
+             return value
+-        value = self._fetch(ENDPOINT, params)
++        value = self._fetch(ENDPOINT, copy.deepcopy(query))
+         self.cache.store(key, value)
+         return value
+diff --git a/catalog/keys.py b/catalog/keys.py
+index 8d2d115..6d51a2e 100644
+--- a/catalog/keys.py
++++ b/catalog/keys.py
+@@ -22,17 +22,28 @@ request", so:
+ """
+ 
+ 
++import json
++
++
+ def build_key(endpoint, params):
+     """Return the cache key (a str) for `endpoint` called with `params`."""
+-    parts = []
+-    for name, value in params.items():
+-        if not value:
+-            continue
+-        parts.append(f"{name!r}={_encode(value)}")
+-    return endpoint + "?" + "&".join(parts)
++    items = sorted(
++        (json.dumps(_encode(name)), json.dumps(_encode(value)))
++        for name, value in params.items()
++        if value is not None
++    )
++    return json.dumps([_encode(endpoint), items])
+ 
+ 
+ def _encode(value):
+-    if isinstance(value, (list, tuple)):
+-        return "[" + ",".join(repr(item) for item in value) + "]"
+-    return repr(value)
++    if isinstance(value, (list, tuple, set, frozenset)):
++        return ["c", sorted(json.dumps(_encode(v)) for v in value)]
++    if isinstance(value, bool):
++        return ["b", value]
++    if isinstance(value, int):
++        return ["i", str(int(value))]
++    if isinstance(value, str):
++        return ["s", str(value)]
++    if isinstance(value, float):
++        return ["f", repr(float(value))]
++    return ["o", type(value).__qualname__, repr(value)]

@@ -1,0 +1,92 @@
+diff --git a/semver.py b/semver.py
+index 128c84a..fe81954 100644
+--- a/semver.py
++++ b/semver.py
+@@ -46,13 +46,72 @@ about a.
+ """
+ 
+ 
++import re as _re
++
++_NUM = r"(?:0|[1-9][0-9]*)"
++_PRE_ID = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
++_BUILD_ID = r"[0-9A-Za-z-]+"
++_RE = _re.compile(
++    rf"({_NUM})\.({_NUM})\.({_NUM})"
++    rf"(?:-({_PRE_ID}(?:\.{_PRE_ID})*))?"
++    rf"(?:\+({_BUILD_ID}(?:\.{_BUILD_ID})*))?"
++)
++
++
++def _parse(v):
++    if not isinstance(v, str):
++        raise ValueError(f"invalid version: {v!r}")
++    m = _RE.fullmatch(v)
++    if m is None:
++        raise ValueError(f"invalid version: {v!r}")
++    major, minor, patch, pre = m.group(1, 2, 3, 4)
++    return (major, minor, patch), (pre.split(".") if pre is not None else None)
++
++
++def _cmp_num(x, y):
++    # Digit strings without leading zeros; avoids int() size limits.
++    if len(x) != len(y):
++        return -1 if len(x) < len(y) else 1
++    return (x > y) - (x < y)
++
++
++def _cmp_ident(x, y):
++    xn, yn = x.isdigit() and x.isascii(), y.isdigit() and y.isascii()
++    if xn and yn:
++        return _cmp_num(x, y)
++    if xn:
++        return -1
++    if yn:
++        return 1
++    return (x > y) - (x < y)
++
++
++def _cmp_parsed(pa, pb):
++    for x, y in zip(pa[0], pb[0]):
++        c = _cmp_num(x, y)
++        if c:
++            return c
++    ra, rb = pa[1], pb[1]
++    if ra is None or rb is None:
++        if ra is None and rb is None:
++            return 0
++        return 1 if ra is None else -1
++    for x, y in zip(ra, rb):
++        c = _cmp_ident(x, y)
++        if c:
++            return c
++    return (len(ra) > len(rb)) - (len(ra) < len(rb))
++
++
+ def compare(a, b):
+     """Return -1, 0 or 1 when version a has lower, equal or higher precedence than b.
+ 
+     The result is exactly one of the ints -1, 0, 1.
+     Raises ValueError if a or b is not a valid version string.
+     """
+-    raise NotImplementedError
++    pa = _parse(a)
++    pb = _parse(b)
++    return _cmp_parsed(pa, pb)
+ 
+ 
+ def max_version(versions):
+@@ -65,4 +124,12 @@ def max_version(versions):
+     raises ValueError wherever it sits, even when it is the only entry. An
+     empty iterable raises ValueError.
+     """
+-    raise NotImplementedError
++    best = None
++    best_parsed = None
++    for v in versions:
++        p = _parse(v)
++        if best_parsed is None or _cmp_parsed(p, best_parsed) > 0:
++            best, best_parsed = v, p
++    if best_parsed is None:
++        raise ValueError("max_version() requires at least one version")
++    return best

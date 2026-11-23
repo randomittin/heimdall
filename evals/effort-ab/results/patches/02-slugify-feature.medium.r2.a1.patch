@@ -1,0 +1,36 @@
+diff --git a/textutil.py b/textutil.py
+index ce6c7e9..3659e63 100644
+--- a/textutil.py
++++ b/textutil.py
+@@ -23,3 +23,31 @@ def title_case(text):
+     'Hello World'
+     """
+     return " ".join(word[:1].upper() + word[1:].lower() for word in text.split())
++
++
++def slugify(text, max_length=None):
++    """Return a URL slug for ``text`` (lower-case ASCII letters/digits and '-')."""
++    import re
++    import unicodedata
++
++    if not isinstance(text, str):
++        raise TypeError("text must be a str")
++    if max_length is not None:
++        if isinstance(max_length, bool) or not isinstance(max_length, int):
++            raise TypeError("max_length must be an int or None")
++        if max_length < 1:
++            raise ValueError("max_length must be >= 1")
++
++    s = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++    slug = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
++    if not slug:
++        return "n-a"
++    if max_length is None or len(slug) <= max_length:
++        return slug
++
++    cut = slug[:max_length]
++    if slug[max_length] != "-":
++        idx = cut.rfind("-")
++        if idx > 0:
++            cut = cut[:idx]
++    return cut.rstrip("-")

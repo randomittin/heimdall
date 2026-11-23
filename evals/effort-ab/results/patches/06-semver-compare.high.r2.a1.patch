@@ -1,0 +1,89 @@
+diff --git a/semver.py b/semver.py
+index 128c84a..0a10872 100644
+--- a/semver.py
++++ b/semver.py
+@@ -46,23 +46,68 @@ about a.
+ """
+ 
+ 
+-def compare(a, b):
+-    """Return -1, 0 or 1 when version a has lower, equal or higher precedence than b.
++import re
++
++_NUM = r"(?:0|[1-9][0-9]*)"
++_PRE_ID = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
++_BUILD_ID = r"[0-9A-Za-z-]+"
++_RE = re.compile(
++    rf"({_NUM})\.({_NUM})\.({_NUM})"
++    rf"(?:-({_PRE_ID}(?:\.{_PRE_ID})*))?"
++    rf"(?:\+({_BUILD_ID}(?:\.{_BUILD_ID})*))?"
++)
++
++
++def _parse(v):
++    """Return (core, prerelease_identifiers_or_None); raise ValueError if invalid."""
++    if not isinstance(v, str):
++        raise ValueError(f"invalid version: {v!r}")
++    m = _RE.fullmatch(v)
++    if m is None:
++        raise ValueError(f"invalid version: {v!r}")
++    core = tuple((len(g), g) for g in m.group(1, 2, 3))  # no leading zeros: length then text
++    pre = m.group(4)
++    return core, (pre.split(".") if pre is not None else None)
++
+ 
+-    The result is exactly one of the ints -1, 0, 1.
+-    Raises ValueError if a or b is not a valid version string.
+-    """
+-    raise NotImplementedError
++def _cmp(x, y):
++    return (x > y) - (x < y)
++
++
++def _compare_parsed(pa, pb):
++    if pa[0] != pb[0]:
++        return _cmp(pa[0], pb[0])
++    ra, rb = pa[1], pb[1]
++    if ra is None or rb is None:
++        return _cmp(ra is None, rb is None)
++    for x, y in zip(ra, rb):
++        xn, yn = x.isdigit() and x.isascii(), y.isdigit() and y.isascii()
++        if xn and yn:
++            c = _cmp((len(x), x), (len(y), y))
++        elif xn != yn:
++            c = -1 if xn else 1
++        else:
++            c = _cmp(x, y)
++        if c:
++            return c
++    return _cmp(len(ra), len(rb))
++
++
++def compare(a, b):
++    """Return -1, 0 or 1 when version a has lower, equal or higher precedence than b."""
++    pa = _parse(a)
++    pb = _parse(b)
++    return _compare_parsed(pa, pb)
+ 
+ 
+ def max_version(versions):
+-    """Return the highest-precedence entry of ``versions``.
+-
+-    ``versions`` is any iterable of version strings (consume it only once).
+-    The result is the ORIGINAL string, not a normalised one. When several
+-    entries share the highest precedence (they differ only in build metadata)
+-    return the first of them. Every entry is validated: an invalid entry
+-    raises ValueError wherever it sits, even when it is the only entry. An
+-    empty iterable raises ValueError.
+-    """
+-    raise NotImplementedError
++    """Return the original string of the highest-precedence entry (first on ties)."""
++    best = best_parsed = None
++    found = False
++    for v in versions:
++        p = _parse(v)
++        if not found or _compare_parsed(p, best_parsed) > 0:
++            best, best_parsed, found = v, p, True
++    if not found:
++        raise ValueError("max_version() requires at least one version, got empty iterable")
++    return best

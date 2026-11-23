@@ -1,0 +1,63 @@
+diff --git a/csvparse.py b/csvparse.py
+index e6fb5a9..74dd112 100644
+--- a/csvparse.py
++++ b/csvparse.py
+@@ -38,4 +38,57 @@ def parse_csv(text, delimiter=","):
+       is not blank: "  \\n" -> [["  "]].
+     * No other processing: no backslash escapes, no type conversion.
+     """
+-    raise NotImplementedError
++    if not isinstance(delimiter, str) or len(delimiter) != 1 or delimiter in '"\r\n':
++        raise ValueError("delimiter must be one character other than quote, CR or LF")
++    if text.startswith("\ufeff"):
++        text = text[1:]
++    n = len(text)
++    records = []
++    i = 0
++    while i < n:
++        record = []
++        if text[i] in "\r\n":
++            i += 2 if text.startswith("\r\n", i) else 1
++            records.append(record)
++            continue
++        while True:
++            # parse one field starting at i (i may equal n)
++            if i < n and text[i] == '"':
++                parts = []
++                j = i + 1
++                while True:
++                    k = text.find('"', j)
++                    if k < 0:
++                        raise ValueError("unterminated quoted field")
++                    parts.append(text[j:k])
++                    if k + 1 < n and text[k + 1] == '"':
++                        parts.append('"')
++                        j = k + 2
++                    else:
++                        i = k + 1
++                        break
++                record.append("".join(parts))
++                if i < n and text[i] != delimiter and text[i] not in "\r\n":
++                    prefix = text[:i]
++                    line = 1 + prefix.count("\n") + prefix.count("\r") - prefix.count("\r\n")
++                    raise ValueError("line %d: unexpected character after closing quote" % line)
++            else:
++                j = i
++                while j < n and text[j] != delimiter and text[j] != "\r" and text[j] != "\n":
++                    j += 1
++                record.append(text[i:j])
++                i = j
++            # now at end of text, delimiter, or terminator
++            if i >= n:
++                break
++            c = text[i]
++            if c == delimiter:
++                i += 1
++                continue
++            if c == "\r" and i + 1 < n and text[i + 1] == "\n":
++                i += 2
++            else:
++                i += 1
++            break
++        records.append(record)
++    return records
