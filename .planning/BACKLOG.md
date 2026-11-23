@@ -86,3 +86,4 @@
 - MED headroom off --backup-dir copies whole settings.json (may hold tokens) into the lean backup with its own mode; chmod 0600 or copy only the hmd slice.
 - [ ] MEDIUM test/no-auto-merge.test.sh fails on main (pre-existing, 8/9): unclassified hits in agents/heimdall-lean.md and skills/heimdall/references/lean-procedures.md:70 (lean-core). Found 2026-11-23.
 - [ ] LOW bin/heimdall:5443 still says "Never retry same tier" — reword for the effort ladder (2026-11-23).
+- [ ] LOW lean_context_parity counts gitignored untracked files (two empty Sept-21 *.tmp in skills/designmatch/.heimdall/ turned check red); measure tracked+unignored only (2026-11-23).
