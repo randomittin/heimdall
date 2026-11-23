@@ -164,7 +164,7 @@ def metrics(parsed):
         "tool_calls": parsed["tools"],
         "hook_events": parsed["hooks"],
         "five_hour_util": five_hour_util(parsed["rate"]),
-        "claude_version": (parsed["init"] or {}).get("claude_version"),
+        "claude_version": (parsed["init"] or {}).get("claude_code_version"),
     }
 
 
@@ -191,7 +191,7 @@ def execute(job, args, state):
     prompt = task["prompt"] + SUFFIX
     key = (job["task"], job["arm"], job["rep"])
     for attempt in range(state["attempts"].get(key, 0) + 1, state["attempts"].get(key, 0) + 4):
-        if state["stop"].is_set():
+        if state["stop"].is_set() or time.monotonic() > state["deadline"]:
             return
         if free_pct(args.tmp_root) < args.min_free_pct:
             state["stop"].set()
@@ -207,6 +207,7 @@ def execute(job, args, state):
         with open(prompt_file) as stdin, open(raw, "w") as stdout, open(f"{raw}.err", "w") as stderr:
             proc = subprocess.Popen(cmd, cwd=work, env=child_env(), stdin=stdin, stdout=stdout,
                                     stderr=stderr, start_new_session=True)
+            state["procs"].add(proc.pid)
             try:
                 proc.wait(timeout=args.timeout)
             except subprocess.TimeoutExpired:
