@@ -118,7 +118,7 @@ Groups per event: UserPromptSubmit 4 · PreToolUse 7 · PostToolUse 4 · Session
 | Event | id | Locked | Matcher | Purpose |
 |---|---|---|---|---|
 | UserPromptSubmit | `parallel-gate` | no | * | Injects a delegation directive when a prompt looks multi-part (`bin/parallel-gate`) |
-| UserPromptSubmit | `ctx-meter-notice` | no | * | Context-window meter notice (`bin/heimdall-ctx-meter`) |
+| UserPromptSubmit | `ctx-meter-notice` | no | * | Context-window meter (`bin/heimdall-ctx-meter`): full notice on stderr, plus ONE line to the model (hook JSON on stdout) when a tier is crossed or the prompt cache went cold above 150K |
 | UserPromptSubmit | `secret-paste-filter` | **yes** | * | Refuses a prompt carrying a pasted credential; value vaulted locally under `{{HMD_SECRET_n}}` (`bin/heimdall-secret-filter`) |
 | UserPromptSubmit | `caveman-level-context` | no | * | Adds the caveman compression level as additionalContext |
 | UserPromptSubmit | `finished-agents-prompt` | no | * | ONE line to the model when finished background agents were never closed: `N finished agents still open: <id> (<desc>, finished Xm ago) — TaskStop them unless keeping one for follow-up.` A task-notification turn fires this event too, so it arrives with the notice. A shell file test ends it when the session has no log: no process, no interpreter (`bin/heimdall-finished-agents prompt`) |
