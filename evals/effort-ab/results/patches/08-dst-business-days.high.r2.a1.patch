@@ -1,0 +1,41 @@
+diff --git a/schedule.py b/schedule.py
+index b5f1091..4a96b3b 100644
+--- a/schedule.py
++++ b/schedule.py
+@@ -34,7 +34,7 @@ business_days_between(a, b)
+       count for the reversed range: business_days_between(b, a) ==
+       -business_days_between(a, b). Equal local dates give 0.
+ """
+-from datetime import timedelta, timezone
++from datetime import timedelta
+ 
+ 
+ def _require_aware(value, name):
+@@ -50,21 +50,21 @@ def add_business_days(dt, n):
+     if n == 0:
+         return dt
+     step = 1 if n > 0 else -1
+-    moment = dt.astimezone(timezone.utc)
++    day = dt.date()
+     remaining = abs(n)
+     while remaining:
+-        moment += timedelta(days=step)
+-        if moment.weekday() < 5:
++        day += timedelta(days=step)
++        if day.weekday() < 5:
+             remaining -= 1
+-    return moment.astimezone(dt.tzinfo)
++    return dt.replace(year=day.year, month=day.month, day=day.day, fold=0)
+ 
+ 
+ def business_days_between(a, b):
+     """Count business days in [a's local date, b's local date), see module docs."""
+     _require_aware(a, "a")
+     _require_aware(b, "b")
+-    start = a.astimezone(timezone.utc).date()
+-    end = b.astimezone(timezone.utc).date()
++    start = a.date()
++    end = b.date()
+     sign = 1
+     if end < start:
+         start, end, sign = end, start, -1

@@ -1,0 +1,64 @@
+diff --git a/summarize.sh b/summarize.sh
+index d86fb18..f1b9a23 100755
+--- a/summarize.sh
++++ b/summarize.sh
+@@ -3,15 +3,48 @@
+ #
+ # Usage: bash summarize.sh <logfile> [N]
+ #
+-# Reads an Apache/nginx common (or combined) log format file, one request per
+-# line, e.g.
+-#   203.0.113.7 - - [10/Oct/2023:13:55:36 +0000] "GET /index.html HTTP/1.1" 200 2326
+-#
+-# Prints the top N (default 3) client IPs by number of successful (2xx/3xx)
+-# requests, one per line as "<count> <ip>", highest count first, ties broken by
+-# ip in plain string order.  See the task description for the full rules.
+-#
+-# NOT IMPLEMENTED YET.
++# Counts only lines that start with an IPv4-shaped address followed by a space
++# and whose status (first token after the closing quote of the first quoted
++# string) is 2xx or 3xx.  Prints "<count> <ip>", count desc, ip ascending.
++
++if [ $# -lt 1 ]; then
++  echo "usage: summarize.sh <logfile> [N]" >&2
++  exit 2
++fi
++
++file=$1
++n=${2:-3}
++
++if [ ! -e "$file" ]; then
++  echo "error: no such file: $file" >&2
++  exit 2
++fi
++
++case $n in
++  ''|*[!0-9]*) echo "error: N must be a positive integer" >&2; exit 2 ;;
++esac
++if [ "$((10#$n))" -lt 1 ]; then
++  echo "error: N must be a positive integer" >&2
++  exit 2
++fi
++n=$((10#$n))
+ 
+-echo "summarize.sh: not implemented yet" >&2
+-exit 1
++LC_ALL=C awk '
++{
++  if (!match($0, /^[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]? /)) next
++  ip = substr($0, 1, RLENGTH - 1)
++  q = index($0, "\"")
++  if (q == 0) next
++  rest = substr($0, q + 1)
++  c = index(rest, "\"")
++  if (c == 0) next
++  rest = substr(rest, c + 1)
++  if (!match(rest, /^[ \t]*[^ \t]+/)) next
++  tok = substr(rest, 1, RLENGTH)
++  sub(/^[ \t]+/, "", tok)
++  if (tok !~ /^[23][0-9][0-9]$/) next
++  count[ip]++
++}
++END { for (ip in count) print count[ip], ip }
++' "$file" | LC_ALL=C sort -k1,1nr -k2,2 | head -n "$n"
++exit 0

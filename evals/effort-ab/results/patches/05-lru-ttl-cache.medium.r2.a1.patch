@@ -1,0 +1,82 @@
+diff --git a/ttlcache.py b/ttlcache.py
+index 152d1de..d18d926 100644
+--- a/ttlcache.py
++++ b/ttlcache.py
+@@ -33,6 +33,7 @@ Rules
+   key.
+ """
+ import time
++from collections import OrderedDict
+ 
+ 
+ class TTLCache:
+@@ -40,28 +41,62 @@ class TTLCache:
+ 
+     def __init__(self, capacity, ttl, clock=time.monotonic):
+         """Validate the arguments and create an empty cache."""
+-        raise NotImplementedError
++        if capacity < 1 or ttl <= 0:
++            raise ValueError("capacity must be >= 1 and ttl > 0")
++        self._cap = capacity
++        self._ttl = ttl
++        self._clock = clock
++        self._d = OrderedDict()  # key -> (value, stamp), LRU first
++
++    def _live(self, key, now):
++        e = self._d.get(key)
++        if e is None:
++            return False
++        if now - e[1] >= self._ttl:
++            del self._d[key]
++            return False
++        return True
++
++    def _purge(self, now):
++        for k in [k for k, e in self._d.items() if now - e[1] >= self._ttl]:
++            del self._d[k]
+ 
+     def put(self, key, value):
+         """Store ``value`` under ``key`` (purge expired, evict LRU if full)."""
+-        raise NotImplementedError
++        now = self._clock()
++        if self._live(key, now):
++            self._d[key] = (value, now)
++            self._d.move_to_end(key)
++            return
++        self._purge(now)
++        if len(self._d) >= self._cap:
++            self._d.popitem(last=False)
++        self._d[key] = (value, now)
+ 
+     def get(self, key, default=None):
+         """Return the live value for ``key`` and mark it most recently used."""
+-        raise NotImplementedError
++        if not self._live(key, self._clock()):
++            return default
++        self._d.move_to_end(key)
++        return self._d[key][0]
+ 
+     def delete(self, key):
+         """Remove ``key``; True if a live entry was removed, else False."""
+-        raise NotImplementedError
++        if not self._live(key, self._clock()):
++            return False
++        del self._d[key]
++        return True
+ 
+     def keys(self):
+         """Return the live keys as a list, least recently used first."""
+-        raise NotImplementedError
++        self._purge(self._clock())
++        return list(self._d)
+ 
+     def __len__(self):
+         """Return the number of live entries."""
+-        raise NotImplementedError
++        self._purge(self._clock())
++        return len(self._d)
+ 
+     def __contains__(self, key):
+         """Return True if ``key`` is live, without changing recency."""
+-        raise NotImplementedError
++        return self._live(key, self._clock())

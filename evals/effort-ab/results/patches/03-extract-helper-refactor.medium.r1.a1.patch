@@ -1,0 +1,47 @@
+diff --git a/orders.py b/orders.py
+index 824d55b..86d22d9 100644
+--- a/orders.py
++++ b/orders.py
+@@ -10,15 +10,18 @@ that names the offending argument.
+ """
+ 
+ 
++def _require_positive_int(value, name):
++    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
++        raise ValueError(f"{name} must be a positive integer")
++
++
+ def create_order(order_id, quantity, unit_price_cents):
+     """Return a new order dict.
+ 
+     ``quantity`` is validated first, then ``unit_price_cents``.
+     """
+-    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+-        raise ValueError("quantity must be a positive integer")
+-    if isinstance(unit_price_cents, bool) or not isinstance(unit_price_cents, int) or unit_price_cents < 1:
+-        raise ValueError("unit_price_cents must be a positive integer")
++    _require_positive_int(quantity, "quantity")
++    _require_positive_int(unit_price_cents, "unit_price_cents")
+     return {"id": order_id, "quantity": quantity, "unit_price_cents": unit_price_cents}
+ 
+ 
+@@ -28,8 +31,7 @@ def update_quantity(order, new_quantity):
+     ``order`` itself is left untouched.  ``new_quantity`` is validated before
+     ``order`` is read.
+     """
+-    if isinstance(new_quantity, bool) or not isinstance(new_quantity, int) or new_quantity < 1:
+-        raise ValueError("new_quantity must be a positive integer")
++    _require_positive_int(new_quantity, "new_quantity")
+     updated = dict(order)
+     updated["quantity"] = new_quantity
+     return updated
+@@ -45,8 +47,7 @@ def split_order(order, parts):
+     ``parts`` is validated before ``order`` is read.  Asking for more parts
+     than there are units raises ``ValueError``.
+     """
+-    if isinstance(parts, bool) or not isinstance(parts, int) or parts < 1:
+-        raise ValueError("parts must be a positive integer")
++    _require_positive_int(parts, "parts")
+     quantity = order["quantity"]
+     if parts > quantity:
+         raise ValueError(f"cannot split an order of {quantity} into {parts} parts")

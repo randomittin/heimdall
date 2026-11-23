@@ -1,0 +1,85 @@
+diff --git a/emitter.js b/emitter.js
+index fa8d38e..d9b75e0 100644
+--- a/emitter.js
++++ b/emitter.js
+@@ -14,50 +14,61 @@ class Emitter {
+ 
+   /** Register `fn` for `event`. */
+   on(event, fn) {
+-    this._listenersOf(event).push(fn);
++    this._listenersOf(event).push({ fn, once: false, ran: false });
+     return this;
+   }
+ 
+-  /** Register `fn` for `event`; it is unregistered after it has run once. */
++  /** Register `fn` for `event`; it is unregistered before it runs, at most once. */
+   once(event, fn) {
+-    const wrapper = (...args) => {
+-      fn.apply(this, args);
+-      this.off(event, wrapper);
+-    };
+-    return this.on(event, wrapper);
++    this._listenersOf(event).push({ fn, once: true, ran: false });
++    return this;
+   }
+ 
+-  /** Remove a registration of `fn` for `event`. Unknown listeners are ignored. */
++  /** Remove the most recently added registration of `fn` for `event`. */
+   off(event, fn) {
+     const listeners = this._events.get(event);
+     if (!listeners) {
+       return this;
+     }
+-    const index = listeners.indexOf(fn);
+-    if (index !== -1) {
+-      listeners.splice(index, 1);
++    for (let i = listeners.length - 1; i >= 0; i--) {
++      if (listeners[i].fn === fn) {
++        listeners.splice(i, 1);
++        break;
++      }
+     }
+     return this;
+   }
+ 
+   /**
+-   * Call every listener of `event` with `args`.
++   * Call every listener of `event` with `args` (over a snapshot).
+    * Returns true when at least one listener ran, false otherwise.
+-   * An 'error' event that nobody listens for is thrown instead of dropped:
+-   * the first argument if it is an Error, otherwise a generic Error.
++   * An 'error' event that nobody listens for is thrown instead of dropped.
+    */
+   emit(event, ...args) {
+-    const listeners = this._events.get(event);
+-    if (!listeners || listeners.length === 0) {
++    const current = this._events.get(event);
++    if (!current || current.length === 0) {
+       if (event === 'error') {
+         throw args[0] instanceof Error ? args[0] : new Error('Unhandled error');
+       }
+       return false;
+     }
+-    for (let i = 0; i < listeners.length; i++) {
+-      listeners[i].apply(this, args);
++    const snapshot = current.slice();
++    let invoked = false;
++    for (const rec of snapshot) {
++      if (rec.once) {
++        if (rec.ran) {
++          continue;
++        }
++        rec.ran = true;
++        const idx = current.indexOf(rec);
++        if (idx !== -1) {
++          current.splice(idx, 1);
++        }
++      }
++      invoked = true;
++      rec.fn.apply(this, args);
+     }
+-    return true;
++    return invoked;
+   }
+ 
+   /** Number of registrations (on + once) currently held for `event`. */

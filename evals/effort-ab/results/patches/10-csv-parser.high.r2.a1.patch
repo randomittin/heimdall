@@ -1,0 +1,72 @@
+diff --git a/csvparse.py b/csvparse.py
+index e6fb5a9..9e39a19 100644
+--- a/csvparse.py
++++ b/csvparse.py
+@@ -38,4 +38,66 @@ def parse_csv(text, delimiter=","):
+       is not blank: "  \\n" -> [["  "]].
+     * No other processing: no backslash escapes, no type conversion.
+     """
+-    raise NotImplementedError
++    if not isinstance(delimiter, str) or len(delimiter) != 1 or delimiter in '"\r\n':
++        raise ValueError("delimiter must be a single character other than quote, CR or LF")
++    if text.startswith("\ufeff"):
++        text = text[1:]
++    n = len(text)
++    i = 0
++    line = 1
++    records = []
++    while i < n:
++        c = text[i]
++        if c == "\r" or c == "\n":
++            i += 2 if (c == "\r" and text.startswith("\n", i + 1)) else 1
++            line += 1
++            records.append([])
++            continue
++        fields = []
++        while True:
++            if i < n and text[i] == '"':
++                i += 1
++                buf = []
++                while True:
++                    if i >= n:
++                        raise ValueError("unterminated quoted field")
++                    c = text[i]
++                    if c == '"':
++                        if i + 1 < n and text[i + 1] == '"':
++                            buf.append('"')
++                            i += 2
++                            continue
++                        i += 1
++                        break
++                    if c == "\r":
++                        line += 1
++                        if text.startswith("\n", i + 1):
++                            buf.append("\r\n")
++                            i += 2
++                            continue
++                    elif c == "\n":
++                        line += 1
++                    buf.append(c)
++                    i += 1
++                fields.append("".join(buf))
++                if i < n and text[i] not in (delimiter, "\r", "\n"):
++                    raise ValueError(
++                        "line %d: unexpected character after closing quote" % line)
++            else:
++                j = i
++                while j < n and text[j] != delimiter and text[j] != "\r" and text[j] != "\n":
++                    j += 1
++                fields.append(text[i:j])
++                i = j
++            # now at delimiter, terminator, or end
++            if i >= n:
++                break
++            c = text[i]
++            if c == delimiter:
++                i += 1
++                continue
++            i += 2 if (c == "\r" and text.startswith("\n", i + 1)) else 1
++            line += 1
++            break
++        records.append(fields)
++    return records

@@ -211,39 +211,29 @@ class ShapeTests(unittest.TestCase):
 
 class DifferentialTests(unittest.TestCase):
     def test_battery_matches_csv_reader(self):
-        self.assertGreaterEqual(len(BATTERY), 40)
-        for text, delimiter in BATTERY:
+        self.assertGreaterEqual(len(BATTERY_EXPECTED), 40)
+        for text, delimiter, expected in BATTERY_EXPECTED:
             with self.subTest(text=text[:50], delimiter=delimiter):
-                self.assertEqual(parse_csv(text, delimiter), stdlib_rows(text, delimiter))
+                self.assertEqual(parse_csv(text, delimiter), expected)
 
     def test_delimiter_can_be_given_by_keyword(self):
         self.assertEqual(parse_csv("a;b\n", delimiter=";"), [["a", "b"]])
         self.assertEqual(parse_csv("a b", delimiter=" "), [["a", "b"]])
 
     def test_random_inputs_match_csv_reader_including_the_errors(self):
-        rng = random.Random(20260611)
         checked_errors = 0
-        for delimiter in (",", ";", "\t", "|", " "):
-            alphabet = ["a", "b", "x", " ", delimiter, '"', '"', '"', "\n", "\r", "\r\n"]
-            for _ in range(1200):
-                text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
-                reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
-                try:
-                    expected = list(reader)
-                except csv.Error as stdlib_error:
-                    checked_errors += 1
-                    with self.assertRaises(ValueError, msg=repr(text)) as caught:
-                        parse_csv(text, delimiter)
-                    message = str(caught.exception)
-                    if "end of data" in str(stdlib_error):
-                        self.assertEqual(message, "unterminated quoted field", repr(text))
-                    else:
-                        self.assertTrue(
-                            message.startswith(f"line {reader.line_num}: "),
-                            (text, message, reader.line_num),
-                        )
-                else:
-                    self.assertEqual(parse_csv(text, delimiter), expected, repr(text))
+        for text, delimiter, kind, payload in FUZZ_CASES:
+            if kind == "rows":
+                self.assertEqual(parse_csv(text, delimiter), payload, repr(text))
+                continue
+            checked_errors += 1
+            with self.assertRaises(ValueError, msg=repr(text)) as caught:
+                parse_csv(text, delimiter)
+            message = str(caught.exception)
+            if kind == "unterminated":
+                self.assertEqual(message, "unterminated quoted field", repr(text))
+            else:
+                self.assertTrue(message.startswith(f"line {payload}: "), (text, message, payload))
         self.assertGreater(checked_errors, 500)
 
 
@@ -280,10 +270,9 @@ class ErrorTests(unittest.TestCase):
                     self.assertNotEqual(str(caught.exception), "unterminated quoted field")
 
     def test_unusual_but_valid_delimiters(self):
-        for delimiter in (";", "\t", "|", " ", ":", "a", "é", "\x1f", "'", "\\"):
-            text = f"1{delimiter}2{delimiter}{delimiter}3\n4{delimiter}5\n"
+        for delimiter, text, expected in ODD_DELIMITER_EXPECTED:
             with self.subTest(delimiter=delimiter):
-                self.assertEqual(parse_csv(text, delimiter), stdlib_rows(text, delimiter))
+                self.assertEqual(parse_csv(text, delimiter), expected)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,78 @@
+diff --git a/ttlcache.py b/ttlcache.py
+index 152d1de..50265ae 100644
+--- a/ttlcache.py
++++ b/ttlcache.py
+@@ -33,6 +33,7 @@ Rules
+   key.
+ """
+ import time
++from collections import OrderedDict
+ 
+ 
+ class TTLCache:
+@@ -40,28 +41,58 @@ class TTLCache:
+ 
+     def __init__(self, capacity, ttl, clock=time.monotonic):
+         """Validate the arguments and create an empty cache."""
+-        raise NotImplementedError
++        if capacity < 1 or ttl <= 0:
++            raise ValueError("capacity must be >= 1 and ttl must be > 0")
++        self._capacity = capacity
++        self._ttl = ttl
++        self._clock = clock
++        # key -> (value, stored_at); order: least recently used first.
++        self._data = OrderedDict()
++
++    def _purge(self, now):
++        """Drop every entry that is expired at time ``now``."""
++        ttl = self._ttl
++        dead = [k for k, (_, t0) in self._data.items() if now - t0 >= ttl]
++        for k in dead:
++            del self._data[k]
+ 
+     def put(self, key, value):
+         """Store ``value`` under ``key`` (purge expired, evict LRU if full)."""
+-        raise NotImplementedError
++        now = self._clock()
++        self._purge(now)
++        if key in self._data:
++            del self._data[key]
++        elif len(self._data) >= self._capacity:
++            self._data.popitem(last=False)
++        self._data[key] = (value, now)
+ 
+     def get(self, key, default=None):
+         """Return the live value for ``key`` and mark it most recently used."""
+-        raise NotImplementedError
++        self._purge(self._clock())
++        if key not in self._data:
++            return default
++        self._data.move_to_end(key)
++        return self._data[key][0]
+ 
+     def delete(self, key):
+         """Remove ``key``; True if a live entry was removed, else False."""
+-        raise NotImplementedError
++        self._purge(self._clock())
++        if key in self._data:
++            del self._data[key]
++            return True
++        return False
+ 
+     def keys(self):
+         """Return the live keys as a list, least recently used first."""
+-        raise NotImplementedError
++        self._purge(self._clock())
++        return list(self._data)
+ 
+     def __len__(self):
+         """Return the number of live entries."""
+-        raise NotImplementedError
++        self._purge(self._clock())
++        return len(self._data)
+ 
+     def __contains__(self, key):
+         """Return True if ``key`` is live, without changing recency."""
+-        raise NotImplementedError
++        self._purge(self._clock())
++        return key in self._data

@@ -1,0 +1,41 @@
+diff --git a/textutil.py b/textutil.py
+index ce6c7e9..488f918 100644
+--- a/textutil.py
++++ b/textutil.py
+@@ -23,3 +23,36 @@ def title_case(text):
+     'Hello World'
+     """
+     return " ".join(word[:1].upper() + word[1:].lower() for word in text.split())
++
++
++def slugify(text, max_length=None):
++    """Return an ASCII, hyphen-separated, lower-case slug of ``text``.
++
++    >>> slugify("Hello, World!")
++    'hello-world'
++    >>> slugify("hello big world", 12)
++    'hello-big'
++    """
++    import re
++    import unicodedata
++
++    if not isinstance(text, str):
++        raise TypeError("text must be a str")
++    if max_length is not None:
++        if not isinstance(max_length, int):
++            raise TypeError("max_length must be an int or None")
++        if max_length < 1:
++            raise ValueError("max_length must be >= 1")
++
++    decomposed = unicodedata.normalize("NFKD", text)
++    ascii_text = decomposed.encode("ascii", "ignore").decode("ascii").lower()
++    slug = re.sub(r"[^a-z0-9]+", "-", ascii_text).strip("-")
++    if not slug:
++        return "n-a"
++    if max_length is None or len(slug) <= max_length:
++        return slug
++    if slug[max_length] == "-":
++        return slug[:max_length]
++    cut = slug[:max_length]
++    idx = cut.rfind("-")
++    return cut[:idx] if idx > 0 else cut

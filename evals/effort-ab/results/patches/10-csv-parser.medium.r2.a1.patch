@@ -1,0 +1,84 @@
+diff --git a/csvparse.py b/csvparse.py
+index e6fb5a9..6172ed1 100644
+--- a/csvparse.py
++++ b/csvparse.py
+@@ -1,4 +1,5 @@
+ """A small CSV parser. The standard library csv module must not be used here."""
++import re
+ 
+ 
+ def parse_csv(text, delimiter=","):
+@@ -38,4 +39,72 @@ def parse_csv(text, delimiter=","):
+       is not blank: "  \\n" -> [["  "]].
+     * No other processing: no backslash escapes, no type conversion.
+     """
+-    raise NotImplementedError
++    if not isinstance(delimiter, str) or len(delimiter) != 1 or delimiter in '"\r\n':
++        raise ValueError("invalid delimiter")
++    if text.startswith("﻿"):
++        text = text[1:]
++    n = len(text)
++    records = []
++    i = 0
++
++    def line_of(pos):
++        return len(re.findall(r"\r\n|\r|\n", text[:pos])) + 1
++
++    def skip_term(p):
++        if text[p] == "\r" and p + 1 < n and text[p + 1] == "\n":
++            return p + 2
++        return p + 1
++
++    while i < n:
++        fields = []
++        while True:
++            if i < n and text[i] == '"':
++                parts = []
++                k = i + 1
++                while True:
++                    q = text.find('"', k)
++                    if q < 0:
++                        raise ValueError("unterminated quoted field")
++                    parts.append(text[k:q])
++                    if q + 1 < n and text[q + 1] == '"':
++                        parts.append('"')
++                        k = q + 2
++                    else:
++                        i = q + 1
++                        break
++                fields.append("".join(parts))
++                if i >= n:
++                    break
++                c = text[i]
++                if c == delimiter:
++                    i += 1
++                    if i >= n:
++                        fields.append("")
++                        break
++                    continue
++                if c in "\r\n":
++                    i = skip_term(i)
++                    break
++                raise ValueError("line %d: unexpected %r after closing quote" % (line_of(i), c))
++            j = i
++            while j < n and text[j] != delimiter and text[j] != "\r" and text[j] != "\n":
++                j += 1
++            field = text[i:j]
++            if j >= n:
++                fields.append(field)
++                i = n
++                break
++            c = text[j]
++            if c == delimiter:
++                fields.append(field)
++                i = j + 1
++                if i >= n:
++                    fields.append("")
++                    break
++                continue
++            i = skip_term(j)
++            if field or fields:
++                fields.append(field)
++            break
++        records.append(fields)
++    return records
