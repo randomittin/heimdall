@@ -1,0 +1,24 @@
+diff --git a/pager.py b/pager.py
+index b95477b..7344f48 100644
+--- a/pager.py
++++ b/pager.py
+@@ -30,9 +30,10 @@ def paginate(items, page, per_page):
+         raise ValueError("per_page must be >= 1")
+ 
+     total = len(items)
+-    pages = total // per_page
++    pages = max(1, -(-total // per_page))
+ 
+-    start = page * per_page
++    page = max(1, min(page, pages))
++    start = (page - 1) * per_page
+     end = start + per_page
+ 
+     return {
+@@ -42,5 +43,5 @@ def paginate(items, page, per_page):
+         "total": total,
+         "pages": pages,
+         "has_next": page < pages,
+-        "has_prev": page > 0,
++        "has_prev": page > 1,
+     }

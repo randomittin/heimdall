@@ -1,0 +1,45 @@
+diff --git a/textutil.py b/textutil.py
+index ce6c7e9..65cb620 100644
+--- a/textutil.py
++++ b/textutil.py
+@@ -23,3 +23,40 @@ def title_case(text):
+     'Hello World'
+     """
+     return " ".join(word[:1].upper() + word[1:].lower() for word in text.split())
++
++
++def slugify(text, max_length=None):
++    """Return an ASCII, hyphen-separated, lower-case slug of ``text``.
++
++    The text is NFKD-normalised and non-ASCII characters are dropped; every run
++    of characters outside ``[a-z0-9]`` becomes a single ``-`` and leading and
++    trailing ``-`` are stripped.  If ``max_length`` is given and the slug is
++    longer, it is truncated to at most ``max_length`` characters on a word
++    boundary (a first word longer than the limit is hard-cut).  An empty result
++    becomes ``'n-a'``.
++
++    >>> slugify("Héllo, Wörld!")
++    'hello-world'
++    >>> slugify("hello big world", 9)
++    'hello-big'
++    """
++    import re
++    import unicodedata
++
++    if not isinstance(text, str):
++        raise TypeError("text must be a str")
++    if max_length is not None and max_length < 1:
++        raise ValueError("max_length must be >= 1")
++
++    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++    slug = re.sub(r"[^a-z0-9]+", "-", ascii_text.lower()).strip("-")
++
++    if max_length is not None and len(slug) > max_length:
++        if slug[max_length] == "-":
++            slug = slug[:max_length]
++        else:
++            cut = slug.rfind("-", 0, max_length)
++            slug = slug[:cut] if cut > 0 else slug[:max_length]
++        slug = slug.rstrip("-")
++
++    return slug or "n-a"

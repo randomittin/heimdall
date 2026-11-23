@@ -307,10 +307,12 @@ def main():
     args = ap.parse_args()
 
     only = {t for t in args.only.split(",") if t}
-    tasks = sorted(p.name for p in args.tasks_dir.iterdir() if (p / "task.json").is_file())
-    tasks = [t for t in tasks if not only or t in only]
+    # The schedule is built over EVERY task dir, then filtered: a subset or staged run keeps the exact
+    # pre-registered order and arm counterbalance (index parity is the position among all tasks).
+    tasks = sorted(p.name for p in args.tasks_dir.iterdir() if p.is_dir())
     arms = [a for a in args.arms.split(",") if a in ARMS]
-    jobs = [j for j in build_schedule(tasks, args.reps, args.seed) if j["arm"] in arms]
+    jobs = [j for j in build_schedule(tasks, args.reps, args.seed)
+            if j["arm"] in arms and (not only or j["task"] in only) and (args.tasks_dir / j["task"] / "task.json").is_file()]
     args.concurrency = max(1, min(args.concurrency, MAX_CONCURRENT))
     args.results.parent.mkdir(parents=True, exist_ok=True)
     args.streams_dir = args.results.parent / "streams"
