@@ -39,8 +39,17 @@
 #     worse than not existing, because it buys confidence nothing earned.
 #   - NON_VERIFIED is told to the operator ONCE per session, never every turn.
 #   - Below the ceiling it prints NOTHING, on either stream.
-#   - The notice goes to STDERR. UserPromptSubmit stdout becomes model context, and a
-#     context warning that itself costs context every turn would be self-defeating.
+#   - TWO CHANNELS. The full notice goes to STDERR, for an operator at a terminal. That
+#     alone reaches nobody: Claude Code shows a UserPromptSubmit hook's stderr to no one
+#     on exit 0, so the meter spoke correctly for 72 days (that session's .notice file
+#     says CEILING) with zero `[heimdall] CONTEXT` strings in its transcript
+#     (docs/analysis/2026-11-22-token-utilization-next.md §4). So the MODEL also gets ONE
+#     short line on STDOUT, as hook JSON (hookSpecificOutput.additionalContext, the shape
+#     bin/lib/hmd_finished_agents.py emits), and only on the prompt where something new is
+#     true: a tier entered or climbed into, +REARM inside the ceiling band, or the cache
+#     gone cold (below). An injected line stays in the conversation and is read again on
+#     every later turn, so nothing is injected per prompt, and below the ceiling nothing
+#     is injected at all. The blind notice stays operator-only.
 #   - Every verb exits 0 on garbage. It runs in the prompt path; it must never be able
 #     to break a turn.
 #
@@ -89,10 +98,34 @@
 # invented-figure move this design forbids itself; adding real tiers to a
 # number that was already right is what was actually missing.
 #
+# IDLE RETURN — THE CACHE WENT COLD WHILE THE SESSION SAT THERE
+# -------------------------------------------------------------
+# The prompt cache lasts about an hour (the 1h TTL a subscription gets). A session that
+# comes back after that re-writes its WHOLE context at cache-write price on the next
+# turn: 102 such gaps were 37.2% of the 72-day session's spend, 78 of them with >150K in
+# context (docs/analysis/2026-11-22-token-utilization-next.md §1). It is also the
+# cheapest moment to compact. So when the gap since the session's last activity is at
+# least HMD_CTX_IDLE_S (3300 s, a margin under the hour) AND the reading is at least the
+# ceiling (150K: no new threshold), `notice` tells the model to suggest /hmd:continue or
+# /compact. A nudge only: it never blocks.
+#   - LAST ACTIVITY is read from the transcript the hook payload names (transcript_path),
+#     not from the published reading: the status bar re-renders every 2 s
+#     (refreshInterval) even when nothing happens, so a reading's ts never goes old while
+#     a session idles. It is the timestamp of the last main-thread `assistant` entry: the
+#     cache is refreshed by an API response, while a tool result, a typed prompt or a
+#     subagent's traffic does not touch the main thread's cache. That is also why it does
+#     not matter whether the current prompt is already written to the file.
+#   - BOUNDED: only the last 1 MiB of the file is read (a long session's transcript runs
+#     to 100 MB), one interpreter launch, no LLM, and only at or over the ceiling.
+#   - UNKNOWN IS QUIET: no transcript_path, a missing, non-regular or unparseable file, or
+#     no assistant entry in the tail -> no line. An unknown gap is never a cold cache.
+#   - The reading must be the session's OWN (a stale one counts: a suspended UI stops
+#     rendering, and what it last showed is what the next turn re-writes).
+#
 # USAGE
 #   heimdall-ctx-meter publish [--session SID]   # stdin: the statusLine JSON blob
 #   heimdall-ctx-meter read    [--session SID] [--json]
-#   heimdall-ctx-meter notice  [--session SID]   # stdin: the UserPromptSubmit JSON
+#   heimdall-ctx-meter notice  [--session SID]   # stdin: the UserPromptSubmit JSON; stderr: the full notice; stdout: at most ONE hook-JSON line for the model
 #   heimdall-ctx-meter gate    [--session SID] [--json]  # may NEW work start? exit 0=proceed(ok/checkpoint/defer), 1=refuse
 #   heimdall-ctx-meter outshare [--json]         # local output-token share vs input (see ENVIRONMENT)
 #
@@ -103,6 +136,7 @@
 #   HMD_CTX_CLIFF       800000  measured quintile-5 boundary (804,141): cache-write 3.2x
 #   HMD_CTX_TTL         900     seconds a reading stays current; older -> NON_VERIFIED
 #   HMD_CTX_REARM       100000  further growth before the ceiling notice repeats
+#   HMD_CTX_IDLE_S      3300    idle gap (seconds) after which the prompt cache is taken as cold
 #   HMD_CTX_NOW         epoch-second override (tests)
 #   HMD_CTX_PROJECTS_ROOT  outshare: root walked for *.jsonl transcripts (default ~/.claude/projects)
 #   HMD_HEADROOM_LEDGER    outshare: headroom ledger read for lifetime.total_input_tokens
@@ -133,6 +167,7 @@ CLIFF_NEAR="${HMD_CTX_CLIFF_NEAR:-700000}"
 CLIFF="${HMD_CTX_CLIFF:-800000}"
 TTL="${HMD_CTX_TTL:-900}"
 REARM="${HMD_CTX_REARM:-100000}"
+IDLE="${HMD_CTX_IDLE_S:-3300}"
 
 # The measured per-request context delta (quintiles 2-4, flat at ~13,320 tok/req). Used
 # ONLY to convert remaining headroom into "how many requests do I have left" — which is
@@ -149,6 +184,9 @@ _commas() { printf '%s' "${1:-}" | sed -e :a -e 's/\(.*[0-9]\)\([0-9]\{3\}\)/\1,
 
 _is_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
+# 3700 -> "61 min", 7300 -> "2 h": how long a session sat idle.
+_span() { if [ "$1" -ge 7200 ]; then printf '%s h' $(( $1 / 3600 )); else printf '%s min' $(( $1 / 60 )); fi; }
+
 # ── argument parse ───────────────────────────────────────────────────────────────
 VERB="${1:-}"; [ $# -gt 0 ] && shift
 SESSION=""
@@ -157,7 +195,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --session) SESSION="${2:-}"; shift 2 ;;
     --json)    JSON_OUT=1; shift ;;
-    --help|-h) sed -n '2,108p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) shift ;;
   esac
 done
@@ -582,12 +620,113 @@ render_blind() {
   e ""
 }
 
+# ── the model channel ────────────────────────────────────────────────────────────
+# What `notice` wants the MODEL to read (header, "TWO CHANNELS"), lines joined by the two
+# characters \n so the whole is already the body of a JSON string. Every line is fixed
+# text plus integers, with no quote and no backslash, which is what makes printing it
+# unescaped safe.
+MODEL_LINES=""
+_tell_model() { if [ -n "$MODEL_LINES" ]; then MODEL_LINES="$MODEL_LINES\\n$1"; else MODEL_LINES="$1"; fi; }
+
+# ONE hook JSON object on stdout, or nothing at all. hookSpecificOutput.additionalContext
+# is what Claude Code adds to the turn for a UserPromptSubmit hook.
+_emit_model() {
+  [ -n "$MODEL_LINES" ] || return 0
+  printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"}}\n' "$MODEL_LINES"
+}
+
+# The lines themselves: one fact and the remedy, the same voice as the stderr block.
+tell_ceiling() { # <tokens>
+  _tell_model "$(printf '[heimdall] CONTEXT %s tokens, past the %s ceiling: each request costs ~6x more than at 118K (measured). Suggest the user run /hmd:save, then /compact.' "$(_commas "$1")" "$CEILING_H")"
+}
+
+tell_cliff() { # <tokens> <CLIFF_NEAR|CLIFF>
+  local reqs
+  if [ "$2" = "CLIFF" ]; then
+    _tell_model "$(printf '[heimdall] CONTEXT %s tokens, past the %s cache cliff (cache writes 3.2x per request). Suggest the user run /hmd:save NOW, then /compact before new work.' "$(_commas "$1")" "$(_commas "$CLIFF")")"
+  else
+    reqs=$(( (CLIFF - $1) / DELTA_PER_REQ )); [ "$reqs" -lt 0 ] && reqs=0
+    _tell_model "$(printf '[heimdall] CONTEXT %s tokens, about %s requests from the %s cache cliff (cache writes 3.2x). Suggest the user run /hmd:save NOW, then /compact.' "$(_commas "$1")" "$reqs" "$(_commas "$CLIFF")")"
+  fi
+}
+
+tell_cold() { # <tokens> <idle seconds>
+  _tell_model "$(printf '[heimdall] CACHE COLD: idle %s, so this turn re-writes all %s context tokens at cache-write price. Suggest the user run /hmd:continue (or /compact) before continuing.' "$(_span "$2")" "$(_commas "$1")")"
+}
+
+# ── idle return — the prompt cache went cold while the session sat there ──────────
+# Why, and what counts as activity: the header, "IDLE RETURN". Prints the epoch second of
+# the last main-thread `assistant` entry of the transcript the payload on stdin names, or
+# nothing whenever that cannot be established. python-only, like publish: a jq path
+# cannot express it, and with no interpreter there is simply no line.
+_last_activity_epoch() {
+  [ -n "$_CTXM_PY" ] || return 0
+  printf '%s' "$STDIN_BLOB" | "$_CTXM_PY" -c '
+import calendar, json, os, re, stat, sys
+WINDOW = 1 << 20
+try:
+    payload = json.load(sys.stdin)
+    path = payload.get("transcript_path") if isinstance(payload, dict) else None
+    if not isinstance(path, str) or not path:
+        sys.exit(0)
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode):
+        sys.exit(0)        # a FIFO or a device would block the prompt on open
+    start = max(0, info.st_size - WINDOW)
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        tail = fh.read(WINDOW)
+except Exception:
+    sys.exit(0)
+lines = tail.split(b"\n")
+if start:
+    lines = lines[1:]      # the window cut the first line in half
+for raw in reversed(lines):
+    if b"assistant" not in raw:
+        continue
+    try:
+        entry = json.loads(raw)
+    except Exception:
+        continue
+    if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain") is True:
+        continue
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?Z$", str(entry.get("timestamp")))
+    if m:
+        print(calendar.timegm(tuple(int(g) for g in m.groups())))
+    break
+' 2>/dev/null || true
+}
+
+# `notice`'s second job, after the tier notice. Cheapest checks first: below the ceiling
+# the transcript is never opened.
+_notice_idle() {
+  { _is_int "$TOKENS" && [ "$TOKENS" -ge "$CEILING" ]; } || return 0
+  # the session's OWN reading, never whichever was newest (_resolve falls back to that)
+  { [ -n "$RESOLVED_SID" ] && [ -f "$CTX_DIR/$RESOLVED_SID.json" ]; } || return 0
+  _ctxm_python
+  local act gap
+  act="$(_last_activity_epoch)"
+  _is_int "$act" || return 0
+  gap=$(( $(_now) - act ))
+  [ "$gap" -ge "$IDLE" ] || return 0
+  tell_cold "$TOKENS" "$gap"
+}
+
 # ── notice — the per-prompt verb. Silent in the normal case, always exit 0. ──────
+# Two independent jobs share ONE hook JSON object between them (header, "TWO CHANNELS"):
+#   _notice_tier  the tier notice: the full render on stderr, and the model's line when a tier is crossed
+#   _notice_idle  the prompt cache went cold while the session sat idle
 do_notice() {
   _slurp
   _resolve
   _note_path
+  _notice_tier
+  _notice_idle
+  _emit_model
+  exit 0
+}
 
+_notice_tier() {
   local prev_state prev_tokens
   prev_state="$(_note_get state)"
   prev_tokens="$(_note_get tokens)"
@@ -598,13 +737,13 @@ do_notice() {
       # Below the ceiling: say NOTHING, and clear the bookkeeping so a later climb
       # back over the ceiling is announced fresh rather than swallowed by a cooldown.
       [ -n "$prev_state" ] && [ "$prev_state" != "OK" ] && _note_put OK "${TOKENS:-0}"
-      exit 0
+      return 0
       ;;
     NON_VERIFIED)
-      [ "$prev_state" = "NON_VERIFIED" ] && exit 0     # quiet-safe: once per session
+      [ "$prev_state" = "NON_VERIFIED" ] && return 0     # quiet-safe: once per session
       render_blind "$REASON"
       _note_put NON_VERIFIED 0
-      exit 0
+      return 0
       ;;
     CEILING)
       # Re-speak on GROWTH, not per prompt. A drop (a compact or a restart) re-baselines
@@ -612,23 +751,32 @@ do_notice() {
       # longer exists and a 500K ascent passes in total silence.
       if [ "$prev_state" = "CEILING" ]; then
         if [ "$TOKENS" -lt "$prev_tokens" ]; then
-          _note_put CEILING "$TOKENS"; exit 0
+          _note_put CEILING "$TOKENS"; return 0
         fi
-        [ "$TOKENS" -lt $(( prev_tokens + REARM )) ] && exit 0
+        [ "$TOKENS" -lt $(( prev_tokens + REARM )) ] && return 0
       fi
       render_ceiling "$TOKENS"
+      # The model hears it when something new is true. Coming DOWN from a cliff tier into
+      # the band (a compaction that did not reach the ceiling) is good news, not news.
+      case "$prev_state" in CLIFF_NEAR|CLIFF) ;; *) tell_ceiling "$TOKENS" ;; esac
       _note_put CEILING "$TOKENS"
-      exit 0
+      return 0
       ;;
     CLIFF_NEAR|CLIFF)
       # An emergency is not rate-limited. The correct response ends the session, so this
       # cannot become wallpaper for long — and at $0.366/request the notice is free.
       render_cliff "$TOKENS" "$STATE"
+      # ...on stderr. The model hears it ONCE per tier: the line stays in the conversation,
+      # and a step down (CLIFF to CLIFF_NEAR) is good news.
+      case "$STATE:$prev_state" in
+        CLIFF_NEAR:CLIFF_NEAR|CLIFF_NEAR:CLIFF|CLIFF:CLIFF) ;;
+        *) tell_cliff "$TOKENS" "$STATE" ;;
+      esac
       _note_put "$STATE" "$TOKENS"
-      exit 0
+      return 0
       ;;
   esac
-  exit 0
+  return 0
 }
 
 # ── outshare — OUTPUT-TOKEN SHARE of local spend, vs external lifetime input ────
@@ -778,7 +926,7 @@ case "$VERB" in
   notice)   do_notice ;;
   gate)     do_gate ;;
   outshare) do_outshare ;;
-  ''|--help|-h|help) sed -n '2,108p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  ''|--help|-h|help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *)
     printf 'heimdall-ctx-meter: unknown verb "%s" (expected publish|read|notice|gate|outshare)\n' "$VERB" >&2
     exit 64

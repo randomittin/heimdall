@@ -39,8 +39,11 @@
 #   K. ONE SOURCE OF TRUTH        — the meter reads context_window.* from the SAME
 #      statusLine stdin blob the status bar's CTX% gauge reads. A second estimator that
 #      could disagree with the number on screen would be worse than none.
-#   L. STDERR, NOT CONTEXT        — the notice must not be injected into the model's
-#      context. A context warning that itself costs context is self-defeating.
+#   L. MODEL-VISIBLE, BOUNDED     — the model gets ONE short line (hook JSON on stdout) on
+#      the prompt where a tier is crossed, and nothing below the ceiling or on a repeat.
+#      It used to be "stderr only, never context": that kept the cost down and the warning
+#      from everyone, because Claude Code shows a UserPromptSubmit hook's stderr to nobody
+#      on exit 0.
 #   M/N. ACTUALLY WIRED           — extracted from the REAL hooks/statusline.sh and the
 #      REAL hooks/hooks.json UserPromptSubmit entry. This is the falsifier: a meter
 #      wired to nothing is a file, not a gate. SessionStart-only would be useless —
@@ -53,8 +56,15 @@
 #      filesystem facts (a live agent, an uncommitted change) — never refuses below
 #      the hard ceiling, never refuses while work is in flight, and fails OPEN the
 #      instant the boundary itself cannot be verified.
+#   S. IDLE RETURN                — a session back after the prompt cache's hour with >=150K
+#      in context is told ONCE, in one model-visible line, that this turn re-writes it all
+#      and that /hmd:continue or /compact first is nearly free. Silent when the gap is short,
+#      the context small, or the gap cannot be established.
 #
 # Usage:  bash test/ctx-meter.test.sh    (exit 0 = every proof holds)
+#
+# budget: 70 s solo (63 s measured with section S): about 170 hermetic runs of the meter,
+# each starting an interpreter, plus the 2 s alarm of the idle-stdin cases.
 
 set -uo pipefail
 
@@ -63,6 +73,9 @@ REPO="$(cd "$SELF_DIR/.." && pwd)"
 METER="$REPO/bin/heimdall-ctx-meter"
 HOOKS="$REPO/hooks/hooks.json"
 STATUSLINE="$REPO/hooks/statusline.sh"
+
+# The model channel is hook JSON; reading it back needs jq (section M already did).
+command -v jq >/dev/null 2>&1 || { echo "FATAL: jq is required"; exit 1; }
 
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
@@ -99,6 +112,12 @@ both() { printf '%s%s' "$OUT" "$ERR"; }
 has()   { grep -qF "$2" <<<"$1"; }
 hasre() { grep -qE "$2" <<<"$1"; }
 hasrei(){ grep -qiE "$2" <<<"$1"; }   # case-insensitive: renders SHOUT
+
+# The model channel: notice's STDOUT, a hook JSON object whose additionalContext is what the model reads.
+ctx_text() { jq -r '.hookSpecificOutput.additionalContext // empty' <<<"$1" 2>/dev/null; }
+ctx_line() { ctx_text "$OUT"; }
+lines_of() { printf '%s\n' "$1" | grep -c .; }     # non-empty lines in a string
+commas()   { printf '%s' "$1" | sed -e :a -e 's/\(.*[0-9]\)\([0-9]\{3\}\)/\1,\2/;ta'; }
 
 # ── 0. the binary exists and is executable ───────────────────────────────────────
 sec "0. THE METER EXISTS:"
@@ -272,20 +291,68 @@ JSON="$("$METER" read --session "$SID" --json 2>/dev/null)"
 has "$JSON" 'NON_VERIFIED' && ok "a blob with no context signal -> NON_VERIFIED, not 0 tokens" \
                            || bad "an absent context signal became a comfortable number: $JSON"
 
-# ── L. the notice goes to STDERR — it must not become context bloat ──────────────
-# EVERY speaking state, not only the cliff. The ceiling and the blind notice render
-# through a DIFFERENT printer than the ruled cliff block, so a cliff-only version of this
-# proof leaves the routine path free to leak onto stdout — and it did: a mutation that
-# moved the ceiling printer to stdout survived the first version of this section.
-sec "L. STDERR, NOT CONTEXT (a context warning must not itself cost context):"
+# ── L. the MODEL gets ONE short line when a tier is crossed — and nothing else ───
+# This section used to prove the opposite: "stdout empty — nothing injected into the model's
+# context". That was the defect, not the safeguard. Claude Code shows a UserPromptSubmit
+# hook's stderr to nobody on exit 0, so the meter spoke correctly for 72 days (that session's
+# .notice file says CEILING) into a stream neither the operator nor the model reads: zero
+# `[heimdall] CONTEXT` strings in its transcript
+# (docs/analysis/2026-11-22-token-utilization-next.md §4). The cost worry it encoded still
+# stands, so the model channel is BOUNDED instead of banned: one line, as hook JSON on stdout
+# (hookSpecificOutput.additionalContext, the shape bin/lib/hmd_finished_agents.py emits), on
+# the prompt where something new is true, and nowhere else — an injected line stays in the
+# conversation and is read again on every later turn. The full render stays on stderr, for an
+# operator at a terminal.
+sec "L. MODEL-VISIBLE: ONE SHORT LINE, ONLY WHEN A TIER IS CROSSED:"
 for L_TOK in 214000 720000 812000; do
   rm -rf "$HEIMDALL_HOME"; publish "$L_TOK"
   notice
-  [ -z "$OUT" ] && ok "$L_TOK tok: stdout empty — nothing injected into the model's context" \
-                || bad "$L_TOK tok wrote to stdout; UserPromptSubmit stdout becomes context: $OUT"
-  [ -n "$ERR" ] && ok "$L_TOK tok: spoken on stderr, where the operator sees it" \
+  L_TXT="$(ctx_line)"
+  if [ "$(lines_of "$OUT")" = 1 ] && jq -e '.hookSpecificOutput.hookEventName == "UserPromptSubmit"' <<<"$OUT" >/dev/null 2>&1; then
+    ok "$L_TOK tok: stdout is ONE line of UserPromptSubmit hook JSON"
+  else
+    bad "$L_TOK tok: stdout is not one line of hook JSON: '$OUT'"
+  fi
+  hasre "$L_TXT" '^\[heimdall\] CONTEXT ' && has "$L_TXT" "$(commas "$L_TOK")" \
+    && ok "$L_TOK tok: the line says CONTEXT and carries the reading" \
+    || bad "$L_TOK tok: the model line is missing or lacks the reading: '$L_TXT'"
+  has "$L_TXT" '/hmd:save' && has "$L_TXT" '/compact' \
+    && ok "$L_TOK tok: it names the remedy (/hmd:save, then /compact)" \
+    || bad "$L_TOK tok: the model line names no remedy: '$L_TXT'"
+  hasrei "$L_TXT" 'restart' && bad "$L_TOK tok: the model line mentions a restart" \
+                            || ok "$L_TOK tok: no restart advice (compaction is the primary remedy)"
+  [ "$(lines_of "$L_TXT")" = 1 ] && [ "${#L_TXT}" -le 300 ] \
+    && ok "$L_TOK tok: ONE short line (${#L_TXT} chars)" \
+    || bad "$L_TOK tok: not one short line (${#L_TXT} chars): '$L_TXT'"
+  [ -n "$ERR" ] && ok "$L_TOK tok: the full render is still spoken on stderr" \
                 || bad "$L_TOK tok: nothing on stderr"
+  [ "$RC" = 0 ] && ok "$L_TOK tok: exit 0" || bad "$L_TOK tok: exit $RC"
 done
+# Not per turn. The cliff block on stderr speaks every prompt (an emergency is not
+# rate-limited); the model already holds the line it was told, so it is not told twice.
+rm -rf "$HEIMDALL_HOME"; publish 812000
+notice; notice
+[ -z "$OUT" ] && [ -n "$ERR" ] \
+  && ok "past the cliff, the 2nd prompt: stderr speaks again, the model is not told twice" \
+  || bad "the 2nd prompt past the cliff told the model again, or said nothing on stderr: out='$OUT'"
+# Something NEW is true on a climb into a higher tier, and on a +100K climb inside the band
+# (the same re-arm stderr uses); a step down (a compaction) is good news and tells it nothing.
+rm -rf "$HEIMDALL_HOME"
+publish 200000; notice; L_A="$OUT"
+publish 205000; notice; L_B="$OUT"
+publish 330000; notice; L_C="$OUT"
+publish 720000; notice; L_D="$OUT"
+publish 812000; notice; L_E="$OUT"
+publish 750000; notice; L_F="$OUT"
+publish 400000; notice; L_G="$OUT"
+[ -n "$L_A" ] && ok "entering the ceiling band tells the model"                       || bad "no model line on entering the band"
+[ -z "$L_B" ] && ok "+5K inside the band: nothing new, the model is not told"         || bad "told the model again at +5K: '$L_B'"
+[ -n "$L_C" ] && ok "+125K inside the band re-arms: told again"                       || bad "no model line at +125K"
+if [ -n "$L_D" ] && has "$(ctx_text "$L_D")" '800,000'; then ok "climbing to 700K tells it, naming the 800,000 cliff"
+else bad "no model line naming the cliff at 720K: '$L_D'"; fi
+[ -n "$L_E" ] && ok "climbing past 800K tells it"                                    || bad "no model line past the cliff"
+[ -z "$L_F" ] && ok "stepping DOWN a tier (a compaction) tells the model nothing"     || bad "told the model on a step down: '$L_F'"
+[ -z "$L_G" ] && ok "dropping from a cliff tier into the ceiling band tells the model nothing" || bad "told the model on a drop into the band: '$L_G'"
 # and the blind notice — the one that fires precisely when nothing can be measured
 rm -rf "$HEIMDALL_HOME"
 notice
@@ -299,11 +366,17 @@ UPS_CMD="$(jq -r '.hooks.UserPromptSubmit[]?.hooks[]?.command // empty' "$HOOKS"
 if [ -n "$UPS_CMD" ]; then
   ok "a UserPromptSubmit hook invokes heimdall-ctx-meter"
   rm -rf "$HEIMDALL_HOME"; publish 880000
-  HOOK_OUT="$(cd "$REPO" && printf '{"session_id":"%s","prompt":"go"}' "$SID" \
-    | CLAUDE_PLUGIN_ROOT="$REPO" HEIMDALL_HOME="$HEIMDALL_HOME" sh -c "$UPS_CMD" 2>&1)"
+  HOOK_JSON="$(cd "$REPO" && printf '{"session_id":"%s","prompt":"go"}' "$SID" \
+    | CLAUDE_PLUGIN_ROOT="$REPO" HEIMDALL_HOME="$HEIMDALL_HOME" sh -c "$UPS_CMD" 2>"$TMP/hook-err.txt")"
   HOOK_RC=$?
+  HOOK_OUT="$HOOK_JSON$(cat "$TMP/hook-err.txt" 2>/dev/null)"
   has "$HOOK_OUT" '━' && ok "the REAL wired hook command fires the cliff notice" \
                       || bad "wired hook produced no notice: $HOOK_OUT"
+  # what Claude Code actually reads from a UserPromptSubmit hook: stdout, parsed as hook JSON
+  jq -e '.hookSpecificOutput.hookEventName == "UserPromptSubmit" and (.hookSpecificOutput.additionalContext | startswith("[heimdall] CONTEXT"))' \
+    <<<"$HOOK_JSON" >/dev/null 2>&1 \
+    && ok "the REAL wired hook's STDOUT alone is the model line, as hook JSON (stderr is not mixed into it)" \
+    || bad "the wired hook's stdout is not the model's hook JSON: '$HOOK_JSON'"
   [ "$HOOK_RC" = 0 ] && ok "the wired hook exits 0 (never blocks a prompt)" || bad "wired hook exit $HOOK_RC"
   # below the ceiling the same wired command must stay silent
   rm -rf "$HEIMDALL_HOME"; publish 90000
@@ -738,6 +811,147 @@ if [ -d "$REAL_HOME_CTX" ] && find "$REAL_HOME_CTX" -name "*$SID*" 2>/dev/null |
 else
   ok "section R never touched the real ~/.heimdall"
 fi
+
+# ── S. IDLE RETURN — the prompt cache went cold while the session sat there ──────
+# THE MEASURED DEFECT: 102 idle gaps over an hour in the 72-day session re-wrote the whole
+# prefix at cache-write price — $441.88, 37.2% of that session's spend, and 78 of them had
+# >150K in the context (docs/analysis/2026-11-22-token-utilization-next.md §1, lever 2). The
+# tier notice cannot see it (the context did not grow, the cache expired) and a return is the
+# cheapest moment to compact. THE RULE: gap since the last main-thread assistant entry of the
+# transcript the payload names >= HMD_CTX_IDLE_S (3300 s) AND the session's reading >= the
+# ceiling (150K) -> ONE model line suggesting /hmd:continue or /compact; silent otherwise,
+# including whenever the gap cannot be established. "Now" is HMD_CTX_NOW, so a 3,700 s gap
+# costs no 3,700 s here.
+sec "S. IDLE RETURN — cache cold AND context >= 150K -> ONE model line to compact; silent otherwise:"
+T0=1795400000
+iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.000Z; }
+tx_entry() { # <type> <epoch> [isSidechain]: one transcript line, shaped like Claude Code's.
+  # Every entry's text mentions "assistant", as real prompts and tool results do, so only the
+  # type field (not a cheap substring skip) can keep a non-assistant entry out of the clock.
+  printf '{"type":"%s","isSidechain":%s,"timestamp":"%s","message":{"role":"%s","content":"the assistant said x"}}\n' \
+    "$1" "${3:-false}" "$(iso "$2")" "$1"
+}
+notice_tx() { # <now> <transcript path> -> OUT/ERR/RC. A hang is cut at 10 s and reads as RC 142, never as silence.
+  OUT="$(printf '{"session_id":"%s","prompt":"go","transcript_path":"%s"}' "$SID" "$2" \
+        | HMD_CTX_NOW="$1" perl -e 'alarm 10; exec @ARGV' "$METER" notice 2>"$TMP/err.txt")"; RC=$?
+  ERR="$(cat "$TMP/err.txt" 2>/dev/null)"
+}
+# A session ACTIVE at T0 (its tier line, if any, already told), quiet for <gap> s, then its first
+# prompt back -> OUT/ERR/RC of THAT prompt. The status bar re-renders every 2 s (refreshInterval)
+# even while nothing happens, so the reading is fresh at return; `stale` models a suspended UI.
+TX_STD="$TMP/tx-std.jsonl"; { tx_entry user $((T0 - 20)); tx_entry assistant "$T0"; } > "$TX_STD"
+idle_return() { # <tokens> <gap> [transcript] [stale]
+  local tok="$1" gap="$2" tx="${3:-$TX_STD}"
+  rm -rf "$HEIMDALL_HOME"
+  HMD_CTX_NOW="$T0" publish "$tok"
+  notice_tx "$T0" "$tx"
+  [ "${4:-}" = stale ] || HMD_CTX_NOW="$((T0 + gap))" publish "$tok"
+  notice_tx "$((T0 + gap))" "$tx"
+}
+
+# S1. the case the lever exists for
+idle_return 200000 3700
+S_TXT="$(ctx_line)"
+hasre "$S_TXT" '^\[heimdall\] CACHE COLD' && ok "3,700 s idle at 200,000 tok -> the model is told the cache is cold" \
+                                          || bad "no cold-cache line after 3,700 s idle at 200,000 tok: out='$OUT'"
+hasre "$S_TXT" 'idle 61 min'   && ok "it states the real gap (3,700 s = 61 min), computed, not canned" \
+                               || bad "the line does not state the gap: '$S_TXT'"
+has   "$S_TXT" '200,000'       && ok "it names what this turn re-writes (200,000 tokens)" || bad "the line omits the reading: '$S_TXT'"
+{ has "$S_TXT" '/compact' && has "$S_TXT" '/hmd:continue'; } \
+                               && ok "it suggests /hmd:continue or /compact" || bad "the line suggests neither remedy: '$S_TXT'"
+[ "$(lines_of "$OUT")" = 1 ] && [ "$(lines_of "$S_TXT")" = 1 ] && [ "${#S_TXT}" -le 300 ] \
+  && ok "ONE short line (${#S_TXT} chars)" || bad "not one short line (${#S_TXT} chars): '$S_TXT'"
+[ "$RC" = 0 ] && ok "exit 0" || bad "exit $RC"
+
+# S2. silent where it should be
+idle_return 100000 3700
+[ -z "$(both)" ] && ok "3,700 s idle at 100,000 tok -> silent on both streams (a small context is cheap to re-write)" \
+                 || bad "spoke at 100,000 tok after 3,700 s: $(both)"
+idle_return 400000 60
+[ -z "$OUT" ] && ok "60 s gap at 400,000 tok -> no idle line (the cache is warm)" || bad "cold-cache line after only 60 s: '$OUT'"
+idle_return 200000 3299
+[ -z "$OUT" ] && ok "3,299 s -> silent, one second under the threshold" || bad "spoke at 3,299 s: '$OUT'"
+idle_return 200000 3300
+[ -n "$(ctx_line)" ] && ok "3,300 s -> speaks: the threshold is inclusive" || bad "silent at exactly 3,300 s"
+HMD_CTX_IDLE_S=600 idle_return 200000 700
+[ -n "$(ctx_line)" ] && ok "HMD_CTX_IDLE_S=600 moves the threshold (700 s speaks)" || bad "HMD_CTX_IDLE_S was not honoured"
+
+# S3. a suspended UI leaves a STALE reading at return; what it last showed is what gets re-written
+idle_return 200000 3700 "$TX_STD" stale
+hasre "$(ctx_line)" '^\[heimdall\] CACHE COLD' && ok "a STALE reading (UI suspended) still counts: its size is what the next turn re-writes" \
+                                               || bad "a stale reading silenced the idle line: out='$OUT'"
+
+# S4. what counts as activity: the last MAIN-THREAD ASSISTANT entry — the cache is refreshed by an
+# API response, not by a tool result, a typed prompt or a subagent
+TX_TAIL="$TMP/tx-tail.jsonl"
+{ tx_entry assistant "$T0"; tx_entry user $((T0 + 3690)); tx_entry attachment $((T0 + 3695)); } > "$TX_TAIL"
+idle_return 200000 3700 "$TX_TAIL"
+[ -n "$(ctx_line)" ] && ok "a prompt or tool result written after the last response is not activity (so it does not matter whether the current prompt is already in the file)" \
+                     || bad "trailing non-assistant entries were counted as activity: out='$OUT'"
+TX_SIDE="$TMP/tx-side.jsonl"
+{ tx_entry assistant "$T0"; tx_entry assistant $((T0 + 3600)) true; } > "$TX_SIDE"
+idle_return 200000 3700 "$TX_SIDE"
+[ -n "$(ctx_line)" ] && ok "a subagent's (sidechain) response does not keep the MAIN thread's cache warm" \
+                     || bad "a sidechain entry was counted as main-thread activity: out='$OUT'"
+
+# S5. no evidence of the gap -> never a cold cache
+rm -rf "$HEIMDALL_HOME"
+HMD_CTX_NOW="$T0" publish 200000; HMD_CTX_NOW="$T0" notice
+HMD_CTX_NOW="$((T0 + 5000))" publish 200000; HMD_CTX_NOW="$((T0 + 5000))" notice
+[ -z "$OUT" ] && ok "the payload names no transcript -> silent (an unknown gap is not a cold cache)" || bad "spoke with no transcript: '$OUT'"
+idle_return 200000 5000 "$TMP/no-such-transcript.jsonl"
+[ -z "$OUT" ] && ok "the transcript path does not exist -> silent" || bad "spoke for a missing transcript: '$OUT'"
+TX_BAD="$TMP/tx-garbage.jsonl"; printf 'not json {{{ assistant\n\001\002 "type":"assistant"\n' > "$TX_BAD"
+idle_return 200000 5000 "$TX_BAD"
+{ [ -z "$OUT" ] && [ "$RC" = 0 ]; } && ok "the transcript is garbage -> silent, exit 0" || bad "garbage transcript: rc=$RC out='$OUT'"
+TX_FIFO="$TMP/tx.fifo"; rm -f "$TX_FIFO"; mkfifo "$TX_FIFO" 2>/dev/null
+if [ -p "$TX_FIFO" ]; then
+  S0=$(date +%s); idle_return 200000 5000 "$TX_FIFO"; E0=$(date +%s)
+  { [ -z "$OUT" ] && [ "$RC" = 0 ] && [ $((E0 - S0)) -le 6 ]; } \
+    && ok "a FIFO as the transcript path is never opened (back in $((E0 - S0))s) -> silent, the prompt cannot block" \
+    || bad "a FIFO transcript path hung or spoke: rc=$RC after $((E0 - S0))s out='$OUT'"
+  rm -f "$TX_FIFO"
+else
+  bad "could not create a fifo — the transcript-hang regression went unproven"
+fi
+
+# S6. bounded: only the last 1 MiB of the file is read (a long session's transcript runs to 100 MB)
+TX_HEAD="$TMP/tx-head.jsonl"; TX_BIGTAIL="$TMP/tx-bigtail.jsonl"
+PADPY='import sys; sys.stdout.write("{\"type\":\"user\",\"message\":{\"content\":\"pad\"}}\n" * 60000)'
+{ tx_entry assistant "$T0"; python3 -c "$PADPY"; } > "$TX_HEAD"
+{ python3 -c "$PADPY"; tx_entry assistant "$T0"; } > "$TX_BIGTAIL"
+idle_return 200000 3700 "$TX_HEAD"
+[ -z "$OUT" ] && ok "the only response is $(( $(wc -c < "$TX_HEAD") / 1000000 )) MB from the end -> not found: only the tail is read" \
+              || bad "the whole transcript was read (an entry beyond the 1 MiB tail was found): '$OUT'"
+idle_return 200000 3700 "$TX_BIGTAIL"
+[ -n "$(ctx_line)" ] && ok "a transcript larger than the window whose last response is at its end -> read from the tail, speaks" \
+                     || bad "a large transcript was skipped instead of read from its tail: out='$OUT'"
+
+# S7. the reading must be this session's own: another session's size is not this one's
+rm -rf "$HEIMDALL_HOME"
+HMD_CTX_NOW="$T0" publish 300000 "other-$$"
+notice_tx "$((T0 + 5000))" "$TX_STD"
+[ -z "$OUT" ] && ok "no reading of its own -> another session's size is never used for the nudge" \
+              || bad "the nudge used another session's reading: '$OUT'"
+
+# S8. a tier crossing and a cold cache on the SAME prompt are still ONE hook JSON object
+rm -rf "$HEIMDALL_HOME"
+HMD_CTX_NOW="$((T0 + 3700))" publish 400000
+notice_tx "$((T0 + 3700))" "$TX_STD"
+S_TXT="$(ctx_line)"
+if [ "$(jq -s 'length' <<<"$OUT" 2>/dev/null)" = 1 ] && [ "$(lines_of "$S_TXT")" = 2 ] \
+   && hasre "$S_TXT" 'CONTEXT' && hasre "$S_TXT" 'CACHE COLD'; then
+  ok "tier entry + cold cache on one prompt -> still ONE hook JSON object, two lines inside it"
+else
+  bad "two model lines did not share one valid hook JSON object: '$OUT'"
+fi
+
+# S9. discoverable: --help documents the knob, and now runs to the last ENVIRONMENT line (the
+# old fixed range stopped short of HMD_CTX_REPO and HMD_CTX_AGENTS_BIN)
+HELP="$("$METER" --help 2>/dev/null)"
+has "$HELP" 'HMD_CTX_IDLE_S'     && ok "--help documents HMD_CTX_IDLE_S" || bad "--help does not mention HMD_CTX_IDLE_S"
+has "$HELP" 'HMD_CTX_AGENTS_BIN' && ok "--help runs to the last ENVIRONMENT line (HMD_CTX_AGENTS_BIN)" \
+                                 || bad "--help is cut short before HMD_CTX_AGENTS_BIN"
 
 printf '\nctx-meter.test.sh: %s passed, %s failed.\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

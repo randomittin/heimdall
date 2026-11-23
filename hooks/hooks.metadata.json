@@ -15,7 +15,7 @@
       "event": "UserPromptSubmit",
       "index": 1,
       "id": "ctx-meter-notice",
-      "description": "Prints the context-window meter notice from heimdall-ctx-meter.",
+      "description": "Context-window meter (heimdall-ctx-meter): the full notice on stderr, plus ONE model-visible line when a tier is crossed or the prompt cache went cold above 150K.",
       "matcher": "",
       "fingerprint": "1ee9504ef0706b674d8dbe95a2419e609ebf995595f74713f63fc55df709cbb1",
       "locked": false,
