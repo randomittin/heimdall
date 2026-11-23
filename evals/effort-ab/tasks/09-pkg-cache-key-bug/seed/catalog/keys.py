@@ -28,7 +28,7 @@ def build_key(endpoint, params):
     for name, value in params.items():
         if not value:
             continue
-        parts.append(f"{name}={_encode(value)}")
+        parts.append(f"{name!r}={_encode(value)}")
     return endpoint + "?" + "&".join(parts)
 
 
