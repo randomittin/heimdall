@@ -5,8 +5,9 @@
 # Journeys, each walked through the real install.sh of the tree under test, offline, in the use-case sandbox of test/use-cases/lib.sh (a private HOME under a
 # private temp root, `env -i`, a fake `claude` and `security`, HEIMDALL_REPO a local git snapshot, so the one network call of an install never leaves the machine):
 #   1. a developer installs hmd on a clean machine: nothing says they have used it before, so the install is LEAN (the decision is recorded once in
-#      <runtime home>/profile.json): the tree has what runs and lacks test/, .planning/ and the on-demand skills, while every object is still in .git. The hmd
-#      launcher still runs and still wraps claude as before; no proxy and no Headroom is installed or routed (INV-L12).
+#      <runtime home>/profile.json): the tree has what runs and lacks test/, .planning/ and the on-demand cut (the five skills and commands/designmatch.md),
+#      while every object is still in .git. The hmd launcher still runs and still wraps claude as before; no proxy and no Headroom is installed or routed
+#      (INV-L12).
 #   2. the same developer upgrades (install.sh again, no flag) after a new release, and has launched hmd in between (the setup marker now exists): the RECORDED
 #      profile is re-applied, never reset and never re-decided (INV-L2, INV-L7), and the new release's new runtime file is on disk (the lean set is re-derived).
 #   3. an install whose runtime home already holds the setup marker, or a skills-config.json that says `grandfathered`, is FULL: the tree on disk is `git ls-files`.
@@ -81,7 +82,7 @@ uc_rc "1. a fresh install.sh finishes" 0
 uc_has "the installer says it applied the lean profile" "$UC_ROOT/lean-1.out" 'Applying lean profile'
 uc_jq "the lean profile is recorded once, in the runtime home (~/.heimdall/profile.json)" '.profile == "lean"' "$CLONE/profile.json"
 if [ "$(git -C "$CLONE" config --bool --get core.sparseCheckout 2>/dev/null || true)" = true ]; then uc_ok "the clone is a sparse checkout"; else uc_bad "the clone is not a sparse checkout"; fi
-for p in test .planning skills/stacks skills/designmatch skills/mac-deep-clean skills/system-health; do
+for p in test .planning skills/stacks skills/designmatch skills/mac-deep-clean skills/system-health commands/designmatch.md; do
   if [ ! -e "$CLONE/$p" ]; then uc_ok "lean: $p is not on disk"; else uc_bad "lean: $p is on disk"; fi
 done
 for p in bin/heimdall hooks/hooks.json agents/heimdall.md skills/heimdall/SKILL.md .claude-plugin/plugin.json settings.json .mcp.json LICENSE \
@@ -90,9 +91,12 @@ for p in bin/heimdall hooks/hooks.json agents/heimdall.md skills/heimdall/SKILL.
 done
 lp_missing "$CLONE" > "$UC_ROOT/lean-missing.txt"
 if [ -s "$UC_ROOT/lean-missing.txt" ]; then uc_ok "the lean tree is narrower than git ls-files"; else uc_bad "nothing was narrowed: the lean tree equals git ls-files"; fi
+# The runtime list is "reachable", not "lean": it still names the cut (bin/designmatch names skills/designmatch/, bin/detect-skills names skills/, and skills.manifest.json
+# names commands/designmatch.md as an on_demand_path). The cut is the real manifest's, written out here on purpose as test/lean-sparse.test.sh does: a path added to it has
+# to be added here too (test/skills-manifest-pack-values.test.sh pins the manifest side), and nothing else may be missing.
 LC_ALL=C comm -12 "$UC_ROOT/lean-missing.txt" <(git -C "$CLONE" cat-file blob HEAD:release/runtime-files.txt | LC_ALL=C sort -u) \
-  | grep -Ev '^skills/(stacks|designmatch|self-improve|system-health|mac-deep-clean)/' > "$UC_ROOT/lean-lost-runtime.txt"
-if [ ! -s "$UC_ROOT/lean-lost-runtime.txt" ]; then uc_ok "INV-L3: every file the runtime list names is on disk, the on-demand skills apart"; else uc_bad "lean lost runtime files" "$(head -3 "$UC_ROOT/lean-lost-runtime.txt" | tr '\n' ' ')"; fi
+  | grep -Ev '^(skills/(stacks|designmatch|self-improve|system-health|mac-deep-clean)/|commands/designmatch\.md$)' > "$UC_ROOT/lean-lost-runtime.txt"
+if [ ! -s "$UC_ROOT/lean-lost-runtime.txt" ]; then uc_ok "INV-L3: every file the runtime list names is on disk, the on-demand cut apart"; else uc_bad "lean lost runtime files" "$(head -3 "$UC_ROOT/lean-lost-runtime.txt" | tr '\n' ' ')"; fi
 if [ "$(git -C "$CLONE" status --porcelain 2>/dev/null | grep -c '^.D')" = 0 ]; then uc_ok "git sees no deleted file (the missing paths are skipped, not removed)"; else uc_bad "git reports tracked files as deleted"; fi
 if git -C "$CLONE" cat-file -e 'HEAD:skills/stacks/SKILL.md' 2>/dev/null; then uc_ok "what the lean tree lacks is still in .git, one local add away"; else uc_bad "skills/stacks/SKILL.md is not in the clone's objects"; fi
 
