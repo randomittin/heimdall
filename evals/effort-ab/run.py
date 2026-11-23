@@ -218,8 +218,12 @@ def execute(job, args, state):
                 except subprocess.TimeoutExpired:
                     os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
+        state["procs"].discard(proc.pid)
         wall = time.monotonic() - t0
         parsed = parse_stream(raw)
+        if state["stop"].is_set() and parsed["result"] is None and not timed_out:
+            shutil.rmtree(work, ignore_errors=True)  # killed by our own stop handler: no row, resume re-runs it
+            return
         reason = infra_reason(parsed, proc.returncode, timed_out)
         rc, tail = run_accept(task_dir, work)
         git(work, "add", "-A")
@@ -282,6 +286,8 @@ def main():
     ap.add_argument("--max-total-usd", type=float, default=60.0)
     ap.add_argument("--stop-util", type=float, default=0.90, help="stop when the 5-hour window reaches this")
     ap.add_argument("--min-free-pct", type=float, default=10.0)
+    ap.add_argument("--deadline-s", type=float, default=float("inf"),
+                    help="start no new run after this many seconds (in-flight runs finish); resume with the same command")
     ap.add_argument("--claude", default=os.environ.get("EFFORT_AB_CLAUDE") or shutil.which("claude"))
     ap.add_argument("--tmp-root", type=Path, default=Path(tempfile.gettempdir()))
     ap.add_argument("--keep", action="store_true", help="keep each run's workdir")
@@ -320,15 +326,34 @@ def main():
                     counted.add(key)
     todo = [j for j in jobs if (j["task"], j["arm"], j["rep"]) not in counted]
     state = {"lock": threading.Lock(), "stop": threading.Event(), "why": "", "done": 0, "spend": 0.0,
-             "total": len(todo), "attempts": attempts}
+             "total": len(todo), "attempts": attempts, "procs": set(),
+             "deadline": time.monotonic() + args.deadline_s}
+
+    def on_signal(signum, _frame):  # kill only the process groups this runner started, then wind down
+        state["stop"].set()
+        state["why"] = f"signal {signum}"
+        for pid in list(state["procs"]):
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
     print(f"effort-ab: {len(todo)} runs to do ({len(jobs) - len(todo)} already counted), "
           f"concurrency {args.concurrency}, results {args.results}", flush=True)
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         for fut in [pool.submit(execute, j, args, state) for j in todo]:
             fut.result()
-    print(f"effort-ab: finished {state['done']} attempts, spend ${state['spend']:.2f}"
+    counted_now = set()
+    for line in args.results.read_text().splitlines():
+        if line.strip() and json.loads(line).get("counted"):
+            row = json.loads(line)
+            counted_now.add((row["task"], row["arm"], row["rep"]))
+    left = sum(1 for j in jobs if (j["task"], j["arm"], j["rep"]) not in counted_now)
+    print(f"effort-ab: finished {state['done']} attempts, spend ${state['spend']:.2f}, remaining {left}"
           + (f", STOPPED: {state['why']}" if state["stop"].is_set() else ""), flush=True)
-    return 3 if state["stop"].is_set() else 0
+    return 3 if state["stop"].is_set() else (4 if left > 0 else 0)
 
 
 if __name__ == "__main__":
