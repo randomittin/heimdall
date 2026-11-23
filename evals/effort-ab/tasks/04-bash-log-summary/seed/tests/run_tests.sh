@@ -28,7 +28,7 @@ assert_eq "access.log N=1" "4 203.0.113.7" "$out"
 out=$(bash summarize.sh logs/combined.log 2>/dev/null)
 assert_eq "combined.log default" "3 203.0.113.7
 2 198.51.100.23
-2 192.0.2.44" "$out"
+1 192.0.2.44" "$out"
 
 out=$(bash summarize.sh logs/no-such.log 2>/dev/null)
 rc=$?

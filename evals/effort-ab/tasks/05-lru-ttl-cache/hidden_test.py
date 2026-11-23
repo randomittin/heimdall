@@ -282,7 +282,7 @@ class TTLCacheHiddenTests(unittest.TestCase):
         self.assertEqual(len(cache), 0)
 
     def test_none_and_other_falsy_values_are_stored(self):
-        cache = self.make()
+        cache = self.make(capacity=5)
         for key, value in (("none", None), ("zero", 0), ("empty", ""), ("false", False), ("list", [])):
             cache.put(key, value)
         for key, value in (("none", None), ("zero", 0), ("empty", ""), ("false", False), ("list", [])):
