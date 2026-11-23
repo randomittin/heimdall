@@ -1,17 +1,17 @@
 {
-  "digest": "aa96231d01359410e91e3c1b7e53a67f819b93ebd61c2299685658b8862f079a",
+  "digest": "142a67151cde9705a48f4dc710ca7edc759fb672fe61bbe52cfd6545e8ab2491",
   "info": {
     "git_trees": {
-      "agents": "70c8dc13a56d397a89a4bf8355c4c7f4860d03ab",
+      "agents": "c116f0325c763d52d82703dcc6e8b24a541ec2c6",
       "commands": "100f7a1ca0d0cfdca442e4ae2bd28c5b43748652",
       "hooks": "ce216fd515e65bcd7bbf580bab06d84efc539249",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
-      "skills": "d77f31ec0b28c11e71bd5b787945b3b4623c2ed9"
+      "skills": "8ca944f54d03454e6a836983d06c350483f63415"
     },
-    "recorded_utc": "2026-11-22T09:16:00Z",
+    "recorded_utc": "2026-11-23T03:48:41Z",
     "summary": {
       "agents": 17,
-      "bytes": 648253,
+      "bytes": 650343,
       "commands": 20,
       "hooks_run": 17,
       "hooks_skipped": 7,
@@ -92,12 +92,12 @@
         "sha256": "e507f04ee73590c476396d8a24973750a89f6c5ac4c0b78f6290e1345071411a"
       },
       "agents/heimdall.md": {
-        "bytes": 67385,
+        "bytes": 68211,
         "frontmatter": {
           "bytes": 844,
           "sha256": "f9a99e9021b557f8d615fcd9ae12fab3d3192d9a4caaecb0114675e751667cf6"
         },
-        "sha256": "0df586298be287e5eb891e4ba6cdb54823aeae0f89200e3f84f09183feecd221"
+        "sha256": "b83f9067f206445379a66d33a143be5dd802f477de5610971e498deaf583efb5"
       },
       "agents/incident-responder.md": {
         "bytes": 2963,
@@ -384,16 +384,16 @@
         "sha256": "ebfd93c4401c332fa54058f456bec5cf7a2aba08f1205d6ece6a07c8b6b8f655"
       },
       "skills/heimdall/SKILL.md": {
-        "bytes": 11777,
+        "bytes": 12015,
         "frontmatter": {
           "bytes": 593,
           "sha256": "20852633ca5061eeef3a1384a3f3831f7c49acd98c115730ff309bbbc44dc627"
         },
-        "sha256": "0bd1af8e6a9314248a949a70b784d20b75b4762bc4ae34204976c4fff3d21689"
+        "sha256": "83d1516cf364a2f4a796fe24e60b7ca431799c0bdcee0528e763cc02f5e539d5"
       },
       "skills/heimdall/references/agent-templates.md": {
-        "bytes": 17095,
-        "sha256": "5cff7f47d4ce54c911f317dfe137c8bc09476b77bce8ea1aebee27285153ca10"
+        "bytes": 17295,
+        "sha256": "e0be9458fbd600b776cdb76a4324801dc84c1fc8ea6fddeebe2c93a9cb9c09ca"
       },
       "skills/heimdall/references/communication-templates.md": {
         "bytes": 5724,
@@ -420,8 +420,8 @@
         "sha256": "e8b075627463e4d059311b34cde6f839caa0c53dcc9e9e08dd17921b8017e48c"
       },
       "skills/heimdall/references/lean-procedures.md": {
-        "bytes": 40310,
-        "sha256": "2038933c990a25634da3d803dfbdd8d07f29ea1d4d71da52c0400cf44013310a"
+        "bytes": 41136,
+        "sha256": "ed686868be7cd8122bb14c373caeac341512a528e1b7877330135a2722122bf4"
       },
       "skills/heimdall/references/maintainer-guide.md": {
         "bytes": 10713,

@@ -52,6 +52,8 @@ A thin brief is strictly worse than a fat one: the agent cannot tell that
 context is missing, so it works confidently from a gap and every downstream gate
 sees a green run. Never paste a brief that exited non-zero.
 
+**Every spawn:** `effort: "low"`/`"medium"` for mechanical, bounded jobs; end the prompt with the report-cap line (≤1,500 chars; `agents/heimdall.md` §4c item 7).
+
 ## Architect Agent
 
 ```
@@ -299,9 +301,9 @@ Agent(subagent_type: "hmd:coder",        description: "auth module — src/auth/
 Agent(subagent_type: "hmd:coder",        description: "API endpoints — src/api/**")
 Agent(subagent_type: "hmd:coder",        description: "UI components — src/components/**")
 Agent(subagent_type: "hmd:test-runner",  description: "the full run, ONLY if the developer said yes at the merge-time recommendation (own repo: the one full sweep; client repo: lint + use-cases)")
-Agent(subagent_type: "hmd:lint-quality", description: "lint after each coder completes")
+Agent(subagent_type: "hmd:lint-quality", description: "lint after each coder completes", effort: "low")
 Agent(subagent_type: "hmd:reviewer",     description: "review all changes before merge")
-Agent(subagent_type: "hmd:docs-writer",  description: "sync docs with implementation")
+Agent(subagent_type: "hmd:docs-writer",  description: "sync docs with implementation", effort: "medium")
 ```
 
 The identity that used to live in a teammate name (`coder-auth`) goes in `description:`
