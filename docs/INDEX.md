@@ -20,6 +20,7 @@ The single map of Heimdall's knowledge tree. Every committed Markdown doc earns 
 | [INSTALL.md](INSTALL.md) | Install disclosure — the three paths, what the installer writes, what leaves the machine, the Headroom proxy, self-maintenance. Moved out of the README. | Load-bearing |
 | [lean-core.md](lean-core.md) | Lean core — what a lean install moves out, `hmd lean` and `hmd reinstall --reset`, rollback, the Headroom and route behaviour, what is not lean yet. | Current (2026-11-22) |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Architecture and capabilities moved out of the README — gates, `rr`, modules, statusline, the Cursor host, the reproducible numbers. | Load-bearing |
+| [rules/README.md](rules/README.md) | Long form of the CLAUDE.md rules (commit attribution, full gate, release convergence, push gates, hook guards, conventions), moved verbatim; CLAUDE.md keeps the digest. | Load-bearing |
 | [superpowers/specs/2026-07-06-teams-growth-strategy.md](superpowers/specs/2026-07-06-teams-growth-strategy.md) | Heimdall Teams growth strategy (Slack-playbook → Cursor-for-teams revenue). | Current (draft) |
 | [../DECISION-GATE.md](../DECISION-GATE.md) | Pre-launch decision gate — written before launch, frozen. | Reference |
 | [../PARITY.md](../PARITY.md) | superx → heimdall feature-surface parity matrix. | Reference |
