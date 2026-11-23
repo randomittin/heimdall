@@ -1,0 +1,9 @@
+{
+  "name": "scheduler-emitter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test emitter.test.js"
+  }
+}
