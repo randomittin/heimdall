@@ -49,6 +49,13 @@
 #       waived copy, with ONLY the control plane its no-signed-traffic-routing
 #       invariant probes made unreachable, is refused and unwound — an
 #       unverifiable invariant never passes.
+#   O3b the non-interactive-passthrough invariant compares a CONTROLLED differential:
+#       the proxy variables are the only thing that differs between its two samples.
+#       Replayed BY STEP (never by waiting) against an armed checkout whose global
+#       usage snapshot is rewritten between the samples, as another live session's
+#       statusline render does: the command without its scratch repo diverges, the
+#       shipped one passes, and the shipped one still refuses a `check` that proxy
+#       variables DO change and a `check` that prints nothing.
 #   O4  `hmd modules optout omniroute` records the decision, `status` renders
 #       it, `repair` honours it as a no-op (real code path, read before this
 #       was written), and `optin` reverses it — all against the real registry.
@@ -385,6 +392,125 @@ else
   if [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ]; then
     ok "GREEN ARM: restored — the copy is byte-identical to the shipped manifest again"
   else bad "restore did not return the copy to the shipped bytes"; fi
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+echo
+echo "O3b — the passthrough invariant varies the proxy variables and NOTHING else"
+# WHY THIS SECTION EXISTS. Every add above runs the manifest's non-interactive-passthrough
+# invariant: two `bin/heimdall-fallback check` samples that must be byte-identical. Run from a
+# checkout whose .heimdall/fallback.json is ARMED (state=auto) -- the maintainer's own, which is
+# where a sweep runs -- `check` also reads the GLOBAL ~/.heimdall/rate-limits.json that every live
+# session's statusline rewrites on each render, and prints which windows it holds (windows_seen
+# flips between {five_hour, seven_day} and {seven_day}). Two samples straddling a rewrite differ,
+# so the add was refused with a false "ambient proxy vars changed the output": 10 of 12 sample
+# pairs on a busy machine, green solo only when no other session happened to render in between.
+# That is a race against other processes, not against a clock, so it is replayed BY STEP and never
+# by waiting: a stand-in session-usage reports the snapshot it reads and then rewrites it, exactly
+# what another session's render does between the two samples. $REPO's own .heimdall/ is never
+# read or written; HOME, TMPDIR and every variable that could redirect the snapshot are pinned.
+if [ "$HAVE_MANIFEST" -eq 0 ]; then
+  skip "O3b needs modules/omniroute/manifest.json — not present yet"
+else
+  PT_CMD="$(jq -r '.invariants["non-interactive-passthrough"].command' "$MANIFEST")"
+  PT_HOME="$TMP/pt-home"; PT_SNAP="$TMP/pt-snapshots"; PT_TMP="$TMP/pt-tmp"
+  PT_ARMED="$TMP/pt-armed-checkout"
+  mkdir -p "$PT_ARMED/bin" "$PT_ARMED/.heimdall" "$PT_HOME/.heimdall" "$PT_SNAP" "$PT_TMP"
+  ln -s "$REPO/bin/heimdall-fallback" "$PT_ARMED/bin/heimdall-fallback"
+  jq -n --arg db "$PT_ARMED/no-such.sqlite" \
+    '{schema:1, state:"auto", target_provider:"aihorde", endpoint:"http://127.0.0.1:9", omniroute_db_path:$db}' \
+    > "$PT_ARMED/.heimdall/fallback.json"
+  PT_NOW="$(date +%s)"
+  jq -n --argjson n "$PT_NOW" '{observed_at:$n, windows_seen:["five_hour","seven_day"],
+        five_hour:{used_percentage:10, resets_at:($n+7200)},
+        seven_day:{used_percentage:10, resets_at:($n+86400)}}' > "$PT_SNAP/both.json"
+  jq -n --argjson n "$PT_NOW" '{observed_at:$n, windows_seen:["seven_day"],
+        seven_day:{used_percentage:10, resets_at:($n+86400)}}' > "$PT_SNAP/seven.json"
+  # Found by `check` as the sibling of bin/heimdall-fallback, the same way the real tool is.
+  cat > "$PT_ARMED/bin/heimdall-session-usage" <<'EOF'
+#!/usr/bin/env bash
+snap="$HOME/.heimdall/rate-limits.json"
+jq -c '{verdict:"under", crossed:false, source:"real", windows_seen:.windows_seen}' "$snap"
+if cmp -s "$snap" "$PT_SNAP_DIR/both.json"; then cp "$PT_SNAP_DIR/seven.json" "$snap"; else cp "$PT_SNAP_DIR/both.json" "$snap"; fi
+EOF
+  chmod +x "$PT_ARMED/bin/heimdall-session-usage"
+
+  # Runs a command string the way the engine's capture does: from a checkout dir, under a perl
+  # alarm, stdout and stderr merged. The one moving part is the one the stand-in moves.
+  pt_run() { # <checkout dir> <command string>
+    ( cd "$1" && env -u HEIMDALL_RATE_LIMIT_STATE -u HEIMDALL_429_MARKER_FILE \
+        -u HEIMDALL_FALLBACK_SESSION_USAGE_BIN -u HEIMDALL_SESSION_TOKEN_BUDGET -u CLAUDE_CODE_SESSION_ID \
+        HOME="$PT_HOME" HEIMDALL_HOME="$PT_HOME/.heimdall" TMPDIR="$PT_TMP" \
+        HEIMDALL_FALLBACK_ASSUME_REACHABLE=1 PT_SNAP_DIR="$PT_SNAP" \
+        perl -e 'alarm 60; exec @ARGV' bash -c "$2" ) 2>&1
+  }
+  pt_reset() { cp "$PT_SNAP/both.json" "$PT_HOME/.heimdall/rate-limits.json"; }
+
+  # RED ARM: the fixture really is a moving world. Two plain back-to-back checks differ in the
+  # windows line alone; if the stand-in stopped moving the snapshot, every arm below would pass
+  # vacuously, so this is asserted before anything is concluded from them.
+  pt_reset
+  PT_P1="$(pt_run "$PT_ARMED" 'bin/heimdall-fallback check </dev/null 2>/dev/null | cat')"
+  PT_P2="$(pt_run "$PT_ARMED" 'bin/heimdall-fallback check </dev/null 2>/dev/null | cat')"
+  if grep -qF 'CAN SEE (five_hour, seven_day)' <<<"$PT_P1" && grep -qF 'CAN SEE (seven_day)' <<<"$PT_P2"; then
+    ok "RED ARM: two plain checks from the armed checkout differ in the windows line — the fixture reproduces the moving world"
+  else bad "the armed fixture did not move between two plain checks (the arms below would pass vacuously): $(printf '%s\n' "$PT_P1" "$PT_P2" | grep -F session_usage)"; fi
+
+  # MUTANT: the shipped command with its scratch repo taken back out is the command the sweep ran.
+  # shellcheck disable=SC2016 # the literal text of the shipped command, not a shell expansion
+  PT_OLD="${PT_CMD//' --repo "$repo"'/}"
+  if [ "$PT_OLD" != "$PT_CMD" ]; then
+    ok "the pre-fix command is derivable from the shipped one — the shipped command passes --repo to both samples"
+  else bad "the shipped command does not pass --repo \"\$repo\": both samples still read whichever checkout runs them"; fi
+  pt_reset
+  PT_OUT_OLD="$(pt_run "$PT_ARMED" "$PT_OLD")"; PT_RC_OLD=$?
+  if [ "$PT_RC_OLD" -ne 0 ] && grep -q 'PASSTHROUGH-DIVERGED' <<<"$PT_OUT_OLD"; then
+    ok "RED ARM: without its scratch repo the invariant diverges (exit $PT_RC_OLD) — the sweep failure, replayed by step"
+  else bad "the pre-fix command did not diverge in the moving world (exit $PT_RC_OLD): $PT_OUT_OLD"; fi
+
+  # GREEN ARM: the shipped command, same checkout, same moving snapshot.
+  pt_reset
+  PT_OUT_NEW="$(pt_run "$PT_ARMED" "$PT_CMD")"; PT_RC_NEW=$?
+  if [ "$PT_RC_NEW" -eq 0 ] && grep -q 'PASSTHROUGH-OK' <<<"$PT_OUT_NEW"; then
+    ok "GREEN ARM: the shipped command passes in the same moving world — its samples read a scratch repo, not the armed checkout"
+  else bad "the shipped command failed in the moving world (exit $PT_RC_NEW): $PT_OUT_NEW"; fi
+  if [ -z "$(ls -A "$PT_TMP")" ]; then
+    ok "the scratch repo is removed on the way out — a passing invariant leaves nothing behind"
+  else bad "the invariant leaked its scratch repo: $(ls -A "$PT_TMP")"; fi
+
+  # TEETH: the fix must not have neutered the invariant. Against a `check` that lets the proxy
+  # variables change its output (the defect the invariant exists for) it still refuses, and
+  # against one that prints nothing it still fails closed.
+  PT_SENS="$TMP/pt-proxy-sensitive"; PT_EMPTY="$TMP/pt-prints-nothing"
+  mkdir -p "$PT_SENS/bin" "$PT_EMPTY/bin"
+  cat > "$PT_SENS/bin/heimdall-fallback" <<'EOF'
+#!/usr/bin/env bash
+if [ -n "${HTTP_PROXY:-}" ]; then echo "  [FAIL] endpoint_reachable"; else echo "  [OK  ] endpoint_reachable"; fi
+EOF
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$PT_EMPTY/bin/heimdall-fallback"
+  chmod +x "$PT_SENS/bin/heimdall-fallback" "$PT_EMPTY/bin/heimdall-fallback"
+  PT_OUT_SENS="$(pt_run "$PT_SENS" "$PT_CMD")"; PT_RC_SENS=$?
+  if [ "$PT_RC_SENS" -ne 0 ] && grep -q 'PASSTHROUGH-DIVERGED' <<<"$PT_OUT_SENS"; then
+    ok "RED ARM: a check that proxy variables DO change is still refused (exit $PT_RC_SENS) — the differential kept its teeth"
+  else bad "a proxy-sensitive check passed the invariant (exit $PT_RC_SENS): $PT_OUT_SENS"; fi
+  PT_OUT_EMPTY="$(pt_run "$PT_EMPTY" "$PT_CMD")"; PT_RC_EMPTY=$?
+  if [ "$PT_RC_EMPTY" -ne 0 ] && grep -q 'NON_VERIFIED' <<<"$PT_OUT_EMPTY" && ! grep -q 'PASSTHROUGH-OK' <<<"$PT_OUT_EMPTY"; then
+    ok "a check that prints nothing fails closed (exit $PT_RC_EMPTY) — two empty samples are not a pass"
+  else bad "a check that prints nothing did not fail closed (exit $PT_RC_EMPTY): $PT_OUT_EMPTY"; fi
+
+  # CLEANUP, both ways, on the refusal paths (the ones a missing trap leaks on): the shipped
+  # command has left nothing behind after the two refusals above, and the same command without its
+  # trap does leave the scratch repo behind, so the emptiness checks can go RED.
+  if [ -z "$(ls -A "$PT_TMP")" ]; then
+    ok "the scratch repo is removed on the refusal paths too (diverged, printed nothing) — nothing is left behind"
+  else bad "the invariant leaked its scratch repo on a refusal path: $(ls -A "$PT_TMP")"; fi
+  PT_TRAP="trap 'rm -rf \"\$repo\"' EXIT"
+  PT_LEAK="${PT_CMD/"$PT_TRAP"/:}"
+  pt_run "$PT_EMPTY" "$PT_LEAK" >/dev/null
+  if [ "$PT_LEAK" != "$PT_CMD" ] && [ -n "$(ls -A "$PT_TMP")" ]; then
+    ok "RED ARM: the same command without its trap leaves the scratch repo behind — the cleanup check discriminates"
+  else bad "the trap-less mutant did not leak (mutation took: $([ "$PT_LEAK" != "$PT_CMD" ] && echo yes || echo no)) — the cleanup check cannot go RED"; fi
+  rm -rf "${PT_TMP:?}"/*
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
