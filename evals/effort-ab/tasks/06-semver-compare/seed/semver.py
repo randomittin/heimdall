@@ -1,0 +1,68 @@
+"""Semantic Versioning 2.0.0 precedence helpers (https://semver.org).
+
+Version grammar
+---------------
+    MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]
+
+* MAJOR, MINOR, PATCH: non-negative decimal integers written with the ASCII
+  digits 0-9. No leading zeros (the single digit "0" is fine). They can be
+  arbitrarily large; do not assume they fit in 64 bits.
+* PRERELEASE (optional, starts at the first "-" after the core): one or more
+  dot-separated identifiers. An identifier is non-empty and made of
+  [0-9A-Za-z-]. An identifier made only of digits is "numeric" and must not
+  have leading zeros. An identifier containing a letter or a hyphen is
+  "alphanumeric" ("0a", "01a" and "-" are alphanumeric, hence valid).
+* BUILD (optional, starts at the first "+"): one or more dot-separated
+  non-empty identifiers of [0-9A-Za-z-]. Leading zeros are allowed here.
+* Anything else is invalid: a leading "v", leading or trailing whitespace
+  (a trailing newline included), a missing component ("1.2"), an extra
+  component ("1.2.3.4"), an empty prerelease or build ("1.2.3-", "1.2.3+"),
+  an empty identifier ("1.2.3-a..b"), non-ASCII digits or letters, and any
+  value that is not a str.
+
+Precedence
+----------
+Versions are compared by the first difference found, left to right:
+
+1. MAJOR, then MINOR, then PATCH, each compared numerically.
+2. If those are equal, a version WITH a prerelease has LOWER precedence than
+   the same version without one.
+3. If both have a prerelease, compare its identifiers left to right:
+   * numeric vs numeric: compared as integers;
+   * alphanumeric vs alphanumeric: compared in ASCII order (so "-" < digits
+     < uppercase < lowercase, e.g. "Beta" < "alpha");
+   * a numeric identifier is always LOWER than an alphanumeric one;
+   * if all shared identifiers are equal, the version with fewer
+     identifiers is lower.
+4. BUILD metadata is IGNORED: "1.0.0+a" and "1.0.0+b" have equal precedence.
+
+Errors
+------
+Invalid input raises ValueError whose message contains repr() of the offending
+value. compare() validates BOTH arguments before it compares anything (a is
+checked first, then b), even when the answer would be obvious, for example
+when a == b or when the majors differ. When both are invalid the error is
+about a.
+"""
+
+
+def compare(a, b):
+    """Return -1, 0 or 1 when version a has lower, equal or higher precedence than b.
+
+    The result is exactly one of the ints -1, 0, 1.
+    Raises ValueError if a or b is not a valid version string.
+    """
+    raise NotImplementedError
+
+
+def max_version(versions):
+    """Return the highest-precedence entry of ``versions``.
+
+    ``versions`` is any iterable of version strings (consume it only once).
+    The result is the ORIGINAL string, not a normalised one. When several
+    entries share the highest precedence (they differ only in build metadata)
+    return the first of them. Every entry is validated: an invalid entry
+    raises ValueError wherever it sits, even when it is the only entry. An
+    empty iterable raises ValueError.
+    """
+    raise NotImplementedError
