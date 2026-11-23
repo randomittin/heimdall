@@ -128,6 +128,7 @@ def analyse(counted, attempts, expected, tasks_dir=HERE / "tasks"):
         "supplementary": {
             "bootstrap_ci95_drop": bootstrap_drop(per_task) if per_task else [None, None],
             "sign_test": sign_test(per_task),
+            "fixtures_changed": changed_fixtures(counted, tasks_dir),
             "attempts_total": len(attempts), "infra_retries": sum(1 for a in attempts if a["infra_failure"]),
             "timeouts": sum(1 for a in attempts if a["timed_out"]),
             "spend_usd_all_attempts": sum(a["cost_usd"] for a in attempts),
@@ -160,6 +161,8 @@ def render(res):
             f"- VERDICT: **{d['verdict']}** (counted runs {res['counted_runs']}/{res['expected_runs']})",
             f"- supplementary (never changes the verdict): bootstrap 95% CI of the drop over tasks "
             f"[{ci[0]:.1%}, {ci[1]:.1%}]" if ci[0] is not None else "- bootstrap CI n/a",
+            ("- FIXTURES CHANGED while the study ran: " + ", ".join(s["fixtures_changed"]) + " (their rows are NOT valid; re-run)"
+             if s["fixtures_changed"] else "- fixtures stable: one content hash per task across all counted rows, equal to the tree now"),
             f"- sign test over tasks: medium lower in {s['sign_test']['medium_lower']}, higher in "
             f"{s['sign_test']['medium_higher']}, p={s['sign_test']['p_two_sided']:.3f}",
             f"- attempts {s['attempts_total']} (infra retries {s['infra_retries']}, timeouts {s['timeouts']}), "
@@ -171,11 +174,12 @@ def render(res):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", type=Path, default=HERE / "results" / "runs.jsonl")
+    ap.add_argument("--tasks-dir", type=Path, default=HERE / "tasks")
     ap.add_argument("--expected", type=int, default=40)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
     counted, attempts = load(args.results)
-    res = analyse(counted, attempts, args.expected)
+    res = analyse(counted, attempts, args.expected, args.tasks_dir)
     print(json.dumps(res, indent=1) if args.json else render(res))
     return 0
 
