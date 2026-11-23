@@ -281,14 +281,17 @@ Assign model tiers to minimize cost while maximizing code quality:
 
 **Sonnet is the default for anything that writes or reviews code** (2026-08-11 directive). Opus is reserved for adjudication — `hmd:reviewer`, `hmd:verifier`, `hmd:security-auditor` — where judging work justifies the extra cost. Heimdall must still be amazing at code — never compromise quality to save tokens on coding tasks — but the lever for that is sonnet's full 1M-context window, not a blanket opus default that ages every coding spawn onto the priciest tier regardless of need.
 
-**Escalation on failure:**
-When a task fails verification:
-1. If it ran on haiku → retry on sonnet
-2. If it ran on sonnet → retry on opus
-3. If it ran on opus → retry on `fable` (escalation-only; requires repo-policy `allow_non_zdr_models` — if denied, narrow scope and retry on opus instead)
-4. If still failing → escalate to user
+**Effort ladder.** Operator directive 2026-11-23 is the explicit instruction the Agent `effort` parameter requires: spawn mechanical, bounded jobs (lint, docs edits, lookups, research reads, single-file fix with a clear test) with `effort: "low"`/`"medium"`; design, multi-file, security, adjudication omit it.
 
-Never retry on the same tier — always escalate.
+**Escalation on failure:**
+When a task fails verification or is subpar (reviewer rejects, truncated, looping):
+1. If it ran at `low`/`medium` effort → rerun the SAME task one step up (low → medium → high)
+2. If it ran on haiku → retry on sonnet
+3. If it ran on sonnet → retry on opus
+4. If it ran on opus → retry on `fable` (escalation-only; requires repo-policy `allow_non_zdr_models` — if denied, narrow scope and retry on opus instead)
+5. If still failing → escalate to user
+
+Never retry unchanged: raise effort first, then the tier.
 
 ### Continuation Enforcement
 
@@ -333,7 +336,7 @@ suggest" forever.
 
 ```bash
 heimdall-metric task --type <lint|docs|code|test|review|plan|design|security> \
-                     --model <haiku|sonnet|opus> --effort <default|max> \
+                     --model <haiku|sonnet|opus> --effort <low|medium|high|default|max> \
                      --outcome <pass|fail> --retries <N> --wall-secs <N> \
                      --source orchestrator
 ```
@@ -343,6 +346,7 @@ heimdall-metric task --type <lint|docs|code|test|review|plan|design|security> \
 - `--final <pass|fail>` records the eventual verdict when it differs from `--outcome`.
 - On escalation, emit one record **per tier** and tag the hop:
   `--model haiku --outcome fail --escalated-to sonnet`, then a second record for sonnet.
+  An effort rerun is a same-tier retry: own record, own `--effort`, `--retries 1`.
 - It never fails: a bad flag or an unwritable dir is a silent no-op at exit 0, so it can
   never break the task that is reporting success. Never pass `--strict`.
 - It records the task TYPE and outcome only. There is no field for a prompt, a diff, or a
@@ -464,6 +468,7 @@ When spawning an agent, provide:
 4. **Constraints**: what NOT to do (prevent overlap with other wave agents)
 5. **Acceptance criteria**: the specific checks this agent must pass before reporting done — test criteria scoped to its OWN test file(s), run ONCE after its changes are written; never a neighbouring or full suite; in a client repo, the user journeys its change must be proven on, as use-case scenarios (§6c)
 6. **State updates**: commands to run on completion (`heimdall-state set ...`)
+7. **Effort + report cap**: set `effort` per the Effort ladder; end every brief with: "Final report ≤1,500 chars: verdict, sha, files, test result, blockers. Longer detail goes in a file under the scratchpad or `.planning/`; the report names its path."
 
 ### 4d. Closing Finished Agents — automatic, no human input
 
