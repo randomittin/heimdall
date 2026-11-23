@@ -1,0 +1,27 @@
+diff --git a/textutil.py b/textutil.py
+index 69cecd4..5ff6936 100644
+--- a/textutil.py
++++ b/textutil.py
+@@ -9,3 +9,22 @@ def title_case(text):
+ def word_count(text):
+     """Number of whitespace-separated words."""
+     return len(text.split())
++
++
++def slugify(text, max_length=None):
++    """Return an ASCII, hyphen-separated, lowercase slug of text."""
++    import re
++    import unicodedata
++
++    if not isinstance(text, str):
++        raise TypeError("text must be a str")
++    if max_length is not None and max_length < 1:
++        raise ValueError("max_length must be >= 1")
++    norm = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++    slug = re.sub(r"[^a-z0-9]+", "-", norm.lower()).strip("-")
++    if max_length is not None and len(slug) > max_length:
++        cut = slug[:max_length]
++        if slug[max_length] != "-" and "-" in cut:
++            cut = cut[:cut.rindex("-")]
++        slug = cut.rstrip("-")
++    return slug or "n-a"

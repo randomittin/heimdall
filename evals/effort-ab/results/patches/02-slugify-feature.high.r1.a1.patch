@@ -1,0 +1,40 @@
+diff --git a/textutil.py b/textutil.py
+index 69cecd4..b0e0b39 100644
+--- a/textutil.py
++++ b/textutil.py
+@@ -1,5 +1,8 @@
+ """Small text helpers."""
+ 
++import re
++import unicodedata
++
+ 
+ def title_case(text):
+     """Capitalise the first letter of every whitespace-separated word, lowercase the rest."""
+@@ -9,3 +12,26 @@ def title_case(text):
+ def word_count(text):
+     """Number of whitespace-separated words."""
+     return len(text.split())
++
++
++def slugify(text, max_length=None):
++    """Return an ASCII, lowercase, hyphen-separated slug of text.
++
++    If max_length is given, the slug is truncated to at most that many
++    characters, preferring a word ('-') boundary. Empty results become 'n-a'.
++    """
++    if not isinstance(text, str):
++        raise TypeError("text must be a str")
++    if max_length is not None and max_length < 1:
++        raise ValueError("max_length must be >= 1")
++    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++    slug = re.sub(r"[^a-z0-9]+", "-", ascii_text.lower()).strip("-")
++    if max_length is not None and len(slug) > max_length:
++        head = slug[:max_length]
++        if slug[max_length] == "-" or head.endswith("-"):
++            slug = head
++        else:
++            cut = head.rfind("-")
++            slug = head[:cut] if cut > 0 else head
++        slug = slug.rstrip("-")
++    return slug or "n-a"

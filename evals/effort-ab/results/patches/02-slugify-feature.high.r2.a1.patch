@@ -1,0 +1,33 @@
+diff --git a/textutil.py b/textutil.py
+index 69cecd4..23c3912 100644
+--- a/textutil.py
++++ b/textutil.py
+@@ -9,3 +9,28 @@ def title_case(text):
+ def word_count(text):
+     """Number of whitespace-separated words."""
+     return len(text.split())
++
++
++def slugify(text, max_length=None):
++    """Return an ASCII, lowercase, '-'-separated slug of text, optionally truncated at a word boundary."""
++    import re
++    import unicodedata
++
++    if not isinstance(text, str):
++        raise TypeError("text must be a str")
++    if max_length is not None and max_length < 1:
++        raise ValueError("max_length must be >= 1")
++
++    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++    slug = re.sub(r"[^a-z0-9]+", "-", ascii_text.lower()).strip("-")
++
++    if max_length is not None and len(slug) > max_length:
++        cut = slug[:max_length]
++        if slug[max_length] != "-" and slug[max_length - 1] != "-":
++            # the cut falls inside a word: back up to the previous boundary
++            idx = cut.rfind("-")
++            if idx > 0:
++                cut = cut[:idx]
++        slug = cut.rstrip("-")
++
++    return slug or "n-a"
