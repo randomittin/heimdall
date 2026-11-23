@@ -1,0 +1,46 @@
+diff --git a/textutil.py b/textutil.py
+index ce6c7e9..499f404 100644
+--- a/textutil.py
++++ b/textutil.py
+@@ -1,5 +1,8 @@
+ """Small text helpers shared by the CMS import scripts."""
+ 
++import re
++import unicodedata
++
+ 
+ def word_count(text):
+     """Return the number of whitespace-separated words in ``text``.
+@@ -23,3 +26,32 @@ def title_case(text):
+     'Hello World'
+     """
+     return " ".join(word[:1].upper() + word[1:].lower() for word in text.split())
++
++
++def slugify(text, max_length=None):
++    """Return an ASCII, hyphen-separated, lower-case slug of ``text``.
++
++    The text is NFKD-normalised and non-ASCII characters are dropped; every
++    run of characters outside ``[a-z0-9]`` becomes a single ``-`` and leading
++    and trailing hyphens are stripped. If ``max_length`` is given and the slug
++    is longer, it is cut at a word boundary where possible (a single overlong
++    first word is hard-cut). An empty result becomes ``'n-a'``.
++
++    >>> slugify("Hello, World!")
++    'hello-world'
++    """
++    if not isinstance(text, str):
++        raise TypeError("text must be a str")
++    if max_length is not None and max_length < 1:
++        raise ValueError("max_length must be >= 1")
++    normalized = unicodedata.normalize("NFKD", text)
++    ascii_text = normalized.encode("ascii", "ignore").decode("ascii").lower()
++    slug = re.sub(r"[^a-z0-9]+", "-", ascii_text).strip("-")
++    if max_length is not None and len(slug) > max_length:
++        cut = slug[:max_length]
++        if slug[max_length] != "-" and not cut.endswith("-"):
++            idx = cut.rfind("-")
++            if idx > 0:
++                cut = cut[:idx]
++        slug = cut.rstrip("-")
++    return slug or "n-a"
