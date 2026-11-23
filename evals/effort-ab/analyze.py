@@ -99,7 +99,7 @@ def analyse(counted, attempts, expected):
     drop = 1 - stats[MED]["mean_output"] / stats[HIGH]["mean_output"] if stats[HIGH]["mean_output"] else 0.0
     q1 = stats[MED]["passes"] >= stats[HIGH]["passes"]
     q2 = not regressed
-    t_ok = drop >= MIN_DROP
+    t_ok = drop >= MIN_DROP - 1e-9
     complete = len(counted) >= expected
     verdict = "INCOMPLETE" if not complete else ("GO" if (q1 and q2 and t_ok) else "NO-GO")
     return {
