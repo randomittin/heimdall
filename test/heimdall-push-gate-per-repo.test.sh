@@ -679,11 +679,12 @@ check_plan() {  # check_plan <label> <base> <command> <class:dir>...   (exact li
   if [ "$got" = "$want" ]; then ok "B. $label"; else bad "B. $label" "command: $cmd | want: $(printf '%s' "$want" | tr '\n\t' '|~') | got: $(printf '%s' "$got" | tr '\n\t' '|~') $(head -c 200 "$W/plan.err")"; fi
 }
 check_strict() {  # check_strict <label> <base> <command> [silent]: at least one row and EVERY row strict: sweep, or a repo-checks row for commits nobody can
-                  # list (`?`, which always blocks: a repo that declares checks keeps owing the receipt under uncertainty). `silent` also accepts no answer
+                  # list (`?`, which always blocks: a repo that declares checks keeps owing the receipt under uncertainty), or an unplaceable row (the hook always
+                  # denies it). `silent` also accepts no answer
   local label="$1" base="$2" cmd="$3" mode="${4:-}" got            # at all: the hook then runs the strict gate on the cwd itself
   got="$(printf '%s' "$cmd" | env HOME="$HOMEDIR" PATH="${PLAN_PATH:-$PATH}" $PLAN_ENV python3 -I -S "$HELPER" "$base" 2>"$W/plan.err")"
   if [ -z "$got" ] && [ "$mode" = silent ]; then ok "B. strict: $label (no answer: the hook falls back to the strict gate on the cwd)"
-  elif [ -n "$got" ] && [ -z "$(printf '%s\n' "$got" | grep -v "^sweep${TAB}" | grep -v "^repo-checks${TAB}.*${TAB}?${TAB}[^${TAB}]*\$")" ]; then ok "B. strict: $label"
+  elif [ -n "$got" ] && [ -z "$(printf '%s\n' "$got" | grep -v "^sweep${TAB}" | grep -v "^unplaceable${TAB}" | grep -v "^repo-checks${TAB}.*${TAB}?${TAB}[^${TAB}]*\$")" ]; then ok "B. strict: $label"
   else bad "B. strict: $label" "command: $cmd | got: $(printf '%s' "$got" | tr '\n\t' '|~') $(head -c 200 "$W/plan.err")"; fi
 }
 check_sources() {  # check_sources <label> <base> <command> <the repo-checks row's third column: full ids comma-separated, - (no commit) or ? (cannot be listed)>
@@ -787,10 +788,10 @@ EOF
 
 # ── fail closed: whatever is uncertain is the strict gate on the repo resolved, else the cwd -- never a warning ──
 check_plan "NOT a repository: a cwd that is not inside one cannot be positively resolved" "$NOGIT" 'git push'      "sweep:$NOGIT"
-check_plan "a variable target -> strict on the cwd, even an unmanaged one"   "$PLAIN" 'git -C "$DIR" push'          "sweep:$PLAIN"
-check_plan "a variable target -> the cwd repo (sweep)"                       "$SWEEP" 'git -C "$DIR" push'           "sweep:$SWEEP"
-check_plan "a substitution target"                                           "$PLAIN" 'git -C "$(pwd)/x" push'       "sweep:$PLAIN"
-check_plan "cd to a variable"                                                "$PLAIN" 'cd "$X" && git push'          "sweep:$PLAIN"
+check_plan "a variable target: the repository cannot be placed -> unplaceable (blocked), even from an unmanaged cwd"  "$PLAIN" 'git -C "$DIR" push'    "unplaceable:$PLAIN"
+check_plan "a variable target from a sweep cwd: the cwd's gate is no stand-in for the repository pushed"            "$SWEEP" 'git -C "$DIR" push'    "unplaceable:$SWEEP"
+check_plan "a substitution target"                                           "$PLAIN" 'git -C "$(pwd)/x" push'       "unplaceable:$PLAIN"
+check_plan "cd to a variable"                                                "$PLAIN" 'cd "$X" && git push'          "unplaceable:$PLAIN"
 check_plan "a target that does not exist -> strict on the cwd"               "$PLAIN" 'git -C /no/such/dir/anywhere push' "sweep:$PLAIN"
 check_plan "a target that is not a repo -> strict on the cwd"                "$PLAIN" "git -C $NOGIT push"           "sweep:$PLAIN"
 check_plan "a bare repository cannot be placed in a work tree -> strict, on the cwd AND on the bare repository itself (the one pushed from)" "$PLAIN" "git -C $BARE push" "sweep:$PLAIN" "sweep:$BARE"
@@ -799,21 +800,55 @@ check_plan "a heredoc body is data, not a command -> nothing found -> strict" "$
 check_plan "empty command -> strict on the cwd"                              "$PLAIN" ''                             "sweep:$PLAIN"
 # an uncertain command gives EVERY repo involved the strict class -- the resolved ones too, whatever their own class says
 check_plan "an unreadable rest of the command: the resolved repo and the cwd both strict" "$PLAIN" "git -C $CHK push \"never closed" "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
-check_plan "a resolved target plus an unresolvable one: both strict"         "$PLAIN" "git -C $CHK push && git -C \"\$X\" push" "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
+check_plan "a resolved target plus an unplaceable one: the whole command is the one unplaceable row"         "$PLAIN" "git -C $CHK push && git -C \"\$X\" push" "unplaceable:$PLAIN"
 check_plan "an unknown git subcommand may be an alias of a push"             "$PLAIN" "git -C $CHK push && git -C $CHK pp" "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
 check_plan "an alias alone: no push is seen -> strict"                       "$PLAIN" "git -c alias.pp=push -C $CHK pp" "sweep:$PLAIN"
-check_plan "a git option this does not know"                                 "$PLAIN" 'git --frobnicate push'        "sweep:$PLAIN"
+check_plan "a git option this does not know may name the repository: unplaceable"  "$PLAIN" 'git --frobnicate push'    "unplaceable:$PLAIN"
 check_plan "a command name held in a variable"                               "$PLAIN" '$GIT push'                    "sweep:$PLAIN"
 check_plan "...also quoted, with an argument for the push"                   "$PLAIN" "\"\$GIT\" -C $CHK push"       "sweep:$PLAIN"
-check_plan "env -C <dir> runs git elsewhere: not followed -> strict"         "$PLAIN" "env -C $CHK git push"         "sweep:$PLAIN"
-check_plan "a sourced script may cd or export anything"                      "$PLAIN" 'source ./env.sh && git push'  "sweep:$PLAIN"
+check_plan "env -C <dir> runs git elsewhere: not followed -> unplaceable"    "$PLAIN" "env -C $CHK git push"         "unplaceable:$PLAIN"
+check_plan "a sourced script may cd or export anything: where the push runs is unknown -> unplaceable" "$PLAIN" 'source ./env.sh && git push'  "unplaceable:$PLAIN"
 check_plan "a bare GIT_DIR= assignment may update an exported variable"      "$PLAIN" "GIT_DIR=$SWEEP/.git; git push" "sweep:$PLAIN"
 check_plan "re-exporting GIT_DIR without a value is not modelled"            "$PLAIN" 'export GIT_DIR; git push'     "sweep:$PLAIN"
 check_plan "declare/local/readonly of a GIT_* name is not modelled"          "$PLAIN" "declare GIT_DIR=$SWEEP/.git; git push" "sweep:$PLAIN"
 PLAN_ENV="CDPATH=$W/repos"
-check_plan "a relative cd with CDPATH set may land elsewhere -> strict"      "$PLAIN" 'cd chk && git push'           "sweep:$PLAIN"
+check_plan "a relative cd with CDPATH set may land elsewhere -> unplaceable" "$PLAIN" 'cd chk && git push'           "unplaceable:$PLAIN"
 check_plan "...but ./<dir> is not searched through CDPATH"                   "$W/repos" 'cd ./chk && git push'       "repo-checks:$CHK"
 PLAN_ENV=""
+
+# ── a push whose repository cannot be PLACED (2026-11-23). Grading the cwd's repository for it is grading ANOTHER repository: live, `for r in <a> <b>; do git -C <dir>/$r push ...; done`
+#    from a cwd whose own gate was green pushed a repository whose own checks were red. No gate can be run for such a push, so the plan is ONE unplaceable row (the hook always denies it) --
+#    whatever else the command holds. A literal -C / cd target is still graded on that repository, inside a loop too. ──
+check_plan "the live loop: -C <dir>/\$r in a for loop (not the cwd's gate: the repositories pushed are unknown)"   "$SWEEP" 'for r in a b; do git -C /repos/$r push -q origin main 2>&1 | tail -2; git -C /repos/$r log origin/main --oneline -1; done' "unplaceable:$SWEEP"
+check_plan "...the same in a while loop reading the names"                   "$PLAIN" 'while read r; do git -C "/repos/$r" push; done < names.txt'  "unplaceable:$PLAIN"
+check_plan "-C \"\$d\" (a quoted variable)"                                   "$PLAIN" 'git -C "$d" push origin main'                               "unplaceable:$PLAIN"
+check_plan "-C \$d (a bare variable)"                                         "$PLAIN" 'git -C $d push'                                             "unplaceable:$PLAIN"
+check_plan "-C \${d} (a braced variable)"                                     "$PLAIN" 'git -C ${d} push'                                           "unplaceable:$PLAIN"
+check_plan "-C \$(cmd)"                                                       "$PLAIN" 'git -C $(cat repo.txt) push'                                "unplaceable:$PLAIN"
+check_plan "-C with a backtick substitution"                                  "$PLAIN" 'git -C `cat repo.txt` push'                                 "unplaceable:$PLAIN"
+check_plan "-C with a glob"                                                   "$PLAIN" "git -C $W/repos/ch* push"                                   "unplaceable:$PLAIN"
+check_plan "-C with a brace expansion"                                        "$PLAIN" "git -C $W/repos/{chk,sweep} push"                           "unplaceable:$PLAIN"
+check_plan "a variable inside a path: -C <dir>/\$r"                           "$PLAIN" "git -C $W/repos/\$r push"                                   "unplaceable:$PLAIN"
+check_plan "--git-dir with a variable (attached)"                             "$PLAIN" 'git --git-dir=$d/.git push'                                 "unplaceable:$PLAIN"
+check_plan "--git-dir with a variable (separate)"                             "$PLAIN" 'git --git-dir "$d/.git" push'                               "unplaceable:$PLAIN"
+check_plan "--work-tree with a variable"                                      "$PLAIN" 'git --work-tree=$d push'                                    "unplaceable:$PLAIN"
+check_plan "git's option words held in a variable (they may hold a -C)"       "$PLAIN" 'git $OPTS push'                                             "unplaceable:$PLAIN"
+check_plan "cd \$d && push"                                                   "$PLAIN" 'cd $d && git push'                                          "unplaceable:$PLAIN"
+check_plan "( cd \"\$d\" && push ) in a subshell"                              "$PLAIN" '(cd "$d" && git push)'                                      "unplaceable:$PLAIN"
+check_plan "a loop that cds to a variable and pushes"                         "$PLAIN" 'for d in a b; do cd $d; git push; cd ..; done'              "unplaceable:$PLAIN"
+check_plan "a loop that cds to a LITERAL directory: a cd inside a loop is not modelled, so the push cannot be placed" "$PLAIN" "for i in 1 2; do cd $CHK; git push; done" "unplaceable:$PLAIN"
+check_plan "pushd to a variable"                                              "$PLAIN" 'pushd $d >/dev/null && git push'                            "unplaceable:$PLAIN"
+check_plan "a placed push beside one that cannot be placed: the plan is the one unplaceable row" "$PLAIN" "git -C $CHK push && git -C \"\$d\" push"   "unplaceable:$PLAIN"
+check_plan "...whichever comes first"                                         "$PLAIN" "git -C \"\$d\" push && git -C $CHK push"                    "unplaceable:$PLAIN"
+check_plan "a dynamic cd in a subshell goes nowhere: the push after it is placed exactly"  "$PLAIN" '(cd $d); git push'                              "unmanaged:$PLAIN"
+check_plan "...likewise a dynamic cd that is not the last element of a pipeline"           "$PLAIN" 'cd $d | cat; git push'                         "unmanaged:$PLAIN"
+check_plan "a variable that is no push is no row: git -C \"\$d\" status, then a plain push" "$PLAIN" 'git -C "$d" status; git push'                    "unmanaged:$PLAIN"
+check_plan "a literal -C inside a loop is graded exactly, on that repository"              "$PLAIN" "for i in 1 2; do git -C $CHK push; done"       "repo-checks:$CHK"
+check_plan "...a loop over two literal pushes grades both"                                 "$PLAIN" "for i in 1; do git -C $CHK push; git -C $SWEEP push; done" "repo-checks:$CHK" "sweep:$SWEEP"
+check_plan "...a while loop too"                                                           "$PLAIN" "while false; do git -C $SWEEP push; done"      "sweep:$SWEEP"
+# a variable in a git option that does NOT name the repository (-c's value: a token in an http header, say) leaves the repository placed, the push uncertain (so strict): it is not unplaceable
+check_plan "-c with a variable value: the repository is still the cwd's, uncertain -> strict"   "$PLAIN" 'git -c "http.extraheader=$H" push origin main' "sweep:$PLAIN"
+check_plan "...with a literal -C the repository it names is graded too (it used to be skipped)" "$PLAIN" "git -C $CHK -c \"http.extraheader=\$H\" push"    "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
 
 # ── the shell model: each construct below is either followed EXACTLY (and gated by the class of what it really pushes) or flagged
 #    (and then every repo involved is strict). Nothing in between: no construct may let a push slip to the warn-only class. ──
@@ -825,7 +860,7 @@ check_plan "\$( ): the substitution's own cd stays inside it"                  "
 check_plan "backticks"                                                         "$PLAIN" "echo \`git -C $CHK push\`"               "repo-checks:$CHK"
 check_plan "escaped, nested backticks are not read -> strict"                  "$PLAIN" "$NEST_BACKTICKS"                         "sweep:$PLAIN"
 check_plan "eval runs in the CURRENT shell: its cd carries on"                 "$PLAIN" "eval 'cd $CHK'; git push"                "repo-checks:$CHK"
-check_plan "eval of a string with a variable in it cannot be read -> strict"   "$PLAIN" 'eval "cd $X"; git push'                  "sweep:$PLAIN"
+check_plan "eval of a string with a variable in it cannot be read: the cd is unknown -> unplaceable" "$PLAIN" 'eval "cd $X"; git push'                  "unplaceable:$PLAIN"
 check_plan "sh -c is a subshell: its cd does not carry out"                    "$PLAIN" "sh -c 'cd $CHK'; git push"               "unmanaged:$PLAIN"
 check_plan "sh -c \"\$VAR\" cannot be read: the resolved push and the cwd both strict" "$PLAIN" "sh -c \"\$CMD\"; git -C $CHK push" "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
 check_plan "xargs git -C <dir> push"                                           "$PLAIN" "xargs git -C $CHK push"                  "repo-checks:$CHK"
@@ -841,25 +876,25 @@ check_plan "find -exec ... git push carries a push in its arguments -> strict" "
 check_plan "perl -e with a git push in it -> strict"                           "$PLAIN" "perl -e 'system(\"git -C $CHK push\")'"  "sweep:$PLAIN"
 check_plan "trap with a push in it, and a push to <dir> -> both strict"        "$PLAIN" "trap 'git push' EXIT; git -C $CHK push"  "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
 check_plan "echo and a commit message that mention a push are only text"       "$PLAIN" "echo \"git push\"; git commit -m \"git push\"; git -C $CHK push" "repo-checks:$CHK"
-check_plan "pushd with no argument swaps the stack: not modelled -> strict"    "$PLAIN" 'pushd; git push'                         "sweep:$PLAIN"
+check_plan "pushd with no argument swaps the stack: not modelled -> unplaceable" "$PLAIN" 'pushd; git push'                         "unplaceable:$PLAIN"
 check_plan "cd A && cd B && git push: the last cd wins"                        "$PLAIN" "cd $CHK && cd $SWEEP && git push"        "sweep:$SWEEP"
 check_plan "cd A; cd <relative to A>; git push"                                "$W/repos" "cd chk; cd ../sweep; git push"         "sweep:$SWEEP"
 check_plan "cd A || cd B: a cd into a directory that exists cannot fail, B never runs" "$PLAIN" "cd $CHK || cd $SWEEP; git push"   "repo-checks:$CHK"
 check_plan "test -d A && cd A; git push: it may or may not move, so BOTH are gated" "$PLAIN" "test -d $CHK && cd $CHK; git push"   "repo-checks:$CHK" "unmanaged:$PLAIN"
 check_plan "false || cd A && git push: gated at both"                          "$PLAIN" "false || cd $CHK && git push"            "repo-checks:$CHK" "unmanaged:$PLAIN"
-check_plan "a cd into a directory that does not exist leaves the cwd unknown -> strict" "$PLAIN" "cd /no/such/dir; git push"     "sweep:$PLAIN"
+check_plan "a cd into a directory that does not exist leaves the cwd unknown -> unplaceable" "$PLAIN" "cd /no/such/dir; git push"     "unplaceable:$PLAIN"
 check_plan "a cd in a backgrounded list does not carry out"                    "$PLAIN" "cd $CHK & git push"                      "unmanaged:$PLAIN"
-check_plan "a cd inside if / while / for / case is not modelled -> strict"     "$PLAIN" "if cd $CHK; then git push; fi"           "sweep:$PLAIN"
-check_plan "a cd inside a brace group is not modelled -> strict"               "$PLAIN" "{ cd $CHK; git push; }"                  "sweep:$PLAIN"
-check_plan "a function definition is not read -> strict"                       "$PLAIN" "f() { cd $CHK; }; f; git push"           "sweep:$PLAIN"
+check_plan "a cd inside if / while / for / case is not modelled -> unplaceable" "$PLAIN" "if cd $CHK; then git push; fi"           "unplaceable:$PLAIN"
+check_plan "a cd inside a brace group is not modelled -> unplaceable"           "$PLAIN" "{ cd $CHK; git push; }"                  "unplaceable:$PLAIN"
+check_plan "a function definition is not read: where its cd leaves the shell is unknown -> unplaceable" "$PLAIN" "f() { cd $CHK; }; f; git push"           "unplaceable:$PLAIN"
 check_plan "an alias may turn any word into a push -> strict"                  "$PLAIN" "alias git='git -C $CHK'; git push"       "sweep:$PLAIN"
-check_plan "cd - : OLDPWD is not known -> strict"                              "$PLAIN" 'cd -; git push'                          "sweep:$PLAIN"
+check_plan "cd - : OLDPWD is not known -> unplaceable"                          "$PLAIN" 'cd -; git push'                          "unplaceable:$PLAIN"
 check_plan "cd ~ : the home directory is where the push then runs (here not a repo) -> strict" "$PLAIN" 'cd ~; git push'          "sweep:$PLAIN"
 check_plan "cd with no argument goes home, likewise"                           "$PLAIN" 'cd; git push'                            "sweep:$PLAIN"
 check_plan "cd to a quoted path with a space"                                  "$PLAIN" "cd '$SPACED' && git push"                "repo-checks:$SPACED"
-check_plan "cd to a quoted path with a space that does not exist -> strict"    "$PLAIN" "cd '$W/no such dir'; git push"           "sweep:$PLAIN"
-check_plan "sudo -D <dir> runs git elsewhere -> strict"                        "$PLAIN" "sudo -D $CHK git push"                   "sweep:$PLAIN"
-check_plan "sudo -i runs a login shell in another directory -> strict"         "$PLAIN" "sudo -i git push"                        "sweep:$PLAIN"
+check_plan "cd to a quoted path with a space that does not exist -> unplaceable" "$PLAIN" "cd '$W/no such dir'; git push"           "unplaceable:$PLAIN"
+check_plan "sudo -D <dir> runs git elsewhere -> unplaceable"                    "$PLAIN" "sudo -D $CHK git push"                   "unplaceable:$PLAIN"
+check_plan "sudo -i runs a login shell in another directory -> unplaceable"     "$PLAIN" "sudo -i git push"                        "unplaceable:$PLAIN"
 
 # ── the class is read from the COMMITS, never the work tree; the stricter of HEAD, its upstream, origin and the refspecs wins ──
 set_upstream() {  # set_upstream <repo> <sha>: refs/remotes/origin/<branch> = sha, the branch tracks it -- no remote is ever contacted
@@ -934,7 +969,20 @@ check_strict "BASH_ENV=<file> runs a file in every shell it starts"          "$P
 
 # ── the third column of a sweep row says whether it is only the strict FALLBACK (the command or git could not be read), or a marker was found ──
 fb_column() { printf '%s' "$2" | env HOME="$HOMEDIR" python3 -I -S "$HELPER" "$1" 2>/dev/null | awk -F'\t' 'NR == 1 { print $3 }'; }
-[ "$(fb_column "$PLAIN" 'git -C "$X" push')" = fallback ] && ok "B. an uncertain command's strict row is marked fallback" || bad "B. an uncertain command's strict row is not marked fallback" "$(fb_column "$PLAIN" 'git -C "$X" push')"
+[ "$(fb_column "$PLAIN" 'git push; source ./x.sh')" = fallback ] && ok "B. an uncertain command's strict row is marked fallback" || bad "B. an uncertain command's strict row is not marked fallback" "$(fb_column "$PLAIN" 'git push; source ./x.sh')"
+# the third column of an unplaceable row names the push it could not place and why, in one line: it is what the deny says
+case "$(fb_column "$PLAIN" 'git -C /repos/$r push -q origin main')" in
+  'git -C /repos/$r push: '*'-C'*) ok "B. an unplaceable row names the push (its words up to the verb) and says an option's value cannot be read" ;;
+  *) bad "B. the third column of an unplaceable row (a variable in -C)" "$(fb_column "$PLAIN" 'git -C /repos/$r push -q origin main')" ;;
+esac
+case "$(fb_column "$PLAIN" 'cd $d && git push origin main')" in
+  'git push: the directory it runs in cannot be followed'*) ok "B. an unplaceable row for a cwd it cannot follow says so" ;;
+  *) bad "B. the third column of an unplaceable row (a cd to a variable)" "$(fb_column "$PLAIN" 'cd $d && git push origin main')" ;;
+esac
+[ "$(printf '%s' $'git -C "$d\tx" push' | env HOME="$HOMEDIR" python3 -I -S "$HELPER" "$PLAIN" 2>/dev/null | awk -F'\t' '{ print NF }')" = 4 ] \
+  && ok "B. an unplaceable row stays ONE line of four tab-separated columns even when the push's own words hold a tab" || bad "B. a tab in the offending words broke the row"
+[ "$(printf 'git -C "$d%s" push' "$(printf 'x%.0s' {1..600})" | env HOME="$HOMEDIR" python3 -I -S "$HELPER" "$PLAIN" 2>/dev/null | awk -F'\t' 'NR == 1 { print (length($3) < 400 ? "short" : "long") }')" = short ] \
+  && ok "B. ...and a very long push is cut: the row is a line of the deny, not the whole command" || bad "B. an unplaceable row's third column is not bounded"
 [ "$(fb_column "$SWEEP" 'git push')" = - ] && ok "B. a sweep row found through a marker is NOT marked fallback (the column holds -)" || bad "B. a marker-derived sweep row is marked fallback" "$(fb_column "$SWEEP" 'git push')"
 [ "$(fb_column "$DANGLE" 'git push')" = fallback ] && ok "B. a marker that cannot be read is a fallback row too" || bad "B. an unreadable marker's strict row is not marked fallback"
 
@@ -1050,8 +1098,10 @@ check_plan "a commit whose test/run-all.sh is a directory is strict: a marker th
 
 # ── the shell differential: every command below is RUN by real bash (and zsh when installed), with a git that only records where it was started
 #    and with which options; the repositories those pushes really went to are then compared with what the resolver answers. Either every real
-#    push is gated at least as strictly as its repository's own class, or the whole plan is the strict class. A model that is wrong in a way
-#    that lets a push through shows up here as a command where the two disagree. ──
+#    push is gated at least as strictly as its repository's own class, or the whole plan is the strict class, or the plan BLOCKS (an unplaceable
+#    row). MUST_BLOCK pins the last for every command whose real push went to a repository named by a variable, a substitution or a cd the resolver
+#    cannot follow: "strict on the directory the shell was in" graded ANOTHER repository there (2026-11-23), and nothing here said so. A model that is
+#    wrong in a way that lets a push through shows up here as a command where the two disagree. ──
 FAKEBIN="$W/fakebin"; mkdir -p "$FAKEBIN" "$W/cdp"
 cat > "$FAKEBIN/git" <<'FAKEGIT_EOF'
 #!/usr/bin/env bash
@@ -1141,7 +1191,29 @@ CORPUS = [
     ("PLAIN", "alias git='git -C @CHK@'; git push"),
     ("PLAIN", "cd /no/such/dir; git push"),
     ("PLAIN", "source ./nothing.sh; git push"),
+    # a push to a repository this cannot place, from real loops over real repositories (2026-11-23): the plan must BLOCK them (MUST_BLOCK below), not grade the cwd's repository
+    ("PLAIN", "for r in chk sweep; do git -C @WREPOS@/$r push; done"),
+    ("PLAIN", 'for r in chk sweep; do git -C "@WREPOS@/$r" push -q origin main 2>&1 | tail -2; git -C "@WREPOS@/$r" log -1 --oneline; done'),
+    ("SWEEP", "for r in chk sweep; do (cd @WREPOS@/$r && git push); done"),
+    ("PLAIN", "for r in chk sweep; do cd @WREPOS@/$r; git push; done"),
+    ("PLAIN", "while read r; do git -C @WREPOS@/$r push; done <<< 'chk'"),
+    ("PLAIN", 'git -C "$(dirname @CHK@)/chk" push -q'),
+    # ...while a loop around a LITERAL target is read exactly
+    ("PLAIN", "for i in 1 2; do git -C @CHK@ push; done"),
+    ("PLAIN", "for i in 1; do git -C @CHK@ push; git -C @SWEEP@ push; done"),
 ]
+# commands whose real push went to a repository the resolver cannot place (a variable, a substitution, a cd it cannot follow): the plan must BLOCK, because
+# grading the directory the shell was in grades ANOTHER repository (the strict class is no stand-in for the repository really pushed)
+MUST_BLOCK = {
+    'cd "$D" && git push', "cd $D; git push", 'git -C "$D" push', 'git -C "$(echo @CHK@)" push', 'eval "cd $D"; git push', "D2=@CHK@; git -C $D2 push",
+    "if cd @CHK@; then git push; fi", "{ cd @CHK@; git push; }", "f() { cd @CHK@; }; f; git push",
+    "for r in chk sweep; do git -C @WREPOS@/$r push; done",
+    'for r in chk sweep; do git -C "@WREPOS@/$r" push -q origin main 2>&1 | tail -2; git -C "@WREPOS@/$r" log -1 --oneline; done',
+    "for r in chk sweep; do (cd @WREPOS@/$r && git push); done",
+    "for r in chk sweep; do cd @WREPOS@/$r; git push; done",
+    "while read r; do git -C @WREPOS@/$r push; done <<< 'chk'",
+    'git -C "$(dirname @CHK@)/chk" push -q',
+}
 
 
 def shell_pushes(shell, base, cmd):
@@ -1191,8 +1263,11 @@ def plan_rows(base, cmd):
 
 
 def verdict(repos, rows):
-    """"strict" when the plan is the strict class throughout (or gave no answer: the hook then runs the strict gate); "exact" when every real
-    push is covered by a row of its own repository at least as strict as that repository's class; None when a push slipped through."""
+    """"blocked" when a row is the unplaceable one (a push whose repository cannot be placed: the hook always denies it); "strict" when the plan is the
+    strict class throughout (or gave no answer: the hook then runs the strict gate); "exact" when every real push is covered by a row of its own
+    repository at least as strict as that repository's class; None when a push slipped through."""
+    if any(r[0] == "unplaceable" for r in rows):
+        return "blocked"
     if not rows or all(r[0] == "sweep" or (r[0] == "repo-checks" and r[2:3] == ["?"]) for r in rows):
         return "strict"
     for repo in repos:
@@ -1204,7 +1279,7 @@ def verdict(repos, rows):
 
 bad, stats = [], {}
 for shell in sys.argv[1:]:
-    exact = strict = pushes = 0
+    exact = strict = blocked = pushes = 0
     for key, template in CORPUS:
         cmd = template
         for name, value in paths.items():
@@ -1221,17 +1296,24 @@ for shell in sys.argv[1:]:
         if got is None:
             bad.append("%s in %s: %r\n         real pushes went to: %s\n         the plan says: %s"
                        % (shell, key, cmd, [os.path.basename(r) if r else None for r in repos], rows))
+        elif template in MUST_BLOCK and not repos:
+            bad.append("%s in %s: %r made no real push, so it proves nothing about the block" % (shell, key, cmd))
+        elif template in MUST_BLOCK and got != "blocked":
+            bad.append("%s in %s: %r\n         real pushes went to: %s\n         the plan is %s, not a block: a push to a repository this cannot place was graded on the directory the shell was in\n         the plan says: %s"
+                       % (shell, key, cmd, [os.path.basename(r) if r else None for r in repos], got, rows))
+        elif got == "blocked":
+            blocked += 1
         elif got == "exact" and repos:
             exact += 1
         else:
             strict += 1
-    stats[shell] = (exact, strict, pushes)
+    stats[shell] = (exact, strict, blocked, pushes)
     if exact < 25:
         bad.append("%s: only %d commands were resolved exactly; the corpus no longer exercises the exact path" % (shell, exact))
 for line in bad:
     print("FAIL " + line)
-for shell, (e, s, p) in stats.items():
-    print("SUMMARY %s: %d commands, %d resolved exactly, %d strict, %d real pushes" % (shell, len(CORPUS), e, s, p))
+for shell, (e, s, b, p) in stats.items():
+    print("SUMMARY %s: %d commands, %d resolved exactly, %d strict, %d blocked outright, %d real pushes" % (shell, len(CORPUS), e, s, b, p))
 sys.exit(1 if bad else 0)
 DIFF_PY_EOF
 DIFF_OUT="$(HMD_DIFF_FIXTURES="$DIFF_FIXTURES" HMD_DIFF_HELPER="$HELPER" HMD_DIFF_FAKEBIN="$FAKEBIN" HMD_DIFF_LOG="$W/diff.log" HMD_DIFF_REALGIT="$REAL_GIT" HMD_DIFF_HOME="$HOMEREPO" \
@@ -1309,6 +1391,14 @@ strict_blocks() {  # strict_blocks <label> <expected gate dir>  -- uses RC OUT E
     ok "$1"
   else
     bad "$1" "rc=$RC calls=$(state_calls) gate ran in '$(state_cwds)' (want '$2') | stdout: $(printf '%s' "$OUT" | head -c 300) | stderr: $(printf '%s' "$ERR" | head -c 300)"
+  fi
+}
+# a push whose repository cannot be placed (2026-11-23): denied outright -- rc 2, the verdict says it cannot place the push -- and NO gate ran, not even the cwd's (it would grade ANOTHER repository)
+unplaced_blocks() {  # unplaced_blocks <label> -- uses RC OUT ERR of the run just made
+  if [ "$RC" = 2 ] && [ "$(state_calls)" = 0 ] && printf '%s' "$OUT" | jq -e '.error | test("^BLOCKED: pre-push gate cannot place this push")' >/dev/null 2>&1 && grep -qF 'BLOCKED' <<<"$ERR"; then
+    ok "$1  [rc=2]"
+  else
+    bad "$1" "rc=$RC calls=$(state_calls) (want 2 and 0) | stdout: $(printf '%s' "$OUT" | head -c 400) | stderr: $(printf '%s' "$ERR" | head -c 300)"
   fi
 }
 
@@ -1447,9 +1537,9 @@ expect_rc "C21b. a green (b) push and an unmanaged push -> allowed" 0
 run_hook "$PLUGIN" "$PLAIN" 'git -C /no/such/dir/anywhere push' FAKE_HSTATE_RC=2
 strict_blocks "C22. a target path that does not exist, cwd unmanaged -> the strict gate on the cwd, BLOCKED" "$PLAIN"
 run_hook "$PLUGIN" "$PLAIN" 'git -C "$DIR" push' FAKE_HSTATE_RC=2
-strict_blocks "C22b. a target held in a variable -> strict on the cwd" "$PLAIN"
+unplaced_blocks "C22b. a target held in a variable: the repository cannot be placed -> BLOCKED outright, no gate run (the cwd's gate would grade another repository)"
 run_hook "$PLUGIN" "$PLAIN" "git -C $B_GREEN push && git -C \"\$X\" push" FAKE_HSTATE_RC=2
-expect_rc "C22c. a green (b) push plus a push that cannot be resolved -> BLOCKED by the strict gate on the cwd" 2
+expect_rc "C22c. a green (b) push plus a push that cannot be placed -> BLOCKED: the push it cannot place blocks the whole command" 2
 run_hook "$PLUGIN" "$PLAIN" "git -C $B_GREEN push && git -C $B_GREEN pp" FAKE_HSTATE_RC=2
 expect_rc "C22d. a git subcommand that is not a known built-in (an alias may be a push) -> the strict gate too" 2
 run_hook "$PLUGIN" "$PLAIN" "git push \"never closed" FAKE_HSTATE_RC=2
@@ -1497,7 +1587,7 @@ expect_rc "C32d. a cd that may or may not happen: BOTH possible targets are gate
 run_hook "$PLUGIN" "$PLAIN" "test -d $B_GREEN && cd $B_GREEN; git push"
 expect_rc "C32e. ...and when every possible target passes (a green record, an unmanaged cwd) the push goes on" 0
 run_hook "$PLUGIN" "$PLAIN" 'cd -; git push' FAKE_HSTATE_RC=2
-strict_blocks "C32f. cd - : OLDPWD is unknown -> the strict gate" "$PLAIN"
+unplaced_blocks "C32f. cd - : OLDPWD is unknown, so the directory the push runs in is -> BLOCKED outright"
 run_hook "$PLUGIN" "$PLAIN" "git -C $B_GREEN push; source ./x.sh" FAKE_HSTATE_RC=2
 { [ "$RC" = 2 ] && [ "$(state_cwds | sed -n 1p)" = "$B_GREEN" ]; } && ok "C32g. an uncertain command makes the resolved (b) repo strict too: its green receipt alone does not pass it  [rc=2]" || bad "C32g. uncertain command left a resolved repo on its own class" "rc=$RC cwds=$(state_cwds | tr '\n' ' ') $OUT"
 
@@ -1529,9 +1619,12 @@ expect_rc "C43b. an uncertain command in a repo that declares checks is BLOCKED 
 run_hook "$PLUGIN" "$B_GREEN" 'git push; source ./x.sh' FAKE_HSTATE_RC=0
 expect_rc "C43b. ...and when the strict gate passes, the receipt row still blocks it: the commits cannot be listed" 2
 denies "C43b. ...cannot be tied to the receipt" 'cannot be tied'
-run_hook "$PLUGIN_REAL" "$PLAIN" 'git -C "$X" push'
+run_hook "$PLUGIN_REAL" "$PLAIN" 'git push; source ./x.sh'
 expect_rc "C43c. an uncertain command in an unmanaged repo is not waved through as unmanaged: the strict gate was never evaluated, so BLOCKED" 2
 denies "C43c. ...says it cannot grade the push" 'cannot grade this push'
+run_hook "$PLUGIN_REAL" "$PLAIN" 'git -C "$X" push'
+expect_rc "C43e. a push whose repository cannot be placed is BLOCKED outright, whatever the cwd's gate would say (here: never armed)" 2
+denies "C43e. ...says it cannot place the push" 'cannot place this push'
 run_hook "$PLUGIN_REAL" "$PLAIN" 'git push'
 { [ "$RC" = 0 ] && grep -q 'WARNING' <<<"$ERR"; } && ok "C43d. ...while the same push stated plainly is only the unmanaged warning  [rc=0]" || bad "C43d. plain push of an unmanaged repo" "rc=$RC $ERR"
 
@@ -1648,6 +1741,56 @@ run_hook "$PLUGIN" "$B_LINKED" 'git push'
 expect_rc "C61. the receipts directory is a symlink to a genuine green receipt elsewhere -> BLOCKED (a link is never followed)" 2
 denies "C61. ...says it is a link" '(?i)link'
 
+# ── 2026-11-23: a push whose repository cannot be PLACED is BLOCKED, whatever the cwd's own gate says. The live case: the session was in heimdall (its gate GREEN) and
+#    `for r in <a> <b>; do git -C <dir>/$r push ...; done` pushed a repository whose own checks were RED, because the resolver graded the cwd's repository alone and the
+#    cwd's gate passed. No gate can be run for a repository nobody can name, so the hook denies and says to restate the push with the directory written out. ──
+LOOP_CMD="for r in bgreen bred; do git -C $W/repos/\$r push -q origin main 2>&1 | tail -2; git -C $W/repos/\$r log origin/main --oneline -1; done"
+run_hook "$PLUGIN" "$SWEEP" "$LOOP_CMD" FAKE_HSTATE_RC=0
+unplaced_blocks "C70. the live loop (-C <dir>/\$r in a for loop), the cwd's own gate GREEN -> BLOCKED (it used to be graded on the cwd alone, and allowed)"
+out_has "C70. ...the deny names the push it could not place" 'repos/$r push'
+out_has "C70. ...says how to restate it: the directory written out, one command per repository" 'one command per repository'
+run_hook "$PLUGIN" "$SWEEP" "$LOOP_CMD" FAKE_HSTATE_RC=2
+unplaced_blocks "C70b. ...the same verdict with the cwd's gate RED: the cwd's gate is not what decides it"
+run_hook "$PLUGIN" "$PLAIN" "$LOOP_CMD" FAKE_HSTATE_RC=0
+unplaced_blocks "C70c. ...and from an unmanaged cwd"
+PAYLOAD_CWD="$SWEEP" run_hook "$PLUGIN" "$PLAIN" "$LOOP_CMD" FAKE_HSTATE_RC=0
+unplaced_blocks "C70d. ...and when the payload's cwd (the shell's) is the sweep repo and the hook process sits elsewhere"
+for form in \
+  'git -C "$d" push origin main' \
+  'git -C $d push' \
+  'git -C ${d} push' \
+  'git -C $(cat repo.txt) push' \
+  'git -C "$(cat repo.txt)" push' \
+  "git -C $W/repos/\$r push" \
+  'git --git-dir "$d/.git" push' \
+  'git --git-dir=$d/.git push' \
+  'cd $d && git push' \
+  'cd "$d" && git push' \
+  '(cd "$d" && git push)' \
+  'for d in a b; do cd $d; git push; cd ..; done' \
+  'while read r; do git -C "/repos/$r" push; done < names.txt' \
+  "git -C $B_GREEN push && git -C \"\$d\" push" \
+  "git -C \"\$d\" push && git -C $B_GREEN push"; do
+  run_hook "$PLUGIN" "$SWEEP" "$form" FAKE_HSTATE_RC=0
+  unplaced_blocks "C71. [$form] with the cwd's gate green -> BLOCKED (the repository cannot be placed)"
+done
+# a literal target is still graded on ITS repository's own record, a loop around it changes nothing
+run_hook "$PLUGIN" "$SWEEP" "for i in 1 2; do git -C $B_GREEN push; done" FAKE_HSTATE_RC=2
+expect_rc "C72. a loop around a LITERAL target is graded on that repository's own record: a green (b) repo -> allowed (the cwd's failing gate is not asked)" 0
+[ "$(state_calls)" = 0 ] && ok "C72. ...heimdall-state was never called" || bad "C72. the cwd's gate was asked for a literal target" "calls=$(state_calls)"
+run_hook "$PLUGIN" "$SWEEP" "for i in 1 2; do git -C $B_RED push; done" FAKE_HSTATE_RC=0
+expect_rc "C72b. ...and a red one is BLOCKED by that repository's own record, not waved through on the cwd's green gate" 2
+denies "C72b. ...naming that repository" "pre-push repo-checks gate failed for $B_RED"
+# a variable in an option that does not name the repository (-c's value) leaves the repository placed: graded, and strict because the push is uncertain
+run_hook "$PLUGIN" "$PLAIN" "git -C $B_RED -c \"http.extraheader=\$H\" push" FAKE_HSTATE_RC=0
+expect_rc "C73. -c with a variable value and a literal -C: the repository -C names is graded too (it used to be skipped), a red one BLOCKS" 2
+denies "C73. ...by that repository's own gate" "pre-push repo-checks gate failed for $B_RED"
+run_hook "$PLUGIN" "$PLAIN" 'git -c "http.extraheader=$H" push origin main' FAKE_HSTATE_RC=0
+{ [ "$RC" = 0 ] && [ "$(state_calls)" = 1 ] && [ "$(state_cwds)" = "$PLAIN" ]; } && ok "C73b. -c with a variable value in the cwd repository: placed, strict, its gate passes -> not over-blocked  [rc=0]" || bad "C73b. a push with a token in -c was blocked or ungraded" "rc=$RC calls=$(state_calls) cwd=$(state_cwds) $OUT"
+# a dynamic cd that stays inside a subshell or a pipeline goes nowhere: the push after it is placed exactly
+run_hook "$PLUGIN" "$B_GREEN" '(cd $d); git push'
+{ [ "$RC" = 0 ] && [ "$(state_calls)" = 0 ] && grep -q 'GREEN' <<<"$ERR"; } && ok "C74. a dynamic cd inside a subshell goes nowhere: the push after it is graded on the cwd's own green record  [rc=0]" || bad "C74. a subshell's dynamic cd blocked the push after it" "rc=$RC $OUT $ERR"
+
 # ── no resolver: gated exactly as before ──
 run_hook "$PLUGIN_NORES" "$PLAIN" 'git push' FAKE_HSTATE_RC=2
 expect_rc "C28. resolver missing -> the old gate on the cwd (fails closed, not open)" 2
@@ -1688,6 +1831,12 @@ e_strict() {  # e_strict <command>: the sweep gate must have run once, in the cw
   run_hook "$PLUGIN" "$PLAIN" "$1" FAKE_HSTATE_RC=2
   { [ "$RC" = 2 ] && [ "$(state_calls)" = 1 ] && [ "$(state_cwds)" = "$PLAIN" ]; } \
     || E_BAD="$E_BAD [$1 => rc=$RC gate-calls=$(state_calls)]"
+}
+e_unplaced() {  # e_unplaced <command>: git runs where the resolver cannot follow (env -C): BLOCKED outright, "cannot place this push", and no gate ran, not even the cwd's
+  N_E=$((N_E + 1))
+  run_hook "$PLUGIN" "$PLAIN" "$1" FAKE_HSTATE_RC=2
+  { [ "$RC" = 2 ] && [ "$(state_calls)" = 0 ] && printf '%s' "$OUT" | grep -q 'cannot place this push'; } \
+    || E_BAD="$E_BAD [$1 => rc=$RC gate-calls=$(state_calls) (wanted 2 and 0, cannot place this push)]"
 }
 while IFS= read -r form; do
   [ -n "$form" ] || continue
@@ -1751,8 +1900,8 @@ e_warned "$SPC" "cp file.txt copy.txt && git -C '$SPC' push"
 e_warned "$SPC" "cp file.txt copy.txt && cd $SPC_ESC && git push"
 e_strict 'env -u FOO git push'
 e_strict 'cp file.txt copy.txt && env -u FOO git push'
-e_strict 'cp file.txt copy.txt && env -C sub git push'
-[ -z "$E_BAD" ] && ok "E1. all $N_E forms are graded: understood ones warned (one warning, the repo pushed named, no sweep gate), env -u / -C strict on the cwd" \
+e_unplaced 'cp file.txt copy.txt && env -C sub git push'
+[ -z "$E_BAD" ] && ok "E1. all $N_E forms are graded: understood ones warned (one warning, the repo pushed named, no sweep gate), env -u strict on the cwd, env -C (git runs somewhere this cannot follow) blocked outright" \
   || bad "E1. forms that walked past the gate (or were graded the wrong way):" "$E_BAD"
 
 # ════════════════════════════════════════════════════════════════════════════

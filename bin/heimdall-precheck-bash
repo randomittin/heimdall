@@ -394,6 +394,12 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
   # the command or git could not be read (then a gate that was never evaluated blocks instead of allowing)
   while IFS=$'\t' read -r PG_CLASS PG_DIR PG_EXTRA PG_GITDIR; do
     case "$PG_CLASS" in
+      unplaceable)
+        # a push whose repository the resolver cannot place (its docstring has the rule): no gate of that repository can be run for it, and the gate of the directory the shell is in
+        # grades ANOTHER repository, so nothing stands in for it. Denied outright, before any gate runs: the cwd's own verdict (green or red) is not what decides it.
+        PG_ESC=$(printf '%s' "$PG_EXTRA" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+        PG_DIR_ESC=$(printf '%s' "$PG_DIR" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+        deny "$(printf '{"error": "BLOCKED: pre-push gate cannot place this push: %s. Which repository it goes to is not known here, so no gate of that repository can be run for it, and the gate of the directory the shell is in (%s) grades a different repository (2026-11-23: a for loop with -C <dir>/$r pushed a repository whose own checks were red, past the green gate of the cwd). Restate it with the directory written out, one command per repository: -C <absolute path> before the verb, or cd <absolute path> first. Each push is then graded on the record of its own repository."}' "$PG_ESC" "$PG_DIR_ESC")" ;;
       repo-checks)
         PG_RUN="$PLUGIN/bin/heimdall-repo-checks"
         if [ -x "$PG_RUN" ]; then

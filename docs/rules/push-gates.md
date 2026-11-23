@@ -102,6 +102,14 @@ warning but isn't blocked; don't drop the gate altogether.* The gate is now chos
   `run` writes passes, every field mutated alone fails).
 - **(c) unmanaged.** One `WARNING` line on stderr, exit 0, and only when the command was understood
   EXACTLY, git resolved the repo, and no commit inspected has either marker.
+- **(d) unplaceable (2026-11-23).** A push whose repository the resolver cannot PLACE (a variable, substitution, glob or brace in `-C`, `--git-dir` or
+  `--work-tree`, option words held in a variable, or a directory the shell is in that it cannot follow: a `cd` to a variable, a conditional or looped `cd`,
+  `source`, CDPATH, `env -C`) has no repository to run a gate in, and the strict gate of the cwd grades ANOTHER repository. Live, a `for r in <a> <b>; do ...
+  -C <dir>/$r ...; done` loop from a cwd whose own gate was green pushed a repository whose own checks were red. The resolver now answers ONE row,
+  `unplaceable`, and the hook denies it (`cannot place this push`, naming the push; no gate runs) whatever the cwd's gate says: restate the push with the
+  directory written out, one command per repository, and each is graded on its own record (a literal `-C` or `cd` target is still graded exactly, inside a loop
+  too). A variable in an option that does not name the repository (`-c`'s value) only makes the push uncertain (strict) with the repository still placed.
+  Proof: `test/heimdall-push-gate-per-repo.test.sh` (B "unplaceable", the differential's MUST_BLOCK commands, C70-C74).
 - **A resolver that cannot answer is graded against EVERY candidate (2026-10-14).** A timeout
   (`HMD_PUSH_TARGET_TIMEOUT_S`), a crash or a missing file never falls back to ONE repository: the strict
   gate runs against the session's cwd, the payload's cwd and each `-C` / `cd` / `--git-dir` / `--work-tree`
