@@ -88,3 +88,5 @@
 - [ ] LOW bin/heimdall:5443 still says "Never retry same tier" — reword for the effort ladder (2026-11-23).
 - [ ] LOW lean_context_parity counts gitignored untracked files (two empty Sept-21 *.tmp in skills/designmatch/.heimdall/ turned check red); measure tracked+unignored only (2026-11-23).
 - [ ] LOW bin/designmatch on a lean install prints no `hmd skills install designmatch` hint (commands/designmatch.md is cut from lean by design) (2026-11-23).
+
+- MEDIUM (2026-11-23): cold x.y.0 receipt infeasible on a loaded host — each cold run trips 2-4 different FLAKY-UNDER-LOAD suites (seen: companion-view, restart-request-hook, heimdall-app, landmine-lint, heimdall-claim-check, heimdall-app-relay-push-ws, app-pair-code, heimdall-ui-send-on-change), which leaves the receipt not full-equivalent, and a --failed amend drops cold. 2.5.0 shipped as 2.4.11 for this reason. Fix: let a cold sweep record a solo-green retry as a cache record, or harden those suites.
