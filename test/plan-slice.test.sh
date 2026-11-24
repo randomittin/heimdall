@@ -192,6 +192,9 @@ rc_is 0 && has "T0.2 runtime" && ok "an id matches case-insensitively" || bad "a
 
 slice --plan "$BOLD" --task T0.1
 has "MARK-B01" && has "baseline-recorder" && lacks "MARK-B02" && ok "bold paragraph T0.1: both its lines, not T0.2" || bad "bold paragraph T0.1: both its lines, not T0.2"
+A1="$(lineof "$BOLD" 'T0.1 baseline-recorder')"; B1="$(lineof "$BOLD" 'MARK-B01')"
+HDR="$(printf '%s\n' "$OUT" | head -n 1)"
+[ "${HDR#*lines $A1-$B1 of}" != "$HDR" ] && ok "bold paragraph T0.1: the range ends at its last line ($A1-$B1), not at the blank line after it" || bad "bold paragraph T0.1: the range ends at its last line ($A1-$B1), not at the blank line after it" "hdr=[$HDR]"
 slice --plan "$BOLD" --task T0.2
 has "MARK-B02" && lacks "MARK-B01" && lacks "MARK-B11" && lacks "Wave 1" && ok "bold paragraph T0.2: stops at the next heading" || bad "bold paragraph T0.2: stops at the next heading"
 
