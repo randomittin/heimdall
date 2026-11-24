@@ -30,7 +30,10 @@
 #   12  outline      an unsliced Read of a big (over 500 lines) python or shell file by a SUBAGENT is answered with its first 100
 #                    lines and its outline, once: the second plain Read gets the whole file and dedup takes over from there. Never
 #                    the main thread, a slice, a short file, another language, a test file, a Read cut short, a file with under 3
-#                    symbols. HMD_READ_OUTLINE=off turns only the outline off; HMD_READ_DEDUP=off turns the whole hook off.
+#                    symbols. HMD_READ_OUTLINE=off turns the outline off; HMD_READ_DEDUP=off leaves it on.
+#   13  defaults     the STUB is opt-in (HMD_READ_DEDUP=on, also 1, true, yes; sections 2-12 run with it on) and the OUTLINE is on by
+#                    default (measured: 7.4% of subagent Read characters, 0.01% for identical re-reads); neither switch touches the other;
+#                    with the outline off and the stub not on nothing is recorded
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -81,9 +84,10 @@ else bad "guardrails manifest: a recommended hook row for read-dedup"; fi
 # status in $RC, stderr in $TMP/stderr. FIRE_HOME is the HEIMDALL_HOME the hook sees; ENVX holds extra NAME=VALUE for one run.
 FIRE_HOME="$HHOME"
 ENVX=()
+BASEX=(HMD_READ_DEDUP=on)   # the stub is opt-in: every section but 13 runs with it on, section 13 runs with nothing set
 fire() {
   OUT="$(printf '%s' "$2" | ( cd "$USERHOME" && env CLAUDE_PLUGIN_ROOT="$REPO" HEIMDALL_HOME="$FIRE_HOME" HOME="$USERHOME" \
-    CLAUDE_PROJECT_DIR="$NOPROJ" ${ENVX[@]+"${ENVX[@]}"} bash -c "$1" ) 2>"$TMP/stderr")"
+    CLAUDE_PROJECT_DIR="$NOPROJ" ${BASEX[@]+"${BASEX[@]}"} ${ENVX[@]+"${ENVX[@]}"} bash -c "$1" ) 2>"$TMP/stderr")"
   RC=$?
 }
 
@@ -446,7 +450,7 @@ reread o2 ag1 "$BIGPY" "$PYBIG"
 stub_for "$BIGPY" "1-702" && ok "HMD_READ_OUTLINE=off leaves dedup on: the second whole read is stubbed" || bad "HMD_READ_OUTLINE=off leaves dedup on" "out=$(printf '%.200s' "$OUT")"
 transcript o3; ENVX=(HMD_READ_DEDUP=off)
 reread o3 ag1 "$BIGPY" "$PYBIG"
-passes_through && [ ! -e "$STATE/o3.ag1.json" ] && ok "HMD_READ_DEDUP=off, the hook's own switch, turns the outline off too: whole, nothing recorded" || bad "HMD_READ_DEDUP=off turns the whole hook off" "out=$(printf '%.200s' "$OUT")"
+outlined && ok "HMD_READ_DEDUP=off (the stub's switch) leaves the outline on" || bad "HMD_READ_DEDUP=off leaves the outline on" "out=$(printf '%.200s' "$OUT")"
 ENVX=()
 
 transcript o4
@@ -456,5 +460,31 @@ reread o4 ag1 "$BIGPY" "$PYBIG"
 outlined && ok "after a compaction cleared the session the file is outlined again (the first outline left context too)" || bad "outlined again after a compaction" "out=$(printf '%.200s' "$OUT")"
 if grep -rqF "$BIGPY" "$STATE" 2>/dev/null; then bad "the outline mark is a hash: a path was stored"; else ok "the outline mark is a hash: not even the path is stored"; fi
 WHOLE=0
+
+echo "13. defaults"
+BASEX=()                                                   # the environment of a user who set nothing
+transcript d1
+reread d1 "" "$P1" "$A"; reread d1 "" "$P1" "$A"
+passes_through && [ ! -e "$STATE/d1._main.json" ] && ok "the stub is OFF by default: an identical re-read comes whole and nothing is recorded" || bad "the stub is off by default" "out=$OUT"
+for word in on ON 1 true yes; do
+  transcript "d2$word"; ENVX=(HMD_READ_DEDUP=$word)
+  reread "d2$word" "" "$P1" "$A"; reread "d2$word" "" "$P1" "$A"
+  stub_for "$P1" "1-30" && ok "HMD_READ_DEDUP=$word opts the stub in" || bad "HMD_READ_DEDUP=$word opts the stub in" "out=$OUT"
+done
+for word in off 0 false no maybe ""; do
+  transcript d3; ENVX=(HMD_READ_DEDUP=$word)
+  reread d3 "" "$P1" "$A"; reread d3 "" "$P1" "$A"
+  passes_through && ok "HMD_READ_DEDUP='$word' leaves the stub off" || bad "HMD_READ_DEDUP='$word' leaves the stub off" "out=$OUT"
+done
+ENVX=(); WHOLE=1
+transcript d4
+reread d4 ag1 "$BIGPY" "$PYBIG"
+outlined && ok "the outline is ON by default: a subagent's whole unsliced Read of a big file is outlined with nothing set" || bad "the outline is on by default" "out=$(printf '%.200s' "$OUT")"
+reread d4 ag1 "$BIGPY" "$PYBIG"; reread d4 ag1 "$BIGPY" "$PYBIG"
+passes_through && ok "with the stub off the plain Reads after the outline are whole and never stubbed" || bad "no stub after the outline when the stub is off" "out=$(printf '%.200s' "$OUT")"
+transcript d5; ENVX=(HMD_READ_OUTLINE=off)
+reread d5 ag1 "$BIGPY" "$PYBIG"
+passes_through && [ ! -e "$STATE/d5.ag1.json" ] && ok "outline off and the stub not on: whole, nothing recorded (the launcher starts no interpreter)" || bad "both off records nothing" "out=$(printf '%.200s' "$OUT")"
+ENVX=(); BASEX=(HMD_READ_DEDUP=on); WHOLE=0
 
 finish

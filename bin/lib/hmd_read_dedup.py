@@ -9,11 +9,18 @@ WHY. 24.3% of the tool-result characters of a measured session's subagents were 
 offset and limit, unchanged since (docs/analysis/2026-11-24-market-token-techniques.md, section 2 and gap 1); Cline and Roo drop such a
 copy. Gap 3 of that document: 20.6M of the 32.7M Read characters were unsliced reads, and an agent rarely needs a whole big file.
 
+MEASURED AGAIN 2026-11-25, every tool_use id counted once over all 187 subagent files of this project (1,900 duplicate ids skipped: copies of
+entries in other files, which is what inflated the 24.3%): 1,877 Reads, 18.8M characters. Identical re-reads: 13 Reads, 0.01% of Read
+characters (the lever-tracking count: 0.2-0.3% of all tool-result characters). So the STUB ships OFF and is opt-in (HMD_READ_DEDUP=on, also 1,
+true, yes); what is written about it below is its hardening for the day it is on. Unsliced Reads of a file over 500 lines that came back
+whole: 81 Reads, 14.6% of Read characters; the ones the OUTLINE answers (python or shell, not a test path, 3 symbols or more): 44 Reads, 7.4%
+of Read characters, 5.6% saved. That clears the 2% bar for shipping the outline ON (HMD_READ_OUTLINE=off turns it off).
+
 PROBED 2026-11-24 on Claude Code 2.1.331 (claude -p, a throwaway hook, one Agent-spawned subagent that Reads one file twice): the
 replacement DOES reach a subagent's Read. That payload carries agent_id and agent_type, the PARENT's session_id and the MAIN
 transcript_path. So the state key is (session_id, agent_id); the main thread, which has no agent_id, is (session_id, "_main").
 
-THE STUB. The response is hashed (sha256 of the text the model was given) under a key made of the path, offset and limit asked for. The
+THE STUB (opt-in). The response is hashed (sha256 of the text the model was given) under a key made of the path, offset and limit asked for. The
 read is stubbed when ALL of these hold, else it is recorded and the original output goes through (no output, exit 0):
   * this agent's last full read of that exact key has the same content hash: a changed file, A then B then A, and any other offset or
     limit are all "full";
@@ -60,8 +67,8 @@ language. Never a trap, never a guess:
     would miss the end), not a test file or a path under test/, tests/, __tests__/, evals/ or fixtures/ (a straight-line script has no
     outline worth reading), not a file with under OUTLINE_MIN_SYMBOLS symbols, not a result that would be no shorter, not a language the
     graph does not parse, not a file its parser cannot read; any error leaves the original output;
-  * HMD_READ_OUTLINE=off (also 0, false, no) turns the outline off and keeps the stub; HMD_READ_DEDUP=off, checked by the launcher, turns
-    the whole hook off.
+  * the two behaviours are independent: HMD_READ_OUTLINE=off (also 0, false, no) turns the outline off, HMD_READ_DEDUP=on turns the stub on;
+    the launcher starts no interpreter when the outline is off and the stub is not on. `hmd guardrails off read-dedup` turns the hook off.
 THRESHOLD, measured on the data of the analysis (171 subagent files of session 0e12831c: 1,853 Reads, 875 unsliced, 11.9M of 18.7M
 characters). Over 400 lines the unsliced reads are 16.1% of them and 38.4% of their characters; over 500 lines 11.0% and 29.2%; over 600
 lines 4.0% and 12.2%. A head and outline cost about 7.5K characters, so a file must be about three times that, 500 lines of 45 characters,
@@ -114,6 +121,8 @@ OUTLINE_HEAD_LINES = 100
 OUTLINE_MAX_SYMBOLS = 80
 OUTLINE_MIN_SYMBOLS = 3    # fewer symbols is nothing to navigate by
 OUTLINE_SKIP_DIRS = frozenset(("test", "tests", "__tests__", "evals", "fixtures"))
+STUB_DEFAULT = False       # opt-in: identical re-reads are 0.01% of subagent Read characters (see MEASURED AGAIN)
+OUTLINE_DEFAULT = True     # on: the outline answers 7.4% of Read characters (see MEASURED AGAIN)
 
 SESSION_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 AGENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}")
@@ -151,8 +160,14 @@ def max_entries():
     return min(count, 4096) if count >= 1 else DEFAULT_MAX_ENTRIES
 
 
-def switched_off(variable):
-    return os.environ.get(variable, "").strip().lower() in ("off", "0", "false", "no")
+def enabled(variable, default):
+    """True or False when the operator set `variable` (on, 1, true, yes / off, 0, false, no, in any case), else `default`."""
+    word = os.environ.get(variable, "").strip().lower()
+    if word in ("on", "1", "true", "yes"):
+        return True
+    if word in ("off", "0", "false", "no"):
+        return False
+    return default
 
 
 def plain(value, pattern):
@@ -535,10 +550,12 @@ def decide(payload):
     read = parse_read(payload)
     if read is None:
         return None
-    if not switched_off("HMD_READ_OUTLINE"):
+    if enabled("HMD_READ_OUTLINE", OUTLINE_DEFAULT):
         out = outline_decide(read)
         if out is not None:
             return out
+    if not enabled("HMD_READ_DEDUP", STUB_DEFAULT):
+        return None
     return dedup_decide(read, payload)
 
 

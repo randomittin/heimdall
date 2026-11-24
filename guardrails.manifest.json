@@ -136,8 +136,8 @@
     {"id": "finished-agents-close", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "finished-agents-close",
      "why": "takes an agent off the finished-and-open list when TaskStop stops it or a SendMessage resumes it"},
     {"id": "read-dedup", "kind": "guard", "tier": "recommended", "layer": "hook", "hook": "read-dedup",
-     "fails": "open", "operator_env": "HMD_READ_DEDUP=off", "proof": "test/read-dedup.test.sh",
-     "why": "a Read byte-identical to the same agent's last Read of that range is replaced by a one-line stub (hashes kept, never content), never after any sign the read left context (a compaction, a clearing, a rewind); a subagent's unsliced Read of a python or shell file over 500 lines gets its head and outline, once (HMD_READ_OUTLINE=off turns only that off)"},
+     "fails": "open", "operator_env": "HMD_READ_OUTLINE=off", "proof": "test/read-dedup.test.sh",
+     "why": "a subagent's unsliced Read of a python or shell file over 500 lines gets its head and outline, once (ON by default: 7.4% of Read characters, measured with tool_use ids deduplicated; HMD_READ_OUTLINE=off turns it off); the re-read stub (a Read byte-identical to the same agent's last one, never after a compaction, a clearing or a rewind) is OFF by default, opt in with HMD_READ_DEDUP=on: identical re-reads measure 0.01% of Read characters"},
     {"id": "finished-agents-close-failed", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "finished-agents-close-failed",
      "why": "takes an agent off the list when TaskStop answers that no such task exists or it is not running"},
 
