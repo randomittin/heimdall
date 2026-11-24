@@ -22,6 +22,16 @@
 # secret-looking string inside a fixture's message.content and asserts it
 # never appears in this tool's stdout, stderr, or --json output.
 #
+# --levers MODE reads MORE of each record, and says so; the guarantee above is
+# narrowed to it, not dropped. It measures the LENGTH (in characters) of user
+# turns, task-notifications and tool results; compares a Read/Edit/Write tool
+# call's file path, offset and limit with the same agent's earlier calls, in
+# memory only; and tests text for a few fixed markers (the read-dedup stub, the
+# report-gate reason, the parallel-gate banner, a task-notification's <status>
+# tag). It prints counts, shares, means and percentiles only, never a path, a
+# prompt, a report or a line of tool output. The test plants a secret in each
+# of those places and asserts it never reaches stdout, stderr or --json.
+#
 # PRICING SOURCE: the `model_prices` block of bin/lib/tier-table.json — the
 # repo's one model table. This tool carries no rate table of its own. Rates are
 # the claude-api skill's list prices (cached 2026-06-24 for the rows through
@@ -49,15 +59,41 @@
 # ratio.
 #
 # USAGE:
-#   heimdall-cost-forensics [--root PATH]... [--json] [--min-requests N]
+#   heimdall-cost-forensics [--root PATH]... [--project NAME]... [--json]
+#                           [--min-requests N]
+#   heimdall-cost-forensics --levers [--since DATE] [--until DATE]
+#                           [--baseline-until DATE] [--cache-ttl SECONDS]
+#                           [--root PATH]... [--project NAME]... [--json]
 #
 #   --root PATH        Scan PATH (a directory, walked recursively for *.jsonl,
 #                       or a single *.jsonl file). Repeatable. Default: scan
 #                       $HMD_COST_FORENSICS_ROOT (colon-separated paths) if
 #                       set, else ~/.claude/projects (ALL projects — this
 #                       tool is not hardcoded to any one repo's slug).
+#   --project NAME      Scan only the project directories (the children of each
+#                       --root) whose name contains NAME. Repeatable. One
+#                       project of the default root: --project Downloads-heimdall
 #   --json              Emit a single machine-readable JSON object instead of
 #                       the human-readable report.
+#   --levers            Verify the token levers instead of printing the cost
+#                       report: the "Falsify" metric of each lever in
+#                       docs/analysis/2026-11-22-token-utilization-next.md and
+#                       2026-11-24-market-token-techniques.md, one row each,
+#                       every number labelled DERIVED with the query that made
+#                       it. Dates are UTC; a window is [since, until).
+#   --since DATE        (--levers) first instant of the window: YYYY-MM-DD or
+#                       YYYY-MM-DDTHH:MM[:SS]. Default: --baseline-until when
+#                       given, else the start of the data.
+#   --until DATE        (--levers) first instant AFTER the window. Default: the
+#                       end of the data.
+#   --baseline-until D  (--levers) add a BEFORE column: everything earlier than
+#                       D, beside the --since/--until window (AFTER). Rates are
+#                       per 30 days / per 100 prompts / shares, so a 72-day
+#                       before and a 7-day after compare.
+#   --cache-ttl SECONDS (--levers) idle gap beyond which the main thread's
+#                       prompt cache counts as expired. Default 3600 (the 1-hour
+#                       TTL a subscription gives the main thread); 300 for an
+#                       account on the 5-minute TTL.
 #   --min-requests N    Minimum distinct requests required before the
 #                       high-vs-low-context regime comparison will run.
 #                       Default 30 (see "HONEST DEGRADATION" above).
@@ -73,6 +109,7 @@
 # priced from a table that can't be trusted. 2 on a bad CLI invocation
 # (unrecognized flag, missing argument).
 
+import datetime
 import json
 import os
 import re
@@ -301,6 +338,29 @@ def extract_request(record):
     return message_id, model, ctx
 
 
+def iter_records(path):
+    """Yield (record, raw_line) for every line of a transcript JSONL that
+    parses as JSON. The ONE place a transcript is opened and decoded: the cost
+    report (iter_requests) and the --levers collector both read through it. A
+    line that is not JSON (the half-written last line of a live session) is
+    skipped; an unreadable file warns and yields nothing.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                yield record, line
+    except OSError as e:
+        eprint("warning: could not read %s: %s" % (path, e))
+        return
+
+
 def iter_requests(path):
     """Yield (model, ctx, timestamp) once per DISTINCT API request in a
     transcript JSONL, deduped by message.id.
@@ -319,29 +379,17 @@ def iter_requests(path):
     the overcounting bug this function exists to avoid.
     """
     seen = set()
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                extracted = extract_request(record)
-                if extracted is None:
-                    continue
-                message_id, model, ctx = extracted
-                if message_id is not None:
-                    if message_id in seen:
-                        continue
-                    seen.add(message_id)
-                ts = record.get("timestamp") if isinstance(record, dict) else None
-                yield model, ctx, ts
-    except OSError as e:
-        eprint("warning: could not read %s: %s" % (path, e))
-        return
+    for record, _line in iter_records(path):
+        extracted = extract_request(record)
+        if extracted is None:
+            continue
+        message_id, model, ctx = extracted
+        if message_id is not None:
+            if message_id in seen:
+                continue
+            seen.add(message_id)
+        ts = record.get("timestamp") if isinstance(record, dict) else None
+        yield model, ctx, ts
 
 
 def discover_roots(cli_roots):
@@ -353,10 +401,12 @@ def discover_roots(cli_roots):
     return [os.path.join(os.path.expanduser("~"), ".claude", "projects")]
 
 
-def discover_files(roots):
+def discover_files(roots, projects=()):
     """Walk every root for *.jsonl files. A root may itself be a single
     *.jsonl file (handy for pointing at one fixture/transcript directly).
     Never raises on a missing/unreadable root — just yields nothing for it.
+    With projects, only the child directories of a root whose name contains
+    one of them are walked (~/.claude/projects holds one directory per project).
     """
     files = []
     for root in roots:
@@ -366,10 +416,18 @@ def discover_files(roots):
             continue
         if not os.path.isdir(root):
             continue
-        for dirpath, _dirs, names in os.walk(root):
-            for name in names:
-                if name.endswith(".jsonl"):
-                    files.append(os.path.join(dirpath, name))
+        tops = [root]
+        if projects:
+            try:
+                tops = [os.path.join(root, n) for n in sorted(os.listdir(root)) if any(p in n for p in projects)]
+            except OSError as e:
+                eprint("warning: could not list %s: %s" % (root, e))
+                continue
+        for top in tops:
+            for dirpath, _dirs, names in os.walk(top):
+                for name in names:
+                    if name.endswith(".jsonl"):
+                        files.append(os.path.join(dirpath, name))
     return sorted(files)
 
 
@@ -777,9 +835,519 @@ def render_json(agg):
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+# ── --levers: the 7-day verification of the token levers ───────────────────
+# Every row is the "Falsify" check of one lever in
+# docs/analysis/2026-11-22-token-utilization-next.md or
+# docs/analysis/2026-11-24-market-token-techniques.md, run over a date window.
+# The transcripts are read once, through iter_records (the cost report's own
+# line loop), into timestamped events; a window is applied to the events
+# afterwards, so the BEFORE and the AFTER column come from one parse.
+LEVER_CTX_THRESHOLD = 300_000               # lever 1: a main-thread request above this many prompt tokens
+EXPIRY_CTX_THRESHOLDS = (150_000, 300_000)  # lever 2: prior context above which an expiry rewrite counts
+EXPIRY_MIN_REWRITE = 0.5                    # a rewrite writes at least this share of the previous prompt as cache
+DEFAULT_CACHE_TTL_S = 3600
+MIN_DAYS_FOR_RATE = 1.0                     # no per-30-day rate from less data than this
+STUB_MAX_CHARS = 1000                       # the read-dedup stub is one line; a long Read result quoting it is not one
+PARALLEL_GATE_MARKER = "MULTI-PART TASK DETECTED"
+GATE_REASON_MARKER = "Full text saved at"
+_STUB_RE = re.compile(
+    r"unchanged since your earlier read of .+ \(lines \d+-\d+\); content is already in your context "
+    r"\[hmd read-dedup stub: ")
+_GATE_BLOCK_RE = re.compile(
+    r"Report is [0-9,]+ chars; cap [0-9,]+\. Full text saved at \S*?subagent-reports/([A-Za-z0-9_-]+)\.md")
+_STATUS_RE = re.compile(r"<status>([^<]{1,40})</status>")
+_TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?(?:Z|\+00:00)?")
+_WRITE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+_EFFORT_LADDER = ("low", "medium", "high", "xhigh", "max")
+_NOT_RECORDED = "(not recorded)"
+_UNKNOWN_TYPE = "(unknown)"
+_Q_MAIN = ("main thread = records outside */subagents/* and not isSidechain; a request is one distinct "
+           "message.id, <synthetic> excluded; prompt tokens = input + cache_read + cache_write")
+
+
+def parse_ts(value):
+    """Epoch seconds (UTC) of an ISO-8601 stamp: a date, a date with a time, or
+    a transcript's own "2026-11-24T10:30:12.345Z". None when it is not one.
+    """
+    found = _TS_RE.fullmatch(value) if isinstance(value, str) else None
+    if found is None:
+        return None
+    year, month, day, hour, minute, second, fraction = found.groups()
+    try:
+        moment = datetime.datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0),
+                                   int(second or 0), tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return moment.timestamp() + (float("0." + fraction) if fraction else 0.0)
+
+
+def format_ts(epoch):
+    if epoch is None:
+        return None
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def agent_type_of(path):
+    """The agentType the sibling <name>.meta.json of a subagent transcript names, or None."""
+    try:
+        with open(path[: -len(".jsonl")] + ".meta.json", "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    kind = meta.get("agentType") if isinstance(meta, dict) else None
+    return kind if isinstance(kind, str) and kind else None
+
+
+def _blocks(record):
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def _tool_call(block):
+    """(tool name, file path or None, offset, limit) of a tool_use block. The
+    path is only a comparison key held in memory; nothing here is printed."""
+    args = block.get("input") if isinstance(block.get("input"), dict) else {}
+    path = args.get("file_path") or args.get("notebook_path")
+    return block.get("name"), path if isinstance(path, str) else None, repr(args.get("offset")), repr(args.get("limit"))
+
+
+def _result_text(block):
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return ""
+
+
+def _turn_text(record):
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    return "".join(b["text"] for b in _blocks(record) if b.get("type") == "text" and isinstance(b.get("text"), str))
+
+
+def _joined(content):
+    if isinstance(content, str):
+        return content
+    return "".join(c for c in content if isinstance(c, str)) if isinstance(content, list) else ""
+
+
+class LeverCollector:
+    """Files the lever events of every transcript it is fed, each stamped with
+    its record's time, for window_metrics to window afterwards.
+
+    PRIVACY: see the --levers paragraph of the header. A record's text is
+    measured (len) or tested against a fixed marker and then dropped; an event
+    holds numbers, a timestamp and the short labels the transcript's own
+    metadata gives (agent type, effort).
+
+    Main thread = a record outside a */subagents/* file and without
+    isSidechain. A request is one distinct message.id per file (the dedup the
+    cost report uses); <synthetic> placeholders are not requests.
+    """
+
+    KINDS = ("main", "expiry", "notification", "prompt", "parallel_gate", "stub", "result", "sub_first", "sub_output")
+
+    def __init__(self, pricing, cache_ttl):
+        self.pricing = pricing
+        self.cache_ttl = cache_ttl
+        self.events = {kind: [] for kind in self.KINDS}
+        self.gate_blocked = {}                  # agent id -> time of the first record naming its report-gate block
+        self.ts_min = self.ts_max = None
+        self.n_files = 0
+        self.synthetic = 0
+        self.unplaced = 0                       # events whose record has no usable timestamp: in no window
+        self.unpriced_main = 0
+        self.write_5m = self.write_1h = 0       # main-thread cache-write tokens by TTL
+        self._seen, self._pending, self._reads, self._agents, self._main = set(), {}, {}, {}, []
+
+    def _add(self, kind, ts, *payload):
+        if ts is None:
+            self.unplaced += 1
+        else:
+            self.events[kind].append((ts,) + payload)
+
+    def scan_file(self, path):
+        self.n_files += 1
+        in_agent_file = "subagents" in os.path.normpath(path).split(os.sep)
+        self._seen, self._pending, self._reads, self._agents, self._main = set(), {}, {}, {}, []
+        for record, line in iter_records(path):
+            if not isinstance(record, dict):
+                continue
+            kind = record.get("type")
+            ts = parse_ts(record.get("timestamp"))
+            agent = (record.get("agentId") or path) if (in_agent_file or record.get("isSidechain") is True) else None
+            if ts is not None and kind in ("user", "assistant", "attachment", "system"):
+                self.ts_min = ts if self.ts_min is None else min(self.ts_min, ts)
+                self.ts_max = ts if self.ts_max is None else max(self.ts_max, ts)
+            if kind == "assistant":
+                self._assistant(record, ts, agent)
+            elif kind == "user":
+                self._user(record, line, ts, agent)
+            elif kind in ("attachment", "system"):
+                self._attachment(record, line, ts, agent)
+        self._finish(path, in_agent_file)
+
+    def _assistant(self, record, ts, agent):
+        extracted = extract_request(record)
+        if extracted is not None:
+            message_id, model, ctx = extracted
+            fresh = message_id is None or message_id not in self._seen
+            if message_id is not None:
+                self._seen.add(message_id)
+            if fresh and model == "<synthetic>":
+                self.synthetic += 1
+            elif fresh:
+                self._request(record, ts, model, ctx, agent)
+        for block in _blocks(record):       # every line: a request's tool_use rides a line of its own
+            if block.get("type") == "tool_use":
+                self._pending[block.get("id")] = _tool_call(block)
+
+    def _request(self, record, ts, model, ctx, agent):
+        if ts is None:
+            self.unplaced += 1
+            return
+        prompt = prompt_tokens(ctx)
+        card, _canon, _estimated = price_for(model, self.pricing)
+        dollars = {k: 0.0 for k in _FIELDS}
+        cost, _unpriced = request_cost(ctx, card, dollars)
+        if agent is None:
+            write = ctx["cache_write_5m"] + ctx["cache_write_1h"]
+            self._main.append((ts, prompt, cost, write, dollars["cache_write_5m"] + dollars["cache_write_1h"]))
+            self.write_5m += ctx["cache_write_5m"]
+            self.write_1h += ctx["cache_write_1h"]
+            self.unpriced_main += cost is None
+            return
+        state = self._agents.setdefault(agent, {"ts": ts, "prompt": prompt, "output": 0, "efforts": {}})
+        state["output"] += ctx["output"]
+        effort = record.get("effort") or record.get("perTurnEffort")
+        if isinstance(effort, str):
+            state["efforts"][effort] = state["efforts"].get(effort, 0) + 1
+
+    def _user(self, record, line, ts, agent):
+        results = [b for b in _blocks(record) if b.get("type") == "tool_result"]
+        for block in results:
+            self._tool_result(block, ts, agent)
+        if results:
+            return
+        origin = record.get("origin")
+        origin_kind = origin.get("kind") if isinstance(origin, dict) else None
+        if GATE_REASON_MARKER in line and origin_kind != "human":
+            self._gate_block(line, ts)
+        if agent is not None:               # a subagent's spawn prompt is not a prompt of the main thread
+            return
+        notification = origin_kind == "task-notification"
+        if not notification and (record.get("isMeta") or record.get("isCompactSummary")):
+            return
+        text = _turn_text(record)
+        if not text:
+            return
+        self._add("prompt", ts)
+        if notification:
+            status = _STATUS_RE.search(text[:1000])
+            self._add("notification", ts, len(text), status.group(1) if status else None)
+
+    def _tool_result(self, block, ts, agent):
+        call = self._pending.pop(block.get("tool_use_id"), None)
+        name = call[0] if call else None
+        text = _result_text(block)
+        if name == "Read" and len(text) <= STUB_MAX_CHARS and _STUB_RE.search(text):
+            self._add("stub", ts, len(text))
+        if agent is None:
+            return
+        held = self._reads.setdefault(agent, {})        # file path -> {(offset, limit)} this agent holds in context
+        identical = False
+        if name == "Read" and call[1] is not None:
+            asked = held.setdefault(call[1], set())
+            identical = (call[2], call[3]) in asked
+            asked.add((call[2], call[3]))
+        elif name in _WRITE_TOOLS and call[1] is not None:
+            held.pop(call[1], None)                     # an edit makes the next read legitimate
+        self._add("result", ts, len(text), name == "Read", identical)
+
+    def _attachment(self, record, line, ts, agent):
+        attachment = record.get("attachment") if record.get("type") == "attachment" else None
+        att_type = attachment.get("type") if isinstance(attachment, dict) else None
+        if GATE_REASON_MARKER in line and (record.get("type") == "system"
+                                           or (isinstance(att_type, str) and att_type.startswith("hook_"))):
+            self._gate_block(line, ts)
+        if (agent is None and att_type == "hook_additional_context" and attachment.get("hookEvent") == "UserPromptSubmit"
+                and PARALLEL_GATE_MARKER in _joined(attachment.get("content"))):
+            self._add("parallel_gate", ts)
+
+    def _gate_block(self, line, ts):
+        found = _GATE_BLOCK_RE.search(line)
+        if found and ts is not None:
+            self.gate_blocked.setdefault(found.group(1), ts)
+
+    def _finish(self, path, in_agent_file):
+        rows = sorted(self._main, key=lambda r: r[0])
+        for ts, prompt, cost, _write, _usd in rows:
+            self._add("main", ts, prompt, cost)
+        for prev, cur in zip(rows, rows[1:]):
+            if cur[0] - prev[0] > self.cache_ttl and cur[3] >= EXPIRY_MIN_REWRITE * prev[1]:
+                self._add("expiry", cur[0], prev[1], cur[3], cur[4])
+        agent_type = agent_type_of(path) if in_agent_file else None
+        for state in self._agents.values():
+            efforts = state["efforts"]
+            effort = max(efforts, key=lambda k: (efforts[k], k)) if efforts else None
+            self._add("sub_first", state["ts"], state["prompt"], agent_type)
+            self._add("sub_output", state["ts"], effort, state["output"])
+
+
+def _in_window(ts, window):
+    return (window["lo"] is None or ts >= window["lo"]) and (window["hi"] is None or ts < window["hi"])
+
+
+def window_metrics(col, window):
+    """The collector's events that fall in one window, aggregated. span_days is
+    the window clipped to the data's own first and last record: a window that
+    names a month the machine has no transcripts for does not dilute a rate.
+    """
+    def pick(kind):
+        return [e[1:] for e in col.events[kind] if _in_window(e[0], window)]
+
+    span = None
+    if col.ts_min is not None:
+        lo = col.ts_min if window["lo"] is None else max(window["lo"], col.ts_min)
+        hi = col.ts_max if window["hi"] is None else min(window["hi"], col.ts_max)
+        span = max(0.0, (hi - lo) / 86400.0)
+    main, results, notifications, expiry = pick("main"), pick("result"), pick("notification"), pick("expiry")
+    return {
+        "span_days": span,
+        "main_n": len(main),
+        "main_above_n": sum(1 for prompt, _c in main if prompt > LEVER_CTX_THRESHOLD),
+        "main_priced_n": sum(1 for _p, c in main if c is not None),
+        "main_usd": sum(c for _p, c in main if c is not None),
+        "main_above_usd": sum(c for p, c in main if c is not None and p > LEVER_CTX_THRESHOLD),
+        "expiry": {t: [e for e in expiry if e[0] > t] for t in EXPIRY_CTX_THRESHOLDS},   # (prior prompt, write tokens, write $)
+        "notification_chars": sorted(c for c, _s in notifications),
+        "notification_completed": sum(1 for _c, s in notifications if s == "completed"),
+        "gate_blocked": sum(1 for ts in col.gate_blocked.values() if _in_window(ts, window)),
+        "prompts": len(pick("prompt")),
+        "parallel_gate": len(pick("parallel_gate")),
+        "result_chars": sum(c for c, _r, _i in results),
+        "read_chars": sum(c for c, r, _i in results if r),
+        "identical_chars": sum(c for c, _r, i in results if i),
+        "identical_n": sum(1 for _c, _r, i in results if i),
+        "stub_hits": len(pick("stub")),
+        "first": pick("sub_first"),         # (prompt tokens, agent type)
+        "output": pick("sub_output"),       # (effort, output tokens)
+    }
+
+
+def _num(x):
+    return "{:,.0f}".format(x)
+
+
+def _pct(part, whole, what):
+    if not whole:
+        return None, "no %s in this window" % what
+    return 100.0 * part / whole, "%s of %s %s" % (_num(part), _num(whole), what)
+
+
+def _expiry_rate(m, threshold):
+    events = m["expiry"][threshold]
+    tail = ""
+    if events:
+        tail = "; mean rewrite %s tokens, $%.4f written" % (
+            _num(sum(e[1] for e in events) / len(events)), sum(e[2] for e in events))
+    if m["span_days"] is None or m["span_days"] < MIN_DAYS_FOR_RATE:
+        return None, "%d event(s); under %.0f day of data, so no per-30-day rate%s" % (len(events), MIN_DAYS_FOR_RATE, tail)
+    return len(events) * 30.0 / m["span_days"], "%d event(s) in %.2f days%s" % (len(events), m["span_days"], tail)
+
+
+def _notification_stat(m, pct):
+    chars = m["notification_chars"]
+    if not chars:
+        return None, "no task-notifications in this window"
+    value = mean(chars) if pct is None else percentile(chars, pct)
+    return value, "n=%d (%d completed)" % (len(chars), m["notification_completed"])
+
+
+def _identical_share(m, of_reads):
+    whole = m["read_chars"] if of_reads else m["result_chars"]
+    value, detail = _pct(m["identical_chars"], whole, "chars of subagent %s" % ("Read results" if of_reads else "tool results"))
+    return value, detail if value is None else "%s (%d identical re-reads)" % (detail, m["identical_n"])
+
+
+def _parallel_gate_rate(m):
+    if not m["prompts"]:
+        return None, "no prompts in this window"
+    return 100.0 * m["parallel_gate"] / m["prompts"], "%d injection(s) over %d prompts" % (m["parallel_gate"], m["prompts"])
+
+
+def _first_request(m, agent_type):
+    prompts = sorted(p for p, t in m["first"] if agent_type is None or (t or _UNKNOWN_TYPE) == agent_type)
+    if not prompts:
+        return None, "no subagents in this window"
+    return mean(prompts), "n=%d subagent(s), p90 %s tokens" % (len(prompts), _num(percentile(prompts, 90)))
+
+
+def _output_by_effort(m, effort):
+    outputs = sorted(o for e, o in m["output"] if (e or _NOT_RECORDED) == effort)
+    if not outputs:
+        return None, "no subagents at this effort in this window"
+    return mean(outputs), "n=%d subagent(s), median %s tokens" % (len(outputs), _num(percentile(outputs, 50)))
+
+
+def lever_rows(metrics):
+    """One row per lever metric: its id, name, unit, the DERIVED label, the
+    query that produces it and, per window, its value and a detail line."""
+    rows = []
+
+    def add(row_id, name, unit, query, fn):
+        rows.append({"id": row_id, "name": name, "unit": unit, "label": "DERIVED", "query": query,
+                     "values": {w: dict(zip(("value", "detail"), fn(m))) for w, m in metrics.items()}})
+
+    cap = "{:,}".format(LEVER_CTX_THRESHOLD)
+    kilo = LEVER_CTX_THRESHOLD // 1000
+    add("main_requests_gt_%dk_share" % kilo, "share of main-thread requests above %s prompt tokens" % cap, "%",
+        "100 * count(main-thread requests with prompt tokens > %s) / count(main-thread requests); %s" % (cap, _Q_MAIN),
+        lambda m: _pct(m["main_above_n"], m["main_n"], "main-thread requests"))
+    add("main_spend_gt_%dk_usd" % kilo, "main-thread spend above %s prompt tokens" % cap, "$",
+        "sum of list-price $ (bin/lib/tier-table.json) of the main-thread requests with prompt tokens > %s; %s" % (cap, _Q_MAIN),
+        lambda m: (m["main_above_usd"], "of $%.4f priced main-thread spend" % m["main_usd"]) if m["main_priced_n"]
+        else (None, "no priced main-thread requests in this window"))
+    add("main_spend_gt_%dk_share" % kilo, "share of main-thread spend above %s prompt tokens" % cap, "%",
+        "100 * (that $) / sum of list-price $ of every priced main-thread request in the window; %s" % _Q_MAIN,
+        lambda m: _pct(m["main_above_usd"], m["main_usd"], "$ of priced main-thread spend") if m["main_priced_n"]
+        else (None, "no priced main-thread requests in this window"))
+    for threshold in EXPIRY_CTX_THRESHOLDS:
+        add("cache_expiry_rewrites_gt_%dk_per_30d" % (threshold // 1000),
+            "cache-expiry rewrites at >%s tokens of context, per 30 days" % "{:,}".format(threshold), "events/30d",
+            "count(main-thread requests that follow an idle gap > TTL seconds, write >= %d%% of the previous request's "
+            "prompt tokens as cache, and whose previous request had prompt tokens > %s) * 30 / days of data in the window "
+            "(needs >= %.0f day); %s" % (100 * EXPIRY_MIN_REWRITE, "{:,}".format(threshold), MIN_DAYS_FOR_RATE, _Q_MAIN),
+            lambda m, t=threshold: _expiry_rate(m, t))
+    add("task_notification_chars_mean", "mean chars of a task-notification (agent report)", "chars",
+        "mean of len(text) over main-thread user turns with origin.kind == task-notification, every status "
+        "(the <status> tag gives the completed count)", lambda m: _notification_stat(m, None))
+    add("task_notification_chars_p90", "p90 chars of a task-notification (agent report)", "chars",
+        "90th percentile (linear interpolation) of the same lengths", lambda m: _notification_stat(m, 90))
+    add("task_notifications_gate_blocked", "agents whose report got the report-gate block", "count",
+        "count(distinct agent ids named by a 'Report is N chars; cap C. Full text saved at .../subagent-reports/<id>.md' "
+        "text in a hook, system or non-human user record; a tool result, assistant text or file snippet that quotes "
+        "it is not a block)", lambda m: (m["gate_blocked"], "of %d task-notifications" % len(m["notification_chars"])))
+    add("subagent_identical_reread_share", "identical re-read chars, share of subagent tool-result chars", "%",
+        "100 * sum(len of Read results that repeat the same agent's earlier Read of the same path, offset and limit "
+        "with no Edit/Write/MultiEdit/NotebookEdit of that path between) / sum(len of every tool result in subagent "
+        "transcripts)", lambda m: _identical_share(m, False))
+    add("subagent_identical_reread_share_of_read_chars", "identical re-read chars, share of subagent Read chars", "%",
+        "the same numerator / sum(len of Read results in subagent transcripts)", lambda m: _identical_share(m, True))
+    add("read_dedup_stub_hits", "Read results replaced by the read-dedup stub", "count",
+        "count(Read results, any thread, of <= %s chars containing 'unchanged since your earlier read of <path> "
+        "(lines a-b); content is already in your context [hmd read-dedup stub: ...')" % "{:,}".format(STUB_MAX_CHARS),
+        lambda m: (m["stub_hits"], "Read results holding the stub"))
+    add("parallel_gate_injections_per_100_prompts", "parallel-gate injections per 100 prompts", "per 100 prompts",
+        "100 * count(UserPromptSubmit hook_additional_context attachments containing '%s') / count(main-thread user "
+        "turns that are text: not a tool result, not isMeta, not a compact summary; typed prompts plus task-notifications "
+        "and other injected turns)" % PARALLEL_GATE_MARKER, _parallel_gate_rate)
+    types = sorted({t or _UNKNOWN_TYPE for m in metrics.values() for _p, t in m["first"]})
+    add("subagent_first_request_context_mean", "subagent first-request context, mean", "tokens",
+        "mean of prompt tokens (input + cache_read + cache_write) of each subagent transcript's first request, "
+        "windowed by that request's timestamp", lambda m: _first_request(m, None))
+    for agent_type in types:
+        add("subagent_first_request_context_mean[%s]" % agent_type, "subagent first-request context, mean, agent type %s" % agent_type,
+            "tokens", "the same, for subagents whose sibling .meta.json names agentType %s" % agent_type,
+            lambda m, t=agent_type: _first_request(m, t))
+    efforts = {e or _NOT_RECORDED for m in metrics.values() for e, _o in m["output"]}
+    for effort in sorted(efforts, key=lambda e: (e == _NOT_RECORDED, _EFFORT_LADDER.index(e) if e in _EFFORT_LADDER else len(_EFFORT_LADDER), e)):
+        add("subagent_output_tokens_per_agent[%s]" % effort, "output tokens per subagent, mean, effort %s" % effort, "tokens",
+            "mean over subagents of the sum of output_tokens of their distinct requests, grouped by the `effort` recorded on "
+            "the subagent's assistant records (most frequent; perTurnEffort when absent; '%s' when neither)" % _NOT_RECORDED,
+            lambda m, e=effort: _output_by_effort(m, e))
+    return rows
+
+
+def lever_windows(since, until, baseline_until):
+    if baseline_until is None:
+        return [{"name": "window", "lo": since, "hi": until}]
+    return [{"name": "before", "lo": None, "hi": baseline_until},
+            {"name": "after", "lo": baseline_until if since is None else since, "hi": until}]
+
+
+def lever_report(col, windows, pricing_source):
+    metrics = {w["name"]: window_metrics(col, w) for w in windows}
+    writes = col.write_5m + col.write_1h
+    notes = []
+    if writes:
+        notes.append("cache TTL assumed %d s; %.0f%% of the main thread's cache-write tokens in scope are 1-hour TTL "
+                     "(pass --cache-ttl 300 for an account on the 5-minute TTL)." % (col.cache_ttl, 100.0 * col.write_1h / writes))
+    if col.synthetic:
+        notes.append("%d <synthetic> request(s) (client-made placeholders) are not counted as requests." % col.synthetic)
+    if col.unpriced_main:
+        notes.append("%d main-thread request(s) use a model the pricing table does not list: every $ row is a floor." % col.unpriced_main)
+    if col.unplaced:
+        notes.append("%d event(s) had no usable timestamp and are in no window." % col.unplaced)
+    return {
+        "mode": "levers",
+        "label": "every number is DERIVED from the transcripts by the query on its row; none is an estimate",
+        "pricing_source": pricing_source,
+        "windows": {w["name"]: {"since": format_ts(w["lo"]), "until": format_ts(w["hi"]),
+                                "span_days": None if metrics[w["name"]]["span_days"] is None else round(metrics[w["name"]]["span_days"], 2)}
+                    for w in windows},
+        "scope": {"n_files": col.n_files, "cache_ttl_seconds": col.cache_ttl,
+                  "main_cache_write_1h_share": round(100.0 * col.write_1h / writes, 1) if writes else None},
+        "rows": lever_rows(metrics),
+        "notes": notes,
+    }
+
+
+def _fmt_value(value, unit):
+    if value is None:
+        return "n/a"
+    if unit == "%":
+        return "%.1f%%" % value
+    if unit == "$":
+        return "$%.4f" % value
+    if unit in ("events/30d", "per 100 prompts"):
+        return "%.2f" % value
+    return _num(value)
+
+
+def render_levers_text(report):
+    out = [
+        "heimdall-cost-forensics --levers",
+        "pricing source: %s" % report["pricing_source"],
+        "privacy: aggregates only (counts, shares, means, percentiles); never a prompt, path, report or tool output. See --help.",
+        "label: every number is DERIVED from the transcripts by the query printed under its row; none is an estimate.",
+        "",
+    ]
+    if report["scope"]["n_files"] == 0:
+        out.append("No transcripts found under the scanned root(s) (0 file(s) scanned). Nothing to report - "
+                   "this is an honest empty result, not an error.")
+        return "\n".join(out)
+    out.append("windows (UTC; since inclusive, until exclusive):")
+    for name, w in report["windows"].items():
+        days = "no data" if w["span_days"] is None else "%.2f days of data" % w["span_days"]
+        out.append("  %-7s %s .. %s   %s" % (name + ":", w["since"] or "(start of data)", w["until"] or "(end of data)", days))
+    out.append("scope: %d file(s) scanned" % report["scope"]["n_files"])
+    out.append("")
+    for row in report["rows"]:
+        out.append("[%s] %s  (DERIVED)" % (row["id"], row["name"]))
+        for name in report["windows"]:
+            cell = row["values"][name]
+            out.append("  %-7s %-12s %s" % (name + ":", _fmt_value(cell["value"], row["unit"]), cell["detail"]))
+        out.append("  query: %s" % row["query"])
+        out.append("")
+    if report["notes"]:
+        out.append("notes:")
+        out.extend("  - %s" % n for n in report["notes"])
+    return "\n".join(out)
+
+
 def main(argv):
     roots = []
+    projects = []
     as_json = False
+    levers = False
+    lever_flags = []                    # the --levers-only flags this command line used
+    since = until = baseline_until = None
+    cache_ttl = DEFAULT_CACHE_TTL_S
     min_requests = MIN_REQUESTS_FOR_REGIME
     i = 0
     while i < len(argv):
@@ -804,10 +1372,51 @@ def main(argv):
             except ValueError:
                 eprint("error: --min-requests must be an integer")
                 return 2
+        elif a == "--project":
+            i += 1
+            if i >= len(argv):
+                eprint("error: --project requires a name argument")
+                return 2
+            projects.append(argv[i])
+        elif a == "--levers":
+            levers = True
+        elif a in ("--since", "--until", "--baseline-until"):
+            i += 1
+            if i >= len(argv):
+                eprint("error: %s requires a date argument" % a)
+                return 2
+            stamp = parse_ts(argv[i])
+            if stamp is None:
+                eprint("error: %s must be YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS] (UTC), got %r" % (a, argv[i]))
+                return 2
+            lever_flags.append(a)
+            if a == "--since":
+                since = stamp
+            elif a == "--until":
+                until = stamp
+            else:
+                baseline_until = stamp
+        elif a == "--cache-ttl":
+            i += 1
+            if i >= len(argv):
+                eprint("error: --cache-ttl requires an integer number of seconds")
+                return 2
+            try:
+                cache_ttl = int(argv[i])
+            except ValueError:
+                cache_ttl = 0
+            if cache_ttl <= 0:
+                eprint("error: --cache-ttl must be a positive integer number of seconds")
+                return 2
+            lever_flags.append(a)
         else:
             eprint("error: unrecognized argument: %s" % a)
             return 2
         i += 1
+
+    if lever_flags and not levers:
+        eprint("error: %s only apply with --levers" % ", ".join(sorted(set(lever_flags))))
+        return 2
 
     try:
         pricing = load_pricing(tier_table_path())
@@ -815,7 +1424,14 @@ def main(argv):
         eprint("error: pricing table: %s" % e)
         return 1
     resolved_roots = discover_roots(roots)
-    files = discover_files(resolved_roots)
+    files = discover_files(resolved_roots, projects)
+    if levers:
+        collector = LeverCollector(pricing, cache_ttl)
+        for path in files:
+            collector.scan_file(path)
+        report = lever_report(collector, lever_windows(since, until, baseline_until), pricing["source"])
+        print(json.dumps(report, indent=2, sort_keys=True) if as_json else render_levers_text(report))
+        return 0
     agg = scan(files, min_requests, pricing)
     if as_json:
         print(render_json(agg))
