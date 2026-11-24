@@ -136,7 +136,7 @@ USAGE
 }
 
 main() {
-  local repo_arg="" input trigger sid cwd project_dir ckpt ts rc
+  local repo_arg="" input trigger sid cwd project_dir ckpt ts rc rd
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -155,6 +155,12 @@ main() {
   case "$trigger" in manual|auto) ;; *) trigger="unknown" ;; esac
   sid="$(_field "$input" session_id)"
   cwd="$(_field "$input" cwd)"
+
+  # bin/heimdall-read-dedup stubs a re-read as "unchanged since your earlier read", true only while that read is still in context, and
+  # a compaction rewrites it away: forget this session's recorded reads FIRST, before any gate below can return early. Bounded and
+  # best effort like everything here; its own transcript check (a compact_boundary since the read) refuses the stub if this is missed.
+  rd="$(_sibling_tool heimdall-read-dedup)"
+  if [ -n "$rd" ] && [ -n "$sid" ]; then _bounded 3 "$rd" clear --session "$sid" >/dev/null 2>&1 || true; fi
 
   if [ -n "$repo_arg" ]; then project_dir="$repo_arg"
   elif [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then project_dir="$CLAUDE_PROJECT_DIR"

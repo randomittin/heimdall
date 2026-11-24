@@ -222,6 +222,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled read-dedup && exit 0; HOOK=\"$HMDP/bin/heimdall-read-dedup\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" post-read; fi; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [

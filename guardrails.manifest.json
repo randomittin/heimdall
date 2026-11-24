@@ -135,6 +135,9 @@
      "why": "honours the phone's interrupt after a tool ran"},
     {"id": "finished-agents-close", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "finished-agents-close",
      "why": "takes an agent off the finished-and-open list when TaskStop stops it or a SendMessage resumes it"},
+    {"id": "read-dedup", "kind": "guard", "tier": "recommended", "layer": "hook", "hook": "read-dedup",
+     "fails": "open", "operator_env": "HMD_READ_DEDUP=off", "proof": "test/read-dedup.test.sh",
+     "why": "a Read byte-identical to the same agent's last Read of that range is replaced by a one-line stub (hashes kept, never content); never after a compaction"},
     {"id": "finished-agents-close-failed", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "finished-agents-close-failed",
      "why": "takes an agent off the list when TaskStop answers that no such task exists or it is not running"},
 

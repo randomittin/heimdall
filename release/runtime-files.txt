@@ -202,6 +202,7 @@ bin/heimdall-queue
 bin/heimdall-queue-mcp
 bin/heimdall-quota-advisor
 bin/heimdall-quota-resume
+bin/heimdall-read-dedup
 bin/heimdall-reap-idle
 bin/heimdall-receipt
 bin/heimdall-redum
@@ -409,6 +410,7 @@ bin/lib/hmd_private_state.py
 bin/lib/hmd_profile.py
 bin/lib/hmd_push_target.py
 bin/lib/hmd_qr.py
+bin/lib/hmd_read_dedup.py
 bin/lib/hmd_relay_approval.py
 bin/lib/hmd_relay_e2e.py
 bin/lib/hmd_relay_ws.py
