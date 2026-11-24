@@ -50,6 +50,14 @@
 #      fabricated) when the payload omits it.
 #   9. The hook is fail-open: no jq, a missing heimdall-metric binary, or a
 #      malformed payload all still exit 0.
+#  10. A blocked stop is recorded ONCE. A SubagentStop hook that answers
+#      decision:block (bin/heimdall-subagent-report-gate) makes the harness fire
+#      every SubagentStop hook again when the agent really stops, that second
+#      payload carrying stop_hook_active:true. The transcript is summed whole
+#      each time, so recording both would count the agent twice: the second
+#      payload records NOTHING — no second metrics.jsonl row and no second
+#      `heimdall-state add-tokens` (total_tokens and total_agents_spawned stay
+#      at the first stop's values).
 #
 # Usage:  bash test/heimdall-metric-hook.test.sh   (exit 0 = all guarantees hold)
 set -uo pipefail
@@ -59,6 +67,7 @@ REPO="$(cd "$SELF_DIR/.." && pwd)"
 HOOKS="$REPO/hooks/hooks.json"
 HOOK_SRC="$REPO/bin/heimdall-metric-hook"
 METRIC_SRC="$REPO/bin/heimdall-metric"
+STATE_SRC="$REPO/bin/heimdall-state"
 
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
@@ -184,7 +193,10 @@ run_hook() {
   # subshell instead, so the wrapper's own CLAUDE_PLUGIN_ROOT lookup sees it.
   (
     cd "$SANDBOX" || exit 1
-    unset HEIMDALL_PLANNING_DIR HEIMDALL_HOME
+    # HEIMDALL_STATE_FILE / SUPERX_STATE_FILE: section 10 runs the real
+    # heimdall-state, which would write a caller-named state file instead of
+    # the sandbox project's.
+    unset HEIMDALL_PLANNING_DIR HEIMDALL_HOME HEIMDALL_STATE_FILE SUPERX_STATE_FILE
     export CLAUDE_PLUGIN_ROOT="$PLUGIN"
     printf '%s' "$1" | bash "$HOOK_CMD_FILE" > /dev/null 2> "$SANDBOX/stderr.log"
   )
@@ -411,6 +423,68 @@ while [ $i -lt ${#CASE_PATHS[@]} ]; do
   fi
   i=$((i+1))
 done
+
+# --- 10. a blocked stop fires this hook twice — only the first is recorded ---
+# bin/heimdall-subagent-report-gate answers decision:block to an over-long final
+# report. The harness keeps the subagent running, then fires EVERY SubagentStop
+# hook again when it stops for real, that second payload carrying
+# stop_hook_active:true. _sum_tokens reads the whole transcript each time, so
+# recording both counted a blocked agent twice: two metrics.jsonl rows and two
+# `heimdall-state add-tokens` calls, each adding the tokens AND one more agent.
+# The sink here is the REAL bin/heimdall-state — `heimdall-state budget` is the
+# one command that answers "what did this session cost" — never a recording
+# fake. Fixtures are constructed: the first stop's transcript carries two usage
+# blocks (150 + 1,450 = 1,600 tokens); the continuation's carries the same
+# turns plus the short summary turn (1,650 more).
+cp "$STATE_SRC" "$PLUGIN/bin/heimdall-state"
+chmod +x "$PLUGIN/bin/heimdall-state"
+( cd "$PROJECT" && unset HEIMDALL_STATE_FILE SUPERX_STATE_FILE && "$PLUGIN/bin/heimdall-state" init ) >/dev/null 2>&1
+
+BLOCKED_FIRST="$TRANSCRIPTS/blocked-first-stop.jsonl"
+cat > "$BLOCKED_FIRST" <<'EOF'
+{"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"tool_use","id":"toolu_4","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_4","content":"a.txt","is_error":false}]}}
+{"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":200,"output_tokens":250,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000},"content":[{"type":"text","text":"DONE. A report far longer than the cap."}]}}
+EOF
+BLOCKED_CONTINUED="$TRANSCRIPTS/blocked-continuation-stop.jsonl"
+{
+  cat "$BLOCKED_FIRST"
+  printf '%s\n' '{"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":20,"output_tokens":30,"cache_creation_input_tokens":0,"cache_read_input_tokens":1600},"content":[{"type":"text","text":"Summary. Full report saved."}]}}'
+} > "$BLOCKED_CONTINUED"
+
+stop_payload() {
+  # $1 = stop_hook_active (a JSON literal), $2 = the agent's transcript — one
+  # hmd:coder agent's SubagentStop payload; both of its stops share one agent_id.
+  jq -cn --argjson active "$1" --arg tp "$2" \
+    '{hook_event_name:"SubagentStop", stop_hook_active:$active, agent_id:"agent-blocked1", agent_type:"hmd:coder", agent_transcript_path:$tp, last_assistant_message:"DONE. A report far longer than the cap."}'
+}
+budget_now() {
+  printf 'tokens=%s agents=%s' "$(jq -r '.budget.total_tokens' "$PROJECT/heimdall-state.json")" "$(jq -r '.budget.total_agents_spawned' "$PROJECT/heimdall-state.json")"
+}
+
+BEFORE=$(lines_now)
+run_hook "$(stop_payload false "$BLOCKED_FIRST")"
+AFTER=$(lines_now)
+if [ "$AFTER" -eq $((BEFORE+1)) ]; then
+  ok "first stop of a blocked agent (stop_hook_active:false) appends exactly one record"
+  [ "$(tail -1 "$METRICS" | jq -r '.tokens')" = "1600" ] && ok "record tokens=1600 (summed from the first stop's transcript)" \
+    || bad "record tokens wrong: $(tail -1 "$METRICS")"
+  [ "$(budget_now)" = "tokens=1600 agents=1" ] && ok "heimdall-state budget after the first stop: tokens=1600 agents=1" \
+    || bad "first-stop budget wrong: $(budget_now)"
+else
+  bad "blocked agent's first stop: expected $((BEFORE+1)) lines, got $AFTER"
+fi
+
+BEFORE=$(lines_now)
+BUDGET_BEFORE="$(budget_now)"
+RC=0
+run_hook "$(stop_payload true "$BLOCKED_CONTINUED")" || RC=$?
+AFTER=$(lines_now)
+[ "$AFTER" -eq "$BEFORE" ] && ok "continuation stop (stop_hook_active:true) appends NO second record — a blocked agent is one row, not two" \
+  || bad "continuation stop recorded the agent again: before=$BEFORE after=$AFTER"
+[ "$(budget_now)" = "$BUDGET_BEFORE" ] && ok "continuation stop leaves heimdall-state budget untouched ($BUDGET_BEFORE) — tokens not summed twice, agent not counted twice" \
+  || bad "continuation stop double-counted in heimdall-state: was $BUDGET_BEFORE, now $(budget_now)"
+[ "$RC" -eq 0 ] && ok "continuation stop exits 0 (fail-open)" || bad "continuation stop exited $RC, expected 0"
 
 # --- collateral check: every other live hook event still present -------------
 for EVENT in UserPromptSubmit PreToolUse PostToolUse SessionStart SessionEnd; do
