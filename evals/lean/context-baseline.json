@@ -4,11 +4,11 @@
     "git_trees": {
       "agents": "c38b8a6e3cb3c115de2a1688ffd5b41dc7d74e2a",
       "commands": "100f7a1ca0d0cfdca442e4ae2bd28c5b43748652",
-      "hooks": "7020cd7a41e4daa734c913808d650ba9cec92a8b",
+      "hooks": "c5d896dc0cf97e35766456baf493f59141124db9",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
       "skills": "7d0f2ae4964dc8f9af6773ffc91e60fb71cb101b"
     },
-    "recorded_utc": "2026-11-24T20:34:43Z",
+    "recorded_utc": "2026-11-24T20:54:03Z",
     "summary": {
       "agents": 17,
       "bytes": 652586,
