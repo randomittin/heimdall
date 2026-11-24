@@ -33,6 +33,10 @@ run_checks() {
   local json_file="$1" out_file
   out_file="$TMPDIR_T/checks.$$.$RANDOM.txt"
   python3 - "$json_file" > "$out_file"
+  local rc=$?
+  # A checker that crashes prints no FAIL line for the assertions it never
+  # reached; without this guard a crash would read as a pass.
+  [ "$rc" -eq 0 ] || bad "checker script crashed (exit $rc): its remaining assertions never ran"
   while IFS= read -r line; do
     case "$line" in
       "PASS "*) ok "${line#PASS }" ;;
@@ -55,6 +59,8 @@ echo "$HELP_OUT" | grep -q "PRICING SOURCE" && ok "--help cites its pricing sour
   || bad "--help missing the pricing source citation"
 echo "$HELP_OUT" | grep -q "2026-06-24" && ok "--help cites the pricing table's cache date" \
   || bad "--help missing the pricing table cache date"
+echo "$HELP_OUT" | grep -q "bin/lib/tier-table.json" && ok "--help names the table the rates are read from" \
+  || bad "--help does not name bin/lib/tier-table.json as the pricing source"
 
 # ── 2. no transcripts found -> honest empty result, exit 0 (not an error) ──
 EMPTY_DIR="$TMPDIR_T/empty"
@@ -309,6 +315,230 @@ RC=$?
 "$TOOL" --min-requests not-a-number >/dev/null 2>&1
 RC=$?
 [ "$RC" -eq 2 ] && ok "non-integer --min-requests exits 2" || bad "non-integer --min-requests exit was $RC, want 2"
+
+# gen_jsonl <outfile> <spec>: one assistant record per spec line, each line
+#   "<message id> <model> <input> <output> <cache_read> <cache_write_5m> <cache_write_1h>"
+gen_jsonl() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+out, spec = sys.argv[1], sys.argv[2]
+with open(out, "w") as fh:
+    for n, line in enumerate(spec.strip().splitlines()):
+        mid, model, tin, tout, read, w5m, w1h = line.split()
+        usage = {
+            "input_tokens": int(tin), "output_tokens": int(tout),
+            "cache_read_input_tokens": int(read),
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": int(w5m),
+                "ephemeral_1h_input_tokens": int(w1h),
+            },
+        }
+        rec = {"type": "assistant", "timestamp": "2026-02-01T00:00:%02dZ" % n,
+               "message": {"id": mid, "model": model, "usage": usage}}
+        fh.write(json.dumps(rec) + "\n")
+PY
+}
+
+# ── 10. the Claude 5.5 generation is priced, from bin/lib/tier-table.json ──
+# Regression for the unpriced-corpus bug (docs/analysis/2026-11-22-token-
+# utilization-next.md, "Finding (tool bug)"): the tool's rate table had no row
+# for any 5.5-generation id, so ~88% of a real corpus's tokens landed in
+# unpriced_models and every dollar figure it printed was a floor.
+#
+# Every request below carries exactly 1,000,000 tokens in EACH of the five
+# fields, so a model's cost in dollars is the plain SUM of its five $/MTok
+# rates, read straight off the list prices:
+#   opus 5.5    4 + 20 + 0.20 + 5.00 + 8.00 = 37.20  (cache read 0.05x, not the 0.1x default)
+#   sonnet 5.5  2 + 10 + 0.10 + 2.50 + 4.00 = 18.60  (dated snapshot id: suffix stripped)
+#   fable 5.2   8 + 40 + 0.20 + 10   + 16   = 74.20  (cache read 0.025x)
+#   mythos 5.2  the fable 5.2 card          = 74.20
+#   total 204.20; cache_read $ = 0.20+0.10+0.20+0.20 = 0.70 (a 0.1x default read would give 2.20)
+GEN55_FILE="$TMPDIR_T/session-gen55.jsonl"
+gen_jsonl "$GEN55_FILE" '
+g_opus   claude-opus-5-5             1000000 1000000 1000000 1000000 1000000
+g_sonnet claude-sonnet-5-5-20261101  1000000 1000000 1000000 1000000 1000000
+g_fable  claude-fable-5-2            1000000 1000000 1000000 1000000 1000000
+g_mythos claude-mythos-5-2           1000000 1000000 1000000 1000000 1000000
+'
+GEN55_JSON="$TMPDIR_T/gen55.json"
+"$TOOL" --root "$GEN55_FILE" --json > "$GEN55_JSON" 2>"$TMPDIR_T/gen55.stderr"
+GEN55_RC=$?
+[ "$GEN55_RC" -eq 0 ] && ok "5.5-generation fixture run exits 0" || bad "5.5-generation fixture run exit code was $GEN55_RC"
+run_checks "$GEN55_JSON" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+def check(name, cond, detail=""):
+    status = "PASS" if cond else "FAIL"
+    print("%s %s%s" % (status, name, ("" if cond or not detail else " (%s)" % detail)))
+
+check("5.5 gen: every token priced (unpriced_tokens_total==0)",
+      d.get("unpriced_tokens_total") == 0, "got %r" % (d.get("unpriced_tokens_total"),))
+check("5.5 gen: unpriced_models is empty",
+      d.get("unpriced_models") == {}, "got %r" % (d.get("unpriced_models"),))
+check("5.5 gen: nothing estimated (all four ids have an exact row)",
+      d.get("estimated_models") == {} and d.get("estimated_cost_usd") == 0,
+      "got %r / %r" % (d.get("estimated_models"), d.get("estimated_cost_usd")))
+per_model = d.get("per_model", {})
+for name, want in (("claude-opus-5-5", 37.2), ("claude-sonnet-5-5", 18.6),
+                   ("claude-fable-5-2", 74.2), ("claude-mythos-5-2", 74.2)):
+    got = per_model.get(name, {}).get("cost_usd")
+    check("%s priced at $%.2f (dated snapshot suffix stripped where present)" % (name, want),
+          got is not None and abs(got - want) < 1e-6,
+          "got %r; per_model keys %r" % (got, sorted(per_model)))
+check("5.5 gen: priced_cost_total_usd==204.20",
+      abs(d.get("priced_cost_total_usd", -1) - 204.2) < 1e-6, "got %r" % (d.get("priced_cost_total_usd"),))
+check("5.5 gen: cache_read $==0.70 (per-model read rates 0.05x/0.025x, not a 0.1x default)",
+      abs(d.get("field_dollars", {}).get("cache_read", -1) - 0.70) < 1e-9,
+      "got %r" % (d.get("field_dollars", {}).get("cache_read"),))
+PY
+
+# ── 11. Haiku 5.5 bills two rate cards, split by prompt length ────────────
+# $0.10 in / $0.50 out for a prompt of 100K tokens or fewer, $0.50 / $2.50
+# above it; cache reads 0.1x, 5m writes 1.25x, 1h writes 2x of the card's own
+# input rate. Prompt = input + cache_read + cache_write (output excluded).
+#   low   prompt 80,000 (20k in, 50k read, 10k write 5m), 100k out:
+#           .002 + .0005 + .00125 + .05          = 0.05375
+#   high  prompt 200,000 (10k in, 140k read, 50k write 1h), 20k out, on the long
+#         card (in .50, read .05, write 1h 1.00, out 2.50):
+#           .005 + .007 + .05 + .05              = 0.112
+#   edge  prompt exactly 100,000 (all input) is NOT above the threshold, so the
+#         low card applies: 100000 x .10 / 1e6   = 0.01 (the long card: 0.05)
+#   total 0.17575; by field: input .017, output .10, cache_read .0075,
+#   cache_write_5m .00125, cache_write_1h .05
+HAIKU_FILE="$TMPDIR_T/session-haiku.jsonl"
+gen_jsonl "$HAIKU_FILE" '
+h_low  claude-haiku-5-5  20000  100000 50000  10000 0
+h_high claude-haiku-5-5  10000  20000  140000 0     50000
+h_edge claude-haiku-5-5  100000 0      0      0     0
+'
+HAIKU_JSON="$TMPDIR_T/haiku.json"
+"$TOOL" --root "$HAIKU_FILE" --json > "$HAIKU_JSON" 2>"$TMPDIR_T/haiku.stderr"
+run_checks "$HAIKU_JSON" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+def check(name, cond, detail=""):
+    status = "PASS" if cond else "FAIL"
+    print("%s %s%s" % (status, name, ("" if cond or not detail else " (%s)" % detail)))
+
+fd = d.get("field_dollars", {})
+check("haiku 5.5: every token priced", d.get("unpriced_tokens_total") == 0,
+      "got %r" % (d.get("unpriced_tokens_total"),))
+check("haiku 5.5: priced_cost_total_usd==0.17575",
+      abs(d.get("priced_cost_total_usd", -1) - 0.17575) < 1e-9, "got %r" % (d.get("priced_cost_total_usd"),))
+check("haiku 5.5: input $==0.017 (long card above 100K, low card at exactly 100K)",
+      abs(fd.get("input", -1) - 0.017) < 1e-9, "got %r" % (fd.get("input"),))
+check("haiku 5.5: output $==0.10", abs(fd.get("output", -1) - 0.10) < 1e-9, "got %r" % (fd.get("output"),))
+check("haiku 5.5: cache_read $==0.0075 (0.1x of each card's own input rate)",
+      abs(fd.get("cache_read", -1) - 0.0075) < 1e-9, "got %r" % (fd.get("cache_read"),))
+check("haiku 5.5: cache_write_5m $==0.00125", abs(fd.get("cache_write_5m", -1) - 0.00125) < 1e-9,
+      "got %r" % (fd.get("cache_write_5m"),))
+check("haiku 5.5: cache_write_1h $==0.05 (2x the long card's input rate)",
+      abs(fd.get("cache_write_1h", -1) - 0.05) < 1e-9, "got %r" % (fd.get("cache_write_1h"),))
+PY
+
+# ── 12. a NEWER unlisted version is an estimate; an OLDER one is unpriced ──
+# A version newer than every listed version of its family is priced as the
+# newest listed row and flagged ESTIMATE, so the next generation is never
+# silently unpriced. An older version nothing lists must NOT borrow a newer
+# model's price (an old model's list price is not inferable from it): it stays
+# in unpriced_models, as does any id the table can't place (section 6).
+NEXT_FILE="$TMPDIR_T/session-next.jsonl"
+gen_jsonl "$NEXT_FILE" '
+n_next  claude-opus-9-9    1000000 1000000 1000000 1000000 1000000
+n_older claude-sonnet-1-0  1000000 1000000 1000000 1000000 1000000
+'
+NEXT_JSON="$TMPDIR_T/next.json"
+"$TOOL" --root "$NEXT_FILE" --json > "$NEXT_JSON" 2>"$TMPDIR_T/next.stderr"
+run_checks "$NEXT_JSON" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+def check(name, cond, detail=""):
+    status = "PASS" if cond else "FAIL"
+    print("%s %s%s" % (status, name, ("" if cond or not detail else " (%s)" % detail)))
+
+per_model = d.get("per_model", {})
+est = d.get("estimated_models", {})
+check("next gen: claude-opus-9-9 flagged as an estimate (5,000,000 tok)",
+      est.get("claude-opus-9-9") == 5000000, "got %r" % (est,))
+check("next gen: estimate names the row it was priced as (opus 5.5)",
+      per_model.get("claude-opus-9-9", {}).get("estimated_as") == "opus 5.5",
+      "got %r" % (per_model.get("claude-opus-9-9"),))
+check("next gen: the estimate carries the newest opus card's $37.20, inside the total",
+      abs(d.get("estimated_cost_usd", -1) - 37.2) < 1e-6 and abs(d.get("priced_cost_total_usd", -1) - 37.2) < 1e-6,
+      "estimated %r, total %r" % (d.get("estimated_cost_usd"), d.get("priced_cost_total_usd")))
+check("next gen: an estimated model is not listed as unpriced",
+      "claude-opus-9-9" not in d.get("unpriced_models", {}), "got %r" % (d.get("unpriced_models"),))
+check("older unlisted version stays unpriced (5,000,000 tok, never borrowed from a newer price)",
+      d.get("unpriced_models", {}).get("claude-sonnet-1-0") == 5000000, "got %r" % (d.get("unpriced_models"),))
+check("older unlisted version adds no dollars and is not an estimate",
+      abs(per_model.get("claude-sonnet-1-0", {}).get("cost_usd", -1)) < 1e-9
+      and "claude-sonnet-1-0" not in est,
+      "got %r / %r" % (per_model.get("claude-sonnet-1-0"), est))
+PY
+NEXT_TEXT="$("$TOOL" --root "$NEXT_FILE" 2>&1)"
+echo "$NEXT_TEXT" | grep -q "ESTIMATE" && ok "text report calls the next-generation dollars an ESTIMATE" \
+  || bad "text report never says ESTIMATE for a model priced by the newest-listed-version rule"
+echo "$NEXT_TEXT" | grep -qF "claude-opus-9-9 as opus 5.5" && ok "text report names the id and the row it was priced as" \
+  || bad "text report does not say 'claude-opus-9-9 as opus 5.5'"
+
+# ── 13. one rate source: the tier table, not a copy inside the tool ───────
+# Same request priced twice, the second time against a copy of the table in
+# which the opus 5.5 input rate is $40 instead of $4. If the tool held its own
+# rate table the number would not move.
+ONE_FILE="$TMPDIR_T/session-one.jsonl"
+gen_jsonl "$ONE_FILE" 'one_opus claude-opus-5-5 1000000 0 0 0 0'
+ALT_TABLE="$TMPDIR_T/alt-tier-table.json"
+python3 - "$ROOT/bin/lib/tier-table.json" "$ALT_TABLE" <<'PY'
+import json, sys
+table = json.load(open(sys.argv[1]))
+for row in table.get("model_prices", {}).get("rows", []):
+    if row.get("family") == "opus" and row.get("version") == "5.5":
+        row["input"] = 40.0
+json.dump(table, open(sys.argv[2], "w"))
+PY
+ONE_JSON="$TMPDIR_T/one.json"
+ALT_JSON="$TMPDIR_T/alt.json"
+"$TOOL" --root "$ONE_FILE" --json > "$ONE_JSON" 2>/dev/null
+HMD_COST_FORENSICS_TIER_TABLE="$ALT_TABLE" "$TOOL" --root "$ONE_FILE" --json > "$ALT_JSON" 2>/dev/null
+run_checks "$ONE_JSON" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+cost = d.get("priced_cost_total_usd")
+print("%s shipped table: 1M opus 5.5 input tokens cost $4.00%s" % (
+    "PASS" if cost is not None and abs(cost - 4.0) < 1e-9 else "FAIL",
+    "" if cost is not None and abs(cost - 4.0) < 1e-9 else " (got %r)" % (cost,)))
+PY
+run_checks "$ALT_JSON" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+cost = d.get("priced_cost_total_usd")
+print("%s HMD_COST_FORENSICS_TIER_TABLE: the same tokens cost $40.00 when the table says so%s" % (
+    "PASS" if cost is not None and abs(cost - 40.0) < 1e-9 else "FAIL",
+    "" if cost is not None and abs(cost - 40.0) < 1e-9 else " (got %r)" % (cost,)))
+PY
+
+# ── 14. an unusable table fails loudly: it never silently prices nothing ──
+BAD_TABLE="$TMPDIR_T/bad-tier-table.json"
+python3 - "$ROOT/bin/lib/tier-table.json" "$BAD_TABLE" <<'PY'
+import json, sys
+table = json.load(open(sys.argv[1]))
+for row in table.get("model_prices", {}).get("rows", []):
+    if row.get("family") == "opus" and row.get("version") == "5.5":
+        del row["output"]
+json.dump(table, open(sys.argv[2], "w"))
+PY
+HMD_COST_FORENSICS_TIER_TABLE="$BAD_TABLE" "$TOOL" --root "$ONE_FILE" --json >"$TMPDIR_T/bad.out" 2>"$TMPDIR_T/bad.err"
+BAD_RC=$?
+[ "$BAD_RC" -eq 1 ] && ok "a row missing its output rate exits 1" || bad "a row missing its output rate exited $BAD_RC, want 1"
+[ ! -s "$TMPDIR_T/bad.out" ] && ok "a malformed table puts nothing on stdout (no half-priced report)" \
+  || bad "a malformed table still printed a report on stdout"
+grep -q '"output"' "$TMPDIR_T/bad.err" && ok "stderr names the missing field" \
+  || bad "stderr does not name the missing \"output\" field"
+HMD_COST_FORENSICS_TIER_TABLE="$TMPDIR_T/no-such-table.json" "$TOOL" --root "$ONE_FILE" --json >"$TMPDIR_T/miss.out" 2>"$TMPDIR_T/miss.err"
+MISS_RC=$?
+[ "$MISS_RC" -eq 1 ] && ok "a missing table file exits 1" || bad "a missing table file exited $MISS_RC, want 1"
+grep -q "pricing table" "$TMPDIR_T/miss.err" && ok "stderr says it is the pricing table that failed" \
+  || bad "stderr does not mention the pricing table"
 
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
