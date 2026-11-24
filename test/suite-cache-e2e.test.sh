@@ -22,6 +22,8 @@
 #   C  a dependency broken -> only that suite (plus the sample) re-runs, goes RED, run exits 1, no entry is kept for it     D  reverted -> green again
 #   E  a comment-only edit of run-all.sh keeps the cache; a real edit changes the salt and every suite re-runs
 #   F  an entry 8 days old, an entry with a forged closure_sha, an entry whose recorded duration exceeds the budget: each MISSES, with its reason printed
+#   G  a suite red in the parallel run and GREEN in its solo re-run (FLAKY-UNDER-LOAD) is recorded in the cache, its solo run being the verdict everywhere else: a COLD sweep on a loaded host
+#      stays cold AND full-equivalent, verifies, and takes the gate and an x.y.0 release; --fail-fast resumes and records it too; a suite red in BOTH runs stays red, with no entry
 #   H  an audited suite that fails with an unchanged closure -> CLOSURE UNSOUND, red, cache purged, and the receipt names it
 #   J  --failed: greens of a RED run are kept; the red suite plus the audit sample re-run, and the amend's receipt verifies and passes the gate in that one command; a
 #      dependency broken under a green suite re-runs it RED (the amend cannot hide a regression); a forged amend is refused
@@ -145,6 +147,7 @@ entry_edit() { # dir suite JQ-FILTER -- edit one cache entry in place (the resul
 days_ago() { date -u -v-"$1"d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "$1 days ago" '+%Y-%m-%dT%H:%M:%SZ'; }
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
 setdep() { printf '#!/usr/bin/env bash\ndep_ok() { return %s; }\n' "$3" > "$1/bin/dep-$2.sh"; }   # dir NN 0|1
+setflaky() { printf '#!/usr/bin/env bash\ndep_ok() { if [ ! -e "$FLAKY_MARK" ]; then : > "$FLAKY_MARK"; return 1; fi; return 0; }\n' > "$1/bin/dep-$2.sh"; }   # dir NN -- red while the file $FLAKY_MARK is absent (the parallel run makes it), green once it exists (the solo re-run)
 
 echo "════════════════════════════════════════════════════════════════"
 echo "suite cache, end to end: reuse, audit, cold, failed, receipts, gate, ship"
@@ -330,6 +333,42 @@ HEAD2="$(git -C "$K" rev-parse HEAD)"
 jq --arg h "$HEAD2" '.head_sha = $h | .amended = []' "$WORK/amend.json" > "$WORK/forged-amend.json"; vr "$K" "$WORK/forged-amend.json"
 if [ "$VR_RC" = 1 ] && printf '%s' "$VR_ERR" | grep -qi 'closure'; then mutant "a forged amend (amended:[] on a commit where a closure moved) is refused" yes; else mutant "a forged amend is refused" no "rc=$VR_RC $VR_ERR"; fi
 
+# ══ G. red under load, green alone ═══════════════════════════════════════════════════════════════════════════════════════
+echo "-- G. a suite red in the parallel run and green in its solo re-run is recorded in the cache: a cold sweep stays cold AND full-equivalent --"
+newfix g; G="$FIX"; MARK="$WORK/flaky.mark"
+setflaky "$G" 05; cm "$G" "s05 goes red under load and green alone"
+rm -f "$MARK"; EXTRA="FLAKY_MARK=$MARK" runit "$G" --cold
+eq "G1 the run is green: the solo re-run of s05 is the verdict" "$RC" "0"
+has "G2 and it prints s05 under FLAKY-UNDER-LOAD" "$OUT" "FLAKY-UNDER-LOAD"
+eq "G3 s05 started twice (the parallel run, then alone) and every other suite once" "$(grep -c '^s05$' "$G.marks"):$(grep -vc '^s05$' "$G.marks")" "2:39"
+eq "G4 the receipt keeps the flake: both exit codes and the line the parallel run printed" "$(rj "$(LAST "$G")" '.flaky_under_load | map("\(.suite) \(.parallel_exit)/\(.solo_exit) \(.parallel_fail_lines | join("|"))") | join(",")')" "s05.test.sh 1/0 FAIL dependency broken in s05"
+eq "G5 the solo green of s05 is in the suite cache: an entry for each of the 40 suites" "$(nent "$G")" "40"
+eq "G6 the receipt is full-equivalent AND cold: 0 cached, 0 audited, 40 entries, 40 suites passed" "$(rj "$(LAST "$G")" '[.exit_code, .full_equivalent, .cache.cold, .cache.suites_cached, .cache.audited, (.cache.entries | length), .suites_passed] | join(",")')" "0,true,true,0,0,40,40"
+G_RECORDED=no; [ "$(nent "$G")" = 40 ] && [ "$(rj "$(LAST "$G")" '.full_equivalent and .cache.cold')" = true ] && G_RECORDED=yes
+vr "$G" "$(LAST "$G")"; eq "G7 verify-receipt re-derives it from the closures at the graded commit and accepts it" "$VR_RC" "0"; [ "$VR_RC" = 0 ] || printf '        %s\n' "$VR_ERR" >&2
+cp "$(LAST "$G")" "$WORK/golden-flaky.json"
+eq "G8 it is the chain anchor: the full-green receipt names HEAD" "$(rj "$(FULLG "$G")" '.head_sha')" "$(git -C "$G" rev-parse HEAD)"
+gate "$G"; eq "G9 the push gate takes it" "$GRC" "0"; has "G10 and still names the flaky suite" "$GOUT" "s05.test.sh"
+mutant "a suite red under load and green on its solo re-run is recorded in the suite cache: the cold sweep stays full-equivalent and cold" "$G_RECORDED" "entries=$(nent "$G")"
+gmut() { # LABEL JQ-FILTER REASON -- verify-receipt on a forged copy of the cold receipt above
+  jq "$2" "$WORK/golden-flaky.json" > "$WORK/forged.json"; vr "$G" "$WORK/forged.json"
+  if [ "$VR_RC" = 1 ] && printf '%s' "$VR_ERR" | grep -qiF -- "$3"; then mutant "verify-receipt: $1" yes; else mutant "verify-receipt: $1" no "rc=$VR_RC want [$3] got [$VR_ERR]"; fi
+}
+gmut "the entry of the flaky suite removed (nothing binds its solo green to a closure)" '.cache.entries |= map(select(.suite != "s05.test.sh"))' "no green entry"
+gmut "a suite counted green although it was red when run alone" '.flaky_under_load[0].solo_exit = 1' "solo re-run"
+rm -f "$MARK"; EXTRA="FLAKY_MARK=$MARK" runit "$G" --cold --fail-fast
+eq "G11 --fail-fast: the solo re-run clears the red, so the sweep resumes, is green and kind=full" "$RC:$(rj "$(LAST "$G")" '[.kind, (.flaky_under_load | map(.suite) | join(",")), has("aborted")] | join(",")')" "0:full,s05.test.sh,false"
+eq "G12 and that receipt is cold and full-equivalent too, with the entry of s05" "$(rj "$(LAST "$G")" '[.full_equivalent, .cache.cold, (.cache.entries | map(select(.suite == "s05.test.sh")) | length)] | join(",")')" "true,true,1"
+setdep "$G" 07 1; cm "$G" "s07 is red for good"
+ANCHOR0="$(sha "$(FULLG "$G")")"
+rm -f "$MARK"; EXTRA="FLAKY_MARK=$MARK" runit "$G" --cold
+eq "G13 a suite red in BOTH runs is red: the run exits 1" "$RC" "1"
+eq "G14 s07 is the only non-green suite and s05 the only flake" "$(rj "$(LAST "$G")" '[(.non_green_suites | join(",")), (.flaky_under_load | map(.suite) | join(","))] | join(" ")')" "s07.test.sh s05.test.sh"
+G_S07="$([ -e "$(ENT "$G")/s07.test.sh.json" ] && echo entry || echo none)"; G_S05="$([ -e "$(ENT "$G")/s05.test.sh.json" ] && echo entry || echo none)"
+eq "G15 s05 keeps its solo green, s07 has no entry: 39 entries" "$G_S05:$G_S07:$(nent "$G")" "entry:none:39"
+eq "G16 the receipt is red and not full-equivalent, and the anchor did not move" "$(rj "$(LAST "$G")" '[.exit_code, .full_equivalent] | join(",")'):$([ "$(sha "$(FULLG "$G")")" = "$ANCHOR0" ] && echo kept || echo moved)" "1,false:kept"
+if [ "$RC" = 1 ] && [ "$G_S07" = none ]; then mutant "a suite red in both the parallel run and the solo re-run stays red: no cache entry, the run exits 1" yes; else mutant "a suite red in both runs stays red" no "rc=$RC s07=$G_S07"; fi
+
 # ══ S. release/ship.sh ════════════════════════════════════════════════════════════════════════════════════════════════
 echo "-- S. release/ship.sh: forged and warm-for-x.y.0 receipts are refused; warm patch and cold x.y.0 pass --"
 newfix s; S="$FIX"
@@ -349,6 +388,15 @@ ship "$T" --minor --no-npm
 has "S5 a cold receipt covers an x.y.0 release" "$SOUT" "green FULL sweep receipt"
 lacks "S6 and is not refused" "$SOUT" "COLD"
 has "S7 ship carries on to the version bump" "$SOUT" "Version bump"
+newfix u; U="$FIX"; setflaky "$U" 05; cm "$U" "s05 goes red under load and green alone"
+rm -f "$MARK"; EXTRA="FLAKY_MARK=$MARK" runit "$U" --cold
+eq "S8 a loaded host: the cold sweep trips s05 (red under load, green alone) and the anchor is still green, cold and full-equivalent" "$RC:$(rj "$(FULLG "$U")" '[.cache.cold, .full_equivalent, (.flaky_under_load | length)] | join(",")')" "0:true,true,1"
+ship "$U" --minor --no-npm
+has "S9 that cold receipt, flake and all, covers an x.y.0 release" "$SOUT" "green FULL sweep receipt"
+lacks "S10 and is not refused for being warm or unverifiable" "$SOUT" "COLD"
+has "S11 ship carries on to the version bump" "$SOUT" "Version bump"
+if printf '%s' "$SOUT" | grep -q 'Version bump' && ! printf '%s' "$SOUT" | grep -q 'COLD'; then mutant "an x.y.0 release is reachable on a loaded host: a cold sweep whose only blemish is a solo-green flake is accepted by ship.sh" yes
+else mutant "an x.y.0 release is reachable on a loaded host" no "rc=$SHRC $(printf '%s' "$SOUT" | tail -c 500)"; fi
 
 # ── falsifiability ───────────────────────────────────────────────────────────────────────────────────────────────────
 echo "════════════════════════════════════════════════════════════════"
