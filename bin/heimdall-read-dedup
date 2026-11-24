@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# heimdall-read-dedup -- stub a Read that returns what the same agent already holds in context: the PostToolUse hook (`post-read`) and
-# `clear --session ID` (the PreCompact hook runs it). Why, the payload fields, the rule, the state and its bounds: the header of
-# bin/lib/hmd_read_dedup.py, which holds the behaviour. This file is only the launcher.
+# heimdall-read-dedup -- stub a Read that returns what the same agent already holds in context, and answer a subagent's unsliced Read of a
+# big source file with its head and outline: the PostToolUse hook (`post-read`) and `clear --session ID` (the PreCompact hook runs it).
+# Why, the payload fields, the rules, the state and its bounds: the header of bin/lib/hmd_read_dedup.py, which holds the behaviour. This
+# file is only the launcher.
 #
-# OFF SWITCH. HMD_READ_DEDUP=off (also 0, false, no) in the environment Claude Code runs in makes `post-read` exit 0 at once: no stub
-# and nothing recorded. `clear` is never switched off: forgetting reads is always safe, and a compaction that happened while the hook
-# was off must not leave state behind for when it is on again. The hook can also be switched off by id: `hmd guardrails off read-dedup`.
+# OFF SWITCHES. HMD_READ_DEDUP=off (also 0, false, no) in the environment Claude Code runs in turns the WHOLE hook off: `post-read` exits 0
+# at once, no stub, no outline and nothing recorded. HMD_READ_OUTLINE=off turns only the outline off (the python module reads it) and
+# keeps the stub. `clear` is never switched off: forgetting reads is always safe, and a compaction that happened while the hook was off
+# must not leave state behind for when it is on again. The hook can also be switched off by id: `hmd guardrails off read-dedup`.
 SELF="${BASH_SOURCE[0]}"
 while [ -h "$SELF" ]; do
   _dir="$(cd "$(dirname "$SELF")" && pwd)"
