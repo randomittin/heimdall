@@ -96,3 +96,7 @@
 - [ ] LOW (2.4.12 review) tier-table model_prices rows and the autoCompactWindow key are not checked against a live source in any test (2026-11-24).
 - [ ] LOW footprint --check red on pre-existing main-prompt overage (+826 B: main_prompt 68,211 vs 67,385) and lean-install bytes 15,707,300 vs 15,700,000; no test runs the check. Trim the prompt or re-baseline deliberately (2026-11-24).
 - [ ] LOW evals/jev-ultrafast/{run.sh,bench.py} enter the runtime closure through the same bare run.sh name in bin/corpus; add to the closure POLICY like evals/effort-ab (2026-11-24).
+- [ ] MEDIUM (2.4.13 review) read outline rows sit inside `file.content`, so Claude Code numbers them 101+ as if file lines; could mislead line-based reasoning. Put the outline in a header the numbering skips, or label rows clearly (2026-11-25).
+- [ ] LOW (2.4.13 review) PreCompact `clear --session` also wipes subagents' outline marks; their next whole Read gets the outline again first (2026-11-25).
+- [ ] LOW (2.4.13 review) outline mark is evicted by the 256-entry cap and keyed on the path as typed; canonicalize the path (2026-11-25).
+- [ ] LOW (2.4.13 review) post-Read hook starts Python on every main-thread Read only to exit; add a shell pre-check on agent_id (2026-11-25).
