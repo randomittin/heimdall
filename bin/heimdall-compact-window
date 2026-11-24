@@ -14,23 +14,27 @@ main-thread spend. The price is real too: older detail is summarized sooner (the
 WHAT IT WRITES. One key, `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000), in the user-level settings.json
 of the agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. A symlink there is followed (the file it points to is edited and the link stays).
 The key is added to, or replaced in, the TEXT of the file, never by re-serializing the document, so every other byte survives: key order, indentation, escapes,
-the trailing newline. The write is a temp file in the same directory and a rename, and it is refused when the file changed since it was read. A file that is not
-a JSON object (or names the key twice) is never touched.
+the trailing newline. The write is a temp file in the same directory and a rename; the file is read again as the last step before the rename, and when it is no longer
+the one that was read (other bytes, or another file in its place) nothing is written and the exit status is 1. A file that is not a JSON object (or names the key
+twice) is never touched.
 
 CONSENT. Nothing is written without the person's yes, the contract of `hmd prove` and `hmd skills install`: `--yes` says it was already given; at a terminal
 (stdin and stdout) the change is shown and `Proceed? [y/N]` is asked; anywhere else nothing is written and the exit status is 3, "consent required": ask the
 person, then run the same command again with --yes. `status` never writes. A run with nothing to change (already set, nothing to undo) never asks.
 
-on      back up the settings file ($HEIMDALL_HOME/compact-window/settings.json.bak, mode 0600), record what was there before (the record, state.json, beside it),
-        then set the key. A value of the person's own that differs from the one asked for is never replaced unless --force is given (exit 4); a value hmd
-        wrote itself is updated in place and still undoes to the state before hmd.
-off     put the key back as hmd found it: removed when it was absent (the file removed when hmd created it), the old value when --force had replaced one. When the
-        file is still byte-for-byte what hmd wrote, the backup is restored verbatim; when something else changed the file since, only the key is reverted and the
-        rest is kept. A value that is no longer the one hmd wrote is the person's by now: exit 4 unless --force. Without a record there is nothing to undo.
+on      back up the settings file ($HEIMDALL_HOME/compact-window/<id>.settings.json.bak, mode 0600), record what was there before (the record, <id>.state.json, beside
+        it), then set the key. <id> is a digest of the settings file's real path: every settings file (every CLAUDE_CONFIG_DIR) keeps a pair of its own, so setting
+        the key in a second one never costs the first its undo. A value of the person's own that differs from the one asked for is never replaced unless --force is
+        given (exit 4); a value hmd wrote itself is updated in place and still undoes to the state before hmd.
+off     put the key back as hmd found it, in the settings file of this environment: removed when it was absent (the file removed when hmd created it), the old value
+        when --force had replaced one. When the file is still byte-for-byte what hmd wrote, the backup is restored verbatim; when something else changed the file
+        since, only the key is reverted and the rest is kept. A value that is no longer the one hmd wrote is the person's by now: exit 4 unless --force. Without a
+        record for this settings file there is nothing to undo here; any other settings file hmd set the key in is named, to be undone with its own CLAUDE_CONFIG_DIR.
 offer   the one-time question install and update ask at a terminal: nothing is printed, read or written without a terminal on stdin and stdout, a setting that is
         already there is never asked about, and an answer (yes or no) is kept in $HEIMDALL_HOME/compact-window/offered so it is asked once. Always exits 0.
-        HEIMDALL_NO_COMPACT_WINDOW_OFFER=1 silences it.
-status  the setting file, the value in it and whether hmd put it there. Exit 1 only when the file cannot be used.
+        HEIMDALL_NO_COMPACT_WINDOW_OFFER=1 silences it. A question left unanswered for 300 seconds is dropped, and not recorded, so it is asked again later;
+        HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S=<seconds> shortens that wait (the test seam: a number above 0 and below 300, anything else is ignored).
+status  the setting file, the value in it and whether hmd put it there, and any other settings file hmd set the key in. Exit 1 only when the file cannot be used.
 
 Exit 0 done or nothing to do. 1 a file that cannot be used or written (nothing was changed; stderr says why). 2 usage. 3 consent required (nothing was written).
 4 refused: the key holds a value that is not hmd's, --force overrides. stdlib only.
@@ -50,6 +54,7 @@ KEY = "autoCompactWindow"
 DEFAULT_TOKENS = 300000
 MIN_TOKENS = 100000
 OFFER_WAIT_S = 300   # an offer left unanswered this long is not asked again that run, and not recorded as answered
+OFFER_WAIT_ENV = "HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S"   # the test seam: a shorter wait, in seconds
 STATE_FILE, BACKUP_FILE, OFFERED_FILE = "state.json", "settings.json.bak", "offered"
 EXIT_FAILED, EXIT_USAGE, EXIT_CONSENT, EXIT_REFUSED = 1, 2, 3, 4
 WHITESPACE = " \t\n\r"
@@ -87,24 +92,48 @@ def settings_path():
     return os.path.join(config, "settings.json")
 
 
+def state_files(settings):
+    """(record, backup): the two files `on` keeps for one settings file, named by a digest of its canonical path (Doc.path). A second settings file (another
+    CLAUDE_CONFIG_DIR) gets a pair of its own, so setting the key there never takes the first one's undo away."""
+    stem = sha256(os.fsencode(settings))[:16]
+    return os.path.join(state_dir(), "%s.%s" % (stem, STATE_FILE)), os.path.join(state_dir(), "%s.%s" % (stem, BACKUP_FILE))
+
+
+def offer_wait():
+    """Seconds an unanswered offer waits: OFFER_WAIT_S, or the shorter wait OFFER_WAIT_ENV asks for (a number above 0 and below OFFER_WAIT_S; anything else is ignored)."""
+    try:
+        seconds = float(os.environ.get(OFFER_WAIT_ENV, ""))
+    except ValueError:
+        return OFFER_WAIT_S
+    return seconds if 0 < seconds < OFFER_WAIT_S else OFFER_WAIT_S
+
+
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def read_bytes(path):
-    """The bytes of `path`; None when it is not there; Unusable when it cannot be read."""
+def read_file(path):
+    """(bytes, identity) of `path`, from one open handle, so the identity is that of the very bytes read: the device and inode the file system names the file by (a
+    file replaced by a copy of itself is not the file that was read). (None, None) when it is not there; Unusable when it cannot be read."""
     try:
         with open(path, "rb") as handle:
-            return handle.read()
+            seen = os.fstat(handle.fileno())
+            return handle.read(), (seen.st_dev, seen.st_ino)
     except FileNotFoundError:
-        return None
+        return None, None
     except OSError as exc:
         raise Unusable("cannot read %s: %s" % (path, exc))
 
 
-def write_atomic(path, data, dir_mode=0o777):
+def read_bytes(path):
+    """The bytes of `path`; None when it is not there; Unusable when it cannot be read."""
+    return read_file(path)[0]
+
+
+def write_atomic(path, data, dir_mode=0o777, before_rename=None):
     """`path` := data through a temp file in the same directory and a rename: a crash leaves the old file or the new one, never half of one. An existing file keeps
-    its permission bits; a new one is private (0600)."""
+    its permission bits; a new one is private (0600). `before_rename` runs once the temp file is complete, as the last step before the rename: it raises to abort,
+    and the temp file is removed."""
     directory = os.path.dirname(path)
     os.makedirs(directory, mode=dir_mode, exist_ok=True)
     try:
@@ -118,6 +147,8 @@ def write_atomic(path, data, dir_mode=0o777):
             out.flush()
             os.fsync(out.fileno())
         os.chmod(temp, mode)
+        if before_rename is not None:
+            before_rename()
         os.replace(temp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -135,7 +166,7 @@ class Doc:
 
     def __init__(self, link):
         self.path = os.path.realpath(link)   # a symlinked settings.json is edited where it points
-        self.raw = read_bytes(self.path)
+        self.raw, self.identity = read_file(self.path)
         self.text = None
         self.members = []                    # (key, key_start, key_end, value_start, value_end)
         self.open_at = self.close_at = 0
@@ -210,16 +241,22 @@ class Doc:
         return self.text[:self.members[index - 1][4]] + self.text[value_end:]
 
 
-def replace_settings(doc, data):
-    """doc.path := data, unless the file is no longer the one `doc` read: then Unusable, and nothing is written."""
-    if read_bytes(doc.path) != doc.raw:
+def ensure_unchanged(doc):
+    """Unusable unless the settings file is, right now, the very file `doc` read (same inode, same bytes): nothing is written over, or removed from under, somebody
+    else's change."""
+    if read_file(doc.path) != (doc.raw, doc.identity):
         raise Unusable("%s changed while hmd was working on it; nothing was written, run the command again" % doc.path)
-    write_atomic(doc.path, data)
 
 
-def load_state():
-    """The record `on` left, None when there is none; Unusable when there is one that cannot be used."""
-    path = os.path.join(state_dir(), STATE_FILE)
+def replace_settings(doc, data):
+    """doc.path := data, unless the file is no longer the one `doc` read: then Unusable, and nothing is written. The look is taken once the new file is complete in its
+    temp file, as the last step before the rename, so the one change it cannot see is one landing in the instant between that look and the rename."""
+    write_atomic(doc.path, data, before_rename=lambda: ensure_unchanged(doc))
+
+
+def load_state(settings):
+    """The record `on` left for the settings file `settings` (its canonical path), None when there is none; Unusable when there is one that cannot be used."""
+    path = state_files(settings)[0]
     raw = read_bytes(path)
     if raw is None:
         return None
@@ -230,15 +267,39 @@ def load_state():
         for field, kind in (("settings", str), ("had_file", bool), ("had_key", bool), ("written", int), ("sha256_after", str)):
             if not isinstance(record.get(field), kind):
                 raise ValueError("its %s is missing" % field)
-    except ValueError as exc:
+        if record["settings"] != settings:
+            raise ValueError("it is the record of another settings file")
+    except (ValueError, RecursionError) as exc:
         raise Unusable("%s cannot be used (%s); remove it by hand once you no longer want hmd to track %s" % (path, exc, KEY))
     return record
 
 
-def forget():
-    """Drop the record and the backup: there is nothing left to undo."""
-    for name in (STATE_FILE, BACKUP_FILE):
-        remove(os.path.join(state_dir(), name))
+def put_record(settings, record):
+    write_atomic(state_files(settings)[0], (json.dumps(record, indent=2) + "\n").encode("utf-8"), 0o700)
+
+
+def other_records(settings):
+    """The settings files, other than `settings`, that hmd set the key in and still holds a record for. A record that cannot be read or used is left out: it is reported
+    when its own settings file is the one asked about."""
+    try:
+        names = sorted(name for name in os.listdir(state_dir()) if name.endswith("." + STATE_FILE))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        try:
+            other = json.loads(read_bytes(os.path.join(state_dir(), name)))["settings"]
+        except (Unusable, ValueError, TypeError, KeyError, RecursionError):
+            continue
+        if isinstance(other, str) and other != settings:
+            found.append(other)
+    return found
+
+
+def forget(settings):
+    """Drop the record and the backup of the settings file `settings`: there is nothing left to undo."""
+    for path in state_files(settings):
+        remove(path)
 
 
 def interactive():
@@ -280,7 +341,8 @@ def parse_tokens(text):
 
 def cmd_on(args):
     try:
-        doc, record = Doc(settings_path()), load_state()
+        doc = Doc(settings_path())
+        record = load_state(doc.path)
     except Unusable as exc:
         warn(str(exc))
         return EXIT_FAILED
@@ -289,12 +351,12 @@ def cmd_on(args):
     if current == wanted:
         say("already set: %s is %s tokens in %s; nothing changed" % (KEY, format(args.tokens, ","), tilde(doc.path)))
         return 0
-    ours = record is not None and record["settings"] == doc.path and current == str(record["written"])
+    ours = record is not None and current == str(record["written"])
     if found is not None and not ours and not args.force:
         warn("%s is already %s in %s: that is your own setting, so it was left alone. --force replaces it (hmd compact-window off then puts %s back)"
              % (KEY, current, tilde(doc.path), current))
         return EXIT_REFUSED
-    backup = os.path.join(state_dir(), BACKUP_FILE)
+    backup = state_files(doc.path)[1]
     now = "not set" if found is None else "%s (%s)" % (current, "set by hmd earlier" if ours else "yours; --force replaces it")
     if not consent(args, "this writes %s" % tilde(doc.path), [
             "hmd compact-window on: set the auto-compact window to %s tokens." % format(args.tokens, ","),
@@ -316,11 +378,14 @@ def cmd_on(args):
                 remove(backup)
             else:
                 write_atomic(backup, doc.raw, 0o700)
-        write_atomic(os.path.join(state_dir(), STATE_FILE), (json.dumps(written, indent=2) + "\n").encode("utf-8"), 0o700)
+        put_record(doc.path, written)
         replace_settings(doc, new)
     except (OSError, Unusable) as exc:
         if not ours:
-            forget()
+            forget(doc.path)
+        else:
+            with contextlib.suppress(OSError):   # the file was not changed: its record goes back to describing it
+                put_record(doc.path, record)
         warn("%s was not changed: %s" % (tilde(doc.path), exc))
         return EXIT_FAILED
     say("set %s to %s tokens in %s" % (KEY, format(args.tokens, ","), tilde(doc.path)))
@@ -332,16 +397,19 @@ def cmd_on(args):
 
 def cmd_off(args):
     try:
-        record = load_state()
+        settings = os.path.realpath(settings_path())
+        record = load_state(settings)
         if record is None:
-            say("hmd did not set %s: nothing to undo" % KEY)
+            say("hmd did not set %s in %s: nothing to undo" % (KEY, tilde(settings)))
+            for other in other_records(settings):
+                say("hmd did set it in %s: undo that one with its own CLAUDE_CONFIG_DIR, hmd compact-window off" % tilde(other))
             return 0
-        doc = Doc(record["settings"])
+        doc = Doc(settings)
     except Unusable as exc:
         warn(str(exc))
         return EXIT_FAILED
     if doc.member is None:
-        forget()
+        forget(doc.path)
         say("%s is not in %s any more: nothing to undo, the record is cleared" % (KEY, tilde(doc.path)))
         return 0
     if doc.value_text != str(record["written"]) and not args.force:
@@ -353,12 +421,11 @@ def cmd_off(args):
             "hmd compact-window off: put %s in %s back as it was before hmd set it." % (KEY, tilde(doc.path)),
             "  result  %s; nothing else in the file is touched" % before]):
         return EXIT_CONSENT
-    backup = read_bytes(os.path.join(state_dir(), BACKUP_FILE)) if record["had_file"] else None
-    exact = sha256(doc.raw) == record["sha256_after"] and (backup is not None or not record["had_file"])
     try:
+        backup = read_bytes(state_files(doc.path)[1]) if record["had_file"] else None
+        exact = sha256(doc.raw) == record["sha256_after"] and (backup is not None or not record["had_file"])
         if exact and not record["had_file"]:
-            if read_bytes(doc.path) != doc.raw:
-                raise Unusable("%s changed while hmd was working on it; nothing was written, run the command again" % doc.path)
+            ensure_unchanged(doc)
             remove(doc.path)
         elif exact:
             replace_settings(doc, backup)
@@ -367,7 +434,7 @@ def cmd_off(args):
     except (OSError, Unusable) as exc:
         warn("%s was not changed: %s" % (tilde(doc.path), exc))
         return EXIT_FAILED
-    forget()
+    forget(doc.path)
     say("restored %s: %s%s" % (tilde(doc.path), "back to %s" % record["previous_raw"] if record["had_key"] else "%s removed" % KEY,
                               "" if exact else " (the file had changed since; only the key was reverted)"))
     return 0
@@ -375,17 +442,20 @@ def cmd_off(args):
 
 def cmd_status(args):
     try:
-        doc, record = Doc(settings_path()), load_state()
+        doc = Doc(settings_path())
+        record = load_state(doc.path)
         offered = read_bytes(os.path.join(state_dir(), OFFERED_FILE))
     except Unusable as exc:
         warn(str(exc))
         return EXIT_FAILED
-    ours = record is not None and record["settings"] == doc.path and doc.value_text == str(record["written"])
+    ours = record is not None and doc.value_text == str(record["written"])
     say("%-9s %s%s" % ("settings", tilde(doc.path), "" if doc.raw is not None else " (does not exist yet)"))
     if doc.member is None:
         say("%-9s not set (the agent's own default applies; `hmd compact-window on` sets it, with your yes)" % "window")
     else:
         say("%-9s %s (%s)" % ("window", doc.value_text, "set by hmd; `hmd compact-window off` undoes it" if ours else "your own setting; hmd did not set it"))
+    for other in other_records(doc.path):
+        say("%-9s hmd also set it in %s; undo that one with its own CLAUDE_CONFIG_DIR, hmd compact-window off" % ("elsewhere", tilde(other)))
     if os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
         say("%-9s CLAUDE_CODE_AUTO_COMPACT_WINDOW=%s is also set in this environment" % ("env", os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]))
     answer = (offered or b"").decode("utf-8", "replace").split()
@@ -418,7 +488,7 @@ def cmd_offer(args):
                      "  On one long session that would have cut about 40%% of main-thread spend; older detail is summarized sooner.\n"
                      "  The file is backed up first, nothing else in it changes, and `hmd compact-window off` puts it back.\n"
                      % (format(DEFAULT_TOKENS, ","), KEY, tilde(doc.path)))
-    answer = ask("Set it now? [y/N] ", OFFER_WAIT_S)
+    answer = ask("Set it now? [y/N] ", offer_wait())
     if answer is None:
         return 0
     if answer:
