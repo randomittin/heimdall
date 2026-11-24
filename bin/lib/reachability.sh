@@ -781,7 +781,7 @@ reach_build_class() {
 # evals/benchmark/false-green/PREREG.md. The tokenizer took the directory `benchmark` for the
 # command bin/benchmark, and with no hook change anywhere bin/benchmark, bin/heimdall-bench
 # and (through bin/lib/fg_bench.py) bin/heimdall-attack went REACHABLE -> LIVE: 150 of 248
-# executables (v2.4.12) became 154 of 249, over the anti-vacuity ceiling. bin/heimdall-cost-
+# executables (the previous release) became 154 of 249, over the anti-vacuity ceiling. bin/heimdall-cost-
 # forensics had read LIVE the same way for longer, off "read by bin/heimdall-cost-forensics"
 # in the file's `purpose`. As with the dispatcher, only the LIVE closure changes: edges-code,
 # so REACHABLE and the dead set, are untouched, and a bin named only from a data file still
