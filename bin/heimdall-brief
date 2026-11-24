@@ -3,9 +3,11 @@
 #
 # A spawned agent's brief = task spec + the few symbols/files it actually
 # references, resolved to spans + blast radius, + referenced capsule IDs
-# (hydrated to their dependency closure) + invariants ref. NEVER the plan,
-# NEVER prior conversation, NEVER restated acceptance criteria. The brief is
-# the on-the-wire context a delta-spawn gets.
+# (hydrated to their dependency closure) + invariants ref. NEVER the plan
+# (--plan inlines the ONE section of it that is this task's own, so the agent
+# never Reads the plan whole; the rest of the plan stays out), NEVER prior
+# conversation, NEVER restated acceptance criteria (the slice IS them). The
+# brief is the on-the-wire context a delta-spawn gets.
 #
 # Symbols resolve from bin/heimdall-graph — the live symbol index over the real
 # tree — NOT from a hand-maintained copy of it. That direction is deliberate:
@@ -32,13 +34,17 @@
 #
 # Usage:
 #   heimdall-brief build --task <id> --spec <text> [--symbols a,b] [--files p,q]
-#       [--capsules x,y] [--invariants <ref>] [--callers N] [--repo DIR]
+#       [--capsules x,y] [--invariants <ref>] [--plan FILE] [--callers N] [--repo DIR]
 #   -h, --help
 #
 # Flags:
 #   --symbols a,b   code symbols (or curated alias ids) the task references
 #   --files p,q     files the task touches — emitted as OUTLINES (spans), so an
 #                   agent reads the one span it needs instead of the whole file
+#   --plan FILE     the plan holding this task's section: the section of --task <id> is inlined verbatim (its files and
+#                   criteria), capped, and nothing else of the plan comes along, so the agent never Reads the plan whole.
+#                   An id the plan lacks is an unresolved ref (exit 1). A relative FILE is read from --repo. The slicer is
+#                   bin/heimdall-plan-slice: one reader of where a task starts and ends.
 #   --callers N     caller rows per symbol (default 5; 0 = none)
 #   --repo DIR      resolve against DIR instead of the repo containing $PWD
 #
@@ -67,15 +73,16 @@ if ! proto_ensure_dirs 2>/dev/null; then
     "it could not be created, so no ref could be looked up" || exit 3
 fi
 
-usage() { sed -n '2,42p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,48p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 [ $# -ge 1 ] || { echo "error: 'build' subcommand required" >&2; usage >&2; exit 2; }
 case "$1" in -h|--help) usage; exit 0 ;; build) shift ;; *) echo "error: unknown subcommand: $1" >&2; exit 2 ;; esac
 
-task=""; spec=""; symbols=""; files=""; capsules=""; invariants=""; repo=""; callers_cap=5
+task=""; spec=""; symbols=""; files=""; capsules=""; invariants=""; plan=""; repo=""; callers_cap=5
 while [ $# -gt 0 ]; do
   case "$1" in
     --task)       task="${2:?--task needs a value}"; shift 2 ;;
+    --plan)       plan="${2:?--plan needs a value}"; shift 2 ;;
     --spec)       spec="${2:?--spec needs a value}"; shift 2 ;;
     --symbols)    symbols="${2:?--symbols needs a value}"; shift 2 ;;
     --files)      files="${2:?--files needs a value}"; shift 2 ;;
@@ -140,6 +147,24 @@ resolver_down() {
 }
 
 alias_value() { jq -r --arg id "$1" '.symbols[$id] // empty' "$SYMBOLS_FILE"; }
+
+# ── plan slice (this task's own section of the plan, never the plan) ─────────
+# One slicer answers: bin/heimdall-plan-slice, so this brief, an agent asking for its own slice and the Read hook's advice cannot disagree about
+# where a task starts and ends. Exit 0 = the section; 4 = proven absent (no such file, or no such id in it), an unresolved ref that refuses the
+# brief exactly as a symbol the graph does not know does; anything else = the slicer never answered: NON_VERIFIED, never "no slice needed".
+if [ -n "$plan" ]; then
+  PLAN_BIN="${HEIMDALL_PLAN_SLICE_BIN:-$SOURCE_DIR/heimdall-plan-slice}"
+  set +e
+  PLAN_OUT="$(cd "$REF_BASE" && "$PLAN_BIN" slice --plan "$plan" --task "$task" 2>"$WORKDIR/plan.err")"
+  PLAN_RC=$?
+  set -e
+  case "$PLAN_RC" in
+    0) { printf '%s\n' "$PLAN_OUT"; echo; } >> "$BODY" ;;
+    4) brief_core_missing "plan task $task — $(head -n 1 "$WORKDIR/plan.err")" ;;
+    *) brief_core_nonverified "plan slicer unreachable — $PLAN_BIN exited $PLAN_RC" "the task's plan section was never checked" || true
+       exit 3 ;;
+  esac
+fi
 
 # ── symbols ──────────────────────────────────────────────────────────────────
 caller_caveat=""
@@ -247,7 +272,11 @@ fi
 nmissing="$(brief_core_missing_count)"
 
 echo "=== DELTA BRIEF — task $task ==="
-echo "# Refs only. Not the plan, not prior conversation, not restated criteria."
+if [ -n "$plan" ]; then
+  echo "# Refs, plus this task's own section of the plan. Not the whole plan, not prior conversation."
+else
+  echo "# Refs only. Not the plan, not prior conversation, not restated criteria."
+fi
 if [ "$nmissing" -gt 0 ]; then
   echo
   brief_core_incomplete_banner "$nmissing"

@@ -10,6 +10,7 @@ Every template below has a `Context:` block. Build it with `bin/heimdall-brief`:
 bin/heimdall-brief build \
   --task <task-id> \
   --spec "<one-line task spec>" \
+  --plan   <the plan file, when the task comes from one; --task is then its id in that plan> \
   --symbols <comma-list of symbols the task touches> \
   --files   <comma-list of files the task edits> \
   --capsules <prior-wave capsule ids> \
@@ -26,6 +27,13 @@ given constraints it never received. This example previously said
 symbol index (`bin/heimdall-graph`), so each one arrives as a real
 `file:line-range` plus the sites that call it, and each `--files` entry arrives
 as an outline of spans rather than a file body.
+
+**A task that comes from a plan carries ITS section of it, not the plan.** `--plan <file>` inlines the section of `--task <id>` (its files and acceptance
+criteria, verbatim, capped at 8000 chars) as a `PLAN SLICE` block and nothing else of the plan; an id the plan lacks refuses the brief (exit 1). Plan files
+(`.planning/**/PLAN*.md`, `docs/superpowers/plans/*.md`) are 28-128 KB and were read whole by 76, 22, 17 and 13 coders for four plans (12.5% of a session's
+subagent Read characters), and every byte rides every later request. The slice IS the acceptance criteria: do not restate them in the prompt, and never paste
+the plan or a sibling task's section. The slicer is `bin/heimdall-plan-slice`: `list --plan <file>` shows the task ids and line ranges, `slice --plan <file>
+--task <id>` re-prints one section, which is also what a coder that arrives without one is told to run.
 
 **"Self-contained" means the agent needs no follow-up conversation. It does NOT
 mean restating the plan.** A brief is self-contained: spans say where to look,
@@ -81,12 +89,13 @@ Scope:
 - [Files to create/modify]
 
 Context:
-- [paste `heimdall-brief build --task ... --symbols ... --files ...` output:
-   symbol spans + their callers + touched-file outlines + capsule closure]
+- [paste `heimdall-brief build --task ... --plan <plan> --symbols ... --files ...` output:
+   the task's own plan section + symbol spans + their callers + touched-file outlines + capsule closure]
 - [Patterns to follow, as file:line exemplars]
 - [Skills to apply]
 
 Constraints:
+- Never Read the plan file whole: your `PLAN SLICE` is your section of it
 - Only modify files in [SCOPE]
 - Do not touch [OUT-OF-SCOPE areas]
 - Write tests alongside implementation

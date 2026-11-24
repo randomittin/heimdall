@@ -172,6 +172,16 @@
       "remote_toggle": false
     },
     {
+      "event": "PreToolUse",
+      "index": 10,
+      "id": "plan-slice-hint",
+      "description": "Advisory, never a deny: a subagent's Read of a whole plan file (.planning/**/PLAN*.md, .planning/plans/*.md, docs/superpowers/plans/*.md; no offset, no limit; 6000 bytes or more) gets additionalContext naming `heimdall-plan-slice slice --plan <file> --task <id>` and `list`, so a coder takes its task's section instead of the 28-128 KB plan (lever 6 of the 2026-11-22 token-utilization analysis). The main thread's own reads (no agent_id) are never touched. A shell substring test on the payload runs first, so a Read that names no plan starts no process. Stateless. Fail-open: any error leaves the Read alone, exit 0. Off: HMD_PLAN_SLICE=off, or heimdall-hooks disable plan-slice-hint (hmd guardrails off plan-slice-hint).",
+      "matcher": "Read",
+      "fingerprint": "cc2cd0e9235894e04926972d92b6e2052b54afa766e4d8560f7d5a731a9ece12",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "PostToolUse",
       "index": 0,
       "id": "corpus-capture",

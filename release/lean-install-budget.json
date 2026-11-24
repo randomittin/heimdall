@@ -57,9 +57,9 @@
         "Grep": 4,
         "MultiEdit": 5,
         "NotebookEdit": 3,
-        "Read": 4,
+        "Read": 5,
         "Write": 6,
-        "total": 10
+        "total": 11
       },
       "SessionEnd": {
         "*": 3,
@@ -83,8 +83,8 @@
         "total": 7
       }
     },
-    "hooks_total": 58
+    "hooks_total": 59
   },
-  "note": "Ceilings for a LEAN install tree: build one the way install.sh does (git clone --depth 1, then bash bin/lib/lean_sparse.sh apply lean DIR) and run bin/heimdall-footprint --check --root DIR --budget release/lean-install-budget.json. Measured on 2026-11-22 after the lean-core merge: 15,631,195 B in 1,122 files, 1 skill and 19 commands described in context, the same 56 hooks as the full tree (INV-L3); the hook ceilings were then raised on purpose to 58 on 2026-11-24, with the full tree's, for the two hooks added that day (read-dedup on PostToolUse Read, subagent-report-gate on SubagentStop). The context and hook ceilings are exact. The two disk ceilings are those numbers rounded up (to the next 100 KB and the next 10 files) because the lean tree carries CHANGELOG.md and release/lean-budget.json, which change with every release. The main prompt ceiling is agents/heimdall.md: the lean prompt (agents/heimdall-lean.md, 29,336 B) is selected in the user-level settings by install.sh --reset once its parity receipt is green, which --root does not see; the lean-core doc under docs/ says how much that saves.",
+  "note": "Ceilings for a LEAN install tree: build one the way install.sh does (git clone --depth 1, then bash bin/lib/lean_sparse.sh apply lean DIR) and run bin/heimdall-footprint --check --root DIR --budget release/lean-install-budget.json. Measured on 2026-11-22 after the lean-core merge: 15,631,195 B in 1,122 files, 1 skill and 19 commands described in context, the same 56 hooks as the full tree (INV-L3); the hook ceilings were then raised on purpose to 58 on 2026-11-24, with the full tree's, for the two hooks added that day (read-dedup on PostToolUse Read, subagent-report-gate on SubagentStop), and to 59 on 2026-11-25 for plan-slice-hint on PreToolUse Read. The context and hook ceilings are exact. The two disk ceilings are those numbers rounded up (to the next 100 KB and the next 10 files) because the lean tree carries CHANGELOG.md and release/lean-budget.json, which change with every release. The main prompt ceiling is agents/heimdall.md: the lean prompt (agents/heimdall-lean.md, 29,336 B) is selected in the user-level settings by install.sh --reset once its parity receipt is green, which --root does not see; the lean-core doc under docs/ says how much that saves.",
   "schema": 1
 }

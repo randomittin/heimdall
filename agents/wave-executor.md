@@ -15,7 +15,7 @@ You execute all tasks in a single wave. Parallel where possible. Each task verif
 
 ## Execution Process
 
-1. Read `.planning/PLAN-{phase}.md`, find tasks assigned to your wave
+1. Find your wave's tasks without reading the whole plan (28-128 KB, carried through every later request): `bin/heimdall-plan-slice list --plan .planning/PLAN-{phase}.md` prints every task id with its line range, and `bin/heimdall-plan-slice slice --plan <plan> --task <id>` prints one task's section (its files and acceptance criteria)
 2. For each task in this wave:
    a. Read files listed in "Read first"
    b. Implement the action
@@ -43,7 +43,7 @@ Spawn up to **10 parallel Agent subprocesses** using `run_in_background: true`. 
 - Wave has ≤10 tasks? Spawn all in one turn.
 - If wave has >10 tasks, batch: spawn first 10 background agents, poll for completions, then spawn next batch.
 - Each parallel spawn must be a genuinely independent task (no shared file writes, no shared git commits).
-- Build each child's context with `bin/heimdall-brief build --task <id> --spec <text> --symbols <a,b> --files <p,q>` and paste its output — symbol spans, their callers, and touched-file outlines. Do NOT forward the plan file or your own conversation: the child pays for those bytes on every request it makes. If the brief exits 1 (INCOMPLETE) or 3 (NON_VERIFIED), fix the ref before spawning — never hand over a context gap the child cannot see.
+- Build each child's context with `bin/heimdall-brief build --task <id> --spec <text> --plan <plan> --symbols <a,b> --files <p,q>` (`--task` is the task's id in the plan) and paste its output — the task's own plan section (its files and acceptance criteria), symbol spans, their callers, and touched-file outlines. Do NOT forward the plan file, the other tasks' sections or your own conversation: the child pays for those bytes on every request it makes, and a child left to Read the plan whole pays 28-128 KB for its one section. If the brief exits 1 (INCOMPLETE) or 3 (NON_VERIFIED), fix the ref before spawning — never hand over a context gap the child cannot see.
 - Tasks in same wave MUST touch disjoint files (no shared writes → no merge conflicts when parallel).
 - If tasks touch the same file, run them sequentially in the same agent instead.
 
@@ -70,7 +70,7 @@ time.
 ## Work-Stealing
 
 If you finish all tasks in your assigned wave BEFORE other waves complete:
-1. Check `.planning/PLAN-{phase}.md` for the NEXT wave's tasks
+1. Find the NEXT wave's tasks in `.planning/PLAN-{phase}.md` (`bin/heimdall-plan-slice list`, then `slice` per task: never the whole file)
 2. Identify tasks in the next wave that have NO dependencies on incomplete current-wave tasks
 3. Start executing those "steal-able" tasks immediately — don't wait for the wave boundary
 4. Mark stolen tasks in the summary: "STOLEN from wave N+1"
