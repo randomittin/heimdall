@@ -22,6 +22,14 @@
 #   (g) a MISSING file yields a degraded record, exit 0.
 #   (h) --cwd <dir> resolves the NEWEST session JSONL under the cwd-slug dir and
 #       sums it (the sweep's resolution path), against a synthetic projects root.
+#   (o-s) the derived cost holds no rate of its own: it reads the model_prices rows of
+#       bin/lib/tier-table.json (through bin/lib/hmd_model_prices.py). (o) the model the
+#       record names is priced at its own row (Opus 5.5 and Sonnet 5.5, not the Opus 5
+#       rates), (p) a record that names no listed model is priced at the opus tier's
+#       newest row and the note says so, (q) a changed table row moves the figure, (r) a
+#       model that bills a second card by prompt length cannot be priced from an
+#       aggregate record: null + a note, (s) an unreadable table or a missing reader
+#       degrades to null + a note, exit 0, and the modes that need no prices still work.
 
 set -euo pipefail
 
@@ -303,9 +311,9 @@ else
   bad "(m) emitted reported-cost pass-through wrong"; printf '%s\n' "$EREC"
 fi
 
-# ── (n) emitted cost NULL => DERIVE from the documented opus pricing table. ──
-# rates ($/Mtok): input 5.00, output 25.00, cache_creation 6.25 (1.25x input),
-#                 cache_read 0.50 (0.1x input).
+# ── (n) emitted cost NULL => DERIVE from the model_prices table, at the row of the model the record names. ──
+# The fixture names claude-opus-4-8, whose row lists ($/Mtok): input 5.00, output 25.00, cache_creation
+# 6.25 (1.25x input), cache_read 0.50 (0.1x input).
 # fixture: in=1_000_000 out=1_000_000 cc=1_000_000 cr=1_000_000, total_cost_usd null.
 #   derived = 5.00 + 25.00 + 6.25 + 0.50 = 36.75
 EMITTED_NOCOST="$WORK/emitted-nocost.json"
@@ -326,7 +334,7 @@ if printf '%s' "$ENC" | jq -e '
     .total_cost_usd == 36.75 and .cost_source == "derived"
   ' >/dev/null 2>&1; then
   COSTV="$(printf '%s' "$ENC" | jq -r '.total_cost_usd')"
-  ok "(n) emitted cost null => DERIVED from opus rates (\$36.75 = 5+25+6.25+0.5), cost_source=derived ($COSTV)"
+  ok "(n) emitted cost null => DERIVED at the named model's row (Opus 4.8: \$36.75 = 5+25+6.25+0.5), cost_source=derived ($COSTV)"
 else
   bad "(n) derived cost wrong (expected 36.75 + cost_source=derived)"; printf '%s\n' "$ENC"
 fi
@@ -341,6 +349,169 @@ if printf '%s' "$ENC" | jq -e '
   ok "(n2) derived-cost record keeps token counts verbatim (never fabricated): total=4M, non_cache=3M"
 else
   bad "(n2) derived-cost record altered token counts"; printf '%s\n' "$ENC"
+fi
+
+# ── (o)-(s) the derived cost reads the ONE price table: bin/lib/tier-table.json model_prices ──
+# heimdall-tokens holds no rate. It prices the model the record NAMES at that model's own row, the opus
+# tier's newest row when the record names no listed model (the note says so), and a figure it cannot back
+# is null + a note, never a guess. Fixture: 1M tokens of every class and no reported cost, so the derived
+# figure is the sum of that row's four rates.
+emit_nocost() {  # emit_nocost <file> [model]
+  local model_line=""
+  [ -n "${2:-}" ] && model_line="\"model\": \"$2\","
+  cat > "$1" <<EOF
+{
+  "session_id": "emit-fixture-prices",
+  "input_tokens": 1000000,
+  "output_tokens": 1000000,
+  "cache_creation_tokens": 1000000,
+  "cache_read_tokens": 1000000,
+  "total_cost_usd": null,
+  $model_line
+  "usage_available": true
+}
+EOF
+}
+
+# Opus 5.5 lists $4 in / $20 out, cache reads $0.20 (0.05x), cache writes 1.25x input = $5.
+#   derived = 4 + 20 + 5 + 0.2 = 29.20   (the Opus 5 rates this tool used to hardcode give 36.75)
+emit_nocost "$WORK/e-opus55.json" claude-opus-5-5
+O55="$("$TOK" emitted "$WORK/e-opus55.json")"
+if printf '%s' "$O55" | jq -e '
+    .total_cost_usd == 29.2 and .cost_source == "derived" and (.note | contains("opus 5.5"))
+  ' >/dev/null 2>&1; then
+  ok "(o) a record naming Opus 5.5 is derived at Opus 5.5's rates (\$29.20 = 4+20+5+0.2), not Opus 5's \$36.75"
+else
+  bad "(o) Opus 5.5 record not derived at the 5.5 rates (expected 29.2, note naming 'opus 5.5')"; printf '%s\n' "$O55"
+fi
+
+# Sonnet 5.5 lists $2 in / $10 out, cache reads $0.10 (0.05x), cache writes $2.50.
+#   derived = 2 + 10 + 2.5 + 0.1 = 14.60   (a model's tokens are not priced at another family's rates)
+emit_nocost "$WORK/e-sonnet55.json" claude-sonnet-5-5
+S55="$("$TOK" emitted "$WORK/e-sonnet55.json")"
+if printf '%s' "$S55" | jq -e '
+    .total_cost_usd == 14.6 and .cost_source == "derived" and (.note | contains("sonnet 5.5"))
+  ' >/dev/null 2>&1; then
+  ok "(o2) a record naming Sonnet 5.5 is derived at Sonnet 5.5's rates (\$14.60 = 2+10+2.5+0.1)"
+else
+  bad "(o2) Sonnet 5.5 record not derived at its own rates (expected 14.6, note naming 'sonnet 5.5')"; printf '%s\n' "$S55"
+fi
+
+# No model named, or one the table has no row for: the opus tier's newest row stands in, and the note says which.
+emit_nocost "$WORK/e-nomodel.json"
+NMR="$("$TOK" emitted "$WORK/e-nomodel.json")"
+if printf '%s' "$NMR" | jq -e '
+    .total_cost_usd == 29.2 and .cost_source == "derived"
+    and (.note | contains("opus 5.5")) and (.note | contains("names no model"))
+  ' >/dev/null 2>&1; then
+  ok "(p) a record naming no model is derived at the opus tier's newest row (\$29.20) and the note says it names no model"
+else
+  bad "(p) a record naming no model is not priced at the opus tier's newest row with a note saying so"; printf '%s\n' "$NMR"
+fi
+emit_nocost "$WORK/e-unlisted.json" claude-sonnet-9-9
+ULR="$("$TOK" emitted "$WORK/e-unlisted.json")"
+if printf '%s' "$ULR" | jq -e '
+    .total_cost_usd == 29.2 and .cost_source == "derived" and (.note | contains("claude-sonnet-9-9 has no row"))
+  ' >/dev/null 2>&1; then
+  ok "(p2) a model the table has no row for is derived at the opus tier's newest row, and the note names the model that had no row"
+else
+  bad "(p2) an unlisted model is not priced at the opus tier with a note naming it"; printf '%s\n' "$ULR"
+fi
+
+# The same tool beside a COPY of its price reader and a table the test controls (bin/ and bin/lib/ mirror the
+# repo, so the tool finds both the way it does in an install): proof it reads the table instead of holding a rate.
+mk_tree() {  # mk_tree <dir>
+  mkdir -p "$1/bin/lib" \
+    && cp "$TOK" "$1/bin/heimdall-tokens" \
+    && cp "$ROOT/bin/lib/hmd_model_prices.py" "$1/bin/lib/hmd_model_prices.py" \
+    && cp "$ROOT/bin/lib/tier-table.json" "$1/bin/lib/tier-table.json"
+}
+
+# (q) the opus 5.5 input rate is $40 in this copy: writes follow it (1.25x = $50), reads keep the row's own $0.20.
+#   derived = 40 + 20 + 50 + 0.2 = 110.20
+if mk_tree "$WORK/tree-mut"; then
+  python3 - "$WORK/tree-mut/bin/lib/tier-table.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+table = json.load(open(path))
+for row in table["model_prices"]["rows"]:
+    if row["family"] == "opus" and row["version"] == "5.5":
+        row["input"] = 40.0
+json.dump(table, open(path, "w"))
+PY
+  MUR="$("$WORK/tree-mut/bin/heimdall-tokens" emitted "$WORK/e-opus55.json")"
+  if printf '%s' "$MUR" | jq -e '.total_cost_usd == 110.2 and .cost_source == "derived"' >/dev/null 2>&1; then
+    ok "(q) one rate source: the same record costs \$110.20 when the table's opus 5.5 input rate is \$40, so no rate is held in the tool"
+  else
+    bad "(q) the derived cost did not follow a changed table row (expected 110.2)"; printf '%s\n' "$MUR"
+  fi
+else
+  bad "(q) could not build a tool tree: bin/lib/hmd_model_prices.py is missing"
+fi
+
+# (r) a model that bills a second rate card by prompt length (here: opus 5.5 above 200,000 prompt tokens) cannot be
+#     priced from an aggregate record, which does not say which requests crossed the threshold: null + a note.
+if mk_tree "$WORK/tree-long"; then
+  python3 - "$WORK/tree-long/bin/lib/tier-table.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+table = json.load(open(path))
+for row in table["model_prices"]["rows"]:
+    if row["family"] == "opus" and row["version"] == "5.5":
+        row["long_context"] = {"above_prompt_tokens": 200000, "input": 8.0, "output": 40.0}
+json.dump(table, open(path, "w"))
+PY
+  LGR="$("$WORK/tree-long/bin/heimdall-tokens" emitted "$WORK/e-opus55.json")"
+  if printf '%s' "$LGR" | jq -e '
+      .total_cost_usd == null and .cost_source == null and .total_tokens == 4000000
+      and (.note | contains("200000 prompt tokens"))
+    ' >/dev/null 2>&1; then
+    ok "(r) a model with a prompt-length rate card is not priced from an aggregate record: null + a note naming the threshold, tokens intact"
+  else
+    bad "(r) a long-context model was priced from an aggregate record"; printf '%s\n' "$LGR"
+  fi
+else
+  bad "(r) could not build a tool tree: bin/lib/hmd_model_prices.py is missing"
+fi
+
+# (s) fail-open: an unreadable table, or a missing price reader, degrades the derived cost to null + a note (exit 0, tokens
+#     intact); the modes that need no prices never notice.
+if mk_tree "$WORK/tree-bad"; then
+  printf '{not json' > "$WORK/tree-bad/bin/lib/tier-table.json"
+  set +e
+  BTR="$("$WORK/tree-bad/bin/heimdall-tokens" emitted "$WORK/e-opus55.json" 2>/dev/null)"; BTRC=$?
+  set -e
+  if [ "$BTRC" -eq 0 ] && printf '%s' "$BTR" | jq -e '
+      .total_cost_usd == null and .cost_source == null and .total_tokens == 4000000
+      and (.note | contains("could not be read"))
+    ' >/dev/null 2>&1; then
+    ok "(s) an unreadable price table => null cost + a note, tokens intact, exit 0 (fail-open)"
+  else
+    bad "(s) an unreadable price table was not degraded cleanly (rc=$BTRC)"; printf '%s\n' "$BTR"
+  fi
+else
+  bad "(s) could not build a tool tree: bin/lib/hmd_model_prices.py is missing"
+fi
+if mk_tree "$WORK/tree-nolib"; then
+  rm -f "$WORK/tree-nolib/bin/lib/hmd_model_prices.py"
+  set +e
+  NLR="$("$WORK/tree-nolib/bin/heimdall-tokens" emitted "$WORK/e-opus55.json" 2>/dev/null)"; NLRC=$?
+  NLJ="$("$WORK/tree-nolib/bin/heimdall-tokens" json "$BLOB" 2>/dev/null)"; NLJRC=$?
+  set -e
+  if [ "$NLRC" -eq 0 ] && printf '%s' "$NLR" | jq -e '
+      .total_cost_usd == null and .total_tokens == 4000000 and (.note | contains("could not be read"))
+    ' >/dev/null 2>&1; then
+    ok "(s2) a missing price reader => null cost + a note, exit 0 (the tool does not die at import)"
+  else
+    bad "(s2) a missing price reader was not degraded cleanly (rc=$NLRC)"; printf '%s\n' "$NLR"
+  fi
+  if [ "$NLJRC" -eq 0 ] && printf '%s' "$NLJ" | jq -e '.total_tokens == 47910 and .total_cost_usd == 0.1234' >/dev/null 2>&1; then
+    ok "(s3) json mode needs no prices and is unaffected by a missing price reader"
+  else
+    bad "(s3) json mode broke when the price reader was missing (rc=$NLJRC)"; printf '%s\n' "$NLJ"
+  fi
+else
+  bad "(s2) could not build a tool tree: bin/lib/hmd_model_prices.py is missing"
 fi
 
 echo

@@ -128,32 +128,80 @@ def _as_float(v):
         return None
 
 
-# ── Documented opus pricing table ($/Mtok) — see TOKEN-METRIC.md ──────────────
+# ── Derived cost ($/Mtok): the model_prices rows of bin/lib/tier-table.json ────
 # Used ONLY to DERIVE total_cost_usd when the source carries no cost (the emitted
-# path). Token counts are NEVER fabricated — only cost may be a labeled derived
-# estimate (cost_source == "derived"). cache_creation (the cache WRITE, 5-minute
-# ephemeral TTL) is 1.25x the input price; cache_read is ~0.1x the input price
-# (the steep discount that is exactly why cache_read is excluded from the budget).
-_OPUS_RATE_PER_MTOK = {
-    "input": 5.00,
-    "output": 25.00,
-    "cache_creation": 6.25,   # 1.25 x input  (5-minute ephemeral cache write)
-    "cache_read": 0.50,       # 0.1  x input  (cache read — the steep discount)
-}
+# path). No rate is written here: they are read through bin/lib/hmd_model_prices.py
+# from the repo's one price table, so a new generation is priced by adding a row
+# there. Token counts are NEVER fabricated — only cost may be a labeled derived
+# estimate (cost_source == "derived"). The record's own model is priced at its own
+# row; a record that names no model, or one the table has no row for, is priced at
+# the opus tier's newest row (what this tool has always derived) and the note says
+# so. cache_creation (the cache WRITE, 5-minute ephemeral TTL) is the row's
+# cache_write_5m, 1.25x its input price; cache_read is the row's own price, 0.05x
+# to 0.1x of input (the steep discount that is exactly why cache_read is excluded
+# from the budget). A figure the table cannot back is null + a note, never a guess:
+# a model that bills a second rate card by prompt length cannot be priced from an
+# aggregate record, and an unreadable table prices nothing.
 _MTOK = 1_000_000.0
 
 
-def derive_opus_cost(rec):
-    """DERIVE total_cost_usd from the documented opus rates and the MEASURED token
-    components in rec. Never invents token counts — it multiplies the exact
-    measured counts by the published per-Mtok rates. Returns a rounded float.
+def _price_table():
+    """(hmd_model_prices, its rows). The module is imported on first use: only the
+    derived cost needs it, and a meter that must never abort its consumer cannot die
+    at import because a file beside it is missing. Raises ImportError, or ValueError
+    (hmd_model_prices.PricesError) when the table cannot be read.
     """
-    return round(
-        rec["input_tokens"] * _OPUS_RATE_PER_MTOK["input"] / _MTOK
-        + rec["output_tokens"] * _OPUS_RATE_PER_MTOK["output"] / _MTOK
-        + rec["cache_creation_tokens"] * _OPUS_RATE_PER_MTOK["cache_creation"] / _MTOK
-        + rec["cache_read_tokens"] * _OPUS_RATE_PER_MTOK["cache_read"] / _MTOK,
+    lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+    if lib not in sys.path:
+        sys.path.append(lib)
+    import hmd_model_prices
+    return hmd_model_prices, hmd_model_prices.load()
+
+
+def _label(card):
+    return "%s %s" % (card["family"], card["version"])
+
+
+def derive_cost(rec):
+    """DERIVE (total_cost_usd, note) from the model_prices table and the MEASURED
+    token components in rec. Never invents token counts — it multiplies the exact
+    measured counts by the row's per-Mtok rates. When the table cannot price this
+    record the cost is None and the note says why.
+    """
+    try:
+        prices_module, prices = _price_table()
+    except (ImportError, ValueError) as e:
+        return None, "the model_prices table could not be read (%s)" % e
+    model = rec.get("model")
+    card = prices_module.card_for(prices, model)
+    stands_in = ""
+    if card is None:
+        card = prices_module.tier_card(prices, "opus")
+        if card is None:
+            return None, "the model_prices table has no opus row to price a record that names no listed model"
+        stands_in = ", the opus tier's newest row because %s" % (
+            "%s has no row there" % model if model else "the record names no model")
+    if card["long_context"] is not None:
+        return None, (
+            "%s bills a second rate card above %d prompt tokens, and an aggregate "
+            "record cannot say which requests crossed it"
+            % (_label(card), card["long_context"]["above_prompt_tokens"])
+        )
+    if card["cache_read"] is None:
+        return None, "the model_prices row for %s has no confirmed cache_read price" % _label(card)
+    usd = round(
+        (rec["input_tokens"] * card["input"]
+         + rec["output_tokens"] * card["output"]
+         + rec["cache_creation_tokens"] * card["cache_write_5m"]
+         + rec["cache_read_tokens"] * card["cache_read"]) / _MTOK,
         6,
+    )
+    return usd, (
+        "total_cost_usd DERIVED from the model_prices table in bin/lib/tier-table.json "
+        "at %s rates (input $%g, output $%g, cache_creation $%g, cache_read $%g per Mtok)%s; "
+        "a labelled estimate. Token counts are exact (measured)."
+        % (_label(card), card["input"], card["output"], card["cache_write_5m"],
+           card["cache_read"], stands_in)
     )
 
 
@@ -440,23 +488,24 @@ def parse_emitted_record(text):
     #
     # COST: the raw record's total_cost_usd is claude's OWN figure — when present,
     # carry it through verbatim and flag cost_source="reported". When the raw cost
-    # is null, DERIVE it from the documented opus pricing table (derive_opus_cost),
-    # multiplying the MEASURED token components by the published per-Mtok rates, and
-    # flag cost_source="derived". The derived figure is a labelled ESTIMATE; the
-    # token counts are never fabricated (they are the source's exact measured ones).
+    # is null, DERIVE it from the model_prices table (derive_cost), multiplying the
+    # MEASURED token components by the per-Mtok rates of the model's row, and flag
+    # cost_source="derived". The derived figure is a labelled ESTIMATE; the token
+    # counts are never fabricated (they are the source's exact measured ones).
     cost = _as_float(obj.get("total_cost_usd"))
     if cost is not None:
         return _finalize(rec, _OUT_KEYS, cost, True)
     # No reported cost — finalize the token components first (this also computes the
     # non_cache figure), then derive cost from the now-final counts + mark it.
     rec = _finalize(rec, _OUT_KEYS, 0.0, False)
-    rec["total_cost_usd"] = derive_opus_cost(rec)
+    derived, note = derive_cost(rec)
+    if derived is None:
+        # nothing is invented: _finalize's null cost + note stands, with why it was not derived either.
+        rec["note"] += " It was not derived either: %s." % note
+        return rec
+    rec["total_cost_usd"] = derived
     rec["cost_source"] = "derived"
-    rec["note"] = (
-        "total_cost_usd DERIVED from the documented opus pricing table "
-        "(input $5.00, output $25.00, cache_creation $6.25, cache_read $0.50 "
-        "per Mtok); a labelled estimate. Token counts are exact (measured)."
-    )
+    rec["note"] = note
     return rec
 
 

@@ -422,7 +422,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-branch-context` | SI-3 git-backed branch-context reader |
 | `heimdall-memory` / `heimdall-vm-bench` | Verified-Memory CLI; its benchmark |
 | `heimdall-md` / `heimdall-web` | document → markdown converter (`hmd md`); dependency-light web fetch/crawl |
-| `heimdall-tokens` / `heimdall-cost-forensics` | model-token accounting meter; portable token/cost forensics |
+| `heimdall-tokens` / `heimdall-cost-forensics` | model-token accounting meter; portable token/cost forensics. No rate is written in either: they price from the `model_prices` rows of `bin/lib/tier-table.json`, `heimdall-tokens` (and the Study A spend meter `bin/lib/fg_agent.py`) through `bin/lib/hmd_model_prices.py`. Proof: `test/heimdall-tokens.test.sh`, `test/hmd-model-prices.test.sh` |
 | `heimdall-caveman` / `-block` / `-compliance` / `-eval` | output-compression level owner (ultra-only); system-prompt block; filler-density audit; multi-arm eval |
 | `heimdall-tier` / `heimdall-model-resolve` | declare/enforce/report model tier; tier → `--model` |
 | `heimdall-persona` / `heimdall-frontdoor` | set-once coder/non-coder persona; directory-aware front door |

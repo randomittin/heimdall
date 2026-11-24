@@ -4,9 +4,10 @@
 `supervise` starts an agent command in its own process group, hands every line it prints to a `Meter`,
 and kills the whole group when the meter's spend reaches the per-run cap or the wall clock passes the
 limit. The meter reads the JSON-lines stream a claude-style agent prints (`--output-format stream-json`):
-it prices the token usage of every distinct assistant message at the published per-token price of the
-model that message names. The agent's own `total_cost_usd` (the final `result` event) is the cost of
-record when the run reports one; the estimate is what the kill acts on while the run is live.
+it prices the token usage of every distinct assistant message at the per-token price of the model
+that message names, read from the model_prices rows of bin/lib/tier-table.json. The agent's own
+`total_cost_usd` (the final `result` event) is the cost of record when the run reports one; the
+estimate is what the kill acts on while the run is live.
 
 Nothing here raises on what an agent prints: a line that is not a JSON object, or a usage block that is
 not numbers, is ignored. An agent that never reports usage is `unmetered`: only the wall clock applies to
@@ -18,30 +19,39 @@ import collections
 import contextlib
 import json
 import os
-import re
 import signal
 import subprocess
 import threading
 import time
 
-# USD per million tokens: input, 5-minute cache write, 1-hour cache write, cache read, output.
-# Published prices (platform.claude.com/docs/en/about-claude/pricing), read 2026-10-05. The same table is
-# frozen in PREREG.md Amendment 1; test/false-green-agent-cap.test.sh fails when the two differ.
-PRICES = {
-    "claude-fable-5-1": (10.0, 12.5, 20.0, 0.25, 50.0),
-    "claude-fable-5": (10.0, 12.5, 20.0, 1.0, 50.0),
-    "claude-opus-5-5": (4.0, 5.0, 8.0, 0.2, 20.0),
-    "claude-opus-5": (5.0, 6.25, 10.0, 0.5, 25.0),
-    "claude-opus-4-8": (5.0, 6.25, 10.0, 0.5, 25.0),
-    "claude-opus-4-7": (5.0, 6.25, 10.0, 0.5, 25.0),
-    "claude-opus-4-6": (5.0, 6.25, 10.0, 0.5, 25.0),
-    "claude-opus-4-5": (5.0, 6.25, 10.0, 0.5, 25.0),
-    "claude-sonnet-5-5": (2.0, 2.5, 4.0, 0.2, 10.0),
-    "claude-sonnet-5": (2.0, 2.5, 4.0, 0.2, 10.0),
-    "claude-sonnet-4-6": (3.0, 3.75, 6.0, 0.3, 15.0),
-    "claude-sonnet-4-5": (3.0, 3.75, 6.0, 0.3, 15.0),
-    "claude-haiku-4-5": (1.0, 1.25, 2.0, 0.1, 5.0),
-}
+import hmd_model_prices
+
+# USD per million tokens: input, 5-minute cache write, 1-hour cache write, cache read, output. None of it is
+# written here: the rates are the model_prices rows of bin/lib/tier-table.json, the repo's one price table
+# (bin/lib/hmd_model_prices.py), so a new generation is priced by adding a row there. A missing or malformed
+# table stops this module at import, before anything is spent. PREREG.md Amendment 1 froze the table as it
+# stood on 2026-10-05; test/false-green-agent-cap.test.sh fails when a row it froze moves, except the one
+# correction it names. A model whose row has an unconfirmed price (a null cache read) is not in the table: it
+# is priced like an unknown model, never guessed.
+_TABLE = hmd_model_prices.load()
+
+
+def _rates(card):
+    return (card["input"], card["cache_write_5m"], card["cache_write_1h"], card["cache_read"], card["output"])
+
+
+def _confirmed(card):
+    """Every price of the card, and of its long-prompt card, is known."""
+    return card["cache_read"] is not None and (card["long_context"] is None or card["long_context"]["cache_read"] is not None)
+
+
+PRICES = {model: _rates(card) for model, card in _TABLE["by_id"].items() if _confirmed(card)}
+if not PRICES:
+    raise hmd_model_prices.PricesError("%s: no row has every price confirmed, so nothing can be metered" % hmd_model_prices.TABLE_PATH)
+# A model that bills a second card for a long prompt (Haiku 5.5 above 100,000 prompt tokens): that length and
+# that card's rates.
+LONG_PROMPT = {model: (card["long_context"]["above_prompt_tokens"], _rates(card["long_context"]))
+               for model, card in _TABLE["by_id"].items() if model in PRICES and card["long_context"] is not None}
 # A model that is not listed is priced at the dearest listed rate in every column: an unknown model is
 # killed early, never late.
 FALLBACK = tuple(max(column) for column in zip(*PRICES.values()))
@@ -50,15 +60,17 @@ TAIL_LINES = 400
 _FIELDS = ("in", "out", "read", "w5", "w1", "search")
 
 
-def _model_key(model):
-    key = re.sub(r"\[[^\]]*\]$", "", model or "")      # drop a context-window suffix: <id>[1m] -> <id>
-    return re.sub(r"-\d{8}$", "", key)                  # drop a dated-snapshot suffix: <id>-YYYYMMDD -> <id>
+def price_for(model, prompt_tokens=0):
+    """((input, 5m write, 1h write, cache read, output) per million tokens, 'table' | 'fallback-highest').
 
-
-def price_for(model):
-    """((input, 5m write, 1h write, cache read, output) per million tokens, 'table' | 'fallback-highest')."""
-    key = _model_key(model)
-    return (PRICES[key], "table") if key in PRICES else (FALLBACK, "fallback-highest")
+    A message whose prompt (input, cache reads and cache writes) is longer than its model's long-prompt
+    length is priced at that model's long-prompt card.
+    """
+    key = hmd_model_prices.model_id(model)
+    if key not in PRICES:
+        return FALLBACK, "fallback-highest"
+    longer_than, long_rates = LONG_PROMPT.get(key, (None, None))
+    return (long_rates if longer_than is not None and prompt_tokens > longer_than else PRICES[key]), "table"
 
 
 def _num(source, key):
@@ -90,7 +102,8 @@ def _merge(a, b):
 
 
 def _cost(record, model):
-    p_in, p_w5, p_w1, p_read, p_out = price_for(model)[0]
+    prompt = record["in"] + record["read"] + record["w5"] + record["w1"]      # what picks a model's card
+    p_in, p_w5, p_w1, p_read, p_out = price_for(model, prompt)[0]
     usd = (record["in"] * p_in + record["w5"] * p_w5 + record["w1"] * p_w1 + record["read"] * p_read + record["out"] * p_out) / 1e6
     if record["fast"]:
         usd *= FAST_MULTIPLIER

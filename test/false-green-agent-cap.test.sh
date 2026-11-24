@@ -5,8 +5,11 @@
 # WHAT THIS PROVES
 #   [P] PRICE   the live spend estimate is tokens x the published per-token price of the model that produced
 #               them; one message id is counted once however many events carry it; an unknown model is priced
-#               at the highest listed rate; the price table in fg_agent.py is exactly the table frozen in
-#               PREREG.md Amendment 1.
+#               at the highest listed rate; the prices are the model_prices rows of bin/lib/tier-table.json
+#               (fg_agent.py holds no table of its own: a changed row moves the estimate, a missing table stops
+#               the meter before anything is spent); every model the table frozen in PREREG.md Amendment 1
+#               lists is still priced as frozen, except claude-sonnet-5-5's cache read, which the table has
+#               since corrected ($0.20 then, $0.10 now).
 #   [K] KILL    a run is killed, the whole process group with its grandchildren, when its estimated spend
 #               reaches the cap or its wall-clock limit passes, and is NOT killed below the cap (falsifiable:
 #               double-counting duplicate message ids would kill the run that must survive).
@@ -58,9 +61,9 @@ report() {  # report <output file>
 # ══════════════════════════════════════════════════════════════════════════════
 echo "[P] price: tokens x the published price of the model that produced them"
 # ══════════════════════════════════════════════════════════════════════════════
-python3 - "$REPO" >"$TMP/p.out" 2>"$TMP/p.out.err" <<'PY'
-import json, os, re, sys
-repo = sys.argv[1]
+python3 - "$REPO" "$TMP" >"$TMP/p.out" 2>"$TMP/p.out.err" <<'PY'
+import json, os, re, shutil, subprocess, sys
+repo, tmp = sys.argv[1], sys.argv[2]
 sys.path.insert(0, os.path.join(repo, "bin", "lib"))
 import fg_agent
 
@@ -114,6 +117,74 @@ t("a dated id resolves to its model (claude-opus-4-5-20251101 is $5 input)", nea
 t("a context-window suffix is ignored (claude-opus-5-5[1m] is $4 input)", near(fed(ev("m", model="claude-opus-5-5[1m]", input_tokens=M)).spend_usd, 4.0))
 t("the first model named is recorded", fed(ev("a", model="claude-sonnet-5-5"), ev("b")).model == "claude-sonnet-5-5")
 
+# the prices are the model_prices rows of bin/lib/tier-table.json (read through bin/lib/hmd_model_prices.py), not a table of this file
+sonnet_read = fed(ev("m", model="claude-sonnet-5-5", cache_read_input_tokens=M))
+t("claude-sonnet-5-5 cache reads cost $0.10 per million, the published price (Amendment 1 froze $0.20)", near(sonnet_read.spend_usd, 0.10), sonnet_read.spend_usd)
+fable = fed(ev("m", model="claude-fable-5-2", input_tokens=M, output_tokens=M))
+t("claude-fable-5-2, a model Amendment 1 did not list, is priced from the table ($8 in + $40 out), not as an unknown one",
+  near(fable.spend_usd, 48.0) and fable.price_basis == "table", (fable.spend_usd, fable.price_basis))
+
+# a model that bills a second card for a long prompt: Haiku 5.5 is $0.10 in / $0.50 out up to 100,000 prompt tokens, $0.50 / $2.50 above
+def haiku(**usage):
+    return fed(ev("m", model="claude-haiku-5-5", **usage))
+t("claude-haiku-5-5 is priced from the table, not as an unknown model", haiku(output_tokens=M).price_basis == "table", haiku(output_tokens=M).price_basis)
+t("a Haiku 5.5 prompt of exactly 100,000 tokens bills the base card ($0.01 in + $0.50 out)",
+  near(haiku(input_tokens=100_000, output_tokens=M).spend_usd, 0.51), haiku(input_tokens=100_000, output_tokens=M).spend_usd)
+t("a Haiku 5.5 prompt of 100,001 tokens bills the long-prompt card ($0.50 in + $2.50 out)",
+  near(haiku(input_tokens=100_001, output_tokens=M).spend_usd, 100_001 * 0.50 / M + 2.50), haiku(input_tokens=100_001, output_tokens=M).spend_usd)
+t("the prompt that picks the card counts cache reads (100,001 read tokens bill at the long card's $0.05)",
+  near(haiku(cache_read_input_tokens=100_001).spend_usd, 100_001 * 0.05 / M), haiku(cache_read_input_tokens=100_001).spend_usd)
+t("and cache writes (100,001 unsplit write tokens bill at the long card's 1-hour $1.00)",
+  near(haiku(cache_creation_input_tokens=100_001).spend_usd, 100_001 * 1.00 / M), haiku(cache_creation_input_tokens=100_001).spend_usd)
+
+# one rate source: fg_agent beside a COPY of its price reader and a table this test edits
+child = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import fg_agent
+meter = fg_agent.Meter()
+meter.feed(json.dumps({"type": "assistant", "message": {"id": "m", "model": "claude-opus-5-5", "content": [], "usage": {"output_tokens": 1000000}}}))
+print(json.dumps({"spend": meter.spend_usd, "basis": meter.price_basis, "listed": "claude-opus-5-5" in fg_agent.PRICES}))
+"""
+
+def meter_in_copy(name, edit):
+    """What a Meter says about 1M claude-opus-5-5 output tokens when the tier-table.json beside the copy was edited by `edit`
+    (no table at all when `edit` is None); {"error": stderr} when the copy cannot be imported."""
+    try:
+        lib = os.path.join(tmp, name)
+        os.makedirs(lib)
+        for module in ("fg_agent.py", "hmd_model_prices.py"):
+            shutil.copy(os.path.join(repo, "bin", "lib", module), lib)
+        if edit is not None:
+            with open(os.path.join(repo, "bin", "lib", "tier-table.json"), encoding="utf-8") as fh:
+                table = json.load(fh)
+            edit(table)
+            with open(os.path.join(lib, "tier-table.json"), "w", encoding="utf-8") as fh:
+                json.dump(table, fh)
+        run = subprocess.run([sys.executable, "-c", child, lib], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"error": repr(exc)}
+    return json.loads(run.stdout) if run.returncode == 0 else {"error": run.stderr[-300:]}
+
+def opus55(table):
+    return next(r for r in table["model_prices"]["rows"] if r["family"] == "opus" and r["version"] == "5.5")
+def output_to_seven(table):
+    opus55(table)["output"] = 7.0
+def read_unconfirmed(table):
+    opus55(table)["cache_read"] = None
+moved = meter_in_copy("copy-moved", output_to_seven)
+t("one rate source: the same 1M output tokens cost $7 when the table beside the copy lists $7, so fg_agent holds no rate", near(moved.get("spend", -1), 7.0), moved)
+unconfirmed = meter_in_copy("copy-unconfirmed", read_unconfirmed)
+t("a row whose cache-read price is unconfirmed is not guessed: its model is priced as an unknown one, flagged fallback-highest",
+  unconfirmed.get("listed") is False and unconfirmed.get("basis") == "fallback-highest" and near(unconfirmed.get("spend", -1), 50.0), unconfirmed)
+no_table = meter_in_copy("copy-no-table", None)
+t("a missing price table stops the meter at import, before anything is spent, and says it is the price table", "price table" in no_table.get("error", ""), no_table)
+def nothing_confirmed(table):
+    for r in table["model_prices"]["rows"]:
+        r["cache_read"] = None
+nothing = meter_in_copy("copy-nothing-confirmed", nothing_confirmed)
+t("a table with no row priced in full stops the meter at import instead of metering against an empty table", "confirmed" in nothing.get("error", ""), nothing)
+
 # modifiers that stack on the token price
 t("fast mode doubles the price", near(fed(ev("m", output_tokens=M, speed="fast")).spend_usd, 40.0))
 t("US-only inference adds 10%", near(fed(ev("m", output_tokens=M, inference_geo="us")).spend_usd, 22.0), fed(ev("m", output_tokens=M, inference_geo="us")).spend_usd)
@@ -149,10 +220,15 @@ frozen = {}
 for row in re.finditer(r"^\| (claude-[a-z0-9-]+) \| ([0-9.]+) \| ([0-9.]+) \| ([0-9.]+) \| ([0-9.]+) \| ([0-9.]+) \|$", text, re.M):
     frozen[row.group(1)] = tuple(float(row.group(i)) for i in range(2, 7))
 t("the price table frozen in PREREG.md Amendment 1 has rows", len(frozen) >= 10, len(frozen))
-t("the price table frozen in PREREG.md Amendment 1 is exactly fg_agent.PRICES", frozen == {k: tuple(v) for k, v in fg_agent.PRICES.items()},
-  "only in the amendment: %s; only in code: %s; differing: %s" % (
-      sorted(set(frozen) - set(fg_agent.PRICES)), sorted(set(fg_agent.PRICES) - set(frozen)),
-      sorted(k for k in frozen if k in fg_agent.PRICES and frozen[k] != tuple(fg_agent.PRICES[k]))))
+# The meter no longer holds that table: it reads the model_prices rows. A row the amendment froze may only differ from what the meter
+# prices now where the one table has been corrected; the single correction so far is claude-sonnet-5-5's cache read (the amendment
+# gave Sonnet 5's $0.20, the published Sonnet 5.5 price is $0.10). Any other difference fails here: it is a change to the preregistered
+# instrument and wants an amendment.
+live = {k: tuple(v) for k, v in fg_agent.PRICES.items()}
+differing = sorted(k for k in frozen if live.get(k) != frozen[k])
+t("every model PREREG.md Amendment 1 froze is still priced as frozen, except claude-sonnet-5-5 (cache read $0.20 frozen, $0.10 now)",
+  differing == ["claude-sonnet-5-5"] and live["claude-sonnet-5-5"] == frozen["claude-sonnet-5-5"][:3] + (0.1, 10.0),
+  "differing from the amendment: %s; claude-sonnet-5-5 now %s, frozen %s" % (differing, live.get("claude-sonnet-5-5"), frozen.get("claude-sonnet-5-5")))
 t("the fallback price is the highest listed in every column", fg_agent.FALLBACK == tuple(max(col) for col in zip(*fg_agent.PRICES.values())), fg_agent.FALLBACK)
 
 print("\n".join(out))
