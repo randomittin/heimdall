@@ -183,6 +183,9 @@
      "why": "marks a subagent rate limit for fallback routing"},
     {"id": "finished-agents-record", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "finished-agents-record",
      "why": "records each finished background agent (id, time, description) per session"},
+    {"id": "subagent-report-gate", "kind": "guard", "tier": "recommended", "layer": "hook", "hook": "subagent-report-gate",
+     "fails": "open", "operator_env": "HMD_REPORT_CAP=3000", "proof": "test/subagent-report-gate.test.sh",
+     "why": "an hmd subagent's final report over 1,500 chars is sent back once to be cut to a summary; the full text is saved to a file the summary names"},
 
     {"id": "stop-metric-reminder", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "stop-metric-reminder",
      "why": "metric reminder at main-agent Stop"},

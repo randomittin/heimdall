@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""heimdall-subagent-report-gate -- SubagentStop hook: an hmd subagent's final report is capped at 1,500 characters.
+
+WHY. A background agent's final report reaches the main thread as a task-notification, which is text Claude Code injects as a user
+message: no hook can rewrite it, and it is carried until compaction. Measured: 1,152 of them, mean 2,390 chars, p90 5,091
+(docs/analysis/2026-11-22-token-utilization-next.md lever 5). The 1,500-char cap was only prose in agents/heimdall.md and the routing
+docs. This is the enforcement (docs/analysis/2026-11-24-market-token-techniques.md, gap 2). Proof: test/subagent-report-gate.test.sh.
+
+WHAT IT DOES. When an hmd worker agent stops with a final message longer than the cap, the hook saves the whole text to
+$HEIMDALL_HOME/subagent-reports/<agent_id>.md (0600, in a 0700 directory) and answers {"decision":"block","reason":...}. Claude Code keeps
+the subagent running and delivers the reason as its next instruction: "Report is N chars; cap 1,500. Full text saved at <path>. Reply with
+a <=1,500-char summary that names that path." The hook saves the text itself, so the agent spends one short turn and no tool call, and an
+agent without a Write tool (reviewer, verifier) can comply. The report the main thread receives is then the summary.
+
+THE PAYLOAD, checked against the current hooks reference (code.claude.com/docs/en/hooks, SubagentStop, 2026-11-24) and the real payloads
+bin/heimdall-metric-hook and bin/lib/hmd_finished_agents.py already read: stop_hook_active, agent_id, agent_type, agent_transcript_path and
+last_assistant_message (the text of the subagent's final response), beside the common fields. `decision: "block"` with a `reason` keeps the
+subagent running; the harness also caps consecutive continuations at 8. A subagent that delivers through the SubagentHandback tool (auto
+mode, Claude Code 2.1.271+) has a last_assistant_message that is only its closing text, which is short: such a report is not measured here.
+
+BLOCKED AT MOST ONCE PER AGENT, so it can never loop. Three independent guards: (1) the saved file IS the record: it is created with
+hmd_private_state.create_once (link(2), atomic) BEFORE the block is answered, and an agent whose file exists passes; if the file cannot be
+created the agent passes, because nothing could be named and a loop would be possible; (2) stop_hook_active true (the harness says this stop
+is the continuation of a stop hook) passes; (3) the cap, once the agent's reply is a summary. A later stop of a RESUMED agent (SendMessage)
+is not capped again: one block per agent id, whatever the retention keeps.
+
+WHO. Only hmd's worker agents: agent_type "hmd:<name>", the plugin namespace, so a user's own `coder` or `reviewer` is never touched. Not the
+two orchestrators ("hmd:heimdall", "hmd:heimdall-lean"): the harness also fires SubagentStop for its internal agents (prompt suggestions, /btw),
+and reports those under the name of the agent the session runs as, which in an hmd session is an orchestrator. Not Explore, general-purpose,
+Plan or fork: not hmd agents.
+
+FAILS OPEN, EXIT 0 ON EVERY PATH. Garbage, an empty or wrong-shape payload, a hostile agent id, no HEIMDALL_HOME and no HOME, a relative
+HEIMDALL_HOME (a repository could ship it), a state directory that is a file or a link (never followed), a disk that will not take the file,
+a missing library: no decision, and one line on stderr when something was actually wrong. A hook never breaks a session.
+
+OFF SWITCH. `hmd guardrails off subagent-report-gate` (hmd hooks disable subagent-report-gate): the hooks.json command checks
+hmd_hook_enabled before it starts this script. Recommended tier, never locked.
+
+ENV. HMD_REPORT_CAP: the cap in characters (code points, not bytes), default 1500. A value that is not a positive integer up to 1000000 is
+the default: a typo never switches the gate off. Read from the hook's own environment, as every override of the guards is.
+
+SIDE EFFECT OF ANY SUBAGENT BLOCK. The other SubagentStop hooks (subagent-metric, subagent-429-detect, finished-agents-record) fire on the
+blocked stop AND on the real one, so an agent blocked here is seen twice by them. bin/heimdall-metric-hook sums the whole transcript's tokens
+each time, so a blocked agent's tokens reach heimdall-state twice: that hook should skip a payload whose stop_hook_active is true.
+
+STATE. $HEIMDALL_HOME/subagent-reports/<agent_id>.md, written and pruned through bin/lib/hmd_private_state.py (no link followed, 0700 / 0600).
+A file older than 14 days is removed by the next block. At most 1,000,000 characters of a report are saved.
+"""
+import json
+import os
+import re
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(HERE, "lib"))  # appended, not inserted: nothing in bin/lib can shadow a stdlib module
+try:
+    import hmd_private_state as ps
+except ImportError:
+    ps = None
+
+DEFAULT_CAP = 1500
+MAX_CAP = 1000000
+CAP_ENV = "HMD_REPORT_CAP"
+NAMESPACE = "hmd:"
+ORCHESTRATORS = ("heimdall", "heimdall-lean")
+REL = "subagent-reports"
+MAX_AGE_S = 14 * 24 * 3600
+MAX_PAYLOAD = 8 << 20      # bytes read from the hook's stdin
+MAX_SAVED = 1000000        # characters of a report saved
+AGENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
+CAP_RE = re.compile(r"[0-9]{1,7}")
+
+
+def report_cap():
+    raw = os.environ.get(CAP_ENV, "")
+    if CAP_RE.fullmatch(raw) and 0 < int(raw) <= MAX_CAP:
+        return int(raw)
+    return DEFAULT_CAP
+
+
+def is_hmd_worker(agent_type):
+    if not isinstance(agent_type, str) or not agent_type.startswith(NAMESPACE):
+        return False
+    name = agent_type[len(NAMESPACE):]
+    return bool(name) and name not in ORCHESTRATORS
+
+
+def state_root():
+    """HEIMDALL_HOME, else $HOME/.heimdall; None when neither names an absolute path. Never /tmp: no place to save is no block."""
+    home = os.environ.get("HEIMDALL_HOME") or ""
+    if not home:
+        user = os.environ.get("HOME") or ""
+        home = os.path.join(user, ".heimdall") if user else ""
+    return home if os.path.isabs(home) else None
+
+
+def read_payload():
+    try:
+        raw = sys.stdin.buffer.read(MAX_PAYLOAD)
+        obj = json.loads(raw.decode("utf-8", "replace"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def save_once(root, agent, text):
+    """Save the whole report as <root>/subagent-reports/<agent>.md unless that file is already there: its path, or None for an agent
+    blocked before. OSError (a link, a plain file, another account's directory, a full disk): nothing could be saved."""
+    os.makedirs(root, 0o700, exist_ok=True)
+    name = agent + ".md"
+    try:
+        ps.create_once(root, REL, name, text[:MAX_SAVED].encode("utf-8", "replace"))
+    except FileExistsError:
+        return None
+    return os.path.join(root, REL, name)
+
+
+def prune(root, keep):
+    """Remove what is older than MAX_AGE_S from the report directory: the next block's tidy-up, never an error."""
+    cutoff = time.time() - MAX_AGE_S
+    for name in ps.names(root, REL):
+        if name == keep:
+            continue
+        st = ps.stat_file(root, REL, name)
+        if st is not None and st.st_mtime < cutoff:
+            ps.remove(root, REL, name)
+
+
+def decision(chars, cap, path):
+    return {"decision": "block", "reason": (
+        "Report is {0:,} chars; cap {1:,}. Full text saved at {2}. Reply with a ≤{1:,}-char summary "
+        "(verdict, files changed, test result, blockers) that names that path.").format(chars, cap, path)}
+
+
+def run():
+    if ps is None:
+        raise ImportError("bin/lib/hmd_private_state.py is missing")
+    payload = read_payload()
+    if payload.get("hook_event_name", "SubagentStop") != "SubagentStop":
+        return 0
+    if payload.get("stop_hook_active") is True:
+        return 0
+    text = payload.get("last_assistant_message")
+    if not isinstance(text, str):
+        return 0
+    cap = report_cap()
+    if len(text) <= cap:
+        return 0
+    if not is_hmd_worker(payload.get("agent_type")):
+        return 0
+    agent = payload.get("agent_id")
+    root = state_root()
+    if not isinstance(agent, str) or not AGENT_RE.fullmatch(agent) or root is None:
+        return 0
+    path = save_once(root, agent, text)
+    if path is None:
+        return 0
+    try:
+        prune(root, agent + ".md")
+    except OSError as exc:  # the tidy-up only: the report is saved and the block stands
+        sys.stderr.write("heimdall-subagent-report-gate: pruning old reports failed: %s\n" % exc)
+    sys.stdout.write(json.dumps(decision(len(text), cap, path)) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def main():
+    try:
+        return run()
+    except Exception as exc:  # a hook never breaks a session: no decision, the reason on stderr
+        sys.stderr.write("heimdall-subagent-report-gate: %s: %s\n" % (type(exc).__name__, exc))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

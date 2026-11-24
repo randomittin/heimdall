@@ -452,6 +452,16 @@
       "remote_toggle": false
     },
     {
+      "event": "SubagentStop",
+      "index": 3,
+      "id": "subagent-report-gate",
+      "description": "Caps an hmd subagent's final report at 1,500 chars (HMD_REPORT_CAP): a longer one is saved whole under $HEIMDALL_HOME/subagent-reports/<agent_id>.md and the agent is sent back ONCE to reply with a summary that names the file. Only hmd:<worker> agents, never the orchestrators. Fail-open, exit 0 on every path.",
+      "matcher": "",
+      "fingerprint": "d1e0d36d42799e7efd11c47039e294ebdc36dc6ebecad3a3dbcbb565b1cc8499",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "Stop",
       "index": 0,
       "id": "stop-metric-reminder",
