@@ -403,7 +403,7 @@ fi
 # 4c. A synthetic tree, built fresh so nothing from §3's accumulated sandbox can bleed
 #     into these counts.
 CLASS_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reach-class-XXXXXX")"
-mkdir -p "$CLASS_SANDBOX/bin" "$CLASS_SANDBOX/hooks" "$CLASS_SANDBOX/commands" "$CLASS_SANDBOX/agents"
+mkdir -p "$CLASS_SANDBOX/bin/lib" "$CLASS_SANDBOX/hooks" "$CLASS_SANDBOX/commands" "$CLASS_SANDBOX/agents"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/hook-direct"
 printf '#!/bin/sh\nbin/human-direct --setup\nbin/dual-path --setup\nexit 0\n' > "$CLASS_SANDBOX/install.sh"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/human-direct"
@@ -436,9 +436,24 @@ printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/brief-shaped"
 # over ALL routes, never merely the one a BFS got to first.
 printf '#!/bin/sh\nexec bin/dual-path\n' > "$CLASS_SANDBOX/bin/hook-relay"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/dual-path"
+# THE DATA-FILE FIXTURE (bin/lib/tier-table.json's shape, the one that moved bin/benchmark,
+# bin/heimdall-bench and bin/heimdall-attack REACHABLE -> LIVE with no hook change): a hook-fired
+# script reads a JSON data file, and the file's own prose names two bins nothing else calls —
+# once as a sentence ("read by bin/data-named") and once as a DIRECTORY inside a path
+# ("evals/dir-named/PREREG.md"), which the tokenizer cannot tell from a command name. A data
+# file runs nothing, so the hook-fired chain must stop there for LIVE.
+printf '#!/bin/sh\ncat bin/lib/data-table.json\n' > "$CLASS_SANDBOX/bin/data-reader"
+printf '{"purpose":"read by bin/data-named to price a session","source":"evals/dir-named/PREREG.md Amendment 1"}\n' \
+  > "$CLASS_SANDBOX/bin/lib/data-table.json"
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/data-named"
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/dir-named"
+# …and the control that keeps the ceiling honest: .mcp.json is a JSON file too, but it is a
+# registration the MCP client itself launches, so what it names is still LIVE.
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/mcp-direct"
 chmod +x "$CLASS_SANDBOX"/bin/* "$CLASS_SANDBOX/install.sh"
-printf '{"hooks":{"X":"run bin/hook-direct now","Y":"run bin/precheck-shaped now","Z":"run bin/hook-relay now"}}\n' \
+printf '{"hooks":{"X":"run bin/hook-direct now","Y":"run bin/precheck-shaped now","Z":"run bin/hook-relay now","W":"run bin/data-reader now"}}\n' \
   > "$CLASS_SANDBOX/hooks/hooks.json"
+printf '{"mcpServers":{"s":{"command":"bin/mcp-direct"}}}\n' > "$CLASS_SANDBOX/.mcp.json"
 
 CLASS_WORK="$WORK/class-sandbox"
 reach_build "$CLASS_SANDBOX" "$CLASS_WORK"
@@ -528,6 +543,30 @@ case "$DP_CHAIN" in
     bad "falsifier: dual-path's classified chain does not show the expected hook root: $DP_CHAIN"
     ;;
 esac
+
+# THE DATA-FILE HOP CEILING. data-named and dir-named are named ONLY by prose inside
+# bin/lib/data-table.json, a JSON data file that a hook-fired script reads. A real path
+# exists (so neither is dead) but a data file runs nothing, so neither may read LIVE: the
+# two classes below are the whole claim, and both bins read LIVE before the ceiling existed.
+DN_CLASS="$(reach_class "$CLASS_WORK" data-named)"
+DD_CLASS="$(reach_class "$CLASS_WORK" dir-named)"
+if [ "$DN_CLASS" = "REACHABLE" ] && [ "$DD_CLASS" = "REACHABLE" ]; then
+  ok "falsifier: bins named only by a sentence or a path inside a JSON data file a hook-fired script reads classify REACHABLE, not LIVE ($(reach_chain_classified "$CLASS_WORK" data-named))"
+else
+  bad "falsifier: DATA-FILE LAUNDERING — data-named is ${DN_CLASS:-DEAD} and dir-named is ${DD_CLASS:-DEAD}, both named only by prose in bin/lib/data-table.json, which runs nothing; a hook-fired reader of a data file must not turn what its sentences mention LIVE (this is how bin/benchmark, bin/heimdall-bench and bin/heimdall-attack read LIVE with no hook change)"
+fi
+
+if [ "$(reach_class "$CLASS_WORK" data-reader)" = "LIVE" ]; then
+  ok "falsifier: the hook-fired script that READS the data file still classifies LIVE (only the data file's own mentions stop relaying)"
+else
+  bad "falsifier: data-reader, named directly by hooks.json, did not classify LIVE — the data-file ceiling cut a hop that is real code"
+fi
+
+if [ "$(reach_class "$CLASS_WORK" mcp-direct)" = "LIVE" ]; then
+  ok "falsifier: a bin named by .mcp.json classifies LIVE (a registration the MCP client launches still relays; only non-registration data files stop)"
+else
+  bad "falsifier: a bin named directly by .mcp.json did NOT classify LIVE — the data-file ceiling must exempt the two hook/MCP registration files"
+fi
 
 # 4d. The design constraint this feature must not violate: the classifier's OWN
 #     production caller, bin/heimdall-deadcode, must itself be LIVE or REACHABLE — if
