@@ -2248,6 +2248,21 @@ case "${1:-}" in
     fi
     exec "$LEAN_BIN" "$@"
     ;;
+  compact-window)
+    # `hmd compact-window status|on|off|offer`: the native auto-compact window of the coding agent, set only with the person's yes
+    # (`--yes`; no terminal and no --yes is exit 3, consent required, nothing written) and undone exactly by `off`. Pass-through to
+    # bin/heimdall-compact-window. Without this arm `hmd compact-window on` fell through to the task-prompt path and started a Claude
+    # run with "compact-window on" as the task. The verb is consumed (`hmd compact-window on --yes` reaches the tool as `on --yes`),
+    # every argument forwards verbatim and the tool is exec'd, so its exit status comes back unchanged.
+    shift
+    COMPACT_WINDOW_BIN="$PLUGIN_DIR/bin/heimdall-compact-window"
+    if [ ! -x "$COMPACT_WINDOW_BIN" ]; then
+      echo "  Error: heimdall-compact-window not found at $COMPACT_WINDOW_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$COMPACT_WINDOW_BIN" "$@"
+    ;;
   team)
     # Pass-through to heimdall-team (new/join/share/show and bare dispatch).
     # Bin dir resolved via $PLUGIN_DIR — same as demo/rr above, never hardcoded.
@@ -4163,6 +4178,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall reinstall --reset  Switch this install to lean in place (backup first, your data stays)"
   echo "  heimdall lean <status|on|off>  Lean profile: smaller install tree and prompt (off restores the full tree)"
   echo "  heimdall lean restore <dir>  Undo reinstall --reset from the backup directory it printed"
+  echo "  heimdall compact-window <status|on|off> [--tokens N]  Compact long sessions at 300K tokens (about 40% less main-thread spend on one measured session); on asks first, off undoes it exactly"
   echo "  heimdall --uninstall      Remove heimdall completely (add --yes for non-interactive)"
   echo "  heimdall --help           Show this help"
   echo "  heimdall team             Team status (solo/shared, owner, how to grow)"

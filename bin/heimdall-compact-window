@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""heimdall-compact-window -- raise the coding agent's native auto-compact window, when the person says yes, and undo it exactly.
+
+    heimdall-compact-window status
+    heimdall-compact-window on  [--tokens N] [--yes] [--force]
+    heimdall-compact-window off [--yes] [--force]
+    heimdall-compact-window offer
+    heimdall-compact-window -h | --help
+
+WHY. A long session pays for its whole history on every turn. Measured on one long hmd session (docs/analysis/2026-11-22-token-utilization-next.md, lever 1:
+a replay of that session, not a promise), compacting at 300,000 tokens instead of letting the context grow toward 900,000 would have cut about 40% of the
+main-thread spend. The price is real too: older detail is summarized sooner (the /hmd:continue handoff and the SessionStart compact re-inject carry the thread).
+
+WHAT IT WRITES. One key, `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000), in the user-level settings.json
+of the agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. A symlink there is followed (the file it points to is edited and the link stays).
+The key is added to, or replaced in, the TEXT of the file, never by re-serializing the document, so every other byte survives: key order, indentation, escapes,
+the trailing newline. The write is a temp file in the same directory and a rename, and it is refused when the file changed since it was read. A file that is not
+a JSON object (or names the key twice) is never touched.
+
+CONSENT. Nothing is written without the person's yes, the contract of `hmd prove` and `hmd skills install`: `--yes` says it was already given; at a terminal
+(stdin and stdout) the change is shown and `Proceed? [y/N]` is asked; anywhere else nothing is written and the exit status is 3, "consent required": ask the
+person, then run the same command again with --yes. `status` never writes. A run with nothing to change (already set, nothing to undo) never asks.
+
+on      back up the settings file ($HEIMDALL_HOME/compact-window/settings.json.bak, mode 0600), record what was there before (the record, state.json, beside it),
+        then set the key. A value of the person's own that differs from the one asked for is never replaced unless --force is given (exit 4); a value hmd
+        wrote itself is updated in place and still undoes to the state before hmd.
+off     put the key back as hmd found it: removed when it was absent (the file removed when hmd created it), the old value when --force had replaced one. When the
+        file is still byte-for-byte what hmd wrote, the backup is restored verbatim; when something else changed the file since, only the key is reverted and the
+        rest is kept. A value that is no longer the one hmd wrote is the person's by now: exit 4 unless --force. Without a record there is nothing to undo.
+offer   the one-time question install and update ask at a terminal: nothing is printed, read or written without a terminal on stdin and stdout, a setting that is
+        already there is never asked about, and an answer (yes or no) is kept in $HEIMDALL_HOME/compact-window/offered so it is asked once. Always exits 0.
+        HEIMDALL_NO_COMPACT_WINDOW_OFFER=1 silences it.
+status  the setting file, the value in it and whether hmd put it there. Exit 1 only when the file cannot be used.
+
+Exit 0 done or nothing to do. 1 a file that cannot be used or written (nothing was changed; stderr says why). 2 usage. 3 consent required (nothing was written).
+4 refused: the key holds a value that is not hmd's, --force overrides. stdlib only.
+"""
+import argparse
+import contextlib
+import datetime
+import hashlib
+import json
+import os
+import select
+import stat
+import sys
+import tempfile
+
+KEY = "autoCompactWindow"
+DEFAULT_TOKENS = 300000
+MIN_TOKENS = 100000
+OFFER_WAIT_S = 300   # an offer left unanswered this long is not asked again that run, and not recorded as answered
+STATE_FILE, BACKUP_FILE, OFFERED_FILE = "state.json", "settings.json.bak", "offered"
+EXIT_FAILED, EXIT_USAGE, EXIT_CONSENT, EXIT_REFUSED = 1, 2, 3, 4
+WHITESPACE = " \t\n\r"
+DECODER = json.JSONDecoder()
+
+
+class Unusable(Exception):
+    """A file this tool must not touch, or could not use; str(error) is the reason. Nothing was changed."""
+
+
+def say(line):
+    print(line)
+
+
+def warn(message):
+    sys.stderr.write("heimdall-compact-window: %s\n" % message)
+
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def runtime_home():
+    """$HEIMDALL_HOME, else ~/.heimdall: the runtime home the way bin/heimdall-lean reads it."""
+    return os.path.abspath(os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall"))
+
+
+def state_dir():
+    return os.path.join(runtime_home(), "compact-window")
+
+
+def settings_path():
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(config, "settings.json")
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_bytes(path):
+    """The bytes of `path`; None when it is not there; Unusable when it cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Unusable("cannot read %s: %s" % (path, exc))
+
+
+def write_atomic(path, data, dir_mode=0o777):
+    """`path` := data through a temp file in the same directory and a rename: a crash leaves the old file or the new one, never half of one. An existing file keeps
+    its permission bits; a new one is private (0600)."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=dir_mode, exist_ok=True)
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = 0o600
+    handle, temp = tempfile.mkstemp(dir=directory, prefix=".hmd-compact-window.", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temp, mode)
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
+
+
+def remove(path):
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+
+
+class Doc:
+    """One settings.json, read once: its text, and where each top-level member sits in it (character spans), so an edit changes nothing but the one key."""
+
+    def __init__(self, link):
+        self.path = os.path.realpath(link)   # a symlinked settings.json is edited where it points
+        self.raw = read_bytes(self.path)
+        self.text = None
+        self.members = []                    # (key, key_start, key_end, value_start, value_end)
+        self.open_at = self.close_at = 0
+        if self.raw is None:
+            return
+        try:
+            self.text = self.raw.decode("utf-8")
+            document = json.loads(self.text)
+        except (ValueError, RecursionError) as exc:
+            raise Unusable("%s is not valid JSON, so it was left alone (%s)" % (self.path, exc))
+        if not isinstance(document, dict):
+            raise Unusable("%s does not hold a JSON object, so it was left alone" % self.path)
+        self.scan()
+        if sum(1 for member in self.members if member[0] == KEY) > 1:
+            raise Unusable("%s names %s more than once, so it was left alone" % (self.path, KEY))
+
+    def skip(self, at):
+        while self.text[at] in WHITESPACE:
+            at += 1
+        return at
+
+    def scan(self):
+        """The spans of the members. The text parsed as one JSON object, so every step below finds what the grammar guarantees."""
+        self.open_at = self.skip(0)
+        at = self.skip(self.open_at + 1)
+        while self.text[at] != "}":
+            key, key_end = DECODER.raw_decode(self.text, at)
+            value_start = self.skip(self.skip(key_end) + 1)
+            _, value_end = DECODER.raw_decode(self.text, value_start)
+            self.members.append((key, at, key_end, value_start, value_end))
+            at = self.skip(value_end)
+            if self.text[at] == ",":
+                at = self.skip(at + 1)
+        self.close_at = at
+
+    @property
+    def member(self):
+        return next((member for member in self.members if member[0] == KEY), None)
+
+    @property
+    def value_text(self):
+        """The value of the key exactly as the file spells it; None when the key is not there."""
+        found = self.member
+        return None if found is None else self.text[found[3]:found[4]]
+
+    def with_key(self, value):
+        """The text with the key set to `value` (its JSON text): replaced where it is, else added as the last member in the layout the file already has."""
+        if self.text is None:
+            return '{\n  "%s": %s\n}\n' % (KEY, value)
+        found = self.member
+        if found is not None:
+            return self.text[:found[3]] + value + self.text[found[4]:]
+        if not self.members:
+            return self.text[:self.open_at + 1] + '\n  "%s": %s\n' % (KEY, value) + self.text[self.close_at:]
+        first, last = self.members[0], self.members[-1]
+        head = self.text[self.open_at:first[1]]
+        lead = self.text[self.text.rfind("\n", 0, first[1]) + 1:first[1]]
+        if "\n" in head and not lead.strip(" \t"):
+            separator = (",\r\n" if "\r\n" in head else ",\n") + lead
+        else:
+            separator = ", "
+        return self.text[:last[4]] + separator + json.dumps(KEY) + self.text[first[2]:first[3]] + value + self.text[last[4]:]
+
+    def without_key(self):
+        """The text with the key's member cut out, its comma and the layout between it and its neighbour with it."""
+        index = next(i for i, member in enumerate(self.members) if member[0] == KEY)
+        _, key_start, _, _, value_end = self.members[index]
+        if len(self.members) == 1:
+            return self.text[:self.open_at + 1] + self.text[self.close_at:]
+        if index + 1 < len(self.members):
+            return self.text[:key_start] + self.text[self.members[index + 1][1]:]
+        return self.text[:self.members[index - 1][4]] + self.text[value_end:]
+
+
+def replace_settings(doc, data):
+    """doc.path := data, unless the file is no longer the one `doc` read: then Unusable, and nothing is written."""
+    if read_bytes(doc.path) != doc.raw:
+        raise Unusable("%s changed while hmd was working on it; nothing was written, run the command again" % doc.path)
+    write_atomic(doc.path, data)
+
+
+def load_state():
+    """The record `on` left, None when there is none; Unusable when there is one that cannot be used."""
+    path = os.path.join(state_dir(), STATE_FILE)
+    raw = read_bytes(path)
+    if raw is None:
+        return None
+    try:
+        record = json.loads(raw)
+        if not isinstance(record, dict) or record.get("schema") != 1:
+            raise ValueError("not a record of this tool")
+        for field, kind in (("settings", str), ("had_file", bool), ("had_key", bool), ("written", int), ("sha256_after", str)):
+            if not isinstance(record.get(field), kind):
+                raise ValueError("its %s is missing" % field)
+    except ValueError as exc:
+        raise Unusable("%s cannot be used (%s); remove it by hand once you no longer want hmd to track %s" % (path, exc, KEY))
+    return record
+
+
+def forget():
+    """Drop the record and the backup: there is nothing left to undo."""
+    for name in (STATE_FILE, BACKUP_FILE):
+        remove(os.path.join(state_dir(), name))
+
+
+def interactive():
+    """A person can be asked: a terminal on stdin and on stdout, the gate every consent in hmd uses."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def ask(question, wait=None):
+    """The answer to `question` on the terminal: True for y or yes, False for anything else (Enter, end of input), None when `wait` seconds pass unanswered."""
+    sys.stderr.write(question)
+    sys.stderr.flush()
+    if wait is not None and not select.select([sys.stdin], [], [], wait)[0]:
+        sys.stderr.write("\n")
+        return None
+    return sys.stdin.readline().strip().lower() in ("y", "yes")
+
+
+def consent(args, summary, details):
+    """True when the write may go ahead: --yes, or an interactive yes. Otherwise False with nothing written and the way forward on stderr."""
+    if args.yes:
+        return True
+    if not interactive():
+        warn("consent required: %s. Nothing was written. Ask the person, then run the same command again with --yes: hmd compact-window %s --yes"
+             % (summary, args.verb))
+        return False
+    sys.stderr.write("\n".join(details) + "\n")
+    if ask("Proceed? [y/N] "):
+        return True
+    warn("consent not given: nothing was written")
+    return False
+
+
+def parse_tokens(text):
+    digits, factor = (text[:-1], 1000) if text.lower().endswith("k") else (text, 1)
+    if not (digits.isascii() and digits.isdigit()) or int(digits) * factor < MIN_TOKENS:
+        raise argparse.ArgumentTypeError("%r is not a token count of %s or more (digits, or a number and k: 250000, 250k)" % (text, format(MIN_TOKENS, ",")))
+    return int(digits) * factor
+
+
+def cmd_on(args):
+    try:
+        doc, record = Doc(settings_path()), load_state()
+    except Unusable as exc:
+        warn(str(exc))
+        return EXIT_FAILED
+    wanted = str(args.tokens)
+    found, current = doc.member, doc.value_text
+    if current == wanted:
+        say("already set: %s is %s tokens in %s; nothing changed" % (KEY, format(args.tokens, ","), tilde(doc.path)))
+        return 0
+    ours = record is not None and record["settings"] == doc.path and current == str(record["written"])
+    if found is not None and not ours and not args.force:
+        warn("%s is already %s in %s: that is your own setting, so it was left alone. --force replaces it (hmd compact-window off then puts %s back)"
+             % (KEY, current, tilde(doc.path), current))
+        return EXIT_REFUSED
+    backup = os.path.join(state_dir(), BACKUP_FILE)
+    now = "not set" if found is None else "%s (%s)" % (current, "set by hmd earlier" if ours else "yours; --force replaces it")
+    if not consent(args, "this writes %s" % tilde(doc.path), [
+            "hmd compact-window on: set the auto-compact window to %s tokens." % format(args.tokens, ","),
+            "  file    %s (only the key %s; every other byte stays as it is)" % (tilde(doc.path), KEY),
+            "  now     %s" % now,
+            "  backup  %s" % tilde(backup),
+            "  undo    hmd compact-window off",
+            "  cost    older detail is summarized sooner; the saving measured on one long session was about 40% of main-thread spend"]):
+        return EXIT_CONSENT
+    new = doc.with_key(wanted).encode("utf-8")
+    if ours:
+        written = dict(record, written=args.tokens, sha256_after=sha256(new))
+    else:
+        written = {"schema": 1, "settings": doc.path, "had_file": doc.raw is not None, "had_key": found is not None, "previous_raw": current,
+                   "written": args.tokens, "sha256_after": sha256(new), "set_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    try:
+        if not ours:
+            if doc.raw is None:
+                remove(backup)
+            else:
+                write_atomic(backup, doc.raw, 0o700)
+        write_atomic(os.path.join(state_dir(), STATE_FILE), (json.dumps(written, indent=2) + "\n").encode("utf-8"), 0o700)
+        replace_settings(doc, new)
+    except (OSError, Unusable) as exc:
+        if not ours:
+            forget()
+        warn("%s was not changed: %s" % (tilde(doc.path), exc))
+        return EXIT_FAILED
+    say("set %s to %s tokens in %s" % (KEY, format(args.tokens, ","), tilde(doc.path)))
+    say("backup %s; undo: hmd compact-window off" % tilde(backup))
+    live = " (`/autocompact %dk` sets it in a running one)" % (args.tokens // 1000) if args.tokens % 1000 == 0 else ""
+    say("It applies to sessions started from now on%s." % live)
+    return 0
+
+
+def cmd_off(args):
+    try:
+        record = load_state()
+        if record is None:
+            say("hmd did not set %s: nothing to undo" % KEY)
+            return 0
+        doc = Doc(record["settings"])
+    except Unusable as exc:
+        warn(str(exc))
+        return EXIT_FAILED
+    if doc.member is None:
+        forget()
+        say("%s is not in %s any more: nothing to undo, the record is cleared" % (KEY, tilde(doc.path)))
+        return 0
+    if doc.value_text != str(record["written"]) and not args.force:
+        warn("%s is %s in %s now, not the %s hmd set: it is yours by now, so it was left alone. --force puts back what was there before hmd"
+             % (KEY, doc.value_text, tilde(doc.path), format(record["written"], ",")))
+        return EXIT_REFUSED
+    before = "its value of %s" % record["previous_raw"] if record["had_key"] else "removed (it was not set)"
+    if not consent(args, "this writes %s" % tilde(doc.path), [
+            "hmd compact-window off: put %s in %s back as it was before hmd set it." % (KEY, tilde(doc.path)),
+            "  result  %s; nothing else in the file is touched" % before]):
+        return EXIT_CONSENT
+    backup = read_bytes(os.path.join(state_dir(), BACKUP_FILE)) if record["had_file"] else None
+    exact = sha256(doc.raw) == record["sha256_after"] and (backup is not None or not record["had_file"])
+    try:
+        if exact and not record["had_file"]:
+            if read_bytes(doc.path) != doc.raw:
+                raise Unusable("%s changed while hmd was working on it; nothing was written, run the command again" % doc.path)
+            remove(doc.path)
+        elif exact:
+            replace_settings(doc, backup)
+        else:
+            replace_settings(doc, (doc.with_key(record["previous_raw"]) if record["had_key"] else doc.without_key()).encode("utf-8"))
+    except (OSError, Unusable) as exc:
+        warn("%s was not changed: %s" % (tilde(doc.path), exc))
+        return EXIT_FAILED
+    forget()
+    say("restored %s: %s%s" % (tilde(doc.path), "back to %s" % record["previous_raw"] if record["had_key"] else "%s removed" % KEY,
+                              "" if exact else " (the file had changed since; only the key was reverted)"))
+    return 0
+
+
+def cmd_status(args):
+    try:
+        doc, record = Doc(settings_path()), load_state()
+        offered = read_bytes(os.path.join(state_dir(), OFFERED_FILE))
+    except Unusable as exc:
+        warn(str(exc))
+        return EXIT_FAILED
+    ours = record is not None and record["settings"] == doc.path and doc.value_text == str(record["written"])
+    say("%-9s %s%s" % ("settings", tilde(doc.path), "" if doc.raw is not None else " (does not exist yet)"))
+    if doc.member is None:
+        say("%-9s not set (the agent's own default applies; `hmd compact-window on` sets it, with your yes)" % "window")
+    else:
+        say("%-9s %s (%s)" % ("window", doc.value_text, "set by hmd; `hmd compact-window off` undoes it" if ours else "your own setting; hmd did not set it"))
+    if os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
+        say("%-9s CLAUDE_CODE_AUTO_COMPACT_WINDOW=%s is also set in this environment" % ("env", os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]))
+    answer = (offered or b"").decode("utf-8", "replace").split()
+    say("%-9s %s" % ("offer", answer[0] if answer else "not asked yet"))
+    return 0
+
+
+def cmd_offer(args):
+    if os.environ.get("HEIMDALL_NO_COMPACT_WINDOW_OFFER") == "1" or not interactive():
+        return 0
+    stamp = os.path.join(state_dir(), OFFERED_FILE)
+
+    def answered(word):
+        try:
+            write_atomic(stamp, ("%s %s\n" % (word, datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))).encode("utf-8"), 0o700)
+        except OSError as exc:
+            warn("could not record the answer in %s (%s): the question may be asked again" % (tilde(stamp), exc))
+
+    if os.path.exists(stamp):
+        return 0
+    try:
+        doc = Doc(settings_path())
+    except Unusable:
+        return 0   # a file this tool must not touch is not offered a write
+    if doc.member is not None:
+        answered("present")
+        return 0
+    sys.stderr.write("\nOne-time question: shrink the token spend of long sessions?\n"
+                     "  hmd can set the agent's native auto-compact window to %s tokens (the key %s in %s).\n"
+                     "  On one long session that would have cut about 40%% of main-thread spend; older detail is summarized sooner.\n"
+                     "  The file is backed up first, nothing else in it changes, and `hmd compact-window off` puts it back.\n"
+                     % (format(DEFAULT_TOKENS, ","), KEY, tilde(doc.path)))
+    answer = ask("Set it now? [y/N] ", OFFER_WAIT_S)
+    if answer is None:
+        return 0
+    if answer:
+        if cmd_on(argparse.Namespace(verb="on", yes=True, force=False, tokens=DEFAULT_TOKENS)) == 0:
+            answered("accepted")
+        return 0
+    answered("declined")
+    say("Left as it was. Any time: hmd compact-window on")
+    return 0
+
+
+def main(argv):
+    args = argv[1:]
+    if args in (["-h"], ["--help"]):
+        sys.stdout.write(__doc__)
+        return 0
+    parser = argparse.ArgumentParser(prog="hmd compact-window", add_help=False)
+    verbs = parser.add_subparsers(dest="verb", required=True)
+    verbs.add_parser("status")
+    verbs.add_parser("offer")
+    for name in ("on", "off"):
+        verb = verbs.add_parser(name)
+        verb.add_argument("--yes", "-y", action="store_true")
+        verb.add_argument("--force", action="store_true")
+        if name == "on":
+            verb.add_argument("--tokens", type=parse_tokens, default=DEFAULT_TOKENS)
+    parsed = parser.parse_args(args)
+    return {"status": cmd_status, "on": cmd_on, "off": cmd_off, "offer": cmd_offer}[parsed.verb](parsed)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

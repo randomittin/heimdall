@@ -105,6 +105,12 @@ minisign -Vp release/heimdall-signing.pub -m heimdall-install.sh -x install.sh.m
 
 **Headroom, an optional local proxy that can read your prompts, is off by default.** A fresh install never installs it, loads no launchd job for it and never points `ANTHROPIC_BASE_URL` at it; `hmd modules status headroom` reports `NOT ATTEMPTED` until you run `hmd headroom on`. That command runs `hmd modules add headroom` if the module is absent (a remote code install with no digest verified) and starts nothing itself: the proxy starts on the first launch you route through `hmd route claude` or `hmd wrap claude`. `hmd headroom off` undoes it (`hmd headroom off --next-session` from inside a routed session), and an install that already has the module keeps it until you run that. Disclosure in full: [docs/INSTALL.md](docs/INSTALL.md) and [SECURITY.md](SECURITY.md#the-headroom-proxy--a-local-process-that-reads-your-prompts).
 
+## Fewer tokens on long sessions: `hmd compact-window`
+
+A long session re-reads its whole history on every turn, so its cost piles up at large contexts. In one measured 72-day hmd session about 75% of the main-thread spend happened above 300,000 tokens of context, and a replay with the agent's native auto-compact window at 300,000 came out about 40% cheaper. That is one session and a replay, not a promise: older detail is summarized sooner, and `/hmd:continue` plus the compact re-inject carry the thread across.
+
+`hmd compact-window on` sets that one key, `autoCompactWindow`, in `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR` is honored; 300,000 by default, `--tokens 250k` to change it). It writes only after your yes (`--yes` when a script is the one asking; with no terminal and no `--yes` it exits 3, "consent required"), backs the file up first, leaves every other byte alone, and never replaces a value you set yourself unless you pass `--force`. `hmd compact-window off` puts the file back exactly as it was, and `hmd compact-window status` shows where you stand. The installer and `hmd --update` ask once, at a terminal, and never in a script or a pipe.
+
 ## Check the proof yourself
 
 No trust required (~1 min, network-free after the clone):
