@@ -405,6 +405,15 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled subagent-report-gate && exit 0; HOOK=\"$HMDP/bin/heimdall-subagent-report-gate\"; if [ -x \"$HOOK\" ]; then \"$HOOK\"; fi; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "Stop": [
