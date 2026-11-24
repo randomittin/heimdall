@@ -77,7 +77,8 @@
 #   reach_exempt_valid ROOT NAME      0 iff exempt AND well-formed AND not past recheck.
 #   reach_build_class WORKDIR    second closure over non-*.md edges only (needs reach_build first).
 #   reach_build_hook_class W     third closure: reach_build_class's own edges, seeded ONLY from
-#                                hook/MCP entry points (needs reach_build_class first).
+#                                hook/MCP entry points, minus the mentions of the dispatcher and of
+#                                data files, which never relay LIVE (needs reach_build_class first).
 #   reach_hop_class REFERRER     LIVE / REACHABLE / PROSE-ONLY for one referrer path (pure).
 #   reach_class WORKDIR NAME     the overall class for bin/NAME; empty/rc1 if dead.
 #   reach_chain_classified W N   reach_chain's receipt, each hop tagged with its class.
@@ -767,10 +768,36 @@ reach_build_class() {
 # itself (and therefore reach_build_class / REACHABLE) is untouched: a bin reachable
 # ONLY through the dispatcher still correctly reads REACHABLE, never DEAD — this is a
 # classification correction, not a reachability regression.
+#
+# DATA-FILE HOP CEILING — the same correction for the other referrer that NAMES programs
+# without RUNNING them: a *.json under bin/ hooks/ sentinels/ that is not itself a hook/MCP
+# registration (bin/lib/tier-table.json, hooks/hooks.metadata.json, bin/protocol/
+# message-schema.json). *.json has no comment syntax, so reach_extract_tokens reads a data
+# file's prose whole and cannot tell a command from a sentence, or from a directory inside a
+# path; and nothing executes a data file's strings, only the registrations the harness or an
+# MCP client reads (the hook seeds). A data file the live closure merely READS is where LIVE
+# stops, never a relay. Not hypothetical: bin/heimdall-ctx-meter, from a hook, runs
+# bin/heimdall-tokens, which reads bin/lib/tier-table.json, whose `source` string cites
+# evals/benchmark/false-green/PREREG.md. The tokenizer took the directory `benchmark` for the
+# command bin/benchmark, and with no hook change anywhere bin/benchmark, bin/heimdall-bench
+# and (through bin/lib/fg_bench.py) bin/heimdall-attack went REACHABLE -> LIVE: 150 of 248
+# executables (v2.4.12) became 154 of 249, over the anti-vacuity ceiling. bin/heimdall-cost-
+# forensics had read LIVE the same way for longer, off "read by bin/heimdall-cost-forensics"
+# in the file's `purpose`. As with the dispatcher, only the LIVE closure changes: edges-code,
+# so REACHABLE and the dead set, are untouched, and a bin named only from a data file still
+# reads REACHABLE, never DEAD. The cost is that a name a script really does exec out of a data
+# file's string reads REACHABLE, not LIVE; under-claiming the strong class is the safe error
+# for a census whose job is to catch it over-claimed, and the one data file whose strings ARE
+# executed, a module manifest's installs_via, is already modelled with bin/heimdall-modules
+# as the referrer (reach_module_installer_tokens), an edge this filter keeps.
 reach_build_hook_class() {
   local w="$1"
   LC_ALL=C awk '$0 == "hooks/hooks.json" || $0 == ".mcp.json"' "$w/seeds" > "$w/hook-seeds" 2>/dev/null
-  LC_ALL=C awk -F'\t' '$1 != "bin/heimdall" && $1 != "bin/hmd"' "$w/edges-code" > "$w/edges-hook" 2>/dev/null
+  LC_ALL=C awk -F'\t' -v seedsf="$w/hook-seeds" '
+    BEGIN { while ((getline s < seedsf) > 0) registration[s] = 1 }
+    $1 == "bin/heimdall" || $1 == "bin/hmd" { next }
+    $1 ~ /\.json$/ && !($1 in registration) { next }
+    { print }' "$w/edges-code" > "$w/edges-hook" 2>/dev/null
 
   LC_ALL=C awk -v nodesf="$w/nodes" -v seedsf="$w/hook-seeds" -v edgesf="$w/edges-hook" '
     BEGIN {
