@@ -22,13 +22,21 @@
 # secret-looking string inside a fixture's message.content and asserts it
 # never appears in this tool's stdout, stderr, or --json output.
 #
-# PRICING SOURCE: the claude-api skill's pricing table (cached 2026-06-24) —
-# see PRICING / PRICING_SOURCE below for the exact $/MTok figures and cache
-# multipliers cited. If a transcript names a model this table doesn't know,
-# this tool NEVER invents a price for it: that model's tokens are still
-# counted and reported, but excluded from every dollar figure, and the model
-# is named in an "unpriced models" list so you know your dollar totals are a
-# floor, not a ceiling.
+# PRICING SOURCE: the `model_prices` block of bin/lib/tier-table.json — the
+# repo's one model table. This tool carries no rate table of its own. Rates are
+# the claude-api skill's list prices (cached 2026-06-24 for the rows through
+# Fable 5.1, Sonnet 5, Opus 5 and Haiku 4.5; cached 2026-11-03 for the 5.5
+# generation, Fable 5.2 and Mythos 5.2), and every report prints the table's
+# own `source` line. An id is matched on FAMILY + VERSION (opus|sonnet|haiku|
+# fable|mythos, then the version), never on the tier alone: one tier's
+# generations list at different prices, so a tier-level rate would misprice
+# them. A version NEWER than every listed version of its family is priced as
+# the newest listed one and reported loudly as an ESTIMATE, never silently.
+# Any other id the table can't place (an unrecognized family, or an older
+# version nothing lists), this tool NEVER invents a price for: its tokens are
+# still counted and reported, but excluded from every dollar figure, and the
+# model is named in an "unpriced models" list so you know your dollar totals
+# are a floor, not a ceiling.
 #
 # HONEST DEGRADATION ON SPARSE DATA: this repo has already been burned once by
 # an n=10 measurement that turned out to be 20-46% sampling noise (see
@@ -55,9 +63,15 @@
 #                       Default 30 (see "HONEST DEGRADATION" above).
 #   -h, --help          Print this header and exit 0.
 #
+# Environment: HMD_COST_FORENSICS_ROOT (see --root) and
+#   HMD_COST_FORENSICS_TIER_TABLE — read the pricing table from this file
+#   instead of bin/lib/tier-table.json (an alternate or test table).
+#
 # Exit status: 0 on a successful run (including the honest "no transcripts
 # found" / "not enough data" cases — those are valid outcomes, not failures).
-# 2 on a bad CLI invocation (unrecognized flag, missing argument).
+# 1 when the pricing table cannot be loaded or fails validation: nothing is
+# priced from a table that can't be trusted. 2 on a bad CLI invocation
+# (unrecognized flag, missing argument).
 
 import json
 import os
@@ -65,38 +79,110 @@ import re
 import sys
 
 # ── Pricing table ($/MTok) ────────────────────────────────────────────────
-# Source: the claude-api skill's pricing table, cached 2026-06-24. Cache
-# multipliers (documented there and cross-checked against
-# docs/analysis/2026-09-02-input-context-cost.md): cache READ = 0.1x the
-# model's own input price, cache WRITE at the 5-minute TTL = 1.25x input,
-# cache WRITE at the 1-hour TTL = 2.0x input, OUTPUT = 5x input — uniform
-# across every current model with one documented exception: Claude Fable 5.1
-# prices cache reads at a flat $0.25/MTok rather than 0.1x its $10 input rate.
-# Claude Mythos 5.1's cache-read rate was explicitly UNCONFIRMED at launch
-# (may or may not share Fable 5.1's flat rate) — left unpriced (None) rather
-# than assumed, so it shows up in "unpriced" rather than silently guessed.
-PRICING_SOURCE = (
-    "claude-api skill pricing table (cached 2026-06-24); cache multipliers "
-    "vs that model's own input price: read=0.1x (Claude Fable 5.1 is a "
-    "documented flat-rate exception at $0.25/MTok; Claude Mythos 5.1's read "
-    "rate was unconfirmed at launch and is left unpriced here), "
-    "write-5m-TTL=1.25x, write-1h-TTL=2.0x, output=5x."
-)
-PRICING = {
-    "claude-fable-5-1": dict(input=10.00, output=50.00, cache_read=0.25, cache_write_5m=12.50, cache_write_1h=20.00),
-    "claude-mythos-5-1": dict(input=10.00, output=50.00, cache_read=None, cache_write_5m=12.50, cache_write_1h=20.00),
-    "claude-fable-5": dict(input=10.00, output=50.00, cache_read=1.00, cache_write_5m=12.50, cache_write_1h=20.00),
-    "claude-opus-5": dict(input=5.00, output=25.00, cache_read=0.50, cache_write_5m=6.25, cache_write_1h=10.00),
-    "claude-opus-4-8": dict(input=5.00, output=25.00, cache_read=0.50, cache_write_5m=6.25, cache_write_1h=10.00),
-    "claude-opus-4-7": dict(input=5.00, output=25.00, cache_read=0.50, cache_write_5m=6.25, cache_write_1h=10.00),
-    "claude-opus-4-6": dict(input=5.00, output=25.00, cache_read=0.50, cache_write_5m=6.25, cache_write_1h=10.00),
-    "claude-sonnet-5": dict(input=2.00, output=10.00, cache_read=0.20, cache_write_5m=2.50, cache_write_1h=4.00),
-    "claude-sonnet-4-6": dict(input=3.00, output=15.00, cache_read=0.30, cache_write_5m=3.75, cache_write_1h=6.00),
-    "claude-haiku-4-5": dict(input=1.00, output=5.00, cache_read=0.10, cache_write_5m=1.25, cache_write_1h=2.00),
-}
+# No rate is written in this file. Rates live in the `model_prices` block of
+# bin/lib/tier-table.json — whose own `purpose`, `source` and `rate_rules`
+# fields say where every number comes from and how the cache lines derive —
+# and load_pricing() reads and validates them. An id is matched on family +
+# version, never on the tier alone: one tier's generations list at different
+# prices, so a tier-level rate would misprice them, and a rate wrong by a
+# factor reads as a number, which is worse than an unpriced token.
+TIER_TABLE_ENV = "HMD_COST_FORENSICS_TIER_TABLE"
 _MTOK = 1_000_000.0
 _DATE_SUFFIX_RE = re.compile(r"-\d{8}$")
+_MODEL_ID_RE = re.compile(r"^claude-([a-z]+)-(\d+(?:-\d+)*)$")
 _FIELDS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+_CACHE_MULTIPLIERS = ("cache_read", "cache_write_5m", "cache_write_1h")
+
+
+class PricingTableError(Exception):
+    """The pricing table is missing or malformed. Fatal on purpose: a tool that
+    quietly priced nothing would reproduce the bug this table fixes (about 12%
+    of a real corpus priced) behind nothing louder than a footnote.
+    """
+
+
+def tier_table_path():
+    override = os.environ.get(TIER_TABLE_ENV)
+    if override:
+        return override
+    here = os.path.dirname(os.path.realpath(__file__))
+    return os.path.join(here, "lib", "tier-table.json")
+
+
+def _rate(spec, key, where):
+    v = spec.get(key)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not v >= 0:
+        raise PricingTableError('%s: "%s" must be a non-negative number, got %r' % (where, key, v))
+    return float(v)
+
+
+def _card(spec, mult, where):
+    """Expand one rate card from its input and output rates. Cache writes are
+    the table's multipliers x the input rate. cache_read is the multiplier too,
+    unless the card sets its own (the list price deviates: Opus 5.5 reads at
+    0.05x) or sets null (unconfirmed: that slice stays unpriced, not guessed).
+    """
+    inp = _rate(spec, "input", where)
+    if "cache_read" not in spec:
+        read = round(inp * mult["cache_read"], 10)
+    elif spec["cache_read"] is None:
+        read = None
+    else:
+        read = _rate(spec, "cache_read", where)
+    return {
+        "input": inp,
+        "output": _rate(spec, "output", where),
+        "cache_read": read,
+        "cache_write_5m": round(inp * mult["cache_write_5m"], 10),
+        "cache_write_1h": round(inp * mult["cache_write_1h"], 10),
+    }
+
+
+def load_pricing(path):
+    """Read and validate the table. Returns {"cards": {(family, version_tuple):
+    rate_card}, "newest": {family: newest listed version_tuple}, "source": str}.
+    A card may carry a "long_context" card: the rates a request bills at when
+    its prompt is above that card's above_prompt_tokens.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            table = json.load(fh)
+    except (OSError, ValueError) as e:
+        raise PricingTableError("%s: cannot read as JSON: %s" % (path, e))
+    block = table.get("model_prices") if isinstance(table, dict) else None
+    raw_mult = table.get("cache_price_multipliers") if isinstance(table, dict) else None
+    if not isinstance(block, dict) or not isinstance(raw_mult, dict):
+        raise PricingTableError('%s: needs "model_prices" and "cache_price_multipliers" objects' % path)
+    mult = {k: _rate(raw_mult, k, "cache_price_multipliers") for k in _CACHE_MULTIPLIERS}
+    source, rows = block.get("source"), block.get("rows")
+    if not (isinstance(source, str) and source.strip()):
+        raise PricingTableError("%s: model_prices.source must say where the rates come from" % path)
+    if not isinstance(rows, list) or not rows:
+        raise PricingTableError("%s: model_prices.rows must be a non-empty list" % path)
+    cards, newest = {}, {}
+    for i, row in enumerate(rows):
+        where = "model_prices.rows[%d]" % i
+        family = row.get("family") if isinstance(row, dict) else None
+        version = row.get("version") if isinstance(row, dict) else None
+        if not (isinstance(family, str) and re.fullmatch(r"[a-z]+", family)
+                and isinstance(version, str) and re.fullmatch(r"\d+(\.\d+)*", version)):
+            raise PricingTableError('%s: needs a lowercase "family" and a "version" like 5.5' % where)
+        where = "%s (%s %s)" % (where, family, version)
+        key = (family, tuple(int(p) for p in version.split(".")))
+        if key in cards:
+            raise PricingTableError("%s: duplicates an earlier row" % where)
+        card = _card(row, mult, where)
+        long_spec = row.get("long_context")
+        if long_spec is not None:
+            where += " long_context"
+            threshold = long_spec.get("above_prompt_tokens") if isinstance(long_spec, dict) else None
+            if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold <= 0:
+                raise PricingTableError('%s: "above_prompt_tokens" must be a positive integer' % where)
+            card["long_context"] = dict(_card(long_spec, mult, where), above_prompt_tokens=threshold)
+        cards[key] = card
+        if family not in newest or key[1] > newest[family]:
+            newest[family] = key[1]
+    return {"cards": cards, "newest": newest, "source": source}
 
 # Sparse-data guards for the high-vs-low-context regime comparison. See the
 # "HONEST DEGRADATION" header comment above for the incident these calibrate
@@ -134,22 +220,39 @@ def _as_int(v):
 
 
 def normalize_model(model):
-    """Strip a trailing dated-snapshot suffix (-YYYYMMDD) to match PRICING's
-    bare model ids — e.g. an id ending in -20260301 has that date suffix
-    removed, leaving the bare id PRICING keys on.
+    """Strip a trailing dated-snapshot suffix (-YYYYMMDD) so a snapshot id
+    matches the pricing table's undated family-and-version ids — e.g. an id
+    ending in -20260301 has that date suffix removed, leaving the bare id.
     """
     if not model or not isinstance(model, str):
         return None
     return _DATE_SUFFIX_RE.sub("", model)
 
 
-def price_for(model):
-    """Return (rate_dict_or_None, canonical_name_or_None). Never invents a
-    price for a model PRICING doesn't list — returns None so the caller must
-    treat that model's tokens as unpriced.
+def price_for(model, pricing):
+    """Return (rate_card_or_None, canonical_name_or_None, estimated_as_or_None).
+
+    An id is placed by family and version against the table's rows. Never
+    invents a price: an id the table can't place gets None, so the caller must
+    treat that model's tokens as unpriced. The one inference is the
+    next-generation rule: a version NEWER than every listed version of its
+    family gets the newest listed row's card, returned flagged (estimated_as
+    names the row) so the report calls it an estimate. An OLDER unlisted
+    version is not inferable from a newer one's price, so it stays unpriced.
     """
     canon = normalize_model(model)
-    return PRICING.get(canon), canon
+    found = _MODEL_ID_RE.match(canon) if canon else None
+    if found is None:
+        return None, canon, None
+    family = found.group(1)
+    version = tuple(int(p) for p in found.group(2).split("-"))
+    card = pricing["cards"].get((family, version))
+    if card is not None:
+        return card, canon, None
+    latest = pricing["newest"].get(family)
+    if latest is not None and version > latest:
+        return pricing["cards"][(family, latest)], canon, "%s %s" % (family, ".".join(map(str, latest)))
+    return None, canon, None
 
 
 def extract_request(record):
@@ -270,13 +373,22 @@ def discover_files(roots):
     return sorted(files)
 
 
+def prompt_tokens(ctx):
+    """The prompt size a request is billed against: uncached input plus every
+    cache token. Output is not part of it.
+    """
+    return ctx["input"] + ctx["cache_read"] + ctx["cache_write_5m"] + ctx["cache_write_1h"]
+
+
 def request_cost(ctx, prices, field_dollars):
     """Return (cost_or_None, unpriced_tokens) for one request, accumulating
     the EXACT per-field dollar contribution of this one request into the
     caller's running field_dollars dict (keyed by the _FIELDS names).
 
-    prices is the rate dict for this request's model, or None if the model is
-    entirely unknown to PRICING. Even when prices IS known, an individual
+    prices is the rate card for this request's model, or None if the model is
+    entirely unknown to the pricing table. A card with a long_context card
+    bills a prompt above that card's threshold at the long_context rates.
+    Even when prices IS known, an individual
     field's rate can still be None (e.g. Mythos 5.1's cache_read) — that
     field's tokens are counted but excluded from the dollar total, and
     reported back via unpriced_tokens rather than silently dropped.
@@ -286,10 +398,14 @@ def request_cost(ctx, prices, field_dollars):
         for field in _FIELDS:
             unpriced += ctx[field]
         return None, unpriced
+    card = prices
+    long_card = prices.get("long_context")
+    if long_card and prompt_tokens(ctx) > long_card["above_prompt_tokens"]:
+        card = long_card
     cost = 0.0
     for field in _FIELDS:
         n = ctx[field]
-        rate = prices.get(field)
+        rate = card.get(field)
         if rate is None:
             unpriced += n
         else:
@@ -399,13 +515,15 @@ def regime_comparison(contexts, min_requests):
     }
 
 
-def scan(files, min_requests):
+def scan(files, min_requests, pricing):
     totals = {k: 0 for k in _FIELDS}
     field_dollars = {k: 0.0 for k in _FIELDS}
     fallback_tokens = 0
     priced_cost_total = 0.0
     unpriced_tokens_total = 0
     unpriced_models = {}
+    estimated_models = {}
+    estimated_cost_total = 0.0
     per_model = {}
     contexts = []
     n_requests = 0
@@ -422,11 +540,12 @@ def scan(files, min_requests):
                 totals[k] += ctx[k]
             if ctx["cache_write_fallback"]:
                 fallback_tokens += ctx["cache_write_5m"]
-            prices, canon = price_for(model)
+            prices, canon, estimated_as = price_for(model, pricing)
             cost, unpriced = request_cost(ctx, prices, field_dollars)
             key = canon or "(unknown model)"
             slot = per_model.setdefault(
-                key, {"requests": 0, "tokens": 0, "cost": 0.0, "unpriced_tokens": 0}
+                key,
+                {"requests": 0, "tokens": 0, "cost": 0.0, "unpriced_tokens": 0, "estimated_as": None},
             )
             slot["requests"] += 1
             slot["tokens"] += sum(ctx[f] for f in _FIELDS)
@@ -434,10 +553,15 @@ def scan(files, min_requests):
             if cost is not None:
                 slot["cost"] += cost
                 priced_cost_total += cost
+            if estimated_as:
+                # estimated_as is only set alongside a rate card, so cost is a float here.
+                slot["estimated_as"] = estimated_as
+                estimated_models[key] = estimated_models.get(key, 0) + sum(ctx[f] for f in _FIELDS) - unpriced
+                estimated_cost_total += cost
             if unpriced:
                 unpriced_models[key] = unpriced_models.get(key, 0) + unpriced
             unpriced_tokens_total += unpriced
-            context_tokens = ctx["input"] + ctx["cache_read"] + ctx["cache_write_5m"] + ctx["cache_write_1h"]
+            context_tokens = prompt_tokens(ctx)
             contexts.append((context_tokens, cost, key))
             if ts:
                 if ts_min is None or ts < ts_min:
@@ -458,6 +582,9 @@ def scan(files, min_requests):
         "priced_cost_total": priced_cost_total,
         "unpriced_tokens_total": unpriced_tokens_total,
         "unpriced_models": unpriced_models,
+        "estimated_models": estimated_models,
+        "estimated_cost_total": estimated_cost_total,
+        "pricing_source": pricing["source"],
         "per_model": per_model,
         "contexts": contexts,
         "ts_min": ts_min,
@@ -469,7 +596,7 @@ def scan(files, min_requests):
 def render_text(agg):
     out = []
     out.append("heimdall-cost-forensics")
-    out.append("pricing source: %s" % PRICING_SOURCE)
+    out.append("pricing source: %s" % agg["pricing_source"])
     out.append(
         "privacy: aggregates only (token counts, model ids, timestamps) — "
         "never prompt/file/tool content. See --help for the full guarantee."
@@ -512,12 +639,25 @@ def render_text(agg):
 
     out.append("── dollar totals (priced requests only) ──")
     out.append("  total priced cost: $%.4f" % agg["priced_cost_total"])
+    if agg["estimated_models"]:
+        listing = ", ".join(
+            "%s as %s" % (k, agg["per_model"][k]["estimated_as"]) for k in sorted(agg["estimated_models"])
+        )
+        out.append(
+            "  $%.4f of that is an ESTIMATE (%d tok): model(s) newer than any "
+            "version the pricing table lists, priced as the newest listed "
+            "version of their family: %s. Add an exact row to "
+            "bin/lib/tier-table.json (model_prices) to make them list price."
+            % (agg["estimated_cost_total"], sum(agg["estimated_models"].values()), listing)
+        )
     if agg["unpriced_tokens_total"]:
         models = ", ".join(sorted(agg["unpriced_models"]))
         out.append(
-            "  %d tok excluded from every dollar figure above — model(s) not "
-            "in the pricing table: %s. Dollar totals here are a FLOOR, not a "
-            "ceiling." % (agg["unpriced_tokens_total"], models)
+            "  %d tok (%.1f%% of all tokens) excluded from every dollar figure "
+            "above — model(s) not in the pricing table: %s. Dollar totals here "
+            "are a FLOOR, not a ceiling. Add rows to bin/lib/tier-table.json "
+            "(model_prices) to price them."
+            % (agg["unpriced_tokens_total"], 100.0 * agg["unpriced_tokens_total"] / total_tok, models)
         )
     out.append(
         "  note: cache-read's TOKEN share above overstates its true $ "
@@ -553,11 +693,13 @@ def render_text(agg):
     out.append("── spend by model ──")
     for key in sorted(agg["per_model"], key=lambda k: agg["per_model"][k]["cost"], reverse=True):
         slot = agg["per_model"][key]
-        unpriced_note = ""
+        note = ""
         if slot["unpriced_tokens"]:
-            unpriced_note = "  (%d tok unpriced)" % slot["unpriced_tokens"]
+            note += "  (%d tok unpriced)" % slot["unpriced_tokens"]
+        if slot["estimated_as"]:
+            note += "  (ESTIMATE: priced as %s)" % slot["estimated_as"]
         out.append(
-            "  %-24s %6d req  $%10.4f%s" % (key, slot["requests"], slot["cost"], unpriced_note)
+            "  %-24s %6d req  $%10.4f%s" % (key, slot["requests"], slot["cost"], note)
         )
     out.append("")
 
@@ -592,7 +734,7 @@ def render_json(agg):
         "available": False, "reason": "no requests found",
     }
     payload = {
-        "pricing_source": PRICING_SOURCE,
+        "pricing_source": agg["pricing_source"],
         "privacy": (
             "aggregates only (token counts, model ids, timestamps) — never "
             "prompt/file/tool content"
@@ -609,12 +751,16 @@ def render_json(agg):
         "priced_cost_total_usd": round(agg["priced_cost_total"], 6),
         "unpriced_tokens_total": agg["unpriced_tokens_total"],
         "unpriced_models": agg["unpriced_models"],
+        "estimated_models": agg["estimated_models"],
+        "estimated_tokens_total": sum(agg["estimated_models"].values()),
+        "estimated_cost_usd": round(agg["estimated_cost_total"], 6),
         "per_model": {
             k: {
                 "requests": v["requests"],
                 "tokens": v["tokens"],
                 "cost_usd": round(v["cost"], 6),
                 "unpriced_tokens": v["unpriced_tokens"],
+                "estimated_as": v["estimated_as"],
             }
             for k, v in agg["per_model"].items()
         },
@@ -663,9 +809,14 @@ def main(argv):
             return 2
         i += 1
 
+    try:
+        pricing = load_pricing(tier_table_path())
+    except PricingTableError as e:
+        eprint("error: pricing table: %s" % e)
+        return 1
     resolved_roots = discover_roots(roots)
     files = discover_files(resolved_roots)
-    agg = scan(files, min_requests)
+    agg = scan(files, min_requests, pricing)
     if as_json:
         print(render_json(agg))
     else:

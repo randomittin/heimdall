@@ -84,17 +84,14 @@ SWEPT_PATHSPECS=(bin hooks agents commands skills modules sentinels deploy .clau
 #                               HEIMDALL_MODEL_<TIER> override. Comments only —
 #                               a pin in its CODE is still caught.
 #   bin/lib/tier-table.json     the no_pinned_ids note, which quotes the exact id
-#                               that rotted as its cautionary example.
-#   bin/heimdall-cost-forensics the PRICING dict ($/MTok rate table). It must
-#                               name each model id to PRICE it from a transcript
-#                               — this is data, never a spawn: the tool looks up
-#                               a rate for an id it already read, it launches
-#                               nothing. Scoped to the dict's own line shape
-#                               (`"claude-...": dict(input=`) only — a pin
-#                               anywhere else in the file is still caught.
+#                               that rotted as its cautionary example. Its
+#                               model_prices rows (read by
+#                               bin/heimdall-cost-forensics, which once had its
+#                               own entry here) split family and version into
+#                               separate fields, so they name no id.
 #   bin/lib/fg_agent.py         the PRICES dict (US$/MTok rate table of the RP4
-#                               false-green Study A runner's spend meter). Same
-#                               class of exemption as cost-forensics above: the
+#                               false-green Study A runner's spend meter). A rate
+#                               table has to name the id it prices: the
 #                               meter reads the full id a finished message NAMES
 #                               and must key a rate on it, so the key can only be
 #                               a concrete id (one tier's generations differ in
@@ -111,7 +108,6 @@ SWEPT_PATHSPECS=(bin hooks agents commands skills modules sentinels deploy .clau
 ALLOW_ROWS='bin/heimdall-bench|--model <id>|PIN_PROBE=claude-opus-4-8|heimdall-bench --live --model claude-
 bin/heimdall-model-resolve|HEIMDALL_MODEL_OPUS|PIN_PROBE=claude-opus-4-8|^#
 bin/lib/tier-table.json|no_pinned_ids|  "probe_pin": "claude-opus-4-8",|"no_pinned_ids"
-bin/heimdall-cost-forensics|PRICING = {|PIN_PROBE=claude-opus-4-8|^    "claude-[a-z0-9-]+": dict\(input=
 bin/lib/fg_agent.py|PRICES = {|    "claude-opus-4-8": ("--model", "claude-opus-4-8"),|^    "claude-[a-z0-9-]+": \([0-9.]+(, [0-9.]+){4}\),$'
 
 # The agent templates whose routing tables an orchestrator reads before it spawns.
