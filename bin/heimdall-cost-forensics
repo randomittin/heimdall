@@ -22,6 +22,16 @@
 # secret-looking string inside a fixture's message.content and asserts it
 # never appears in this tool's stdout, stderr, or --json output.
 #
+# --levers MODE reads MORE of each record, and says so; the guarantee above is
+# narrowed to it, not dropped. It measures the LENGTH (in characters) of user
+# turns, task-notifications and tool results; compares a Read/Edit/Write tool
+# call's file path, offset and limit with the same agent's earlier calls, in
+# memory only; and tests text for a few fixed markers (the read-dedup stub, the
+# report-gate reason, the parallel-gate banner, a task-notification's <status>
+# tag). It prints counts, shares, means and percentiles only, never a path, a
+# prompt, a report or a line of tool output. The test plants a secret in each
+# of those places and asserts it never reaches stdout, stderr or --json.
+#
 # PRICING SOURCE: the `model_prices` block of bin/lib/tier-table.json — the
 # repo's one model table. This tool carries no rate table of its own. Rates are
 # the claude-api skill's list prices (cached 2026-06-24 for the rows through
@@ -49,15 +59,41 @@
 # ratio.
 #
 # USAGE:
-#   heimdall-cost-forensics [--root PATH]... [--json] [--min-requests N]
+#   heimdall-cost-forensics [--root PATH]... [--project NAME]... [--json]
+#                           [--min-requests N]
+#   heimdall-cost-forensics --levers [--since DATE] [--until DATE]
+#                           [--baseline-until DATE] [--cache-ttl SECONDS]
+#                           [--root PATH]... [--project NAME]... [--json]
 #
 #   --root PATH        Scan PATH (a directory, walked recursively for *.jsonl,
 #                       or a single *.jsonl file). Repeatable. Default: scan
 #                       $HMD_COST_FORENSICS_ROOT (colon-separated paths) if
 #                       set, else ~/.claude/projects (ALL projects — this
 #                       tool is not hardcoded to any one repo's slug).
+#   --project NAME      Scan only the project directories (the children of each
+#                       --root) whose name contains NAME. Repeatable. One
+#                       project of the default root: --project Downloads-heimdall
 #   --json              Emit a single machine-readable JSON object instead of
 #                       the human-readable report.
+#   --levers            Verify the token levers instead of printing the cost
+#                       report: the "Falsify" metric of each lever in
+#                       docs/analysis/2026-11-22-token-utilization-next.md and
+#                       2026-11-24-market-token-techniques.md, one row each,
+#                       every number labelled DERIVED with the query that made
+#                       it. Dates are UTC; a window is [since, until).
+#   --since DATE        (--levers) first instant of the window: YYYY-MM-DD or
+#                       YYYY-MM-DDTHH:MM[:SS]. Default: --baseline-until when
+#                       given, else the start of the data.
+#   --until DATE        (--levers) first instant AFTER the window. Default: the
+#                       end of the data.
+#   --baseline-until D  (--levers) add a BEFORE column: everything earlier than
+#                       D, beside the --since/--until window (AFTER). Rates are
+#                       per 30 days / per 100 prompts / shares, so a 72-day
+#                       before and a 7-day after compare.
+#   --cache-ttl SECONDS (--levers) idle gap beyond which the main thread's
+#                       prompt cache counts as expired. Default 3600 (the 1-hour
+#                       TTL a subscription gives the main thread); 300 for an
+#                       account on the 5-minute TTL.
 #   --min-requests N    Minimum distinct requests required before the
 #                       high-vs-low-context regime comparison will run.
 #                       Default 30 (see "HONEST DEGRADATION" above).
@@ -73,6 +109,7 @@
 # priced from a table that can't be trusted. 2 on a bad CLI invocation
 # (unrecognized flag, missing argument).
 
+import datetime
 import json
 import os
 import re
@@ -301,6 +338,29 @@ def extract_request(record):
     return message_id, model, ctx
 
 
+def iter_records(path):
+    """Yield (record, raw_line) for every line of a transcript JSONL that
+    parses as JSON. The ONE place a transcript is opened and decoded: the cost
+    report (iter_requests) and the --levers collector both read through it. A
+    line that is not JSON (the half-written last line of a live session) is
+    skipped; an unreadable file warns and yields nothing.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                yield record, line
+    except OSError as e:
+        eprint("warning: could not read %s: %s" % (path, e))
+        return
+
+
 def iter_requests(path):
     """Yield (model, ctx, timestamp) once per DISTINCT API request in a
     transcript JSONL, deduped by message.id.
@@ -319,29 +379,17 @@ def iter_requests(path):
     the overcounting bug this function exists to avoid.
     """
     seen = set()
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                extracted = extract_request(record)
-                if extracted is None:
-                    continue
-                message_id, model, ctx = extracted
-                if message_id is not None:
-                    if message_id in seen:
-                        continue
-                    seen.add(message_id)
-                ts = record.get("timestamp") if isinstance(record, dict) else None
-                yield model, ctx, ts
-    except OSError as e:
-        eprint("warning: could not read %s: %s" % (path, e))
-        return
+    for record, _line in iter_records(path):
+        extracted = extract_request(record)
+        if extracted is None:
+            continue
+        message_id, model, ctx = extracted
+        if message_id is not None:
+            if message_id in seen:
+                continue
+            seen.add(message_id)
+        ts = record.get("timestamp") if isinstance(record, dict) else None
+        yield model, ctx, ts
 
 
 def discover_roots(cli_roots):
@@ -353,10 +401,12 @@ def discover_roots(cli_roots):
     return [os.path.join(os.path.expanduser("~"), ".claude", "projects")]
 
 
-def discover_files(roots):
+def discover_files(roots, projects=()):
     """Walk every root for *.jsonl files. A root may itself be a single
     *.jsonl file (handy for pointing at one fixture/transcript directly).
     Never raises on a missing/unreadable root — just yields nothing for it.
+    With projects, only the child directories of a root whose name contains
+    one of them are walked (~/.claude/projects holds one directory per project).
     """
     files = []
     for root in roots:
@@ -366,10 +416,18 @@ def discover_files(roots):
             continue
         if not os.path.isdir(root):
             continue
-        for dirpath, _dirs, names in os.walk(root):
-            for name in names:
-                if name.endswith(".jsonl"):
-                    files.append(os.path.join(dirpath, name))
+        tops = [root]
+        if projects:
+            try:
+                tops = [os.path.join(root, n) for n in sorted(os.listdir(root)) if any(p in n for p in projects)]
+            except OSError as e:
+                eprint("warning: could not list %s: %s" % (root, e))
+                continue
+        for top in tops:
+            for dirpath, _dirs, names in os.walk(top):
+                for name in names:
+                    if name.endswith(".jsonl"):
+                        files.append(os.path.join(dirpath, name))
     return sorted(files)
 
 
