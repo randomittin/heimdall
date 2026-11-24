@@ -24,6 +24,10 @@
 #      swallowed resolver stderr, so without its own gate it printed a bare
 #      "fable" and the whole policy was decorative.
 #   7. opus/sonnet/haiku are unaffected by repo policy (all are ZDR-eligible).
+#   8. A tier states no price of its own: `heimdall-tier table` prices each tier at
+#      the newest model_prices row of its family (the current generation), a newer
+#      row moves the tier price with no second edit, and a tier with no row fails
+#      loudly instead of printing an invented number.
 #
 # PERF NOTE: every table assertion runs inside ONE python3 process. Interpreter
 # startup on a loaded machine is seconds, so a spawn-per-assertion loop pushed
@@ -50,8 +54,8 @@ echo "--------------------------------------------------------------------"
 
 # ── 1-2. TABLE CONTENT: spec classes at spec tiers, every agent mapped ──
 REPORT="$TMP/table-report.txt"
-python3 - "$TABLE" "$REPO/agents" <<'PY' > "$REPORT" 2>"$TMP/table-err"
-import glob, json, os, sys
+python3 - "$TABLE" "$REPO/agents" "$REPO/bin/heimdall-tier" <<'PY' > "$REPORT" 2>"$TMP/table-err"
+import glob, json, os, re, shutil, subprocess, sys, tempfile
 
 # Spec 2.1 routing table, transcribed. A mismatch means the encoded table drifted
 # from the written one.
@@ -63,7 +67,7 @@ SPEC = {
     "orchestrator": "opus", "security_critical": "opus", "gate_adjudication": "opus",
 }
 
-table_path, agents_dir = sys.argv[1], sys.argv[2]
+table_path, agents_dir, tier_bin = sys.argv[1], sys.argv[2], sys.argv[3]
 out = []
 
 
@@ -114,9 +118,97 @@ emit(tiers.get("haiku", {}).get("rank", 0) < tiers.get("sonnet", {}).get("rank",
      "rank orders haiku < sonnet < opus")
 emit(tiers.get("fable", {}).get("rank") == tiers.get("opus", {}).get("rank"),
      "fable shares opus's rank (spec 2.1 top row is 'Opus / Fable')")
-emit(all(meta.get("price_input_per_mtok", 0) > 0
-         and meta.get("price_output_per_mtok", 0) > 0 for meta in tiers.values()),
-     "every tier carries a nonzero input and output price")
+# Tier prices. A tier states NO price of its own: the number lives once, in the
+# newest model_prices row of the tier's family, so it cannot drift from the
+# per-model list prices. The stored copy did: it read Sonnet 4.6's $3/$15 for
+# "sonnet" after Sonnet 5.5 listed at $2/$10 (Opus $5/$25 vs $4/$20, Haiku $1/$5
+# vs $0.10/$0.50), and everything that read the tier price repeated it.
+stored = sorted(name for name, meta in tiers.items()
+                if "price_input_per_mtok" in meta or "price_output_per_mtok" in meta)
+emit(not stored, "no tier stores its own price, model_prices is the one source (stored: %s)"
+     % (stored or "none"))
+
+
+def version_key(row):
+    return tuple(int(part) for part in row["version"].split("."))
+
+
+def newest_rows(rows):
+    newest = {}
+    for row in rows:
+        family = row["family"]
+        if family not in newest or version_key(row) > version_key(newest[family]):
+            newest[family] = row
+    return newest
+
+
+newest = newest_rows(table.get("model_prices", {}).get("rows", []))
+unpriced = sorted(set(tiers) - set(newest))
+emit(not unpriced, "every tier has a model_prices row of its own family (unpriced: %s)"
+     % (unpriced or "none"))
+
+
+def printed_prices(binary):
+    """{tier: (input, output)} that `heimdall-tier table` prints, plus its exit
+    code and stderr. Parsed from the printed table: that is what a reader sees."""
+    run = subprocess.run([binary, "table"], capture_output=True, text=True)
+    shown = {}
+    for line in run.stdout.splitlines():
+        found = re.match(r"(\w+)\s+rank \d+\s+\$([0-9.]+)/\$([0-9.]+) per Mtok", line)
+        if found:
+            shown[found.group(1)] = (float(found.group(2)), float(found.group(3)))
+    return shown, run.returncode, run.stderr
+
+
+# $/MTok input/output of the current generation, from the claude-api skill's
+# Current Models table (pricing cached 2026-11-03). A bare tier alias resolves
+# to the current generation, so the tier's price IS that generation's price.
+CURRENT = {"haiku": (0.10, 0.50),     # Claude Haiku 5.5
+           "sonnet": (2.00, 10.00),   # Claude Sonnet 5.5
+           "opus": (4.00, 20.00),     # Claude Opus 5.5
+           "fable": (8.00, 40.00)}    # Claude Fable 5.2
+shown, rc, err = printed_prices(tier_bin)
+emit(shown == {name: (round(row["input"], 2), round(row["output"], 2))
+               for name, row in newest.items() if name in tiers},
+     "heimdall-tier table prints each tier at its family's newest model_prices row (rc=%d, got %s)"
+     % (rc, shown))
+for name in sorted(CURRENT):
+    emit(shown.get(name) == CURRENT[name],
+         "tier %s prints the current-generation price %s (got %s)"
+         % (name, CURRENT[name], shown.get(name)))
+
+# Single-source property: add a row and the tier price follows, no second edit.
+# The newest row (10.1: a string compare ranks it below 5.5) sits in the middle,
+# an older row first and another last, so the first row, the last row and a
+# string max all give the wrong answer.
+workdir = tempfile.mkdtemp(prefix="tier-price.")
+try:
+    os.makedirs(os.path.join(workdir, "lib"))
+    copy_bin = os.path.join(workdir, "heimdall-tier")
+    shutil.copy(tier_bin, copy_bin)
+    mutated = json.loads(json.dumps(table))
+    mutated_rows = mutated["model_prices"]["rows"]
+    mutated_rows.insert(0, {"family": "opus", "version": "1.0", "input": 99.0, "output": 99.0})
+    mutated_rows.insert(len(mutated_rows) // 2,
+                        {"family": "opus", "version": "10.1", "input": 1.5, "output": 7.5})
+    mutated_rows.append({"family": "opus", "version": "2.0", "input": 98.0, "output": 98.0})
+    with open(os.path.join(workdir, "lib", "tier-table.json"), "w") as handle:
+        json.dump(mutated, handle)
+    shown_m, rc_m, err_m = printed_prices(copy_bin)
+    emit(shown_m.get("opus") == (1.5, 7.5),
+         "a newer opus row moves the opus tier price, numeric newest wins not first/last/string order (got %s)"
+         % (shown_m.get("opus"),))
+    emit(all(shown_m.get(name) == CURRENT[name] for name in ("haiku", "sonnet", "fable")),
+         "the other tiers keep pricing from their own rows after that edit (got %s)" % (shown_m,))
+    mutated["model_prices"]["rows"] = [row for row in mutated_rows if row["family"] != "haiku"]
+    with open(os.path.join(workdir, "lib", "tier-table.json"), "w") as handle:
+        json.dump(mutated, handle)
+    bare = subprocess.run([copy_bin, "table"], capture_output=True, text=True)
+    emit(bare.returncode != 0 and "haiku" in bare.stderr,
+         "a tier with no model_prices row fails loudly, no invented price (rc=%d stderr=%r)"
+         % (bare.returncode, bare.stderr.strip()))
+finally:
+    shutil.rmtree(workdir, ignore_errors=True)
 
 emit(table.get("non_zdr_tiers") == ["fable"],
      "non_zdr_tiers = %r (must match the tier the resolver gates)"
@@ -151,11 +243,11 @@ else
       *)   bad "unparseable table-check line: $verdict|$message" ;;
     esac
   done < "$REPORT"
-  # Anti-vacuous floor: the block above emits 26 verdicts. Fewer means it bailed
+  # Anti-vacuous floor: the block above emits 38 verdicts. Fewer means it bailed
   # early and a green run would be meaningless.
-  [ "$LINES" -ge 26 ] \
+  [ "$LINES" -ge 38 ] \
     && ok "table check ran all $LINES assertions" \
-    || bad "table check emitted only $LINES verdicts — expected at least 26"
+    || bad "table check emitted only $LINES verdicts — expected at least 38"
 fi
 
 # ── 3. FABLE REFUSED LOUDLY UNDER A FORBIDDING POLICY ──

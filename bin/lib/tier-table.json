@@ -6,33 +6,26 @@
   "tiers": {
     "haiku": {
       "rank": 1,
-      "price_input_per_mtok": 1.0,
-      "price_output_per_mtok": 5.0,
       "context_window": 200000,
       "zdr_eligible": true
     },
     "sonnet": {
       "rank": 2,
-      "price_input_per_mtok": 3.0,
-      "price_output_per_mtok": 15.0,
       "context_window": 1000000,
       "zdr_eligible": true
     },
     "opus": {
       "rank": 3,
-      "price_input_per_mtok": 5.0,
-      "price_output_per_mtok": 25.0,
       "context_window": 1000000,
       "zdr_eligible": true
     },
     "fable": {
       "rank": 3,
-      "price_input_per_mtok": 10.0,
-      "price_output_per_mtok": 50.0,
       "context_window": 1000000,
       "zdr_eligible": false
     }
   },
+  "tier_price_rule": "A tier states no price: it is priced at the newest model_prices row whose family is the tier name (a bare alias resolves to the current generation). Add a row and the tier price follows; bin/heimdall-tier derives it and fails loudly for a tier with no row.",
 
   "inherit_declaration": {
     "value": "inherit",
@@ -48,7 +41,7 @@
     "tiers_with_1m_window": ["sonnet", "opus", "fable"],
     "suffix_required": { "sonnet": "[1m]" },
     "no_1m_variant": ["haiku"],
-    "note": "The per-tier prices above are BASE rates for requests at or under 200K input tokens. Only sonnet's opt-in [1m] is confirmed to carry a long-context premium above that threshold. opus does NOT carry it: Anthropic's own model docs state opus's 1M window bills at standard API pricing with no long-context premium, and this repo's own token-spend-forensics.md prices opus sessions past 900K input tokens at flat base rate plus only the ordinary cache multipliers, never a premium term, so a base-rate total from this table IS the bill on opus while on sonnet[1m] it is only a FLOOR. fable is undocumented either way and must not be assumed to match opus or sonnet until measured. bin/heimdall-model-resolve appends [1m] to sonnet (where 1M is opt-in) and leaves opus/fable bare (1M is already their default maximum); haiku has no 1M variant at all and is exempt.",
+    "note": "The per-tier prices (tier_price_rule) are BASE rates for requests at or under 200K input tokens (haiku: 100K, see its long_context card). Only sonnet's opt-in [1m] is confirmed to carry a long-context premium above that threshold. opus does NOT carry it: Anthropic's own model docs state opus's 1M window bills at standard API pricing with no long-context premium, and this repo's own token-spend-forensics.md prices opus sessions past 900K input tokens at flat base rate plus only the ordinary cache multipliers, never a premium term, so a base-rate total from this table IS the bill on opus while on sonnet[1m] it is only a FLOOR. fable is undocumented either way and must not be assumed to match opus or sonnet until measured. bin/heimdall-model-resolve appends [1m] to sonnet (where 1M is opt-in) and leaves opus/fable bare (1M is already their default maximum); haiku has no 1M variant at all and is exempt.",
     "why_not_priced_here": "The exact premium multiplier is set by the API's pricing, not by hmd, and hardcoding a number here would create a second cost accounting that can silently disagree with the first. This block records WHERE the premium applies so a reader is never misled into treating a base-rate total as complete; it deliberately does not invent the multiplier."
   },
 
@@ -60,7 +53,7 @@
   },
 
   "model_prices": {
-    "purpose": "Per-model list prices in US dollars per million tokens, read by bin/heimdall-cost-forensics to price a session transcript. The tiers block above holds ONE representative price per tier for routing arithmetic; it cannot price a transcript, because one tier's generations list at different prices (Opus 5.5 below Opus 5, Haiku 5.5 at a tenth of Haiku 4.5) and a rate wrong by a factor reads as a number, which is worse than an unpriced token. Rows are matched on family + version, kept as separate fields so this file names no model id (test/operational-model-pin.test.sh forbids a pinned id on this path).",
+    "purpose": "Per-model list prices in US dollars per million tokens, read by bin/heimdall-cost-forensics to price a session transcript. This is the one place a rate is written (tier prices derive from it). One price per tier cannot price a transcript, because one tier's generations list at different prices (Opus 5.5 below Opus 5, Haiku 5.5 at a tenth of Haiku 4.5) and a rate wrong by a factor reads as a number, which is worse than an unpriced token. Rows are matched on family + version, kept as separate fields so this file names no model id (test/operational-model-pin.test.sh forbids a pinned id on this path).",
     "source": "claude-api skill model reference. Rows through Fable 5.1, Sonnet 5, Opus 5 and Haiku 4.5: pricing cached 2026-06-24. Claude 5.5 generation (Opus, Sonnet, Haiku), Fable 5.2 and Mythos 5.2: pricing cached 2026-11-03 (SKILL.md Current Models table; shared/models.md; shared/prompt-caching.md Economics; shared/model-migration.md, Migrating to Claude Haiku 5.5).",
     "rate_rules": "A row gives input and output. Cache writes are cache_price_multipliers x input. cache_read is cache_price_multipliers.cache_read x input unless the row sets it: Fable 5.1, Fable 5.2 and Mythos 5.2 read at 0.025x, Opus 5.5 and Sonnet 5.5 at 0.05x. A row may set cache_read to null when the read price is unconfirmed: that slice is reported as unpriced, never guessed. long_context is a second rate card for a request whose prompt (uncached input + cache reads + cache writes) is above above_prompt_tokens; Haiku 5.5 bills $0.10 in / $0.50 out up to 100K prompt tokens and $0.50 / $2.50 above, its cache lines following each card's own input rate. Not modelled: fast mode, which bills a premium multiple of the same card (those requests read low), and non-first-party platforms, which price separately.",
     "unlisted_versions": "A version NEWER than every listed version of its family is priced as the newest listed one and reported as an ESTIMATE, so a new generation is never silently unpriced. A family this table lacks, or an older version it does not list, is never priced: an older model's price cannot be inferred from a newer one's. Add a row to make an estimate exact.",
