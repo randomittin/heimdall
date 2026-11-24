@@ -24,10 +24,15 @@
 #      change, no record, backup or temp file left behind, and a retry works; the same while the person is at the prompt (the file hmd created is not removed)
 #   O  a record that cannot be read or used (permissions, not JSON, a field missing, another file's record): exit 1, said plainly, nothing changed, the record undamaged
 #   P  an offer nobody answers gives up after the wait (HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S shortens it, junk is ignored), writes nothing and is not recorded as answered
+#   Q  an install from 2.4.12, which kept ONE record and ONE backup for the whole machine (state.json, settings.json.bak), written here by the real 2.4.12 tool read from git
+#      (tag v2.4.12): whichever verb comes first after the update (off, status, on --tokens) finds it and works as it did (off byte for byte, "set by hmd", an update without
+#      --force); the pair goes to the names of the settings file the record names (a symlinked spelling of this file's path included) and is never adopted for another one; a
+#      record that cannot be read or used is exit 1 with nothing moved; a record already in place for that file is never replaced; the move is idempotent and an interrupted
+#      one is finished by the next run
 #
 # HERMETIC. HOME, HEIMDALL_HOME and the settings file are throwaway for every scenario; CLAUDE_CONFIG_DIR is unset; nothing reads or writes the operator's ~/.claude
 # or ~/.heimdall. CW_BIN=<file> points the suite at another copy of the tool (a mutant, for the break-it check).
-# budget: about 12 s solo: roughly 170 starts of one python script, a dozen of them on a pty, one on a pty that waits out the 1 s seam. No network.
+# budget: about 16 s solo: roughly 200 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git), a dozen on a pty, one on a pty that waits out the 1 s seam. No network.
 # EXIT: 0 = every assertion passes; 1 = any FAIL.
 set -uo pipefail
 
@@ -456,6 +461,104 @@ for seam in abc 0 -3 nan inf 1e9 ''; do
   eq "P: the seam [$seam] is ignored: the wait stays 300 s" 300 "$(scrub env HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S="$seam" "$PY" -I "$TMP/drive.py" wait "$CW" 2>&1)"
 done
 eq "P: with no seam the wait is 300 s" 300 "$(scrub "$PY" -I "$TMP/drive.py" wait "$CW" 2>&1)"
+
+# ---- Q. an install from 2.4.12: the one record and backup it kept for the whole machine (state.json, settings.json.bak) belong to the settings file the record names ------
+# The fixture is the real old format: the 2.4.12 tool itself, read from git (tag v2.4.12), writes it. Whichever verb the person runs first after the update must find it.
+OLD="$TMP/heimdall-compact-window-2.4.12"
+git -C "$REPO" show v2.4.12:bin/heimdall-compact-window >"$OLD" 2>"$ERR"; RC=$?
+eq "Q: the 2.4.12 tool is read from git (a checkout without the tag needs: git fetch --tags)" 0 "$RC"
+if [ "$RC" -eq 0 ]; then
+  chmod +x "$OLD"
+  old()     { scrub "$OLD" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }                                                          # the 2.4.12 tool, no terminal
+  oldat()   { local dir="$1"; shift; scrub env CLAUDE_CONFIG_DIR="$dir" "$OLD" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }      # ... with CLAUDE_CONFIG_DIR=$dir
+  bare()    { find "$H/.heimdall/compact-window" -maxdepth 1 \( -name state.json -o -name settings.json.bak \) 2>/dev/null | wc -l | tr -d ' '; }   # the 2.4.12 names still in place
+  listing() { find "$H/.heimdall/compact-window" -type f -exec cksum {} + 2>/dev/null | sort; }                                     # every file kept, with its checksum
+  LEG=""   # set per scenario: the record under its 2.4.12 name
+
+  # off is the first verb after the update
+  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+  old on --yes
+  eq "Q: the 2.4.12 tool kept one pair under the bare names (so the fixture is the old format)" "0|2|2" "$RC|$(bare)|$(state)"
+  cw off --yes
+  eq "Q: off, the first verb after the update, undoes what 2.4.12 set: the key is gone" "0|ABSENT" "$RC|$(value)"
+  chk "Q: ... byte for byte" same "$S" "$TMP/orig"
+  eq "Q: ... and the pair is gone, under either name" "0|0" "$(bare)|$(state)"
+
+  # status is the first verb after the update
+  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; old on --yes
+  cw status
+  eq "Q: status, the first verb after the update: hmd set it, not 'your own setting'" "0|1|0" "$RC|$(grep -c 'set by hmd' "$OUT")|$(grep -c 'your own setting' "$OUT")"
+  eq "Q: ... the pair has the names of its settings file now: no bare name left, both files kept" "0|2" "$(bare)|$(state)"
+  before="$(listing)"; cw status; cw status
+  eq "Q: the move is idempotent: two more runs change nothing" "$before" "$(listing)"
+  cw off --yes
+  eq "Q: ... and off after it restores the file byte for byte" "0|ABSENT|same|0" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+
+  # on --tokens is the first verb after the update
+  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; old on --yes
+  cw on --yes --tokens 250k
+  eq "Q: on --tokens, the first verb after the update: hmd's own value is updated, no --force" "0|250000" "$RC|$(value)"
+  cw off --yes
+  eq "Q: ... and off still undoes to the very first state, byte for byte" "0|ABSENT|same|0" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+
+  # the record names ANOTHER settings file (2.4.12 run with a different CLAUDE_CONFIG_DIR): it becomes that file's, and is never adopted for this one
+  new_home; mkdir -p "$H/second"; S2="$H/second/settings.json"
+  printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; printf '%s' "$COMPACT" >"$S2"; cp "$S2" "$TMP/orig2"
+  oldat "$H/second" on --yes
+  cw status
+  eq "Q: a 2.4.12 record of another settings file: this file is not set, and the other one is named" "0|1|1" "$RC|$(grep -c 'not set' "$OUT")|$(grep -c -F '~/second/settings.json' "$OUT")"
+  eq "Q: ... the pair went to the other file's names, not this one's: this file untouched, no bare name left" "same|0|2" "$(same "$S" "$TMP/orig" && echo same)|$(bare)|$(state)"
+  cw off --yes
+  eq "Q: off here: nothing to undo (the record is not this file's), the other file is named and keeps its key" "0|1|1|300000" "$RC|$(grep -c 'nothing to undo' "$OUT")|$(grep -c -F '~/second/settings.json' "$OUT")|$(valueof "$S2")"
+  cwat "$H/second" off --yes
+  eq "Q: off with its own CLAUDE_CONFIG_DIR restores that file byte for byte, the pair gone" "0|ABSENT|same|0" "$RC|$(valueof "$S2")|$(same "$S2" "$TMP/orig2" && echo same)|$(state)"
+  chk "Q: ... and this file was never touched" same "$S" "$TMP/orig"
+
+  # the record spells this file's path through a symlink: it canonicalizes to this file, so it is this file's, and is rewritten to the real path
+  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; ln -s "$H/.claude" "$H/linkdir"; old on --yes
+  LEG="$H/.heimdall/compact-window/state.json"
+  sed "s|\"settings\": \".*\"|\"settings\": \"$H/linkdir/settings.json\"|" "$LEG" >"$TMP/spelled" && cp "$TMP/spelled" "$LEG"
+  cw status
+  eq "Q: a 2.4.12 record that spells this file through a symlink: hmd set it" "0|1" "$RC|$(grep -c 'set by hmd' "$OUT")"
+  chk "Q: ... and the record now names the real path" grep -q "\"settings\": \"$S\"" "$(rec)"
+  cw off --yes
+  eq "Q: ... off restores it byte for byte" "0|ABSENT|same|0" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+
+  # a 2.4.12 record that cannot be read or used: exit 1, said plainly, nothing changed or moved, the record undamaged
+  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; old on --yes; cp "$S" "$TMP/after-on"
+  LEG="$H/.heimdall/compact-window/state.json"; cp "$LEG" "$TMP/legacy-record"; make_unreadable "$LEG"
+  for verb in "status" "on --yes" "off --yes"; do
+    cw $verb
+    eq "Q: [$verb] with a 2.4.12 record that cannot be read: exit 1, names it, no traceback" "1|1|0" "$RC|$(grep -c 'cannot read .*state.json' "$ERR")|$(grep -c Traceback "$ERR")"
+    chk "Q: [$verb] left the settings file alone and moved nothing" test "$(same "$S" "$TMP/after-on" && echo same)|$(bare)" = "same|2"
+  done
+  rm -rf "$LEG"; cp "$TMP/legacy-record" "$LEG"
+  for bad_record in 'not json' '{"schema": 2}' '{"schema": 1, "settings": "relative.json", "had_file": false, "had_key": false, "written": 300000, "sha256_after": "x"}'; do
+    printf '%s' "$bad_record" >"$LEG"
+    cw off --yes
+    eq "Q: the 2.4.12 record [$bad_record] cannot be used: exit 1, says so and how to clear it" "1|1|1" "$RC|$(grep -c 'cannot be used' "$ERR")|$(grep -c 'remove it by hand' "$ERR")"
+    chk "Q: ... the settings file is left alone and nothing was moved" test "$(same "$S" "$TMP/after-on" && echo same)|$(bare)" = "same|2"
+  done
+  cp "$TMP/legacy-record" "$LEG"; cw off --yes
+  eq "Q: the record put back, off undoes it: the attempts above damaged nothing" "0|ABSENT|same|0" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+
+  # a record of the same file is already in place (made by a run before the move existed): the newer one stays, the old pair is left alone
+  new_home; printf '%s' "$PRETTY" >"$S"
+  cw on --yes --tokens 250k; NEWREC="$(rec)"; cp "$NEWREC" "$TMP/newer-record"
+  old on --yes --force --tokens 400k
+  eq "Q: the fixture: a 2.4.12 pair next to a record of the same settings file (4 files)" "0|2|4" "$RC|$(bare)|$(state)"
+  cw status
+  chk "Q: the record already in place is never replaced by the old one" cmp -s "$NEWREC" "$TMP/newer-record"
+  eq "Q: ... and the old pair is left where it is, not deleted" "2|4" "$(bare)|$(state)"
+
+  # a move interrupted after the backup moved (the record still under the old name): the next run finishes it
+  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; old on --yes
+  cw status
+  mv "$(rec)" "$H/.heimdall/compact-window/state.json"
+  eq "Q: the fixture: the backup under its own name, the record under the old one" "1|2" "$(bare)|$(state)"
+  cw off --yes
+  eq "Q: the next run finishes the move: off restores the file byte for byte, the pair gone" "0|ABSENT|same|0" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+fi
 
 echo
 echo "compact-window: $PASS passed, $FAIL failed"

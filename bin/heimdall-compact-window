@@ -36,6 +36,11 @@ offer   the one-time question install and update ask at a terminal: nothing is p
         HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S=<seconds> shortens that wait (the test seam: a number above 0 and below 300, anything else is ignored).
 status  the setting file, the value in it and whether hmd put it there, and any other settings file hmd set the key in. Exit 1 only when the file cannot be used.
 
+UPDATING FROM 2.4.12. That release kept ONE record and ONE backup for the whole machine, state.json and settings.json.bak. The first time `status`, `on` or `off` runs they are moved
+to the names of the settings file the record names (its real path, which the record is rewritten to say), so a yes given to 2.4.12 still has its `off`, `status` and `on --tokens`.
+A record of another settings file becomes that file's, never this one's; a record already kept for the file is the newer one and stays; a record that cannot be read or used is
+exit 1 with nothing moved, like any other.
+
 Exit 0 done or nothing to do. 1 a file that cannot be used or written (nothing was changed; stderr says why). 2 usage. 3 consent required (nothing was written).
 4 refused: the key holds a value that is not hmd's, --force overrides. stdlib only.
 """
@@ -254,9 +259,12 @@ def replace_settings(doc, data):
     write_atomic(doc.path, data, before_rename=lambda: ensure_unchanged(doc))
 
 
-def load_state(settings):
-    """The record `on` left for the settings file `settings` (its canonical path), None when there is none; Unusable when there is one that cannot be used."""
-    path = state_files(settings)[0]
+def unusable_record(path, reason):
+    return Unusable("%s cannot be used (%s); remove it by hand once you no longer want hmd to track %s" % (path, reason, KEY))
+
+
+def read_record(path, settings=None):
+    """The record in `path`, None when there is none; Unusable when it cannot be read or used, or, given `settings`, when it is the record of another settings file."""
     raw = read_bytes(path)
     if raw is None:
         return None
@@ -267,20 +275,60 @@ def load_state(settings):
         for field, kind in (("settings", str), ("had_file", bool), ("had_key", bool), ("written", int), ("sha256_after", str)):
             if not isinstance(record.get(field), kind):
                 raise ValueError("its %s is missing" % field)
-        if record["settings"] != settings:
+        if settings is not None and record["settings"] != settings:
             raise ValueError("it is the record of another settings file")
     except (ValueError, RecursionError) as exc:
-        raise Unusable("%s cannot be used (%s); remove it by hand once you no longer want hmd to track %s" % (path, exc, KEY))
+        raise unusable_record(path, exc)
     return record
 
 
+def record_bytes(record):
+    return (json.dumps(record, indent=2) + "\n").encode("utf-8")
+
+
+def migrate_legacy():
+    """2.4.12 kept ONE record and ONE backup for the whole machine (state.json, settings.json.bak); every settings file has a pair of its own now (state_files). The first time any verb
+    looks, the old pair is moved to the names of the settings file its record names, so a yes given to 2.4.12 still has its `off`, `status` and `on --tokens` after the update. The pair goes
+    to the file the record NAMES, spelled as its real path (the record is rewritten to say so), never to the one being asked about: a record of another settings file stays that file's.
+    The backup moves first and the record last, so a move that was interrupted is finished by the next run; a record already in place for that file is the newer one, and the old pair
+    is left where it is. Unusable when the old record cannot be read or used, or the pair cannot be moved: nothing is lost, and the verb fails the way it does for any record it cannot use."""
+    old_record, old_backup = os.path.join(state_dir(), STATE_FILE), os.path.join(state_dir(), BACKUP_FILE)
+    record = read_record(old_record)
+    if record is None:
+        return
+    try:
+        if not os.path.isabs(record["settings"]):
+            raise ValueError("its settings is not an absolute path")
+        owner = os.path.realpath(record["settings"])
+        new_record, new_backup = state_files(owner)
+    except ValueError as exc:
+        raise unusable_record(old_record, exc)
+    if os.path.lexists(new_record):
+        return
+    try:
+        if record["settings"] != owner:
+            write_atomic(old_record, record_bytes(dict(record, settings=owner)), 0o700)
+        if os.path.lexists(old_backup):
+            os.replace(old_backup, new_backup)
+        os.replace(old_record, new_record)
+    except OSError as exc:
+        raise Unusable("cannot move the record and backup 2.4.12 kept (%s) to the names of the settings file they describe: %s" % (tilde(old_record), exc))
+
+
+def load_state(settings):
+    """The record `on` left for the settings file `settings` (its canonical path), None when there is none; Unusable when there is one that cannot be used. A pair 2.4.12 kept
+    under the old names is moved to its settings file's names first (migrate_legacy)."""
+    migrate_legacy()
+    return read_record(state_files(settings)[0], settings)
+
+
 def put_record(settings, record):
-    write_atomic(state_files(settings)[0], (json.dumps(record, indent=2) + "\n").encode("utf-8"), 0o700)
+    write_atomic(state_files(settings)[0], record_bytes(record), 0o700)
 
 
 def other_records(settings):
-    """The settings files, other than `settings`, that hmd set the key in and still holds a record for. A record that cannot be read or used is left out: it is reported
-    when its own settings file is the one asked about."""
+    """The settings files, other than `settings`, that hmd set the key in and still holds a record for (a 2.4.12 pair is listed once load_state has moved it to its own names, which
+    every verb that calls this does first). A record that cannot be read or used is left out: it is reported when its own settings file is the one asked about."""
     try:
         names = sorted(name for name in os.listdir(state_dir()) if name.endswith("." + STATE_FILE))
     except OSError:
