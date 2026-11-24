@@ -1,14 +1,14 @@
 {
-  "digest": "142a67151cde9705a48f4dc710ca7edc759fb672fe61bbe52cfd6545e8ab2491",
+  "digest": "2eec390056d8f57a4b514beb8f9eeafffcc727487d73a07a1599d4ef86178593",
   "info": {
     "git_trees": {
       "agents": "c116f0325c763d52d82703dcc6e8b24a541ec2c6",
       "commands": "100f7a1ca0d0cfdca442e4ae2bd28c5b43748652",
-      "hooks": "ce216fd515e65bcd7bbf580bab06d84efc539249",
+      "hooks": "b0aa223e315142d3d67802284b59cd3be554b71c",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
       "skills": "8ca944f54d03454e6a836983d06c350483f63415"
     },
-    "recorded_utc": "2026-11-23T03:48:41Z",
+    "recorded_utc": "2026-11-24T20:12:22Z",
     "summary": {
       "agents": 17,
       "bytes": 650343,
@@ -744,19 +744,19 @@
     },
     "hooks_json": {
       "hooks/hooks.json": {
-        "bytes": 38914,
+        "bytes": 39823,
         "events": {
-          "PostToolUse": 7,
+          "PostToolUse": 8,
           "PostToolUseFailure": 1,
           "PreCompact": 1,
           "PreToolUse": 10,
           "SessionEnd": 3,
           "SessionStart": 17,
           "Stop": 7,
-          "SubagentStop": 3,
+          "SubagentStop": 4,
           "UserPromptSubmit": 7
         },
-        "sha256": "89ca6d20046142b6f422a598ffc9bcb16c7a92b8d3e4a732aff73ecf52f61bc1"
+        "sha256": "50ad038ef048947a57534a1edfb6f7734a72cc55fd62e53ef00fff7ee57938c8"
       }
     },
     "settings": {
