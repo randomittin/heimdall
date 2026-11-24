@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# heimdall-read-dedup -- stub a Read that returns what the same agent already holds in context: the PostToolUse hook (`post-read`) and
-# `clear --session ID` (the PreCompact hook runs it). Why, the payload fields, the rule, the state and its bounds: the header of
-# bin/lib/hmd_read_dedup.py, which holds the behaviour. This file is only the launcher.
+# heimdall-read-dedup -- stub a Read that returns what the same agent already holds in context, and answer a subagent's unsliced Read of a
+# big source file with its head and outline: the PostToolUse hook (`post-read`) and `clear --session ID` (the PreCompact hook runs it).
+# Why, the payload fields, the rules, the state and its bounds: the header of bin/lib/hmd_read_dedup.py, which holds the behaviour. This
+# file is only the launcher.
 #
-# OFF SWITCH. HMD_READ_DEDUP=off (also 0, false, no) in the environment Claude Code runs in makes `post-read` exit 0 at once: no stub
-# and nothing recorded. `clear` is never switched off: forgetting reads is always safe, and a compaction that happened while the hook
-# was off must not leave state behind for when it is on again. The hook can also be switched off by id: `hmd guardrails off read-dedup`.
+# SWITCHES, read in the environment Claude Code runs in. The STUB is opt-in: HMD_READ_DEDUP=on (also 1, true, yes). The OUTLINE is on
+# unless HMD_READ_OUTLINE=off (also 0, false, no). With the outline off and the stub not on, `post-read` exits 0 at once: no interpreter,
+# nothing recorded. `clear` is never switched off: forgetting reads is always safe, and a compaction that happened while the hook was off
+# must not leave state behind for when it is on again. The whole hook can also be switched off by id: `hmd guardrails off read-dedup`.
 SELF="${BASH_SOURCE[0]}"
 while [ -h "$SELF" ]; do
   _dir="$(cd "$(dirname "$SELF")" && pwd)"
@@ -15,7 +17,11 @@ done
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 
 if [ "${1:-}" = post-read ]; then
-  case "${HMD_READ_DEDUP:-}" in off | OFF | 0 | false | no) exit 0 ;; esac
+  # Conservative: exit here only when the outline is off AND the stub is certainly not on; any other spelling goes on to the module.
+  case "${HMD_READ_OUTLINE:-}" in
+    off | OFF | Off | 0 | false | no)
+      case "${HMD_READ_DEDUP:-}" in '' | off | OFF | Off | 0 | false | no) exit 0 ;; esac ;;
+  esac
 fi
 
 # The interpreter the way bin/heimdall-ctx-meter resolves it (bin/lib/hmd-python.sh: a version-manager shim costs ~145 ms a call).
