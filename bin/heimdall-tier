@@ -6,7 +6,7 @@ the Haiku tier handles. Nothing was wrong with any single run — nothing had ev
 DECLARED what tier that task wanted, so nothing could notice it was running three
 tiers above it. This command makes the declaration explicit and recorded:
 
-    table     print the routing table as encoded
+    table     print the routing table as encoded, each tier priced from model_prices
     declare   record the tier a spawn runs at (and whether it inherited one)
     check     conformance: every spawn template declares a tier (spec 3.4)
     agents    per-agent tier/model/override report (statusline data source)
@@ -89,6 +89,25 @@ def class_tier(table, name):
     return meta['tier']
 
 
+def tier_price(table, tier):
+    """(input, output, version): $/Mtok of a tier, from the model_prices rows.
+
+    A bare tier alias resolves to the current generation, so a tier is priced at
+    the newest listed row of its family. The table stores no per-tier price: that
+    second copy is what went stale (Sonnet 4.6's $3/$15 under "sonnet" after
+    Sonnet 5.5 listed at $2/$10). A tier with no row fails loudly: an unpriced
+    tier must not print an invented number.
+    """
+    rows = [row for row in table['model_prices']['rows'] if row['family'] == tier]
+    if not rows:
+        raise SystemExit(
+            "heimdall-tier: tier %r has no model_prices row of family %r in "
+            "tier-table.json, so it has no price (a tier is priced at the newest "
+            "row of its family)" % (tier, tier))
+    newest = max(rows, key=lambda row: [int(part) for part in row['version'].split('.')])
+    return newest['input'], newest['output'], newest['version']
+
+
 def gate_tier(tier, repo):
     """Run the requested tier past the resolver, which owns the non-ZDR policy.
 
@@ -157,9 +176,10 @@ def cmd_table(args):
         meta = table['tiers'][tier]
         classes = sorted(by_tier.get(tier, []))
         flag = '' if meta.get('zdr_eligible', True) else '  [non-ZDR: opt-in required]'
-        print('%-7s rank %d  $%.2f/$%.2f per Mtok  ctx %s%s'
-              % (tier, meta['rank'], meta['price_input_per_mtok'],
-                 meta['price_output_per_mtok'], format(meta['context_window'], ','), flag))
+        price_in, price_out, version = tier_price(table, tier)
+        print('%-7s rank %d  $%.2f/$%.2f per Mtok (v%s)  ctx %s%s'
+              % (tier, meta['rank'], price_in, price_out, version,
+                 format(meta['context_window'], ','), flag))
         if not classes:
             print('        (no task class routes here by default)')
         for name in classes:

@@ -404,6 +404,7 @@ bin/lib/hmd_finished_agents.py
 bin/lib/hmd_fix_chain.sh
 bin/lib/hmd_guardrail_enabled.sh
 bin/lib/hmd_kill_guard.py
+bin/lib/hmd_model_prices.py
 bin/lib/hmd_nofollow_write.py
 bin/lib/hmd_pair_optin.py
 bin/lib/hmd_plan_verify.py

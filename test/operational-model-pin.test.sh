@@ -86,29 +86,15 @@ SWEPT_PATHSPECS=(bin hooks agents commands skills modules sentinels deploy .clau
 #   bin/lib/tier-table.json     the no_pinned_ids note, which quotes the exact id
 #                               that rotted as its cautionary example. Its
 #                               model_prices rows (read by
-#                               bin/heimdall-cost-forensics, which once had its
-#                               own entry here) split family and version into
-#                               separate fields, so they name no id.
-#   bin/lib/fg_agent.py         the PRICES dict (US$/MTok rate table of the RP4
-#                               false-green Study A runner's spend meter). A rate
-#                               table has to name the id it prices: the
-#                               meter reads the full id a finished message NAMES
-#                               and must key a rate on it, so the key can only be
-#                               a concrete id (one tier's generations differ in
-#                               price; a bare alias prices nothing). Data, never
-#                               a spawn: nothing in the table is passed to a CLI.
-#                               The table is frozen verbatim in the locked
-#                               PREREG.md Amendment 1, and
-#                               test/false-green-agent-cap.test.sh fails if the
-#                               two differ. Scoped to the dict's own line shape
-#                               (`"claude-...": (<five rates>),`) only — a pin
-#                               anywhere else in the file, comments included, is
-#                               still caught, as is a same-shaped line that
-#                               carries anything but five numbers.
+#                               bin/heimdall-cost-forensics, bin/heimdall-tokens
+#                               and bin/lib/fg_agent.py, the last of which once
+#                               had its own entry here for a rate table of its
+#                               own) split family and version into separate
+#                               fields, so they name no id: fg_agent.py builds
+#                               the id its meter keys on from them.
 ALLOW_ROWS='bin/heimdall-bench|--model <id>|PIN_PROBE=claude-opus-4-8|heimdall-bench --live --model claude-
 bin/heimdall-model-resolve|HEIMDALL_MODEL_OPUS|PIN_PROBE=claude-opus-4-8|^#
-bin/lib/tier-table.json|no_pinned_ids|  "probe_pin": "claude-opus-4-8",|"no_pinned_ids"
-bin/lib/fg_agent.py|PRICES = {|    "claude-opus-4-8": ("--model", "claude-opus-4-8"),|^    "claude-[a-z0-9-]+": \([0-9.]+(, [0-9.]+){4}\),$'
+bin/lib/tier-table.json|no_pinned_ids|  "probe_pin": "claude-opus-4-8",|"no_pinned_ids"'
 
 # The agent templates whose routing tables an orchestrator reads before it spawns.
 ROUTING_TEMPLATES="agents/heimdall.md agents/architect.md agents/planner.md"
@@ -322,7 +308,7 @@ else
   got="$(env -u HEIMDALL_MODEL_HAIKU "$RESOLVE" haiku 2>/dev/null)"
   case "$got" in
     *'[1m]'*) bad "haiku resolved to '$got' — no haiku[1m] exists; this would be an invalid --model" ;;
-    *) ok "haiku carries no [1m] suffix (no such variant exists; its window is 200K)" ;;
+    *) ok "haiku carries no [1m] suffix (no such variant exists)" ;;
   esac
   # opus already defaults to 1M — the 4.x-era suffix must not be re-added
   got="$(env -u HEIMDALL_MODEL_OPUS "$RESOLVE" opus 2>/dev/null)"
