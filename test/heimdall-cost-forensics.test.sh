@@ -540,5 +540,396 @@ MISS_RC=$?
 grep -q "pricing table" "$TMPDIR_T/miss.err" && ok "stderr says it is the pricing table that failed" \
   || bad "stderr does not mention the pricing table"
 
+# ── 15. --levers: the 7-day verification of the token levers ──────────────
+# docs/analysis/2026-11-22-token-utilization-next.md and 2026-11-24-market-
+# token-techniques.md each end a lever with a "Falsify" check. --levers runs
+# every one of them over a date window in one command, before vs after a date.
+# The fixture below is a project tree built so that every number is hand-
+# checkable; the stub text and the gate reason come from the hooks' OWN code, so
+# the day a hook rewords its message this suite goes red instead of the
+# recogniser going blind. Windows: before = everything < 2026-11-24, after =
+# everything >= 2026-11-24 (UTC). Corpus floor 2026-11-10T00:00:00Z, ceiling
+# 2026-11-27T00:00:00Z: the before window spans 14.0 days, the after window 3.0.
+LEVERS_DIR="$TMPDIR_T/levers"
+LEVERS_SECRET="LEVERS_SECRET_DO_NOT_LEAK_q42"
+export LEVERS_EXPECT="$TMPDIR_T/levers-expect.json"
+python3 - "$LEVERS_DIR" "$LEVERS_SECRET" "$ROOT" > "$LEVERS_EXPECT" <<'PY'
+import datetime, importlib.machinery, importlib.util, json, os, sys
+
+out_root, SECRET, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.append(os.path.join(repo, "bin", "lib"))
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+dedup = load("hmd_read_dedup", os.path.join(repo, "bin", "lib", "hmd_read_dedup.py"))
+gate = load("report_gate", os.path.join(repo, "bin", "heimdall-subagent-report-gate"))
+SONNET = "claude-sonnet-5"
+MARK = "⚡ MULTI-PART TASK DETECTED (~3 independent subtasks)."
+APATH = "/home/%s/p/a.py" % SECRET
+CPATH = "/home/%s/p/c.py" % SECRET
+
+
+def reason(agent):
+    return gate.decision(1801, 1500, "/h/.heimdall/subagent-reports/%s.md" % agent)["reason"]
+
+
+def iso(day, sec):
+    moment = datetime.datetime(2026, 11, day, tzinfo=datetime.timezone.utc) + datetime.timedelta(seconds=sec)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def use(inp=0, out=0, read=0, w5m=0, w1h=0):
+    return {"input_tokens": inp, "output_tokens": out, "cache_read_input_tokens": read,
+            "cache_creation": {"ephemeral_5m_input_tokens": w5m, "ephemeral_1h_input_tokens": w1h}}
+
+
+def pad(text, n):
+    assert len(text) < n, (len(text), n)
+    return (text + " " * n)[:n]
+
+
+def notif(n, status):
+    head = "<task-notification>\n<task-id>n%d</task-id>\n<status>%s</status>\n<result>%s" % (n, status, SECRET)
+    tail = "</result>\n</task-notification>"
+    text = head + "x" * (n - len(head) - len(tail)) + tail
+    assert len(text) == n
+    return text
+
+
+class Transcript:
+    def __init__(self, rel, agent=None, agent_type=None):
+        self.path = os.path.join(out_root, rel)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fh = open(self.path, "w")
+        self.agent = agent
+        if agent and agent_type:
+            with open(self.path[:-len(".jsonl")] + ".meta.json", "w") as meta:
+                json.dump({"agentType": agent_type, "description": SECRET}, meta)
+
+    def put(self, rec):
+        rec["isSidechain"] = self.agent is not None
+        if self.agent:
+            rec["agentId"] = self.agent
+        self.fh.write(json.dumps(rec) + "\n")
+
+    def request(self, ts, mid, usage, blocks=None, model=SONNET, effort=None):
+        for block in blocks or [{"type": "text", "text": "ok"}]:
+            rec = {"type": "assistant", "timestamp": ts,
+                   "message": {"id": mid, "model": model, "usage": usage, "content": [block]}}
+            if effort:
+                rec["effort"] = rec["perTurnEffort"] = effort
+            self.put(rec)
+
+    def text(self, ts, content, origin=None, **extra):
+        rec = {"type": "user", "timestamp": ts, "message": {"role": "user", "content": content}}
+        if origin:
+            rec["origin"] = {"kind": origin}
+        rec.update(extra)
+        self.put(rec)
+
+    def result(self, ts, tool_id, text):
+        self.put({"type": "user", "timestamp": ts, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tool_id, "content": text}]}})
+
+    def attach(self, ts, attachment):
+        self.put({"type": "attachment", "timestamp": ts, "attachment": attachment})
+
+    def tool(self, ts, mid, usage, name, tid, tool_input, result_text, effort=None):
+        """A request that calls one tool, then that tool's result. The tool_use rides the SECOND line of
+        the request (a real transcript writes one line per content block, all repeating the usage)."""
+        self.request(ts, mid, usage, [{"type": "thinking", "thinking": "hm"},
+                                      {"type": "tool_use", "id": tid, "name": name, "input": tool_input}], effort=effort)
+        self.result(ts, tid, result_text)
+
+    def inject(self, ts, event, content):
+        self.attach(ts, {"type": "hook_additional_context", "hookEvent": event, "hookName": event, "content": [content]})
+
+
+# ---- before: the main thread of proj-a (day 10) ----------------------------
+m = Transcript("proj-a/sess-before.jsonl")
+m.text(iso(10, 0), "kickoff " + SECRET)                                              # human prompt 1, the corpus floor
+m.text(iso(10, 9 * 3600), "plain prompt")                                            # human 2
+m.text(iso(10, 9 * 3600 + 5), "<system-reminder>x</system-reminder>", isMeta=True)   # meta: not a prompt
+m.text(iso(10, 11 * 3600), [{"type": "text", "text": "block prompt"}])               # human 3, text-block content
+m.text(iso(10, 13 * 3600), "origin prompt", origin="human")                          # human 4
+m.text(iso(10, 15 * 3600), "last human")                                             # human 5
+m.text(iso(10, 20 * 3600 + 100), "compact summary", isCompactSummary=True)           # not a prompt
+for k, (n, status) in enumerate(((1000, "completed"), (2000, "completed"), (3000, "completed"),
+                                 (4000, "completed"), (10000, "failed"))):
+    m.text(iso(10, 17 * 3600 + k * 10), notif(n, status), origin="task-notification")  # 5 more prompts
+for k in range(4):
+    m.inject(iso(10, 9 * 3600 + 10 + k), "UserPromptSubmit", MARK + " " + SECRET)    # 4 parallel-gate injections
+for k in range(2):
+    m.inject(iso(10, 9 * 3600 + 20 + k), "UserPromptSubmit", "HMD OUTPUT COMPRESSION - level: ultra.")
+m.inject(iso(10, 9 * 3600 + 30), "PreToolUse", MARK)                                 # wrong event: not counted
+# (second of day 10, cache_read, cache_write_1h); every other usage field is 0, so each prompt is read + write.
+# Idle gaps of 2 h: r2 rewrites a 100K prefix (below 150K), r4 a 200K one, r6 a 350K one. r8 follows a gap but
+# the cache survived (writes 10K of 360K), r9 is a compaction after idle (writes 20K of 370K): neither is a rewrite.
+for i, (sec, read, w1h) in enumerate([
+        (10 * 3600, 90000, 10000), (12 * 3600, 0, 100000), (12 * 3600 + 60, 100000, 100000),
+        (14 * 3600 + 60, 0, 200000), (14 * 3600 + 120, 200000, 150000), (16 * 3600 + 120, 0, 350000),
+        (16 * 3600 + 180, 350000, 10000), (18 * 3600 + 180, 360000, 10000), (20 * 3600 + 180, 0, 20000),
+        (20 * 3600 + 240, 20000, 10000)], 1):
+    if i in (3, 4):   # the main thread Reads one file twice: a subagent metric must not see it
+        m.tool(iso(10, sec), "mb%d" % i, use(read=read, w1h=w1h), "Read", "mt%d" % i, {"file_path": APATH}, pad("main read", 700))
+    else:
+        m.request(iso(10, sec), "mb%d" % i, use(read=read, w1h=w1h))
+m.request(iso(10, 21 * 3600), "mb_syn", use(read=400000), model="<synthetic>")        # excluded: client-made placeholder
+
+# ---- before: four subagents (day 11) ---------------------------------------
+T = iso(11, 10)
+b1 = Transcript("proj-a/sess-before/subagents/agent-b1.jsonl", "b1", "hmd:coder")
+b1.text(iso(11, 0), "spawn prompt " + SECRET)
+for rid, out, rd, w5m, name, tin, size in (
+        ("b1r1", 1000, 0, 40000, "Read", {"file_path": APATH}, 1000),
+        ("b1r2", 3000, 40000, 1000, "Read", {"file_path": APATH}, 1000),                          # identical re-read
+        ("b1r3", 0, 41000, 0, "Read", {"file_path": APATH, "offset": 10, "limit": 5}, 200),       # other range
+        ("b1r4", 0, 41000, 0, "Edit", {"file_path": APATH, "old_string": "a", "new_string": "b"}, 50),
+        ("b1r5", 0, 41000, 0, "Read", {"file_path": APATH}, 1100),                                # after the edit
+        ("b1r6", 0, 41000, 0, "Read", {"file_path": APATH}, 1100),                                # identical re-read
+        ("b1r7", 0, 41000, 0, "Bash", {"command": "ls"}, 650),
+        ("b1r8", 0, 41000, 0, "Read", {"file_path": "/home/%s/p/b.py" % SECRET}, 2000)):
+    b1.tool(T, rid, use(out=out, read=rd, w5m=w5m), name, rid.replace("r", "t"), tin, pad("r", size), effort="high")
+b2 = Transcript("proj-a/sess-before/subagents/agent-b2.jsonl", "b2", "hmd:coder")
+b2.tool(T, "b2r1", use(out=2000, w5m=50000), "Read", "b2t1", {"file_path": APATH}, pad("r", 1000), effort="high")
+b2.tool(T, "b2r2", use(read=50000, w5m=1000), "Read", "b2t2", {"file_path": APATH}, pad("r", 1000), effort="high")
+b3 = Transcript("proj-a/sess-before/subagents/agent-b3.jsonl", "b3", "Explore")
+b3.tool(T, "b3r1", use(out=600, w5m=20000), "Bash", "b3t1", {"command": "ls"}, pad("b", 900), effort="medium")
+b3.request(T, "b3r2", use(read=480000, w5m=20000), effort="medium")          # 500K inside a subagent: not main-thread
+b4 = Transcript("proj-a/sess-before/subagents/agent-b4.jsonl", "b4")           # no meta file, no effort recorded
+b4.request(T, "b4r1", use(out=1000, w5m=30000))
+
+# ---- after: the main thread (days 25-27) -----------------------------------
+n = Transcript("proj-a/sess-after.jsonl")
+n.text(iso(25, 0), "after kickoff")
+for k in range(5):
+    n.text(iso(25, 5 * 3600 + k), "human %d" % k)
+n.text(iso(27, 0), "last prompt")                                              # the corpus ceiling; 7 human prompts
+for k, size in enumerate((800, 1200, 1500)):
+    n.text(iso(25, 4 * 3600 + k * 10), notif(size, "completed"), origin="task-notification")
+n.inject(iso(25, 5 * 3600 + 10), "UserPromptSubmit", MARK)                      # 1 injection in 10 prompts
+for k in range(2):
+    n.inject(iso(25, 5 * 3600 + 20 + k), "UserPromptSubmit", "HMD OUTPUT COMPRESSION - level: ultra.")
+n.attach(iso(25, 5 * 3600 + 40), {"type": "hook_success", "hookEvent": "SubagentStop", "hookName": "SubagentStop",
+                                  "stdout": json.dumps({"decision": "block", "reason": reason("a1")})})   # a1 again
+for k, ctx in enumerate((30000, 100000, 200000, 300000)):                        # 300,000 is NOT above 300K
+    n.request(iso(25, 6 * 3600 + k * 60), "na%d" % (k + 1), use(read=ctx - 10000, w1h=10000))
+
+# ---- after: two subagents, stubs and gate blocks ---------------------------
+T = iso(25, 3600)
+S1 = "     1→" + dedup.STUB % (APATH, 1, 40)         # cat -n style prefix: the recogniser must search, not anchor
+S2 = dedup.STUB % (CPATH, 1, 90)
+a1 = Transcript("proj-a/sess-after/subagents/agent-a1.jsonl", "a1", "hmd:coder")
+a1.tool(T, "a1r1", use(out=500, w5m=30000), "Read", "a1t1", {"file_path": APATH}, pad("r", 1000), effort="medium")
+a1.tool(T, "a1r2", use(out=1000, read=30000, w5m=1000), "Read", "a1t2", {"file_path": APATH}, S1, effort="medium")
+a1.tool(T, "a1r3", use(read=31000), "Read", "a1t3", {"file_path": CPATH}, pad("r", 3000), effort="medium")
+a1.tool(T, "a1r4", use(read=31000), "Bash", "a1t4", {"command": "grep stub"}, pad(dedup.STUB % ("/x/y.py", 1, 5), 300), effort="medium")
+a1.tool(T, "a1r5", use(read=31000), "Bash", "a1t5", {"command": "cat"}, pad(reason("a9"), 500), effort="medium")   # quoted, not a block
+a1.request(T, "a1r6", use(read=31000), [{"type": "text", "text": reason("a8")}], effort="medium")                  # assistant quote
+a1.attach(T, {"type": "hook_blocking_error", "hookEvent": "SubagentStop", "hookName": "SubagentStop",
+              "blockingError": json.dumps({"blockingError": reason("a1")})})                                        # block 1
+a2 = Transcript("proj-a/sess-after/subagents/agent-a2.jsonl", "a2", "hmd:coder")
+a2.tool(T, "a2r1", use(out=1500, w5m=34000), "Read", "a2t1", {"file_path": CPATH}, pad("r", 3000), effort="medium")
+a2.tool(T, "a2r2", use(out=1000, read=34000, w5m=1000), "Read", "a2t2", {"file_path": CPATH}, S2, effort="medium")
+long_body = "x" * 2000 + dedup.STUB % ("/x/y.py", 1, 5)
+a2.tool(T, "a2r3", use(read=35000), "Read", "a2t3", {"file_path": "/home/%s/p/hook.py" % SECRET},
+        long_body + "y" * (5000 - len(long_body)), effort="medium")                          # long Read quoting the stub
+a2.text(T, "Stop hook feedback:\n" + reason("a2"), isMeta=True)                              # block 2
+a2.attach(T, {"type": "edited_text_file", "filename": "x", "snippet": reason("a7")})         # a snippet, not a hook
+
+# ---- decoy project and the window-boundary fixture -------------------------
+Transcript("proj-b/sess-other.jsonl").request(iso(10, 5000), "ob1", use(read=600000))
+edge = Transcript("../levers-edge/sess-edge.jsonl")
+for sec_day, ts in ((23, 86399), (24, 0), (24, 1)):
+    edge.request(iso(sec_day, ts), "e%d" % ts, use(read=400000))
+for t in (m, b1, b2, b3, b4, n, a1, a2, edge):
+    t.fh.close()
+print(json.dumps({"stub_chars": len(S1) + len(S2)}))
+PY
+[ -s "$LEVERS_EXPECT" ] && ok "levers fixture generated (stub and gate text taken from the hooks' own code)" \
+  || bad "levers fixture generator failed"
+
+grep -q "MULTI-PART TASK DETECTED" "$ROOT/bin/parallel-gate" && ok "levers: bin/parallel-gate still emits the marker the tool counts" \
+  || bad "levers: bin/parallel-gate no longer emits MULTI-PART TASK DETECTED"
+
+LEVERS_ARGS=(--levers --root "$LEVERS_DIR" --project proj-a --baseline-until 2026-11-24)
+"$TOOL" "${LEVERS_ARGS[@]}" --json > "$TMPDIR_T/levers.json" 2>"$TMPDIR_T/levers.stderr"
+LEVERS_RC=$?
+[ "$LEVERS_RC" -eq 0 ] && ok "--levers run exits 0" || bad "--levers run exit code was $LEVERS_RC, want 0"
+run_checks "$TMPDIR_T/levers.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+exp = json.load(open(__import__("os").environ["LEVERS_EXPECT"]))
+S = exp["stub_chars"]
+rows = {r["id"]: r for r in d["rows"]}
+B, A = "before", "after"
+def check(name, cond, detail=""):
+    print("%s %s%s" % ("PASS" if cond else "FAIL", name, ("" if cond or not detail else " (%s)" % detail)))
+def v(rid, win):
+    row = rows.get(rid)
+    return None if row is None else row["values"].get(win, {}).get("value")
+def detail(rid, win):
+    row = rows.get(rid)
+    return "" if row is None else row["values"].get(win, {}).get("detail", "")
+def near(rid, win, want, tol=1e-6):
+    got = v(rid, win)
+    check("%s %s == %.4f" % (rid, win, want), got is not None and abs(got - want) <= tol, "got %r" % (got,))
+
+check("windows: before ends and after starts at 2026-11-24T00:00:00Z (--since defaults to --baseline-until)",
+      d["windows"][B]["until"] == "2026-11-24T00:00:00Z" and d["windows"][A]["since"] == "2026-11-24T00:00:00Z",
+      "got %r" % (d["windows"],))
+check("windows: before spans 14.0 days, after 3.0 (nominal bound, capped at the data's own horizon)",
+      d["windows"][B]["span_days"] == 14.0 and d["windows"][A]["span_days"] == 3.0, "got %r" % (d["windows"],))
+check("every row is labelled DERIVED and carries its query",
+      all(r["label"] == "DERIVED" and len(r["query"]) > 20 for r in d["rows"]), "rows %r" % ([r["id"] for r in d["rows"]],))
+
+# lever 1: main-thread context. 10 main requests (a <synthetic> one, subagent requests and proj-b are not main-thread of
+# this project): r5-r8 are above 300K = 4 of 10; their $ 0.64+1.4+0.11+0.112 = 2.262 of 4.064.
+near("main_requests_gt_300k_share", B, 40.0)
+near("main_requests_gt_300k_share", A, 0.0)
+near("main_spend_gt_300k_usd", B, 2.262)
+near("main_spend_gt_300k_usd", A, 0.0)
+near("main_spend_gt_300k_share", B, 100 * 2.262 / 4.064)
+near("main_spend_gt_300k_share", A, 0.0)
+# lever 2: cache-expiry rewrites. r4 (prior 200K) and r6 (prior 350K) are above 150K, only r6 above 300K; r2's prior is
+# 100K, r8 kept its cache, r9 compacted. 14.0 days -> x30/14.
+near("cache_expiry_rewrites_gt_150k_per_30d", B, 2 * 30 / 14)
+near("cache_expiry_rewrites_gt_300k_per_30d", B, 1 * 30 / 14)
+near("cache_expiry_rewrites_gt_150k_per_30d", A, 0.0)
+check("rewrite row states the mean rewritten tokens (275,000) and the $ of the writes (2.2000)",
+      "275,000" in detail("cache_expiry_rewrites_gt_150k_per_30d", B) and "2.2000" in detail("cache_expiry_rewrites_gt_150k_per_30d", B),
+      "got %r" % (detail("cache_expiry_rewrites_gt_150k_per_30d", B),))
+# lever 5: task-notification reports. before [1000,2000,3000,4000,10000]: mean 4000, p90 7600; after [800,1200,1500].
+near("task_notification_chars_mean", B, 4000.0)
+near("task_notification_chars_p90", B, 7600.0)
+near("task_notification_chars_mean", A, 3500 / 3)
+near("task_notification_chars_p90", A, 1440.0)
+check("notification row says how many were completed (4 of 5)", "4 completed" in detail("task_notification_chars_mean", B),
+      "got %r" % (detail("task_notification_chars_mean", B),))
+# report gate: agents a1 (a hook_blocking_error, repeated once as a hook_success) and a2 (a user feedback) are blocked;
+# a quoted tool result (a9), an assistant quote (a8) and an edited-file snippet (a7) are not blocks.
+near("task_notifications_gate_blocked", B, 0)
+near("task_notifications_gate_blocked", A, 2)
+check("gate row relates the blocks to the notifications (of 3)", "of 3" in detail("task_notifications_gate_blocked", A),
+      "got %r" % (detail("task_notifications_gate_blocked", A),))
+# lever 6: identical re-reads by subagents. before: results 7100+2000+900 = 10000 chars, Read 8400, identical 1000+1100+1000
+# = 3100. after: results 12800+S, Read 12000+S, identical S (the two stubs).
+near("subagent_identical_reread_share", B, 31.0)
+near("subagent_identical_reread_share_of_read_chars", B, 100 * 3100 / 8400)
+near("subagent_identical_reread_share", A, 100 * S / (12800 + S))
+near("subagent_identical_reread_share_of_read_chars", A, 100 * S / (12000 + S))
+near("read_dedup_stub_hits", B, 0)
+near("read_dedup_stub_hits", A, 2)
+# lever 7: parallel-gate injections per 100 prompts: 4 of 10 before, 1 of 10 after.
+near("parallel_gate_injections_per_100_prompts", B, 40.0)
+near("parallel_gate_injections_per_100_prompts", A, 10.0)
+# lever 4: subagent first-request context. before 40K, 50K (coders), 20K (Explore), 30K (no meta file); after 30K, 34K.
+near("subagent_first_request_context_mean", B, 35000.0)
+near("subagent_first_request_context_mean", A, 32000.0)
+near("subagent_first_request_context_mean[hmd:coder]", B, 45000.0)
+near("subagent_first_request_context_mean[hmd:coder]", A, 32000.0)
+near("subagent_first_request_context_mean[Explore]", B, 20000.0)
+check("an agent type absent from a window reads n/a there", v("subagent_first_request_context_mean[Explore]", A) is None)
+near("subagent_first_request_context_mean[(unknown)]", B, 30000.0)
+# lever 3: output tokens per subagent by recorded effort. b1 4000 (1000 + 3000, the duplicated request line counted once),
+# b2 2000 -> high mean 3000; b3 600 medium; b4 1000 with no effort. after: a1 1500, a2 2500 -> medium 2000.
+near("subagent_output_tokens_per_agent[high]", B, 3000.0)
+near("subagent_output_tokens_per_agent[medium]", B, 600.0)
+near("subagent_output_tokens_per_agent[(not recorded)]", B, 1000.0)
+near("subagent_output_tokens_per_agent[medium]", A, 2000.0)
+check("effort level absent from a window reads n/a there", v("subagent_output_tokens_per_agent[high]", A) is None)
+PY
+
+# no --project: proj-b's lone 600K request joins the before window (5 of 11 above 300K)
+"$TOOL" --levers --root "$LEVERS_DIR" --baseline-until 2026-11-24 --json > "$TMPDIR_T/levers-all.json" 2>/dev/null
+run_checks "$TMPDIR_T/levers-all.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+got = {r["id"]: r for r in d["rows"]}["main_requests_gt_300k_share"]["values"]["before"]["value"]
+print("%s without --project every project directory is scanned (5 of 11 requests above 300K = 45.45%%)%s" % (
+    "PASS" if got is not None and abs(got - 100 * 5 / 11) < 1e-6 else "FAIL", "" if got is not None and abs(got - 100 * 5 / 11) < 1e-6 else " (got %r)" % (got,)))
+PY
+
+# --cache-ttl is read: a 3 h TTL makes every 2 h gap a cache hit, so no expiry rewrite remains
+"$TOOL" "${LEVERS_ARGS[@]}" --cache-ttl 10800 --json > "$TMPDIR_T/levers-ttl.json" 2>/dev/null
+run_checks "$TMPDIR_T/levers-ttl.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+got = {r["id"]: r for r in d["rows"]}["cache_expiry_rewrites_gt_150k_per_30d"]["values"]["before"]["value"]
+print("%s --cache-ttl 10800 leaves no expiry rewrite (a 2 h gap is inside that TTL)%s" % (
+    "PASS" if got == 0.0 else "FAIL", "" if got == 0.0 else " (got %r)" % (got,)))
+PY
+
+# single window: without --baseline-until there is one column, named "window"
+"$TOOL" --levers --root "$LEVERS_DIR" --project proj-a --since 2026-11-24 --json > "$TMPDIR_T/levers-one.json" 2>/dev/null
+run_checks "$TMPDIR_T/levers-one.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+rows = {r["id"]: r for r in d["rows"]}
+ok = sorted(d["windows"]) == ["window"] and all(sorted(r["values"]) == ["window"] for r in d["rows"])
+print("%s without --baseline-until there is a single column named window%s" % ("PASS" if ok else "FAIL", "" if ok else " (windows %r)" % (sorted(d["windows"]),)))
+got = rows["read_dedup_stub_hits"]["values"]["window"]["value"]
+print("%s --since alone covers the after data (2 stub hits)%s" % ("PASS" if got == 2 else "FAIL", "" if got == 2 else " (got %r)" % (got,)))
+PY
+
+# window edges: --since is inclusive and --until exclusive; a window under one day gives no per-30-day rate
+"$TOOL" --levers --root "$TMPDIR_T/levers-edge" --since 2026-11-24 --until 2026-11-24T00:00:01Z --json > "$TMPDIR_T/levers-edge.json" 2>/dev/null
+run_checks "$TMPDIR_T/levers-edge.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+rows = {r["id"]: r for r in d["rows"]}
+share = rows["main_requests_gt_300k_share"]["values"]["window"]
+print("%s window [00:00:00, 00:00:01) holds exactly the request stamped 00:00:00 (1 of 1)%s" % (
+    "PASS" if share["value"] == 100.0 and "1 of 1" in share["detail"] else "FAIL", "" if share["value"] == 100.0 else " (got %r)" % (share,)))
+rate = rows["cache_expiry_rewrites_gt_150k_per_30d"]["values"]["window"]["value"]
+print("%s a window shorter than a day prints no per-30-day rate (n/a, never an extrapolation)%s" % (
+    "PASS" if rate is None else "FAIL", "" if rate is None else " (got %r)" % (rate,)))
+PY
+
+# empty window and empty root: honest "nothing to report", exit 0
+"$TOOL" --levers --root "$LEVERS_DIR" --project proj-a --since 2030-01-01 --json > "$TMPDIR_T/levers-none.json" 2>/dev/null
+LEVERS_NONE_RC=$?
+run_checks "$TMPDIR_T/levers-none.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+got = {r["id"]: r for r in d["rows"]}["main_requests_gt_300k_share"]["values"]["window"]["value"]
+print("%s a window with no requests reads n/a, never 0%%%s" % ("PASS" if got is None else "FAIL", "" if got is None else " (got %r)" % (got,)))
+PY
+[ "$LEVERS_NONE_RC" -eq 0 ] && ok "--levers on an empty window exits 0" || bad "--levers on an empty window exited $LEVERS_NONE_RC"
+"$TOOL" --levers --root "$EMPTY_DIR" 2>&1 | grep -q "honest empty result" && ok "--levers on an empty root reports an honest empty result" \
+  || bad "--levers on an empty root did not report an honest empty result"
+
+# the text report: every row carries DERIVED and its query, both columns are named, nothing private is printed
+LEVERS_TEXT="$("$TOOL" "${LEVERS_ARGS[@]}" 2>&1)"
+[ "$(echo "$LEVERS_TEXT" | grep -c "DERIVED")" -ge 19 ] && ok "text report labels every one of the 19 rows DERIVED" \
+  || bad "text report has fewer than 19 DERIVED labels"
+[ "$(echo "$LEVERS_TEXT" | grep -c "query:")" -ge 19 ] && ok "text report prints a query: line for every row" \
+  || bad "text report has fewer than 19 query lines"
+echo "$LEVERS_TEXT" | grep -q "before" && echo "$LEVERS_TEXT" | grep -q "after" && ok "text report names the before and after columns" \
+  || bad "text report does not name the before and after columns"
+if echo "$LEVERS_TEXT" | grep -qF "$LEVERS_SECRET" || grep -qF "$LEVERS_SECRET" "$TMPDIR_T/levers.json" "$TMPDIR_T/levers.stderr"; then
+  bad "PRIVACY VIOLATION: --levers printed text from a transcript (prompt, report, path, tool output or hook text)"
+else
+  ok "privacy: --levers prints aggregates only; the secret planted in prompts, reports, paths, results and hook text never appears"
+fi
+"$TOOL" --help 2>&1 | grep -q -e "--levers" && ok "--help documents --levers" || bad "--help does not document --levers"
+
+# bad invocations exit 2
+"$TOOL" --since 2026-11-24 >/dev/null 2>&1
+RC=$?; [ "$RC" -eq 2 ] && ok "--since without --levers exits 2 (never silently ignored)" || bad "--since without --levers exited $RC, want 2"
+"$TOOL" --levers --since not-a-date >/dev/null 2>&1
+RC=$?; [ "$RC" -eq 2 ] && ok "--levers --since not-a-date exits 2" || bad "--since not-a-date exited $RC, want 2"
+"$TOOL" --levers --baseline-until >/dev/null 2>&1
+RC=$?; [ "$RC" -eq 2 ] && ok "--baseline-until without a value exits 2" || bad "--baseline-until without a value exited $RC, want 2"
+"$TOOL" --levers --cache-ttl 0 >/dev/null 2>&1
+RC=$?; [ "$RC" -eq 2 ] && ok "--cache-ttl 0 exits 2" || bad "--cache-ttl 0 exited $RC, want 2"
+
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
