@@ -37,7 +37,7 @@
 #      property of the code), but it is never hidden: the receipt keeps the suite, both exit
 #      codes and the failing lines the parallel run printed (flaky_under_load), the run prints it
 #      loudly, and the push gate names it whenever it passes. With the suite cache on, its solo green is also RECORDED as the suite's cache entry (see "FLAKY-UNDER-LOAD AND THE CACHE" in the
-#      suite cache notes below), so a flake no longer costs the receipt its full_equivalent. A suite that is red ALONE stays red.
+#      suite cache notes below), so a flake no longer costs the receipt its full_equivalent; that entry is MARKED, so no later sweep serves it (the next one re-runs the suite). A suite that is red ALONE stays red.
 #   8. THE TREE ITSELF IS A GUARANTEE. A frozen `git status` is taken before the first suite
 #      starts and again after the very last one (including solo red re-runs) finishes. Any
 #      tracked file a suite added, modified, deleted, or TYPE-CHANGED (e.g. swapped for a
@@ -143,6 +143,9 @@
 # only blemishes are such suites is therefore full-equivalent AND cold -- an x.y.0 release needs both, and on a loaded host every cold sweep trips two to four of them, which made a minor release unreachable
 # (2.5.0 shipped as 2.4.11). Nothing is hidden: flaky_under_load in the receipt keeps both exit codes and the failing lines the parallel run printed, the run prints the section, and the push gate names the
 # suites. A suite red in BOTH runs is red and stores nothing; --fail-fast and the aborted receipt are as before (a stopped run is never full-equivalent, whatever its cache holds).
+# THE MARK. The entry of such a suite carries flaky_under_load:true (bin/lib/suite-cache.sh): valid for the receipt of the sweep that wrote it, never served by a lookup. So the NEXT sweep always re-runs the suite: a solo
+# green is no proof that the race is gone, and a green cached for up to 7 days left a real race untested and unnamed at the push gate. The plan and the summary say "re-running N suites flaky last time" and name
+# them; a parallel run that passes stores a clean entry (the mark is cleared) and the suite is served from the cache like any other; one that flakes again is named in the receipt and at the gate again.
 # AUDIT. max(20, 10%) of the hits (drawn by seed from HEAD and the salt, so it is reproducible; HMD_SUITE_CACHE_AUDIT_PCT may only RAISE the 10) are re-run anyway. An audited suite that fails
 # with an unchanged closure is CLOSURE UNSOUND: its closure missed something it reads. The run is RED, the whole cache is purged (the next sweep is cold) and the suite should be pinned in
 # test/closure-hints.json ({"<suite>": {"always_run": true}}); a tracked file cannot be edited mid-sweep, so the runner names the hint and never writes it.
@@ -735,7 +738,7 @@ fi
 # Decided before the order, because only the suites that will run are ordered. HIT = a reusable green: not launched, a CACHED row, counted green; every other suite keeps its place in RUN. The ON
 # switch is a full sweep of a clean, committed tree. _cache_store_green runs from the launch loop, _cache_note_result and _cache_epilogue from CLASSIFY RESULTS.
 CACHE_ON=0; CACHE_WHY=""; CACHE_DIR=""; CACHE_SALT=""; CACHE_HEAD=""; CACHE_TMP=""; CACHE_JSON=""; CACHE_COMPOSE_ERR=""
-CACHED=(); _CACHE_NEWRUN=(); UNSOUND=(); FULL_EQ=false; n_cached=0; CACHED_ASSERT=0; N_MISSES=0; N_AUDIT=0; N_FORCED=0; N_AUDITED_RAN=0; N_FRESH=0; CACHE_STORE_FAIL=0; n_unsound=0; AMEND_FROM=""
+CACHED=(); _CACHE_NEWRUN=(); UNSOUND=(); FULL_EQ=false; n_cached=0; CACHED_ASSERT=0; N_MISSES=0; N_FLAKYLAST=0; N_AUDIT=0; N_FORCED=0; N_AUDITED_RAN=0; N_FRESH=0; CACHE_STORE_FAIL=0; n_unsound=0; AMEND_FROM=""
 _sha256_file() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1" 2>/dev/null; } | awk 'NR == 1 { print $1 }'; }
 # _cache_plan -- fills CACHED, narrows RUN/TO_RUN to the suites that must launch and returns 0; returns 1 with CACHE_WHY when the cache cannot be used (RUN is untouched then)
 _cache_plan() {
@@ -755,7 +758,7 @@ _cache_plan() {
   "$engine" hash-all --repo "$REPO" >"$CACHE_TMP/closures.tsv" 2>"$err" || { CACHE_WHY="the closure engine failed: $(head -n 1 "$err")"; return 1; }
   CACHE_DIR="$(suite_cache_dir "$REPO")" || { CACHE_WHY="no cache directory"; return 1; }
   now="$(date +%s)"
-  : > "$CACHE_TMP/hits.txt"; : > "$CACHE_TMP/miss.txt"; : > "$CACHE_TMP/reasons.txt"; : > "$CACHE_TMP/forced.txt"; : > "$CACHE_TMP/audit.txt"; : > "$CACHE_TMP/stored.txt"; : > "$CACHE_TMP/hitfacts.tsv"
+  : > "$CACHE_TMP/hits.txt"; : > "$CACHE_TMP/miss.txt"; : > "$CACHE_TMP/reasons.txt"; : > "$CACHE_TMP/forced.txt"; : > "$CACHE_TMP/audit.txt"; : > "$CACHE_TMP/stored.txt"; : > "$CACHE_TMP/hitfacts.tsv"; : > "$CACHE_TMP/flakylast.txt"
   if [ "$FAILED_ONLY" -eq 1 ] && [ -n "$PREV_RECEIPT" ]; then
     printf '%s' "$PREV_RECEIPT" | jq -r '(.non_green_suites // [])[]' > "$CACHE_TMP/forced.txt" 2>/dev/null || : > "$CACHE_TMP/forced.txt"
     AMEND_FROM="$(_sha256_file "$RECEIPT_FILE")"
@@ -772,6 +775,7 @@ _cache_plan() {
       printf '%s\n' "$name" >> "$CACHE_TMP/hits.txt"
     else
       printf '%s\t%s\n' "$name" "${hit#MISS }" >> "$CACHE_TMP/reasons.txt"; printf '%s\n' "$name" >> "$CACHE_TMP/miss.txt"
+      case "$hit" in "MISS $SUITE_CACHE_FLAKY_REASON"*) printf '%s\n' "$name" >> "$CACHE_TMP/flakylast.txt" ;; esac   # a green only the flaky mark keeps from being a HIT
     fi
   done
   if [ -s "$CACHE_TMP/hits.txt" ]; then
@@ -806,23 +810,24 @@ _cache_plan() {
     if [ "$verdict" = C ]; then CACHED+=("$name"); else _CACHE_NEWRUN+=("$s"); fi
   done < "$CACHE_TMP/decisions.txt"
   RUN=(${_CACHE_NEWRUN[@]+"${_CACHE_NEWRUN[@]}"}); TO_RUN=${#RUN[@]}; n_cached=${#CACHED[@]}
-  N_MISSES="$(grep -c . "$CACHE_TMP/miss.txt" || true)"; N_AUDIT="$(grep -c . "$CACHE_TMP/audit.txt" || true)"
+  N_MISSES="$(grep -c . "$CACHE_TMP/miss.txt" || true)"; N_AUDIT="$(grep -c . "$CACHE_TMP/audit.txt" || true)"; N_FLAKYLAST="$(grep -c . "$CACHE_TMP/flakylast.txt" || true)"
   N_FORCED="$(awk 'NR == FNR { f[$1] = 1; next } ($1 in f) { n++ } END { print n + 0 }' "$CACHE_TMP/forced.txt" "$CACHE_TMP/runnames.txt")"
   CACHED_ASSERT="$(printf '%s\n' ${CACHED[@]+"${CACHED[@]}"} | awk -F'\t' 'NR == FNR { c[$1] = 1; next } ($1 in c) { n += $3 } END { print n + 0 }' - "$CACHE_TMP/hitfacts.tsv")"
   return 0
 }
-# _cache_store_green IDX -- suite IDX just finished and PROG_* describe its verdict: in the parallel phase, or, for a red under load, its solo re-run (_solo_retry calls this too). A clean green goes into the
-# cache NOW, so a run that is stopped or goes red later keeps it. A red is never stored.
+# _cache_store_green IDX [flaky] -- suite IDX just finished and PROG_* describe its verdict: in the parallel phase, or, for a red under load, its solo re-run (_solo_retry calls this too, with `flaky`). A clean green goes
+# into the cache NOW, so a run that is stopped or goes red later keeps it. A red is never stored. `flaky` adds flaky_under_load:true: valid for this sweep's receipt, never served by a lookup (the next sweep re-runs the suite).
 _cache_store_green() {
-  local i="$1" name csha dur body
+  local i="$1" flaky=false name csha dur body
+  [ "${2:-}" != flaky ] || flaky=true
   [ "$PROG_STATUS" = PASS ] || return 0
   name="${RUN[$i]##*/}"
   [ -z "$(live_reason "${RUN[$i]}")" ] || return 0
   csha="$(awk -F'\t' -v p="test/$name" '$1 == p { print $2; exit }' "$CACHE_TMP/closures.tsv")"
   [ -n "$csha" ] || return 0
   dur="$(cat "$WORK/$i.dur" 2>/dev/null || echo 0)"
-  body="$(jq -nc --arg suite "$name" --arg closure "$csha" --arg salt "$CACHE_SALT" --argjson p "$PROG_P" --argjson dur "$dur" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg head "$CACHE_HEAD" \
-    '{suite:$suite, closure_sha:$closure, salt:$salt, exit_code:0, assertions_passed:$p, assertions_failed:0, live_reason:"", tree_integrity_violations:0, finished_at:$at, ran_at_head:$head, duration_s:$dur}' 2>/dev/null)" || return 0
+  body="$(jq -nc --arg suite "$name" --arg closure "$csha" --arg salt "$CACHE_SALT" --argjson p "$PROG_P" --argjson dur "$dur" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg head "$CACHE_HEAD" --argjson flaky "$flaky" \
+    '{suite:$suite, closure_sha:$closure, salt:$salt, exit_code:0, assertions_passed:$p, assertions_failed:0, live_reason:"", tree_integrity_violations:0, finished_at:$at, ran_at_head:$head, duration_s:$dur} + (if $flaky then {flaky_under_load:true} else {} end)' 2>/dev/null)" || return 0
   if suite_cache_store "$CACHE_DIR" "$name" "$body" 2>>"$CACHE_TMP/store.err"; then printf '%s\n' "$name" >> "$CACHE_TMP/stored.txt"; else CACHE_STORE_FAIL=$((CACHE_STORE_FAIL + 1)); fi
   return 0
 }
@@ -868,6 +873,18 @@ _cache_epilogue() {
   printf '%s\n' ${CACHED[@]+"${CACHED[@]}"} | awk -F'\t' 'NR == FNR { c[$1] = 1; next } ($1 in c) { print "CACHED|" $1 "|" $3 "|0|-|-" }' - "$CACHE_TMP/hitfacts.tsv" > "$CACHE_TMP/cachedrows.txt"
   while IFS= read -r name; do [ -z "$name" ] || ROWS+=("$name"); done < "$CACHE_TMP/cachedrows.txt"
 }
+# _flakylast_list -- the suites this sweep re-ran only because the cache would not serve them (flaky last time: CACHE_TMP/flakylast.txt, filled by the plan), each with how its re-run went: "flaky again" (red in
+# the parallel run, green alone: it is in FLAKY), "clean this time" (a PASS row), else "not green" (red, timed out, never started)
+_flakylast_list() {
+  local name tag x row out=""
+  while IFS= read -r name; do
+    tag="not green"
+    for row in ${ROWS[@]+"${ROWS[@]}"}; do case "$row" in "PASS|$name|"*) tag="clean this time" ;; esac; done
+    for x in ${FLAKY[@]+"${FLAKY[@]}"}; do [ "${x##*/}" != "$name" ] || tag="flaky again"; done
+    out="${out:+$out, }$name ($tag)"
+  done < "$CACHE_TMP/flakylast.txt"
+  printf '%s' "$out"
+}
 if [ "$NO_CACHE" -eq 1 ]; then CACHE_WHY="--no-cache"
 elif _cache_plan; then CACHE_ON=1
 fi
@@ -881,6 +898,7 @@ else
     echo "cache: cold -- all ${TO_RUN} suites run and every green is stored; nothing is served from the cache (salt ${CACHE_SALT:0:12})"
   else
     echo "cache: on -- ${n_cached} of $((TO_RUN + n_cached)) suites served from the cache, ${TO_RUN} to run (${N_MISSES} changed or new, ${N_AUDIT} audited, ${N_FORCED} forced) (salt ${CACHE_SALT:0:12})"
+    [ "$N_FLAKYLAST" -eq 0 ] || echo "cache: re-running ${N_FLAKYLAST} suite$([ "$N_FLAKYLAST" -eq 1 ] || echo s) flaky last time (red under load, green alone: a solo green is never served from the cache): $(paste -sd' ' "$CACHE_TMP/flakylast.txt")"
   fi
   if [ "$FAILED_ONLY" -eq 1 ]; then
     echo "failed-first: ${N_FORCED} suite(s) the last receipt had non-green, ${N_MISSES} with no valid cache entry, then the audit sample (${N_AUDIT}) as in any sweep: one command, and the receipt is gate-grade"
@@ -1320,9 +1338,10 @@ _solo_retry() {
   wait $!
   if [ "$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)" = "0" ]; then
     FLAKY+=("${RUN[$i]}"); FLAKY_IDX+=("$i")
-    # The solo run is the verdict (it counts green), so the cache records it as the suite's green and the receipt keeps its full_equivalent ("FLAKY-UNDER-LOAD AND THE CACHE" at the top). A solo run that is
-    # no clean green (counts that cannot be parsed, failures printed with exit 0) stores nothing: _cache_store_green reads PROG_STATUS, which _progress_fields sets from the solo run's own .rc and .out.
-    if [ "$CACHE_ON" -eq 1 ]; then _progress_fields "$i"; _cache_store_green "$i"; fi
+    # The solo run is the verdict (it counts green), so the cache records it as the suite's green and the receipt keeps its full_equivalent ("FLAKY-UNDER-LOAD AND THE CACHE" at the top). The entry is MARKED
+    # (`flaky`): valid for this sweep's receipt, never served by a lookup, so the next sweep re-runs the suite. A solo run that is no clean green (counts that cannot be parsed, failures printed with exit 0)
+    # stores nothing: _cache_store_green reads PROG_STATUS, which _progress_fields sets from the solo run's own .rc and .out.
+    if [ "$CACHE_ON" -eq 1 ]; then _progress_fields "$i"; _cache_store_green "$i" flaky; fi
   fi
 }
 # _ff_trip IDX -- red suite IDX is red for good: no suite is started from here on. The ones running finish; every one never started is NOTRUN.
@@ -1783,7 +1802,7 @@ if [ "$n_unparsed" -gt 0 ]; then
   echo ""
 fi
 if [ "${#FLAKY[@]}" -gt 0 ]; then
-  echo "${YEL}${BLD}FLAKY-UNDER-LOAD (${#FLAKY[@]})${OFF} — red under --jobs $JOBS, green alone (shared-state contention); counted GREEN, recorded in the receipt (flaky_under_load) with the parallel run's failing lines$([ "$CACHE_ON" -eq 0 ] || echo ", and its solo green goes into the suite cache"):"
+  echo "${YEL}${BLD}FLAKY-UNDER-LOAD (${#FLAKY[@]})${OFF} — red under --jobs $JOBS, green alone (shared-state contention); counted GREEN, recorded in the receipt (flaky_under_load) with the parallel run's failing lines$([ "$CACHE_ON" -eq 0 ] || echo ", and its solo green goes into the suite cache marked flaky_under_load (the next sweep re-runs it)"):"
   for x in ${FLAKY[@]+"${FLAKY[@]}"}; do echo "  bash test/$(basename "$x")"; done
   echo ""
 fi
@@ -1817,6 +1836,7 @@ echo "wall clock: ${ELAPSED}s"
 if [ "$CACHE_ON" -eq 1 ]; then
   _oldest="$(printf '%s' "${CACHE_JSON:-null}" | jq -r '.oldest_entry_age_days // "-"' 2>/dev/null || echo -)"
   echo "cache: ${N_FRESH} fresh, ${n_cached} cached (audited ${N_AUDITED_RAN}), oldest ${_oldest}d"
+  [ "$N_FLAKYLAST" -eq 0 ] || echo "cache: re-running ${N_FLAKYLAST} suite$([ "$N_FLAKYLAST" -eq 1 ] || echo s) flaky last time: $(_flakylast_list)"
   [ "$CACHE_STORE_FAIL" -eq 0 ] || echo "${YEL}cache: ${CACHE_STORE_FAIL} green result(s) could not be stored (reasons: ${CACHE_TMP}/store.err)${OFF}"
 fi
 echo "load avg:   start ${LOAD_START_DISP} (1m/5m/15m) -> end ${LOAD_END_DISP} (1m/5m/15m)   cpu_count=${NCPU:-n/a}"

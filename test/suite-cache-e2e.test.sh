@@ -24,6 +24,9 @@
 #   F  an entry 8 days old, an entry with a forged closure_sha, an entry whose recorded duration exceeds the budget: each MISSES, with its reason printed
 #   G  a suite red in the parallel run and GREEN in its solo re-run (FLAKY-UNDER-LOAD) is recorded in the cache, its solo run being the verdict everywhere else: a COLD sweep on a loaded host
 #      stays cold AND full-equivalent, verifies, and takes the gate and an x.y.0 release; --fail-fast resumes and records it too; a suite red in BOTH runs stays red, with no entry
+#   Q  a flake is re-run by the NEXT sweep: its solo green is MARKED (flaky_under_load) so it counts for the receipt that wrote it and is never served again. The sweep after a flake
+#      launches it although its closure, salt and entry age are unchanged ("re-running N suites flaky last time"), the gate names it again when the race recurs, and one clean
+#      parallel run clears the mark, after which the cache serves it as any other suite
 #   H  an audited suite that fails with an unchanged closure -> CLOSURE UNSOUND, red, cache purged, and the receipt names it
 #   J  --failed: greens of a RED run are kept; the red suite plus the audit sample re-run, and the amend's receipt verifies and passes the gate in that one command; a
 #      dependency broken under a green suite re-runs it RED (the amend cannot hide a regression); a forged amend is refused
@@ -368,6 +371,37 @@ G_S07="$([ -e "$(ENT "$G")/s07.test.sh.json" ] && echo entry || echo none)"; G_S
 eq "G15 s05 keeps its solo green, s07 has no entry: 39 entries" "$G_S05:$G_S07:$(nent "$G")" "entry:none:39"
 eq "G16 the receipt is red and not full-equivalent, and the anchor did not move" "$(rj "$(LAST "$G")" '[.exit_code, .full_equivalent] | join(",")'):$([ "$(sha "$(FULLG "$G")")" = "$ANCHOR0" ] && echo kept || echo moved)" "1,false:kept"
 if [ "$RC" = 1 ] && [ "$G_S07" = none ]; then mutant "a suite red in both the parallel run and the solo re-run stays red: no cache entry, the run exits 1" yes; else mutant "a suite red in both runs stays red" no "rc=$RC s07=$G_S07"; fi
+
+# ══ Q. a flake is re-run by the NEXT sweep ═══════════════════════════════════════════════════════════════════════════════
+echo "-- Q. the solo green of a flake counts for the receipt that wrote it and is never served again: the next sweep re-runs the suite --"
+newfix q; Q="$FIX"; QM="$WORK/q-flaky.mark"
+setflaky "$Q" 05; cm "$Q" "s05 goes red under load and green alone"
+rm -f "$QM"; EXTRA="FLAKY_MARK=$QM" runit "$Q" --cold
+eq "Q1 the cold sweep trips s05: green, cold, full-equivalent, and the receipt names the flake" "$RC:$(rj "$(LAST "$Q")" '[.full_equivalent, .cache.cold, (.flaky_under_load | map(.suite) | join(","))] | join(",")')" "0:true,true,s05.test.sh"
+Q_MARKED="$(jq -s -r '[.[] | select(.flaky_under_load == true) | .suite] | join(",")' "$(ENT "$Q")"/*.json)"
+eq "Q2 its solo green is recorded AND marked flaky_under_load in the cache, no other entry is marked, and every suite has an entry" "$Q_MARKED:$(nent "$Q")" "s05.test.sh:40"
+vr "$Q" "$(LAST "$Q")"; eq "Q3 verify-receipt accepts that receipt: the mark changes nothing the receipt counts" "$VR_RC" "0"; [ "$VR_RC" = 0 ] || printf '        %s\n' "$VR_ERR" >&2
+Q_COLD_OK=no; [ "$Q_MARKED" = s05.test.sh ] && [ "$VR_RC" = 0 ] && [ "$(rj "$(LAST "$Q")" '.full_equivalent and .cache.cold')" = true ] && Q_COLD_OK=yes
+rm -f "$QM"; EXTRA="FLAKY_MARK=$QM" runit "$Q"
+eq "Q4 the next sweep launches s05 although its closure, the salt and the age of its entry are unchanged, plus the audit sample of the 39 other suites" "$(ran "$Q")" "$(expected_ran "$Q" s05)"
+has "Q5 and says so: re-running 1 suite flaky last time" "$OUT" "re-running 1 suite flaky last time"
+has "Q6 with the reason beside the suite" "$OUT" "s05.test.sh: flaky under load"
+eq "Q7 the race recurred: green, full-equivalent, not cold, 21 fresh (s05 and the 20 audited), 19 cached, and s05 is named in flaky_under_load again" "$RC:$(rj "$(LAST "$Q")" '[.full_equivalent, .cache.cold, .cache.suites_fresh, .cache.suites_cached, .cache.audited, (.flaky_under_load | map(.suite) | join(","))] | join(",")')" "0:true,false,21,19,20,s05.test.sh"
+has "Q8 the summary says how the re-run went" "$OUT" "flaky last time: s05.test.sh (flaky again)"
+vr "$Q" "$(LAST "$Q")"; eq "Q9 verify-receipt accepts the warm receipt that re-ran the flake" "$VR_RC" "0"; [ "$VR_RC" = 0 ] || printf '        %s\n' "$VR_ERR" >&2
+gate "$Q"; eq "Q10 the push gate takes it" "$GRC" "0"; has "Q11 and names the flake again: a real race is not hidden by the cache" "$GOUT" "s05.test.sh"
+Q_RERAN=no; ran "$Q" | grep -qw s05 && [ "$(rj "$(LAST "$Q")" '.flaky_under_load | map(.suite) | join(",")')" = s05.test.sh ] && printf '%s' "$GOUT" | grep -q 's05.test.sh' && Q_RERAN=yes
+EXTRA="FLAKY_MARK=$QM" runit "$Q"
+eq "Q12 the mark holds until a parallel run passes: s05 is launched once more" "$(ran "$Q")" "$(expected_ran "$Q" s05)"
+eq "Q13 it passed in the parallel run this time: green, no flake in the receipt, and its entry is clean again" "$RC:$(rj "$(LAST "$Q")" '.flaky_under_load | length'):$(rj "$(ENT "$Q")/s05.test.sh.json" '.flaky_under_load // false')" "0:0:false"
+has "Q14 the summary says how the re-run went" "$OUT" "flaky last time: s05.test.sh (clean this time)"
+EXTRA="FLAKY_MARK=$QM" runit "$Q"
+eq "Q15 one clean parallel run clears it: the next sweep serves s05 from the cache again, so only the audit sample runs" "$(ran "$Q")" "$(expected_ran "$Q")"
+lacks "Q16 and no suite is listed as flaky last time" "$OUT" "flaky last time"
+Q_CLEARED=no; [ "$(ran "$Q")" = "$(expected_ran "$Q")" ] && ! printf '%s' "$OUT" | grep -q 'flaky last time' && [ "$(rj "$(ENT "$Q")/s05.test.sh.json" '.flaky_under_load // false')" = false ] && Q_CLEARED=yes
+mutant "a flake's solo green is recorded for the receipt that counts it and marked flaky_under_load: the cold sweep stays full-equivalent and cold" "$Q_COLD_OK" "marked=[$Q_MARKED] entries=$(nent "$Q")"
+mutant "the sweep after a flake re-runs it although its closure, salt and entry age are unchanged, and the push gate names it again when the race recurs" "$Q_RERAN" "ran=$(ran "$Q")"
+mutant "one clean parallel run clears the mark: the sweep after that serves the suite from the cache again" "$Q_CLEARED" "ran=$(ran "$Q") want=$(expected_ran "$Q")"
 
 # ══ S. release/ship.sh ════════════════════════════════════════════════════════════════════════════════════════════════
 echo "-- S. release/ship.sh: forged and warm-for-x.y.0 receipts are refused; warm patch and cold x.y.0 pass --"

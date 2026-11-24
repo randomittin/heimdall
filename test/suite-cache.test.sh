@@ -9,7 +9,8 @@
 # Proven here (every call runs in a fresh /bin/bash -- 3.2 on macOS -- under `set -euo pipefail`, the strictest way to source the lib):
 #   A  lookup   a fresh entry for the same closure + salt is a HIT; a changed closure, a changed salt, an entry older than the age cap
 #               (7 days, inclusive; a caller may only TIGHTEN it), one dated in the future, a missing, corrupt, oversized, symlinked,
-#               directory-shaped or another suite's entry, and every malformed argument are a MISS with a reason -- never a crash
+#               directory-shaped or another suite's entry, and every malformed argument are a MISS with a reason -- never a crash; a green marked
+#               flaky_under_load (red under load, green alone) is valid and kept, but a MISS too: the NEXT sweep re-runs that suite
 #   B  store    only a CLEAN GREEN record is stored: a red, a timeout, a discrepancy (exit 0 but failures printed), unparsed counts, a
 #               live suite and a tree-integrity violation are refused, and a refusal forgets what was cached for that suite before; the
 #               write is atomic, 0600 in a 0700 directory, and never follows a link out of the cache directory
@@ -135,6 +136,23 @@ p_age_edge() {
   lk "$((NOW0 + 7 * DAY + 1))"; miss "day(s) old"                                    # one second over: a MISS
 }
 p_miss_future()  { fresh; stored alpha.test.sh "$(entry)" || return 1; lk "$((NOW0 - 1))"; miss future; }
+p_miss_flaky() { # a green solo re-run of a suite that was red under load: stored and kept as it is, but never served -- the NEXT sweep re-runs the suite
+  fresh; stored alpha.test.sh "$(entry flaky_under_load=true)" || return 1
+  [ "$(jq -r '.flaky_under_load' "$CACHE/alpha.test.sh.json")" = true ] || return 1      # the mark is kept on disk
+  lk; miss "flaky under load" || return 1                                                  # valid for the receipt that counts it, a MISS for any lookup
+  stored alpha.test.sh "$(entry)" || return 1                                              # a clean green stored over it ...
+  lk; hit                                                                                  # ... is served again: one clean run clears the mark
+}
+p_flaky_schema() { # the mark is `true` or absent: false, null, a string or a number is no mark, so the entry is refused by store and ignored by lookup
+  local v
+  for v in false null '"yes"' '"true"' 1; do
+    fresh; store alpha.test.sh "$(entry "flaky_under_load=$v")"
+    { [ "$RC" -eq 1 ] && [ ! -e "$CACHE/alpha.test.sh.json" ]; } || { printf 'flaky_under_load=%s was stored: ' "$v"; return 1; }
+    fresh; plant alpha.test.sh "$(entry "flaky_under_load=$v")"; lk; miss "flaky_under_load" || { printf 'flaky_under_load=%s planted: ' "$v"; return 1; }
+  done
+}
+check "a green marked flaky_under_load is stored and kept, is a MISS that names the flake, and a clean green stored over it is a HIT again" p_miss_flaky
+check "flaky_under_load is true or absent: false, null, a string or a number is refused by store and ignored by lookup" p_flaky_schema
 p_miss_absent() {
   fresh; lk; miss "no entry" || return 1                                              # no cache directory at all
   mkdir -p "$CACHE"; lk; miss "no entry"                                              # a cache directory without that entry
@@ -534,6 +552,7 @@ for f in $FIELDS; do
   walk "$f null" "$f=null"
   walk "$f wrong ($(wrong "$f"))" "$f=$(wrong "$f")"
 done
+for v in false null '"yes"' 1; do walk "flaky_under_load=$v (the optional mark is true or absent)" "flaky_under_load=$v"; done
 if [ "$MK" -eq "$MT" ]; then ok "every mutated field is refused by store and ignored by lookup ($MK/$MT)"; else bad "schema mutations survived: $MK of $MT killed"; fi
 SCHEMA_K="$MK"; SCHEMA_T="$MT"
 
@@ -581,6 +600,9 @@ mutant compose-audited  'if [ "$audited" -gt "$fresh" ]; then' 'if false; then' 
 mutant compose-salt     'if $other != null then'               'if false then'                        p_compose_salt
 mutant compose-old      'elif $old != null then'               'elif false then'                      p_compose_old
 mutant compose-future   'elif $future != null then'           'elif false then'                      p_compose_future
+
+mutant flaky-miss       'elif .flaky_under_load == true then'  'elif false then'                      p_miss_flaky
+mutant flaky-schema     'or $e.flaky_under_load == true)'      'or true)'                             p_flaky_schema
 
 if [ "$MK" -eq "$MT" ]; then ok "falsifiability: $MK/$MT mutations killed (fields $SCHEMA_K/$SCHEMA_T, guards $((MK - SCHEMA_K))/$((MT - SCHEMA_T)))"; else bad "falsifiability: only $MK/$MT mutations killed"; fi
 echo "falsifiability: $MK/$MT"

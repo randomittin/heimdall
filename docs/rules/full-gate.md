@@ -118,8 +118,11 @@ rule below about who may start a run, when it is recommended and how its output 
   is stored too, since the solo run is already its verdict for the exit code, the gate and
   the release script: a cold sweep whose only blemishes are such suites stays cold and
   full-equivalent (a minor release is reachable on a loaded host), and each flake stays in
-  the receipt (`flaky_under_load`) and the summary; a suite red in both runs is red and
-  stores nothing. The receipt stays `kind:"full"` plus a `cache` block and `full_equivalent`; the
+  the receipt (`flaky_under_load`) and the summary. That entry is marked `flaky_under_load`,
+  so it counts for the receipt that wrote it and is never served again: the next sweep
+  re-runs the suite (`re-running N suites flaky last time` in the plan and the summary),
+  the first parallel run that passes clears the mark, and a race that recurs is named at
+  the push gate again. A suite red in both runs is red and stores nothing. The receipt stays `kind:"full"` plus a `cache` block and `full_equivalent`; the
   push gate and the release script re-derive it (`bin/heimdall-suite-closure
   verify-receipt`), never on the flag's word. `--cold` (or `HMD_COLD=1`) ignores the cache
   and runs every suite: an x.y.0 release needs that cold receipt, a patch release takes a
