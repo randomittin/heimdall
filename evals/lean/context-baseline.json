@@ -1,17 +1,17 @@
 {
-  "digest": "142a67151cde9705a48f4dc710ca7edc759fb672fe61bbe52cfd6545e8ab2491",
+  "digest": "56d810e6e7091ff2e2bc8e43932731581168e049abe0eb70b22a13a90ea67ee3",
   "info": {
     "git_trees": {
-      "agents": "c116f0325c763d52d82703dcc6e8b24a541ec2c6",
+      "agents": "c38b8a6e3cb3c115de2a1688ffd5b41dc7d74e2a",
       "commands": "100f7a1ca0d0cfdca442e4ae2bd28c5b43748652",
-      "hooks": "ce216fd515e65bcd7bbf580bab06d84efc539249",
+      "hooks": "7020cd7a41e4daa734c913808d650ba9cec92a8b",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
-      "skills": "8ca944f54d03454e6a836983d06c350483f63415"
+      "skills": "7d0f2ae4964dc8f9af6773ffc91e60fb71cb101b"
     },
-    "recorded_utc": "2026-11-23T03:48:41Z",
+    "recorded_utc": "2026-11-24T20:34:43Z",
     "summary": {
       "agents": 17,
-      "bytes": 650343,
+      "bytes": 652586,
       "commands": 20,
       "hooks_run": 17,
       "hooks_skipped": 7,
@@ -44,12 +44,12 @@
         "sha256": "8d2f5f03e3bf3ac5c8d98592e1af106ce4575af00c1467094a3fb6671277dde5"
       },
       "agents/coder.md": {
-        "bytes": 20779,
+        "bytes": 21358,
         "frontmatter": {
           "bytes": 529,
           "sha256": "ff2507e683742901b47814d46208aa532bf1d51988d73474f5993713723f8f91"
         },
-        "sha256": "0b2ecf6ec5383a5cf2cd05aa5056605918d4887f656d2bb447d2ab2081a47b32"
+        "sha256": "52325564ef2ca557064e580c4de224554501d0b3c9796cd28785bf63e2347455"
       },
       "agents/database-architect.md": {
         "bytes": 3645,
@@ -164,12 +164,12 @@
         "sha256": "33762a862a371b31655286aa64662c54a0f9fc286ca7d2177e9913739dcfc9dc"
       },
       "agents/wave-executor.md": {
-        "bytes": 7924,
+        "bytes": 8489,
         "frontmatter": {
           "bytes": 356,
           "sha256": "92bca4caf9e4dc70ae2da08f8a4798aa120da02c72146558ba613c8cbd894949"
         },
-        "sha256": "7d4509f09b05c34b4df9d4408553b6bc0ae812ae4b24eb22c8a023ab70005dfa"
+        "sha256": "1bb19dfcd512ce0d4659e5083655e8fe74f2bfa954908534efdeb1fe3d342fbb"
       },
       "commands/autocommit.md": {
         "bytes": 937,
@@ -392,8 +392,8 @@
         "sha256": "83d1516cf364a2f4a796fe24e60b7ca431799c0bdcee0528e763cc02f5e539d5"
       },
       "skills/heimdall/references/agent-templates.md": {
-        "bytes": 17295,
-        "sha256": "e0be9458fbd600b776cdb76a4324801dc84c1fc8ea6fddeebe2c93a9cb9c09ca"
+        "bytes": 18394,
+        "sha256": "b70446853851dd7bd1bdbcf49c636ccaec639d5fea007c233b41b36ba994cb93"
       },
       "skills/heimdall/references/communication-templates.md": {
         "bytes": 5724,
@@ -744,19 +744,19 @@
     },
     "hooks_json": {
       "hooks/hooks.json": {
-        "bytes": 38914,
+        "bytes": 40286,
         "events": {
-          "PostToolUse": 7,
+          "PostToolUse": 8,
           "PostToolUseFailure": 1,
           "PreCompact": 1,
-          "PreToolUse": 10,
+          "PreToolUse": 11,
           "SessionEnd": 3,
           "SessionStart": 17,
           "Stop": 7,
-          "SubagentStop": 3,
+          "SubagentStop": 4,
           "UserPromptSubmit": 7
         },
-        "sha256": "89ca6d20046142b6f422a598ffc9bcb16c7a92b8d3e4a732aff73ecf52f61bc1"
+        "sha256": "68e5284030914d286998416cc3534df124ee650d609151ff7a29dad991a6d3c8"
       }
     },
     "settings": {
