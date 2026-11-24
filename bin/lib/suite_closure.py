@@ -94,6 +94,9 @@ verify-receipt  a sweep receipt (kind "full") carries a `cache` block:
              HMD_SUITE_CACHE_AUDIT_PCT may only RAISE the 10.
              A suite the receipt lists in flaky_under_load (red under parallel load, green on its solo re-run) is held to the rule of every other suite: it needs its entry,
              and its record must say it passed alone (solo_exit 0), because a suite that is red when run alone is red.
+             The mark that keeps such a suite out of the NEXT sweep's cache hits (flaky_under_load: true on its entry in .heimdall/receipts/suite-cache, written by run-all.sh and
+             honoured by the lookup in bin/lib/suite-cache.sh) is not part of the receipt, which counts that entry like any other and names the flake in flaky_under_load: a cold
+             receipt holding a marked entry, and the warm receipt of the sweep that re-ran the suite, verify the same way (test/suite-cache-e2e.test.sh, section Q).
 
 A cooperating-agent control, not a security boundary: like last-sweep.json it is a plain local file, and it catches stale, copied and
 hand-edited-by-accident receipts, not someone who can recompute every hash.

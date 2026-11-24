@@ -22,6 +22,9 @@
 #   finished_at                UTC, 2026-10-19T12:00:00Z -- the age cap counts from here
 #   ran_at_head                the full object id of the commit it ran at (provenance; not compared)
 #   duration_s                 seconds
+#   flaky_under_load           OPTIONAL, `true` or absent (never false): the suite was red in the parallel phase and green in its solo re-run (FLAKY-UNDER-LOAD). Such an entry is a valid green for
+#                              the receipt of the sweep that wrote it (compose counts it, so that receipt stays full-equivalent) and lookup NEVER serves it: the next sweep re-runs the suite, and a
+#                              clean green stored over it (no field) clears the mark.
 # The caller hands over the facts it already has (the sweep's exit code, the parsed counts, live_reason, the tree-integrity count) VERBATIM; the
 # schema decides. It is ONE jq definition (_SUITE_CACHE_JQ_DEFS) read by the writer and by the reader, so what store accepts and what lookup
 # trusts cannot drift apart (the pattern of bin/lib/hmd_repo_receipt.py). An entry with a missing, mistyped or unknown field is refused / ignored.
@@ -31,7 +34,8 @@
 #   suite_cache_name SUITE                -> the bare name, or rc 1. A path is reduced to its file name, so nothing can leave the cache directory.
 #   suite_cache_lookup DIR SUITE CLOSURE_SHA SALT MAX_DAYS NOW
 #                                         -> ONE line: "HIT" (rc 0) or "MISS <reason>" (rc 1), never a crash. HIT needs a valid entry for this suite whose
-#                                            closure_sha and salt equal the arguments and whose age is 0..MAX_DAYS days. MAX_DAYS can only TIGHTEN the
+#                                            closure_sha and salt equal the arguments, whose age is 0..MAX_DAYS days and that is not marked flaky_under_load
+#                                            (that one is "MISS $SUITE_CACHE_FLAKY_REASON ..."). MAX_DAYS can only TIGHTEN the
 #                                            7-day ceiling (the rule of hmd_sweep_tighten, bin/lib/sweep-chain.sh); empty = the ceiling, junk = the
 #                                            ceiling with a note on stderr. NOW is epoch seconds. An entry dated after NOW is a MISS.
 #   suite_cache_store DIR SUITE JSON      -> rc 0: stored (atomic: temp file + rename). Anything but a clean green record of SUITE is refused AND forgets the
@@ -46,7 +50,7 @@
 #                                            fewer than asked) and says so. HITS_FILE: one suite name per line; blank lines and duplicates are ignored.
 #   suite_cache_compose_receipt DIR SALT NOW COLD FRESH CACHED AUDITED SUITES_FILE
 #                                         -> the `cache` block of the sweep receipt on one line, built from the entries ON DISK of the suites listed (each
-#                                            must have a valid entry under SALT, no older than the cap), so the receipt cannot claim more than the cache
+#                                            must have a valid entry under SALT, no older than the cap; one marked flaky_under_load counts like any other), so the receipt cannot claim more than the cache
 #                                            shows. FRESH = suites that ran (audited hits included), CACHED = hits served without running, AUDITED = hits
 #                                            re-run as the audit sample. COLD is true or false, and a cold run served nothing from the cache.
 #
@@ -75,6 +79,7 @@ SUITE_CACHE_AUDIT_MIN=20        # at least this many hits are re-run (or all of 
 SUITE_CACHE_AUDIT_PCT=10        # at least this percent of the hits are re-run; HMD_SUITE_CACHE_AUDIT_PCT may only raise it
 SUITE_CACHE_MAX_BYTES=16384     # an entry over this is not one: it is never read whole into memory or handed to a parser
 SUITE_CACHE_DIR_NAME='suite-cache'
+SUITE_CACHE_FLAKY_REASON='flaky under load when last run'   # how the MISS of an entry marked flaky_under_load begins; test/run-all.sh counts its "flaky last time" suites by it
 
 # Written out, not ranges: [a-z] is not ASCII-only in every locale, and a suite name becomes a file name.
 _SUITE_CACHE_ALNUM='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
@@ -96,7 +101,8 @@ def spec: . as $e | [
   {k: "tree_integrity_violations", ok: ($e.tree_integrity_violations | type == "number" and . == 0), what: "0 (nothing from a run that violated tree integrity is cached)"},
   {k: "finished_at", ok: ($e.finished_at | rx("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z") and (try (fromdateiso8601 | true) catch false)), what: "a UTC timestamp like 2026-10-19T12:00:00Z"},
   {k: "ran_at_head", ok: ($e.ran_at_head | rx("[0-9a-f]{40}(?:[0-9a-f]{24})?")), what: "the full object id of the commit the suite ran at"},
-  {k: "duration_s", ok: ($e.duration_s | type == "number" and . >= 0 and . < 1e9), what: "a number of seconds, 0 or more"}
+  {k: "duration_s", ok: ($e.duration_s | type == "number" and . >= 0 and . < 1e9), what: "a number of seconds, 0 or more"},
+  {k: "flaky_under_load", ok: (($e | has("flaky_under_load") | not) or $e.flaky_under_load == true), what: "true (red under load, green alone) or absent: never false, null or any other value"}
 ];
 def entry_problem:
   if type != "object" then "the entry is not a JSON object"
@@ -241,7 +247,7 @@ suite_cache_lookup() {
   if [ ! -f "$f" ]; then _suite_cache_miss "entry is not a regular file"; return 1; fi
   { body="$(head -c "$((SUITE_CACHE_MAX_BYTES + 1))" "$f")"; } 2>/dev/null || { _suite_cache_miss "unreadable entry"; return 1; }   # the group's redirect also hushes bash 4.4+'s "ignored null byte" warning: a corrupt entry is a MISS, quietly
   if [ "${#body}" -gt "$SUITE_CACHE_MAX_BYTES" ]; then _suite_cache_miss "entry is oversized"; return 1; fi
-  out="$(printf '%s' "$body" | jq -s -r --arg suite "$suite" --arg closure "$closure" --arg salt "$salt" --argjson days "$days" --argjson now "$now" "$_SUITE_CACHE_JQ_DEFS"'
+  out="$(printf '%s' "$body" | jq -s -r --arg suite "$suite" --arg closure "$closure" --arg salt "$salt" --argjson days "$days" --argjson now "$now" --arg flaky "$SUITE_CACHE_FLAKY_REASON" "$_SUITE_CACHE_JQ_DEFS"'
     def verdict:
       if length != 1 then "MISS invalid entry: expected exactly one JSON value"
       else .[0]
@@ -253,6 +259,7 @@ suite_cache_lookup() {
           else ($now - (.finished_at | fromdateiso8601)) as $age
             | if $age < 0 then "MISS entry is dated in the future"
               elif $age > ($days * 86400) then "MISS entry is \(($age / 86400) | floor) day(s) old (limit \($days))"
+              elif .flaky_under_load == true then "MISS \($flaky) (red in the parallel run, green alone): its solo green is never served, so it is re-run until a parallel run passes"
               else "HIT" end
           end
       end;
