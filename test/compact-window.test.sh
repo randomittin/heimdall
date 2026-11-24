@@ -151,6 +151,14 @@ eq "B: the key is gone" ABSENT "$(value)"
 chk "B: what the other tool added is kept" grep -q '"addedLater"' "$S"
 chk "B: and off says only the key was reverted" grep -q "only the key was reverted" "$OUT"
 
+# ---- B2. an unrelated hand edit between on and off, hmd's key still the last member (the key-only revert is the exact inverse of the append) ---------------------
+new_home; printf '%s' "$PRETTY" >"$S"; sed 's/1\.50/2.25/' "$S" >"$TMP/edited"
+cw on --yes
+sed -i.bak 's/1\.50/2.25/' "$S" && rm -f "$S.bak"
+cw off --yes
+eq "B2: off after an unrelated edit: exit 0, the key is gone" "0|ABSENT" "$RC|$(value)"
+chk "B2: only the key was reverted: byte for byte the edited original" same "$S" "$TMP/edited"
+
 # ---- C. no settings file --------------------------------------------------------------------------------------------------------------------------------------
 new_home; rmdir "$H/.claude"
 cw on --yes
