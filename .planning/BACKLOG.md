@@ -95,3 +95,5 @@
 - [ ] MEDIUM (2.4.12 review) bin/heimdall-compact-window:311-319 `on` against a second settings path (CLAUDE_CONFIG_DIR changed) overwrites the first record/backup, so the first can't be undone. Fix: key the record by settings path (2026-11-24).
 - [ ] LOW (2.4.12 review) bin/heimdall-compact-window:215 check-then-rename race (2026-11-24).
 - [ ] LOW (2.4.12 review) tier-table model_prices rows and the autoCompactWindow key are not checked against a live source in any test (2026-11-24).
+- [ ] LOW footprint --check red on pre-existing main-prompt overage (+826 B: main_prompt 68,211 vs 67,385) and lean-install bytes 15,707,300 vs 15,700,000; no test runs the check. Trim the prompt or re-baseline deliberately (2026-11-24).
+- [ ] LOW evals/jev-ultrafast/{run.sh,bench.py} enter the runtime closure through the same bare run.sh name in bin/corpus; add to the closure POLICY like evals/effort-ab (2026-11-24).
