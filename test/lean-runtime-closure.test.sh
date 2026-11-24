@@ -5,7 +5,8 @@
 #   1. THE RULES, on a fixture repository (a temp git index, no commit: the tool reads what is staged): every kind of reference reaches its file (shell `.`, `$PLUGIN_DIR/x`,
 #      `"$HERE/../x"`, a hook command in hooks.json, a Python import, a Python os.path.join of separate literals, a JSON manifest string, a chain of three hops), a directory
 #      named by its literal prefix is kept WHOLE (the unknown dynamic path stays included), and what only SAYS a path (echo text, a comment, a docstring, a bare `docs/` word)
-#      names nothing; test/ and .planning/ are never runtime even when code names them, and `explain` says why.
+#      names nothing; test/, .planning/ and evals/effort-ab/ are never runtime even when code names them (a bare run.sh in bin/ names EVERY run.sh of the repository,
+#      the effort harness's among them, and its fixtures, patches and results would ride along), and `explain` says why.
 #   2. BREAK IT: delete one reference from the fixture and the file it reached drops out of the list.
 #   3. `check`: an equal list passes; a list missing a path, carrying a stray path, or unreadable fails (1, 1, 2) and the first two name the path.
 #   4. THE REAL REPOSITORY: the plan's acceptance (evals/oracles/registry.json in, nothing from test/), the committed release/runtime-files.txt IS the computed list, every root
@@ -121,6 +122,24 @@ EOF
 put templates/settings.tpl <<'EOF'
 template
 EOF
+put bin/runner <<'EOF'
+#!/usr/bin/env bash
+bash "$PLUGIN_DIR/evals/gates/$gate/run.sh"
+EOF
+put evals/gates/g1/run.sh <<'EOF'
+echo gate
+EOF
+put evals/effort-ab/run.sh <<'EOF'
+exec python3 "$HERE/run.py"
+EOF
+put evals/effort-ab/run.py <<'EOF'
+import os
+HERE = os.path.dirname(os.path.realpath(__file__))
+TASKS = os.path.join(HERE, "tasks")
+EOF
+put evals/effort-ab/tasks/t1.txt <<'EOF'
+task
+EOF
 for f in docs/guide.md docs/commented-out.md docs/py-comment.md docs/py-doc.md docs/other/x.md evals/other/x.json relay/src/x.ts test/main.test.sh test/run-all.sh .planning/STATE.md; do
   printf 'not runtime\n' | put "$f"
 done
@@ -131,10 +150,12 @@ bin/lib/dyn.sh
 bin/lib/util.sh
 bin/main
 bin/pytool
+bin/runner
 data/conf.json
 data/deeper.txt
 data/leaf.txt
 data/second.json
+evals/gates/g1/run.sh
 hooks/guard.sh
 hooks/hooks.json
 install.sh
@@ -151,6 +172,9 @@ docs/guide.md
 docs/other/x.md
 docs/py-comment.md
 docs/py-doc.md
+evals/effort-ab/run.py
+evals/effort-ab/run.sh
+evals/effort-ab/tasks/t1.txt
 evals/other/x.json
 relay/src/x.ts
 test/main.test.sh
@@ -175,6 +199,8 @@ run fxpol "$TOOL" --repo "$FX" explain test/run-all.sh
 if [ "$(RC fxpol)" = 0 ] && go fxpol "non-runtime by policy" && go fxpol "bin/main"; then ok "explain: test/run-all.sh is non-runtime by policy, and says bin/main named it"; else bad "explain policy: $(show fxpol)"; fi
 run fxpl "$TOOL" --repo "$FX" explain .planning/STATE.md
 if [ "$(RC fxpl)" = 0 ] && go fxpl "non-runtime by policy"; then ok "explain: .planning/STATE.md is non-runtime by policy"; else bad "explain .planning: $(show fxpl)"; fi
+run fxeff "$TOOL" --repo "$FX" explain evals/effort-ab/run.sh
+if [ "$(RC fxeff)" = 0 ] && go fxeff "non-runtime by policy" && go fxeff "bin/runner"; then ok "explain: evals/effort-ab/run.sh is non-runtime by policy, and says bin/runner named it (a bare run.sh names every run.sh); the other run.sh stays runtime"; else bad "explain effort-ab: $(show fxeff)"; fi
 run fxno "$TOOL" --repo "$FX" explain docs/guide.md
 if [ "$(RC fxno)" = 0 ] && go fxno "nothing reachable"; then ok "explain: docs/guide.md is non-runtime because nothing names it"; else bad "explain unreferenced: $(show fxno)"; fi
 run fxbad "$TOOL" --repo "$FX" explain no/such/file
@@ -219,6 +245,7 @@ if [ -f "$LIST" ] && [ -z "$NOT_TRACKED" ]; then ok "every line of the list is a
 if [ -f "$LIST" ] && LC_ALL=C sort -c -u "$LIST" 2>/dev/null; then ok "the list is sorted and has no repeated or blank-looking lines"; else bad "the list is not sorted-unique"; fi
 if [ -f "$LIST" ] && [ "$(grep -c '' "$LIST")" -lt "$(grep -c '' "$T/tracked.txt")" ] && [ "$(grep -c '' "$LIST")" -gt 100 ]; then ok "the list is a real subset: $(grep -c '' "$LIST") of $(grep -c '' "$T/tracked.txt") tracked files"; else bad "the list is not a proper subset of the tracked files"; fi
 if [ -f "$LIST" ] && ! grep -q '^\.planning/' "$LIST"; then ok "nothing under .planning/ is runtime"; else bad ".planning/ paths in the list"; fi
+if ! grep -q '^evals/effort-ab/' "$T/real.out" && { [ ! -f "$LIST" ] || ! grep -q '^evals/effort-ab/' "$LIST"; }; then ok "nothing under evals/effort-ab/ is runtime, computed or committed (bin/corpus names a bare run.sh, which names every run.sh)"; else bad "evals/effort-ab/ paths in the list: $(grep -c '^evals/effort-ab/' "$T/real.out") computed, $(grep -c '^evals/effort-ab/' "$LIST" 2>/dev/null) committed"; fi
 
 echo "-- 5. the mutant: a referenced file removed from the committed list --"
 if [ -f "$LIST" ]; then

@@ -25,8 +25,11 @@ THE GRAPH. Read from the git INDEX (`git ls-files --stage`), never the work tree
             `"$PLUGIN_DIR"/skills/*`) is named by its literal prefix, so the WHOLE directory is kept: an unknown dynamic path stays INCLUDED, never dropped. What a
             directory pulls in is scanned only when it is code. A path built from nothing literal (`"$dir/$file"`) names nothing and adds nothing; the smoke test of the
             lean tree is what catches that, not this tool.
-  policy    two trees are never runtime payload, whoever names them: test/ (verification: the code that mentions test/run-all.sh addresses the TARGET repo's suite,
-            never its own) and .planning/ (per-project state the hooks write into the repo they run in). `explain` shows what named them.
+  policy    three trees are never runtime payload, whoever names them: test/ (verification: the code that mentions test/run-all.sh addresses the TARGET repo's suite,
+            never its own), .planning/ (per-project state the hooks write into the repo they run in) and evals/effort-ab/ (a developer's A/B harness: bin/corpus names a
+            bare `run.sh` for the oracle gates it runs, the reader above resolves a bare code name to EVERY tracked file of that name, and so the harness's run.sh, and
+            through it its fixtures, patches and results, joined the install; the bare name cannot be spelled any other way, because the gate id in the path is a
+            variable). `explain` shows what named them.
 
 Commands (exit 0 ok, 1 `check` found drift, 2 usage or a repository it cannot read):
   list                  the runtime files, sorted, one per line (the format of release/runtime-files.txt)
@@ -57,7 +60,8 @@ ROOT_DIR = "bin/"
 ROOT_FILES = ("hooks/hooks.json", "install.sh")
 # trees that are never runtime payload, with the reason `explain` prints
 POLICY = (("test/", "verification, not runtime: the code that names test/... addresses the target repo's own suite"),
-          (".planning/", "per-project state the hooks write into the repo they run in, not plugin payload"))
+          (".planning/", "per-project state the hooks write into the repo they run in, not plugin payload"),
+          ("evals/effort-ab/", "a developer's eval run from a full checkout: no installed code reads it, and a bare file name in bin/ that its harness shares with others must not pull its fixtures, patches and results into an install"))
 # variables that name the plugin root or the running script's own directory: a directory written under one of them is the real one. suite_closure's list, minus the
 # test-directory names (a suite's), plus the names the hooks and installers use for the plugin root and for bin/
 ANCHOR_VARS = frozenset(sc.DIR_VARS - {"TEST_DIR", "TESTS_DIR", "SUITE_DIR"}) | frozenset(

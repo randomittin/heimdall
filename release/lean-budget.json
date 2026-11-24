@@ -29,10 +29,11 @@
         "Edit": 4,
         "MultiEdit": 3,
         "NotebookEdit": 3,
+        "Read": 3,
         "SendMessage": 3,
         "TaskStop": 3,
         "Write": 4,
-        "total": 7
+        "total": 8
       },
       "PostToolUseFailure": {
         "*": 0,
@@ -70,16 +71,16 @@
         "total": 7
       },
       "SubagentStop": {
-        "*": 3,
-        "total": 3
+        "*": 4,
+        "total": 4
       },
       "UserPromptSubmit": {
         "*": 7,
         "total": 7
       }
     },
-    "hooks_total": 56
+    "hooks_total": 58
   },
-  "note": "Ceilings for bin/heimdall-footprint --check on the FULL tree: a measured number above its ceiling fails. They are the numbers measured on 2026-11-22 after the lean-core merge (17 agents, heimdall-lean among them; the main prompt agents/heimdall.md at 67,385 B; 56 hooks), exact and not rounded, so a hook, a skill or a byte of prompt added later fails the check until this file is raised on purpose. Disk is not budgeted here on purpose: tracked bytes in a dev checkout grow with every test, doc and hook-written journal commit, so a disk ceiling would turn red on unrelated work. A lean install tree has its own budget in the same schema, release/lean-install-budget.json, checked with --root DIR --budget FILE (the lean-core doc under docs/, section 'Measure it').",
+  "note": "Ceilings for bin/heimdall-footprint --check on the FULL tree: a measured number above its ceiling fails. They are the numbers measured on 2026-11-22 after the lean-core merge (17 agents, heimdall-lean among them; the main prompt agents/heimdall.md at 67,385 B; 56 hooks; the hook ceilings were then raised on purpose to 58 on 2026-11-24 for the two hooks added that day, read-dedup on PostToolUse Read and subagent-report-gate on SubagentStop), exact and not rounded, so a hook, a skill or a byte of prompt added later fails the check until this file is raised on purpose. Disk is not budgeted here on purpose: tracked bytes in a dev checkout grow with every test, doc and hook-written journal commit, so a disk ceiling would turn red on unrelated work. A lean install tree has its own budget in the same schema, release/lean-install-budget.json, checked with --root DIR --budget FILE (the lean-core doc under docs/, section 'Measure it').",
   "schema": 1
 }
