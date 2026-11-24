@@ -105,6 +105,21 @@
 #               defaults sensibly (0) unset is honest; inventing a start time
 #               to subtract would not be.
 #
+# ONE RECORD PER AGENT, NOT PER STOP. A SubagentStop hook can answer
+# decision:block (bin/heimdall-subagent-report-gate does, once, to an over-long
+# final report). The harness then keeps the subagent running and fires EVERY
+# SubagentStop hook a second time when it stops for real, that payload carrying
+# stop_hook_active:true. _sum_tokens reads the WHOLE transcript, so recording
+# both stops counted a blocked agent twice: two metrics.jsonl rows, and
+# `heimdall-state add-tokens` run twice (each call adds the tokens AND one more
+# to total_agents_spawned). cmd_stop therefore records NOTHING for a payload
+# whose stop_hook_active is the boolean true. The first stop's record already
+# holds the agent's work; what it lacks is the one short continuation turn,
+# which is the cheaper error than the whole transcript twice. Replacing the
+# earlier row by agent_id is not on offer: metrics.jsonl rows carry no agent id
+# and are append-only, and add-tokens is a running sum. Proof:
+# test/heimdall-metric-hook.test.sh section 10.
+#
 # MUST FAIL OPEN — a metrics emitter is telemetry, not a correctness gate.
 # Every path below reaches exit 0; heimdall-metric is never called with
 # --strict, and its own exit code is always discarded.
@@ -253,6 +268,12 @@ cmd_stop() {
   input="$(cat 2>/dev/null || true)"
   [ -n "$input" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
+
+  # The continuation of a blocked stop: the first stop already recorded this
+  # agent (ONE RECORD PER AGENT, in the header). Only the boolean true counts;
+  # any other value, a missing field or a payload jq cannot parse falls through
+  # to the checks below, unchanged.
+  printf '%s' "$input" | jq -e '.stop_hook_active == true' >/dev/null 2>&1 && return 0
 
   local agent_type
   agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty' 2>/dev/null)"
