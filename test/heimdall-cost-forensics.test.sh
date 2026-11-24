@@ -919,7 +919,7 @@ if echo "$LEVERS_TEXT" | grep -qF "$LEVERS_SECRET" || grep -qF "$LEVERS_SECRET" 
 else
   ok "privacy: --levers prints aggregates only; the secret planted in prompts, reports, paths, results and hook text never appears"
 fi
-"$TOOL" --help 2>&1 | grep -q -e "--levers" && ok "--help documents --levers" || bad "--help does not document --levers"
+echo "$HELP_OUT" | grep -q -e "--levers" && ok "--help documents --levers" || bad "--help does not document --levers"
 
 # bad invocations exit 2
 "$TOOL" --since 2026-11-24 >/dev/null 2>&1
