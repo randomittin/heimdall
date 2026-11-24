@@ -435,6 +435,17 @@ ask_dream_permission() {
   return 0
 }
 
+# ── the one token-saver question, on the MANUAL update only ──
+# Same shape and reasons as ask_dream_permission above: `hmd --update` is a moment a person is present, the helper's own terminal gate (stdin AND stdout)
+# decides between asking and doing nothing at all (no output, no read, no write), it asks once and keeps the answer, and it never changes the update's
+# exit code. The BACKGROUND `check` must never reach this function.
+ask_compact_window() {
+  local cw="$SELF_DIR/heimdall-compact-window"
+  [ -x "$cw" ] || return 0
+  "$cw" offer || true
+  return 0
+}
+
 # ── repair deferred / broken optional modules (the recurring, hands-off moment) ──
 # WHY THIS LIVES HERE. `hmd install` must not block on a multi-GB download, so an
 # optional module is legitimately ABSENT right after a successful install — and a
@@ -1099,6 +1110,7 @@ cmd_update() {
   # have been failing at 03:00 for weeks. Idempotent (asked once, then silent), silent
   # when no grant is needed, and a no-op when nobody is at the terminal.
   ask_dream_permission || true
+  ask_compact_window || true
 
   installed="$(installed_version)"
   latest="$(latest_version)"

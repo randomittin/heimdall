@@ -96,6 +96,7 @@ bin/heimdall-claim-check
 bin/heimdall-cleanup
 bin/heimdall-clip
 bin/heimdall-collision
+bin/heimdall-compact-window
 bin/heimdall-comprehend
 bin/heimdall-conformance
 bin/heimdall-connect

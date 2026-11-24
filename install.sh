@@ -852,6 +852,23 @@ ensure_dream_permission() {
   return 0
 }
 
+# ── The one token-saver question, asked at setup: `hmd compact-window` ───────────────────────────────────
+#
+# It sets the agent's native auto-compact window (one key in the user-level settings.json) to 300,000 tokens, the biggest measured lever on a long
+# session's spend (about 40% of main-thread spend in the one session replayed). That file is the person's, so this step only ever ASKS: the helper
+# (bin/heimdall-compact-window offer) draws the question when stdin AND stdout are a terminal, writes nothing without a yes, asks once and keeps the
+# answer. Under `curl | bash`, in CI or in any pipe it prints nothing, reads nothing and writes nothing, so the install never blocks and a
+# non-interactive install leaves ~/.claude/settings.json exactly as it was; the question waits for the next `hmd --update` at a terminal. We do not
+# re-test the terminal here (two copies of that gate drift). Every word the person sees comes from the helper, and this ALWAYS returns 0: an offer
+# must never fail an install that otherwise succeeded.
+ensure_compact_window_offer() {
+  local plugin_dir="$1"
+  local cw="$plugin_dir/bin/heimdall-compact-window"
+  [ -x "$cw" ] || return 0
+  "$cw" offer || true
+  return 0
+}
+
 # ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
 #
 # install.sh's own step — the PATH export — emits started→succeeded|failed +
@@ -1891,6 +1908,9 @@ main() {
   if [ "$DS_STATE" = "scheduled" ]; then
     ensure_dream_permission "$PLUGIN_DIR" || true
   fi
+
+  # The one token-saver question (hmd compact-window): only at a terminal, once, never a write without a yes, never a failed install.
+  ensure_compact_window_offer "$PLUGIN_DIR" || true
 
   # PATH setup — make `hmd` reachable without the user hand-editing a profile.
   # ensure_path_on_profile appends a single guarded export to the right shell

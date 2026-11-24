@@ -21,6 +21,7 @@ guard
 uninstall
 reinstall
 lean
+compact-window
 team
 invite
 join
