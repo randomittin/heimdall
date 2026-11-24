@@ -94,7 +94,7 @@
     "/tmp/heimdall-*"
   ],
   "goal": null,
-  "auto_checkpoint_at": "2026-11-22T04:55:32Z",
+  "auto_checkpoint_at": "2026-11-24T20:41:06Z",
   "ai_backend": {
     "selected": "claude-code",
     "selected_at": "2026-08-18T07:28:54Z",
