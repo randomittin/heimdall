@@ -36,7 +36,8 @@
 #      it COUNTS GREEN (the solo re-run is the verdict, as it always was -- contention is not a
 #      property of the code), but it is never hidden: the receipt keeps the suite, both exit
 #      codes and the failing lines the parallel run printed (flaky_under_load), the run prints it
-#      loudly, and the push gate names it whenever it passes. A suite that is red ALONE stays red.
+#      loudly, and the push gate names it whenever it passes. With the suite cache on, its solo green is also RECORDED as the suite's cache entry (see "FLAKY-UNDER-LOAD AND THE CACHE" in the
+#      suite cache notes below), so a flake no longer costs the receipt its full_equivalent. A suite that is red ALONE stays red.
 #   8. THE TREE ITSELF IS A GUARANTEE. A frozen `git status` is taken before the first suite
 #      starts and again after the very last one (including solo red re-runs) finishes. Any
 #      tracked file a suite added, modified, deleted, or TYPE-CHANGED (e.g. swapped for a
@@ -134,8 +135,14 @@
 # file without its comments, the two runner libraries in test/lib, sweep-chain.sh, hook-owned-path.sh, the hints, the cache library, the engine, the tool versions); bin/lib/suite-cache.sh
 # stores and compares (.heimdall/receipts/suite-cache/<suite>.json, gitignored). A suite whose entry matches both, is under 7 days old (HMD_SUITE_CACHE_MAX_DAYS may only lower that) and was
 # recorded within the budget it would run under now is a HIT: not launched, a CACHED row, counted green. The rest are launched, changed-closure suites first, and each GREEN is stored THE MOMENT
-# it finishes -- also when the run later goes red or is stopped, so a red run no longer throws away what it had proved. Never stored: a red, a timeout, a discrepancy, unparsed counts, a suite that
-# was red under load and green only alone (FLAKY-UNDER-LOAD), a live suite; a suite that ran and was not green also forgets its older entry.
+# it finishes -- also when the run later goes red or is stopped, so a red run no longer throws away what it had proved. Never stored: a red, a timeout, a discrepancy, unparsed counts, a live suite;
+# a suite that ran and was not green also forgets its older entry.
+# FLAKY-UNDER-LOAD AND THE CACHE. A suite red in the parallel phase and GREEN in its solo re-run is stored the moment that re-run passes (_solo_retry: the re-run phase and --fail-fast's confirmation both go
+# through it), as a green of that suite at its closure hash and the salt. The solo run is already the verdict everywhere else (the exit code, suites_passed, the push gate and release/ship.sh count it
+# green, because contention is not a property of the code), so the record changes no verdict: it binds the same verdict to the commit, which is what lets verify-receipt re-derive it. A cold sweep whose
+# only blemishes are such suites is therefore full-equivalent AND cold -- an x.y.0 release needs both, and on a loaded host every cold sweep trips two to four of them, which made a minor release unreachable
+# (2.5.0 shipped as 2.4.11). Nothing is hidden: flaky_under_load in the receipt keeps both exit codes and the failing lines the parallel run printed, the run prints the section, and the push gate names the
+# suites. A suite red in BOTH runs is red and stores nothing; --fail-fast and the aborted receipt are as before (a stopped run is never full-equivalent, whatever its cache holds).
 # AUDIT. max(20, 10%) of the hits (drawn by seed from HEAD and the salt, so it is reproducible; HMD_SUITE_CACHE_AUDIT_PCT may only RAISE the 10) are re-run anyway. An audited suite that fails
 # with an unchanged closure is CLOSURE UNSOUND: its closure missed something it reads. The run is RED, the whole cache is purged (the next sweep is cold) and the suite should be pinned in
 # test/closure-hints.json ({"<suite>": {"always_run": true}}); a tracked file cannot be edited mid-sweep, so the runner names the hint and never writes it.
@@ -804,8 +811,8 @@ _cache_plan() {
   CACHED_ASSERT="$(printf '%s\n' ${CACHED[@]+"${CACHED[@]}"} | awk -F'\t' 'NR == FNR { c[$1] = 1; next } ($1 in c) { n += $3 } END { print n + 0 }' - "$CACHE_TMP/hitfacts.tsv")"
   return 0
 }
-# _cache_store_green IDX -- suite IDX just finished in the parallel phase (PROG_* describe it). A clean green goes into the cache NOW, so a run that is stopped or goes red later keeps it. A red is never
-# stored here; a red that passes alone (FLAKY-UNDER-LOAD) is not a clean green either, and is dealt with in _cache_note_result.
+# _cache_store_green IDX -- suite IDX just finished and PROG_* describe its verdict: in the parallel phase, or, for a red under load, its solo re-run (_solo_retry calls this too). A clean green goes into the
+# cache NOW, so a run that is stopped or goes red later keeps it. A red is never stored.
 _cache_store_green() {
   local i="$1" name csha dur body
   [ "$PROG_STATUS" = PASS ] || return 0
@@ -819,13 +826,17 @@ _cache_store_green() {
   if suite_cache_store "$CACHE_DIR" "$name" "$body" 2>>"$CACHE_TMP/store.err"; then printf '%s\n' "$name" >> "$CACHE_TMP/stored.txt"; else CACHE_STORE_FAIL=$((CACHE_STORE_FAIL + 1)); fi
   return 0
 }
-# _cache_note_result IDX NAME STATUS -- CLASSIFY RESULTS: what the cache keeps of a suite that ran. A suite that is not a clean green forgets its older entry too. An AUDITED suite that is red for good
-# (not FLAKY-UNDER-LOAD: that one passed alone) although its closure had not changed is CLOSURE UNSOUND.
+# _cache_note_result IDX NAME STATUS -- CLASSIFY RESULTS: what the cache keeps of a suite that ran. A clean green is already stored (_cache_store_green), and so is a red under load that passed ALONE
+# (FLAKY-UNDER-LOAD, stored by _solo_retry: its solo run is the verdict). A suite that is not a green forgets its older entry, and so does a flake whose solo green could not be stored. An AUDITED suite
+# that is red for good (not FLAKY-UNDER-LOAD: that one passed alone) although its closure had not changed is CLOSURE UNSOUND.
 _cache_note_result() {
   local i="$1" name="$2" status="$3" flaky=0 f
   if grep -Fxq -- "$name" "$CACHE_TMP/audit.txt" 2>/dev/null; then N_AUDITED_RAN=$((N_AUDITED_RAN + 1)); fi
   for f in ${FLAKY_IDX[@]+"${FLAKY_IDX[@]}"}; do [ "$f" = "$i" ] && flaky=1; done
-  if [ "$status" = PASS ] && [ "$flaky" -eq 0 ]; then return 0; fi
+  if [ "$status" = PASS ]; then
+    [ "$flaky" -eq 0 ] && return 0
+    grep -Fxq -- "$name" "$CACHE_TMP/stored.txt" 2>/dev/null && return 0
+  fi
   [ -z "$(live_reason "${RUN[$i]}")" ] || return 0
   suite_cache_invalidate "$CACHE_DIR" "$name" 2>/dev/null || true
   if [ "$flaky" -eq 0 ] && grep -Fxq -- "$name" "$CACHE_TMP/audit.txt" 2>/dev/null; then UNSOUND+=("$name"); fi
@@ -1289,7 +1300,7 @@ _disk_gate() {
 # ABORT_FROM = the index of the first suite never started, as REFUSED_FROM is for the disk floor; every suite from there on is NOTRUN.
 FF_TRIPPED=0; FF_HOLD=0; FF_PENDING=(); FF_TRIP_NAME=""; ABORT_FROM=$TO_RUN
 FLAKY=(); FLAKY_IDX=()
-# _solo_retry IDX -- run red suite IDX again ALONE and keep both runs' evidence: the parallel run's .rc/.out/.t0/.t1 become *.parallel. A pass is FLAKY-UNDER-LOAD. Shared by the re-run phase
+# _solo_retry IDX -- run red suite IDX again ALONE and keep both runs' evidence: the parallel run's .rc/.out/.t0/.t1 become *.parallel. A pass is FLAKY-UNDER-LOAD, and (cache on) is stored as the suite's green. Shared by the re-run phase
 # below and by --fail-fast, which needs a red confirmed BEFORE it stops the sweep.
 _solo_retry() {
   local i="$1"
@@ -1307,7 +1318,12 @@ _solo_retry() {
   # descendant for _abort_sweep to stop.
   run_one "$i" "${RUN[$i]}" 9>&- &
   wait $!
-  if [ "$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)" = "0" ]; then FLAKY+=("${RUN[$i]}"); FLAKY_IDX+=("$i"); fi
+  if [ "$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)" = "0" ]; then
+    FLAKY+=("${RUN[$i]}"); FLAKY_IDX+=("$i")
+    # The solo run is the verdict (it counts green), so the cache records it as the suite's green and the receipt keeps its full_equivalent ("FLAKY-UNDER-LOAD AND THE CACHE" at the top). A solo run that is
+    # no clean green (counts that cannot be parsed, failures printed with exit 0) stores nothing: _cache_store_green reads PROG_STATUS, which _progress_fields sets from the solo run's own .rc and .out.
+    if [ "$CACHE_ON" -eq 1 ]; then _progress_fields "$i"; _cache_store_green "$i"; fi
+  fi
 }
 # _ff_trip IDX -- red suite IDX is red for good: no suite is started from here on. The ones running finish; every one never started is NOTRUN.
 _ff_trip() {
@@ -1767,7 +1783,7 @@ if [ "$n_unparsed" -gt 0 ]; then
   echo ""
 fi
 if [ "${#FLAKY[@]}" -gt 0 ]; then
-  echo "${YEL}${BLD}FLAKY-UNDER-LOAD (${#FLAKY[@]})${OFF} — red under --jobs $JOBS, green alone (shared-state contention); counted GREEN, recorded in the receipt (flaky_under_load) with the parallel run's failing lines:"
+  echo "${YEL}${BLD}FLAKY-UNDER-LOAD (${#FLAKY[@]})${OFF} — red under --jobs $JOBS, green alone (shared-state contention); counted GREEN, recorded in the receipt (flaky_under_load) with the parallel run's failing lines$([ "$CACHE_ON" -eq 0 ] || echo ", and its solo green goes into the suite cache"):"
   for x in ${FLAKY[@]+"${FLAKY[@]}"}; do echo "  bash test/$(basename "$x")"; done
   echo ""
 fi
@@ -2163,7 +2179,7 @@ if [ "$SWEEP_KIND" = incremental ]; then
 else
   if [ "$CACHE_ON" -eq 1 ]; then
     echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed, ${n_cached} served from the suite cache, tree untouched."
-    [ "$FULL_EQ" = true ] || echo "  cache: the receipt is NOT full-equivalent (a suite has no cache record, e.g. FLAKY-UNDER-LOAD, or the cache block could not be built): the gate and release/ship.sh will not take it. Run: bash test/run-all.sh --failed"
+    [ "$FULL_EQ" = true ] || echo "  cache: the receipt is NOT full-equivalent (a suite has no cache record, e.g. a green the cache could not store, or the cache block could not be built): the gate and release/ship.sh will not take it. Run: bash test/run-all.sh --failed"
   else
     echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed, tree untouched."
   fi

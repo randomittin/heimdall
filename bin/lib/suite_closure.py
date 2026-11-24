@@ -92,6 +92,8 @@ verify-receipt  a sweep receipt (kind "full") carries a `cache` block:
              refused; a cold receipt, in which every suite ran in that sweep, is exempt); and the audit sample was drawn: audited >=
              min(hits, max(20, 10% of the hits)), hits = suites_cached + audited. HMD_SUITE_CACHE_MAX_DAYS may only LOWER the 7,
              HMD_SUITE_CACHE_AUDIT_PCT may only RAISE the 10.
+             A suite the receipt lists in flaky_under_load (red under parallel load, green on its solo re-run) is held to the rule of every other suite: it needs its entry,
+             and its record must say it passed alone (solo_exit 0), because a suite that is red when run alone is red.
 
 A cooperating-agent control, not a security boundary: like last-sweep.json it is a plain local file, and it catches stale, copied and
 hand-edited-by-accident receipts, not someone who can recompute every hash.
@@ -1816,6 +1818,16 @@ def shape_problems(receipt):
         problems.append("kind is %r, not \"full\": only a full-equivalent sweep stands in for a full one" % (receipt.get("kind"),))
     if "full_equivalent" in receipt and receipt["full_equivalent"] is not True:
         problems.append("full_equivalent is %r: the receipt itself says it is not full-equivalent" % (receipt["full_equivalent"],))
+    flaky = receipt.get("flaky_under_load", [])
+    if not isinstance(flaky, list):
+        problems.append("flaky_under_load must be a list of {suite, parallel_exit, solo_exit}")
+    else:
+        # a suite red under parallel load counts green only because its solo re-run passed, and that green is a cache entry held to the rules of every other (below): a record that says it was red alone contradicts the receipt
+        for i, item in enumerate(flaky):
+            if not isinstance(item, dict) or not isinstance(item.get("suite"), str) or item["suite"] == "":
+                problems.append("flaky_under_load[%d] must be an object naming a suite" % i)
+            elif not _int(item.get("solo_exit")) or item["solo_exit"] != 0:
+                problems.append("flaky_under_load[%d] (%s) did not pass its solo re-run (solo_exit %r): a suite that is red when run alone is red, and no receipt may count it green" % (i, item["suite"], item.get("solo_exit")))
     cache = receipt.get("cache")
     if not isinstance(cache, dict):
         problems.append("the receipt has no cache block (a receipt without one is not a closure-composed sweep)")

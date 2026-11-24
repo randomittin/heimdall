@@ -32,8 +32,8 @@ message, a script written to disk) is no merge, as it is no sweep to the sweep g
                            RELEASE's bar (release/ship.sh) and is named on the Release: line only, never recommended for a push, so a red or a running sweep changes nothing here. The Why and the
                            Cost measure from the NEWEST green record among those on file (the one that leaves the fewest commits uncovered, then the latest finished_at): a use-case receipt, a
                            full-sweep proof, or a green full run of a clean tree that is NOT full-equivalent. That last kind is why last-sweep.json is read at all: test/run-all.sh moves the anchor
-                           and writes the archive only for a full-equivalent green (its anchor block, after the receipt is written), so a green sweep in which one suite passed only on its solo re-run
-                           (no cache record for it, full_equivalent=false) lives in last-sweep.json alone and the anchor lags behind it BY DESIGN, not by a runner bug
+                           and writes the archive only for a full-equivalent green (its anchor block, after the receipt is written), so a green sweep in which a suite's green has no cache record
+                           (full_equivalent=false: a result the cache could not store; a suite that passed only on its solo re-run is stored since 2026-11-24) lives in last-sweep.json alone and the anchor lags behind it BY DESIGN, not by a runner bug
               repo-checks  .heimdall/repo-checks.json is declared: its own receipt (bin/lib/hmd_repo_receipt.py) must be green and current for the commit, and it
                            attests ONE commit. Run: bin/heimdall-repo-checks run --repo <repo>
               unmanaged    neither (or a declaration that cannot be used): lint plus the use-case suite, skills/heimdall/references/use-case-tests.md
@@ -89,7 +89,7 @@ GH_VALUE_OPTS = frozenset(("-R", "--repo"))
 NAME_OK = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 FULL_GREEN_KEEP = 20  # how many receipts/full-green/<head_sha>.json the runner keeps (test/run-all.sh FULL_GREEN_KEEP, newest by modification time): the most of them this reads
 STAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")  # a receipt's finished_at, `date -u '+%Y-%m-%dT%H:%M:%SZ'`: stamps of this form sort as text
-NOT_FULL_EQUIVALENT = "not full-equivalent (a suite has no cache record, e.g. one that passed only on its solo re-run), so the push gate takes it for no proof"
+NOT_FULL_EQUIVALENT = "not full-equivalent (a suite has no cache record, e.g. a green the cache could not store), so the push gate takes it for no proof"
 TYPICAL_RUN = "about 6 minutes"  # one whole run of the use-case runner (every journey, then every mutant, three at a time) as measured on 2026-11-22; the wall clock of a receipt on file replaces it
 TYPICAL_ON = "2026-11-22"
 RELEASE_NOTE = ("this is the bar for a push. A release (release/ship.sh) is another one: it needs a green full sweep, bash test/run-all.sh; nothing here asks for that before a push.")
@@ -511,7 +511,7 @@ def load_receipt(rdir, name, top):
 
 def receipt_kind(receipt):
     """("proof", None) for a green full receipt of a clean tree that is full-equivalent and names a commit; ("green", None) for the same that is NOT full-equivalent (the run was
-    green, but a suite that passed only on its solo re-run has no cache record, so the gate takes no commit on its word); ("red", None); or ("partial", why it is none of those)."""
+    green, but a suite has no cache record (its green could not be stored), so the gate takes no commit on its word); ("red", None); or ("partial", why it is none of those)."""
     sha = receipt.get("head_sha")
     if not isinstance(sha, str) or not sg.COMMIT.match(sha):
         return "partial", "the sweep receipt names no commit"
@@ -549,7 +549,7 @@ def finished(receipt):
 def green_sweeps(rdir, top, last):
     """[(receipt, "proof" or "green")], newest finished_at first, of every green full sweep of a clean tree on file for this checkout: last-sweep.json (`last`, already read),
     last-full-green.json and the receipts/full-green/ archive. The runner moves the anchor and writes the archive only for a sweep that is full-equivalent, so a green run in which a
-    suite passed only on its solo re-run (kind "green") lives in last-sweep.json alone and the anchor lags behind it by design: only all three together hold the last green run.
+    suite has no cache record (kind "green") lives in last-sweep.json alone and the anchor lags behind it by design: only all three together hold the last green run.
     Receipts of equal time keep that order, and one run found under two names counts once. A record that is missing, unreadable, red, partial or of another checkout is not one."""
     found, seen = [], set()
     for r in [last] + [load_receipt(rdir, name, top)[0] for name in ["last-full-green.json"] + archived(rdir)]:

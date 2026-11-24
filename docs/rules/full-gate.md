@@ -114,7 +114,12 @@ rule below about who may start a run, when it is recommended and how its output 
   max(20, 10%) of the hits re-run anyway (seeded by HEAD and the salt); an audited suite
   that fails with an unchanged closure is `CLOSURE UNSOUND`: red run, cache purged. Each
   green is stored the moment it finishes, so a red, stopped or cancelled run keeps what it
-  proved. The receipt stays `kind:"full"` plus a `cache` block and `full_equivalent`; the
+  proved. A suite red under parallel load but green on its solo re-run (`FLAKY-UNDER-LOAD`)
+  is stored too, since the solo run is already its verdict for the exit code, the gate and
+  the release script: a cold sweep whose only blemishes are such suites stays cold and
+  full-equivalent (a minor release is reachable on a loaded host), and each flake stays in
+  the receipt (`flaky_under_load`) and the summary; a suite red in both runs is red and
+  stores nothing. The receipt stays `kind:"full"` plus a `cache` block and `full_equivalent`; the
   push gate and the release script re-derive it (`bin/heimdall-suite-closure
   verify-receipt`), never on the flag's word. `--cold` (or `HMD_COLD=1`) ignores the cache
   and runs every suite: an x.y.0 release needs that cold receipt, a patch release takes a
