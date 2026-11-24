@@ -88,5 +88,4 @@
 - [ ] LOW bin/heimdall:5443 still says "Never retry same tier" — reword for the effort ladder (2026-11-23).
 - [ ] LOW lean_context_parity counts gitignored untracked files (two empty Sept-21 *.tmp in skills/designmatch/.heimdall/ turned check red); measure tracked+unignored only (2026-11-23).
 - [ ] LOW bin/designmatch on a lean install prints no `hmd skills install designmatch` hint (commands/designmatch.md is cut from lean by design) (2026-11-23).
-
-- MEDIUM (2026-11-23, security bot): evals/effort-ab/run.py gives each `claude -p` child blanket Bash + acceptEdits with the real HOME. Fixtures are repo-owned and each run is in a mktemp copy, but nothing bounds a child to its workdir. Fix: throwaway HOME (auth only) + sandbox-exec, or allowlist Bash(python3 -m unittest:*). Run the harness only on committed fixtures until then.
+- [ ] MEDIUM bin/lib/tier-table.json tier-level prices are stale for the 5.5 generation (sonnet $3/$15 vs $2/$10, opus $5/$25 vs $4/$20, haiku $1/$5 vs $0.10/$0.50; cache read 0.05x/0.025x). Every consumer of tier prices misreports cost; cost-forensics now uses model_prices instead (2026-11-24).

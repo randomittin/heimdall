@@ -7,8 +7,18 @@ tasks/<id>/seed, `claude -p` headless in a scrubbed environment, then the hidden
 decides pass/fail. One JSONL row per attempt; analysis is analyze.py.
 
 Safety: the child never inherits this process's environment (no tokens, no proxy, no session
-pointers); --safe-mode disables hooks, plugins, CLAUDE.md and MCP; --no-session-persistence writes no
-transcript; the disk floor and the account's 5-hour usage window are checked between runs.
+pointers); --safe-mode disables hooks, plugins, CLAUDE.md and MCP; --restricted also ignores the user's
+own settings files (their allow rules, e.g. a blanket Bash(curl:*), would widen the child) and confines the
+file tools to the workdir; Bash is allowlisted to the fixture language's toolchain and every other prompt is
+denied (--permission-prompts none); --no-session-persistence writes no transcript; the disk floor and the
+account's 5-hour usage window are checked between runs.
+
+Confinement (macOS): every child, the hidden acceptance run (it executes what the child wrote) and the
+post-run git calls run under sandbox-exec: writes only to the workdir, a private per-run TMPDIR and Claude
+Code's own per-cwd scratch, and no read of the common credential stores. The runner fails closed, naming
+--no-sandbox, when sandbox-exec is missing or a probe shows it confines nothing. HOME stays the real HOME: the
+subscription login is a macOS Keychain item that a throwaway HOME cannot reach, and the runner never reads,
+copies or logs it. The network stays open (the CLI needs the API).
 """
 import argparse
 import gzip
@@ -16,6 +26,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -35,12 +46,33 @@ SUFFIX = (
     "outside it. Run the visible tests before you finish. When done, reply with one short sentence."
 )
 KEEP_ENV = ("HOME", "PATH", "TMPDIR", "LANG", "USER", "LOGNAME")
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+# Credential stores (relative to HOME) a child cannot read. The Keychain stays readable: the CLI's login lives there.
+SECRET_PATHS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".netrc", ".npmrc", ".config/gcloud", ".config/gh")
+SANDBOX_PROFILE = (
+    "(version 1)\n(allow default)\n(deny file-write*)\n"
+    "(allow file-write*\n"
+    '    (subpath (param "WORK"))\n    (subpath (param "SCRATCH"))\n    (subpath (param "CLAUDE_TMP"))\n'
+    '    (literal "/dev/null")\n    (literal "/dev/dtracehelper")\n    (literal "/dev/stdout")\n    (literal "/dev/stderr")\n'
+    '    (literal "/dev/tty")\n    (regex #"^/dev/fd/[0-9]+$")\n'
+    # the only /tmp names tools hardcode: Claude Code's per-command cwd file (without it every Bash result reads
+    # "Exit code 1") and diff's temp file when it reads stdin
+    + r'    (regex #"^/private/tmp/(claude-[0-9a-f]+-cwd|diff\.[A-Za-z0-9]+)$"))' + "\n"
+    "(deny file-read*\n"
+    + "\n".join(f'    (subpath (string-append (param "HOME") "/{p}"))' for p in SECRET_PATHS)
+    + ")\n"
+)
 
 
-def child_env():
-    """The ONLY environment a child ever sees: no tokens, no ANTHROPIC_*, no CLAUDE_* session state."""
+def child_env(tmpdir=None):
+    """The ONLY environment a child ever sees: no tokens, no ANTHROPIC_*, no CLAUDE_* session state.
+    HOME stays the real one (the login is a Keychain item); TMPDIR is the run's private scratch when given."""
     env = {k: os.environ[k] for k in KEEP_ENV if k in os.environ}
+    env.setdefault("HOME", str(Path.home()))
     env.setdefault("LANG", "en_US.UTF-8")
+    if tmpdir:
+        env["TMPDIR"] = str(tmpdir)
+        env["TMPPREFIX"] = f"{tmpdir}/zsh"  # zsh puts here-document temp files at /tmp/zsh<rand> unless told otherwise
     env.update(
         TERM="dumb", NO_COLOR="1", PYTHONDONTWRITEBYTECODE="1", GIT_TERMINAL_PROMPT="0",
         GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
@@ -50,13 +82,68 @@ def child_env():
     return env
 
 
-def claude_cmd(claude, model, effort, budget):
+def claude_cmd(claude, model, effort, budget, allowed):
     return [
-        claude, "-p", "--model", model, "--effort", effort, "--safe-mode", "--no-session-persistence",
+        claude, "-p", "--model", model, "--effort", effort, "--safe-mode", "--restricted", "--no-session-persistence",
         "--output-format", "stream-json", "--verbose", "--include-hook-events",
         "--permission-mode", "acceptEdits", "--permission-prompts", "none",
-        "--max-budget-usd", str(budget), "--tools", TOOLS, "--allowedTools", TOOLS,
+        "--max-budget-usd", str(budget), "--tools", TOOLS, "--allowedTools", *allowed,
     ]
+
+
+def allowed_tools(task_dir):
+    """The --allowedTools rules of one fixture. Read, Glob and Grep (read-only, in the workdir) and Edit and Write
+    (acceptEdits) need none, and --restricted confines them to the workdir; Bash gets only the fixture language's
+    toolchain (python3, node, or the fixture's own .sh files). Anything else that would prompt is denied."""
+    lang = json.loads((task_dir / "task.json").read_text())["lang"]
+    if lang == "python":
+        rules = ["python3 *"]
+    elif lang == "node":
+        rules = ["node *"]
+    elif lang == "bash":
+        rules = [f"bash {p.relative_to(task_dir / 'seed')} *" for p in sorted((task_dir / "seed").rglob("*.sh"))]
+    else:
+        rules = []
+    if not rules:
+        raise ValueError(f"{task_dir.name}: no Bash allowlist for fixture language {lang!r}")
+    return [f"Bash({rule})" for rule in rules]
+
+
+def claude_tmp_dir(work):
+    """Claude Code keeps per-cwd scratch under /tmp/claude-<uid>/<cwd with every non-alphanumeric as '-'>."""
+    return Path(f"/private/tmp/claude-{os.getuid()}") / re.sub(r"[^A-Za-z0-9]", "-", str(work))
+
+
+def sandbox_argv(sandbox_exec, work, scratch, home):
+    """Command prefix that runs what follows with writes confined to work, scratch and Claude's own per-cwd
+    scratch. The paths must be real (symlinks resolved): the kernel matches resolved paths."""
+    params = {"WORK": work, "SCRATCH": scratch, "CLAUDE_TMP": claude_tmp_dir(work), "HOME": home}
+    return [sandbox_exec, *(arg for k, v in params.items() for arg in ("-D", f"{k}={v}")), "-p", SANDBOX_PROFILE]
+
+
+def unconfined(argv):
+    return argv
+
+
+def sandbox_problem(sandbox_exec, tmp_root, home):
+    """None when sandbox-exec really confines writes on this machine, else why not (the runner then refuses to start)."""
+    if not (sandbox_exec and os.access(sandbox_exec, os.X_OK)):
+        return f"no sandbox-exec at {sandbox_exec} (macOS only)"
+    probe = Path(tempfile.mkdtemp(prefix="effort-ab.sbx.", dir=tmp_root)).resolve()
+    try:
+        work, scratch, outside = (probe / name for name in ("work", "scratch", "outside"))
+        for d in (work, scratch, outside):
+            d.mkdir()
+        script = 'echo 1 > "$1/in" && echo 1 > "$2/in"; echo 1 > "$3/out"'
+        subprocess.run(sandbox_argv(sandbox_exec, work, scratch, home) + ["/bin/sh", "-c", script, "sh", work, scratch, outside],
+                       capture_output=True, timeout=30)
+        confined = (work / "in").exists() and (scratch / "in").exists() and not (outside / "out").exists()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"sandbox-exec could not run a probe: {exc}"
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+    return None if confined else (f"{sandbox_exec} did not confine a probe child (it must write inside its workdir "
+                                  "and scratch and be refused outside them)")
 
 
 def build_schedule(task_ids, reps, seed):
@@ -83,13 +170,13 @@ def fixture_sha(task_dir):
     return digest.hexdigest()
 
 
-def git(cwd, *args):
-    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=cwd, env=child_env(),
+def git(cwd, *args, scratch=None, confine=unconfined):
+    return subprocess.run(confine(["git", "-c", "core.hooksPath=/dev/null", *args]), cwd=cwd, env=child_env(scratch),
                           capture_output=True, text=True, timeout=60)
 
 
 def make_workdir(task_dir, tmp_root):
-    work = Path(tempfile.mkdtemp(prefix=f"effort-ab.{task_dir.name}.", dir=tmp_root))
+    work = Path(tempfile.mkdtemp(prefix=f"effort-ab.{task_dir.name}.", dir=tmp_root)).resolve()
     shutil.copytree(task_dir / "seed", work, dirs_exist_ok=True)
     git(work, "init", "-q")
     (work / ".git" / "info" / "exclude").write_text("__pycache__/\n*.pyc\nnode_modules/\n")
@@ -98,11 +185,12 @@ def make_workdir(task_dir, tmp_root):
     return work
 
 
-def run_accept(task_dir, work):
-    env = {k: os.environ[k] for k in ("HOME", "PATH", "TMPDIR", "LANG") if k in os.environ}
-    env.update(ACCEPT_DIR=str(task_dir), PYTHONDONTWRITEBYTECODE="1", TERM="dumb")
+def run_accept(task_dir, work, scratch, confine):
+    """Hidden acceptance executes what the child wrote, so it is confined like the child."""
+    env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG") if k in os.environ}
+    env.update(ACCEPT_DIR=str(task_dir), TMPDIR=str(scratch), PYTHONDONTWRITEBYTECODE="1", TERM="dumb")
     try:
-        p = subprocess.run(["bash", str(task_dir / "accept.sh")], cwd=work, env=env,
+        p = subprocess.run(confine(["bash", str(task_dir / "accept.sh")]), cwd=work, env=env,
                            capture_output=True, text=True, timeout=60)
         return p.returncode, (p.stdout + p.stderr)[-500:]
     except subprocess.TimeoutExpired:
@@ -209,14 +297,23 @@ def execute(job, args, state):
             return
         sha_before = fixture_sha(task_dir)
         work = make_workdir(task_dir, args.tmp_root)
+        scratch = Path(tempfile.mkdtemp(prefix=f"effort-ab.{job['task']}.tmp.", dir=args.tmp_root)).resolve()
+        env = child_env(scratch)
+        confine = ((lambda argv: sandbox_argv(args.sandbox_exec, work, scratch, env["HOME"]) + argv)
+                   if args.sandbox_exec else unconfined)
         tag = f"{job['task']}.{job['arm']}.r{job['rep']}.a{attempt}"
+
+        def cleanup():
+            for path in (work, scratch, claude_tmp_dir(work)):
+                shutil.rmtree(path, ignore_errors=True)
+
         raw = args.streams_dir / f"{tag}.jsonl"
         prompt_file = args.streams_dir / f"{tag}.prompt"
         prompt_file.write_text(prompt)
-        cmd = claude_cmd(args.claude, args.model, job["arm"], args.budget_usd)
+        cmd = confine(claude_cmd(args.claude, args.model, job["arm"], args.budget_usd, args.allowed[job["task"]]))
         t0, timed_out = time.monotonic(), False
         with open(prompt_file) as stdin, open(raw, "w") as stdout, open(f"{raw}.err", "w") as stderr:
-            proc = subprocess.Popen(cmd, cwd=work, env=child_env(), stdin=stdin, stdout=stdout,
+            proc = subprocess.Popen(cmd, cwd=work, env=env, stdin=stdin, stdout=stdout,
                                     stderr=stderr, start_new_session=True)
             state["procs"].add(proc.pid)
             try:
@@ -233,13 +330,13 @@ def execute(job, args, state):
         wall = time.monotonic() - t0
         parsed = parse_stream(raw)
         if state["stop"].is_set() and parsed["result"] is None and not timed_out:
-            shutil.rmtree(work, ignore_errors=True)  # killed by our own stop handler: no row, resume re-runs it
+            cleanup()  # killed by our own stop handler: no row, resume re-runs it
             return
         reason = infra_reason(parsed, proc.returncode, timed_out)
-        rc, tail = run_accept(task_dir, work)
-        git(work, "add", "-A")
-        patch = git(work, "diff", "--cached", "HEAD").stdout
-        stat = git(work, "diff", "--cached", "--numstat", "HEAD").stdout.split("\n")
+        rc, tail = run_accept(task_dir, work, scratch, confine)
+        git(work, "add", "-A", scratch=scratch, confine=confine)
+        patch = git(work, "diff", "--cached", "HEAD", scratch=scratch, confine=confine).stdout
+        stat = git(work, "diff", "--cached", "--numstat", "HEAD", scratch=scratch, confine=confine).stdout.split("\n")
         changed = [ln.split("\t") for ln in stat if ln.strip()]
         final = (not reason) or attempt >= state["attempts"].get(key, 0) + 3
         row = {
@@ -249,6 +346,7 @@ def execute(job, args, state):
             "pass": rc == 0 and not reason, "accept_rc": rc, "accept_tail": tail,
             "fixture_sha": sha_before, "fixture_stable": fixture_sha(task_dir) == sha_before,
             "timed_out": timed_out, "exit_code": proc.returncode, "wall_s": round(wall, 1),
+            "sandboxed": bool(args.sandbox_exec),
             "infra_failure": bool(reason), "infra_reason": reason,
             "files_changed": len(changed),
             "diff_lines": sum(int(c[0]) + int(c[1]) for c in changed if c[0].isdigit() and c[1].isdigit()),
@@ -260,7 +358,7 @@ def execute(job, args, state):
         os.remove(raw)
         prompt_file.unlink(missing_ok=True)
         if not args.keep:
-            shutil.rmtree(work, ignore_errors=True)
+            cleanup()
         with state["lock"]:
             state["done"] += 1
             state["spend"] += row["cost_usd"]
@@ -301,10 +399,16 @@ def main():
     ap.add_argument("--deadline-s", type=float, default=float("inf"),
                     help="start no new run after this many seconds (in-flight runs finish); resume with the same command")
     ap.add_argument("--claude", default=os.environ.get("EFFORT_AB_CLAUDE") or shutil.which("claude"))
+    ap.add_argument("--sandbox-exec", default=SANDBOX_EXEC,
+                    help="sandbox-exec every child, the acceptance run and git run under (macOS; default %(default)s)")
+    ap.add_argument("--no-sandbox", action="store_true",
+                    help="run children UNCONFINED (explicit opt-out; the tool allowlist and --restricted still apply)")
     ap.add_argument("--tmp-root", type=Path, default=Path(tempfile.gettempdir()))
     ap.add_argument("--keep", action="store_true", help="keep each run's workdir")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    if args.no_sandbox:
+        args.sandbox_exec = None
 
     only = {t for t in args.only.split(",") if t}
     # The schedule is built over EVERY task dir, then filtered: a subset or staged run keeps the exact
@@ -317,8 +421,18 @@ def main():
     args.results.parent.mkdir(parents=True, exist_ok=True)
     args.streams_dir = args.results.parent / "streams"
     args.patches_dir = args.results.parent / "patches"
+    try:
+        args.allowed = {t: allowed_tools(args.tasks_dir / t) for t in sorted({j["task"] for j in jobs})}
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if args.dry_run:
-        json.dump({"claude": claude_cmd(args.claude or "claude", args.model, "<effort>", args.budget_usd),
+        sandbox = None if not args.sandbox_exec else {
+            "exec": args.sandbox_exec, "available": os.access(args.sandbox_exec, os.X_OK), "profile": SANDBOX_PROFILE,
+            "argv_prefix": sandbox_argv(args.sandbox_exec, "<workdir>", "<scratch>", child_env()["HOME"])}
+        json.dump({"claude": claude_cmd(args.claude or "claude", args.model, "<effort>", args.budget_usd,
+                                        next(iter(args.allowed.values()), [])),
+                   "allowed_tools_by_task": args.allowed, "sandbox": sandbox,
                    "child_env_names": sorted(child_env()), "concurrency": args.concurrency,
                    "jobs": jobs}, sys.stdout, indent=1)
         print()
@@ -326,6 +440,12 @@ def main():
     if not args.claude:
         print("error: claude binary not found (set --claude or EFFORT_AB_CLAUDE)", file=sys.stderr)
         return 2
+    if args.sandbox_exec:
+        problem = sandbox_problem(args.sandbox_exec, args.tmp_root, child_env()["HOME"])
+        if problem:
+            print(f"error: {problem}; refusing to run children unconfined (pass --no-sandbox to accept that)",
+                  file=sys.stderr)
+            return 2
     args.streams_dir.mkdir(parents=True, exist_ok=True)
     args.patches_dir.mkdir(parents=True, exist_ok=True)
 
@@ -355,7 +475,8 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     print(f"effort-ab: {len(todo)} runs to do ({len(jobs) - len(todo)} already counted), "
-          f"concurrency {args.concurrency}, results {args.results}", flush=True)
+          f"concurrency {args.concurrency}, sandbox {'on' if args.sandbox_exec else 'OFF'}, results {args.results}",
+          flush=True)
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         for fut in [pool.submit(execute, j, args, state) for j in todo]:
             fut.result()
