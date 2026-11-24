@@ -18,10 +18,16 @@
 #   J  offer: asked once at a terminal, never off one (no output, no write), never when the key is there, silenced by HEIMDALL_NO_COMPACT_WINDOW_OFFER
 #   K  status; -h; no verb is a usage error
 #   L  wiring: the install.sh step writes nothing without a terminal; the dispatcher reaches the tool; help, runhmd's subcommand list, `hmd --update` and the README name it
+#   M  a second settings file (CLAUDE_CONFIG_DIR changed): `on` there never overwrites the first file's record and backup, each file is undone on its own, `off` and
+#      `status` act on the current file and name the others hmd set; the record is keyed by the canonical path (a symlinked config directory is the same file)
+#   N  the file changed while hmd was working (another writer saves it after hmd read it, even after hmd's own last look): exit 1, nothing of hmd's written over the
+#      change, no record, backup or temp file left behind, and a retry works; the same while the person is at the prompt (the file hmd created is not removed)
+#   O  a record that cannot be read or used (permissions, not JSON, a field missing, another file's record): exit 1, said plainly, nothing changed, the record undamaged
+#   P  an offer nobody answers gives up after the wait (HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S shortens it, junk is ignored), writes nothing and is not recorded as answered
 #
 # HERMETIC. HOME, HEIMDALL_HOME and the settings file are throwaway for every scenario; CLAUDE_CONFIG_DIR is unset; nothing reads or writes the operator's ~/.claude
 # or ~/.heimdall. CW_BIN=<file> points the suite at another copy of the tool (a mutant, for the break-it check).
-# budget: about 10 s solo: roughly 120 starts of one python script, a dozen of them on a pty. No network.
+# budget: about 12 s solo: roughly 170 starts of one python script, a dozen of them on a pty, one on a pty that waits out the 1 s seam. No network.
 # EXIT: 0 = every assertion passes; 1 = any FAIL.
 set -uo pipefail
 
@@ -94,6 +100,56 @@ status = os.waitpid(pid, 0)[1]
 sys.stdout.buffer.write(bytes(screen))
 sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
 PYEOF
+cat >"$TMP/drive.py" <<'PYEOF'
+import importlib.machinery, importlib.util, os, sys, tempfile
+# drive.py wait <tool>                                              the seconds an unanswered offer waits, in this environment
+# drive.py race <tool> <settings> <point> <kind> -- <args...>       the tool run in this process; at <point> another writer saves the settings file as <kind>
+#   point  write   the new file is being written: after the tool's first look at the settings file, before its rename (what a check made earlier cannot see)
+#          prompt  the person is deciding (the end of the consent step)
+#   kind   inplace the same file, one more newline at the end    swap  a new file (temp + rename) with that newline    twin  a new file with the very same bytes
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader("compact_window_under_test", sys.argv[2])
+module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(module)
+if sys.argv[1] == "wait":
+    print("%g" % module.offer_wait())
+    sys.exit(0)
+settings, point, kind = sys.argv[3:6]
+args = sys.argv[sys.argv.index("--") + 1:]
+fired = []
+
+def other_writer():
+    if fired:
+        return
+    fired.append(kind)
+    with open(settings, "rb") as handle:
+        raw = handle.read()
+    data = raw if kind == "twin" else raw + b"\n"
+    if kind == "inplace":
+        with open(settings, "wb") as handle:
+            handle.write(data)
+    else:
+        with open(settings + ".other", "wb") as handle:
+            handle.write(data)
+        os.replace(settings + ".other", settings)
+
+if point == "write":
+    real_mkstemp = tempfile.mkstemp
+    def mkstemp(*a, **k):
+        made = real_mkstemp(*a, **k)
+        if os.path.realpath(k.get("dir", "")) == os.path.dirname(os.path.realpath(settings)):
+            other_writer()
+        return made
+    tempfile.mkstemp = mkstemp
+else:
+    real_consent = module.consent
+    def consent(*a, **k):
+        answer = real_consent(*a, **k)
+        other_writer()
+        return answer
+    module.consent = consent
+sys.exit(module.main(["heimdall-compact-window"] + args))
+PYEOF
 "$PY" -I -c 'import pty; pty.openpty()' >/dev/null 2>&1 || { echo "no pseudo-terminal can be opened here: the terminal cases cannot run"; exit 1; }
 
 H=""; S=""; N=0
@@ -102,7 +158,9 @@ scrub() { env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u HEIMDAL
 cw()    { scrub "$CW" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }                                 # no terminal
 cwpty() { local a="$1"; shift; scrub "$PY" -I "$TMP/pty_drive.py" "$a" -- "$CW" "$@" >"$OUT" 2>"$ERR"; RC=$?; }   # a person at a terminal who types $a
 value() { "$PY" -I "$TMP/chk.py" value "$S"; }
-state() { ls "$H/.heimdall/compact-window" 2>/dev/null | grep -c -E '^(state.json|settings.json.bak)$'; }
+state() { find "$H/.heimdall/compact-window" -type f \( -name '*state.json' -o -name '*settings.json.bak' \) 2>/dev/null | wc -l | tr -d ' '; }   # records and backups kept
+rec()   { find "$H/.heimdall/compact-window" -type f -name '*state.json' 2>/dev/null | head -n 1; }                                   # the first record
+bak()   { find "$H/.heimdall/compact-window" -type f -name '*settings.json.bak' 2>/dev/null | head -n 1; }                            # the first backup
 same()  { cmp -s "$1" "$2"; }
 
 PRETTY='{
@@ -133,7 +191,7 @@ for layout in PRETTY COMPACT TABS; do
   eq "A/$layout: the key is 300000" 300000 "$(value)"
   chk "A/$layout: every other member is the same, in order, at every level" "$PY" -I "$TMP/chk.py" others "$TMP/orig" "$S"
   eq "A/$layout: the record and the backup are kept" 2 "$(state)"
-  same "$H/.heimdall/compact-window/settings.json.bak" "$TMP/orig"; chk "A/$layout: the backup is the file as it was, byte for byte" test "$?" = 0
+  same "$(bak)" "$TMP/orig"; chk "A/$layout: the backup is the file as it was, byte for byte" test "$?" = 0
   cw off --yes
   eq "A/$layout: off --yes exits 0" 0 "$RC"
   chk "A/$layout: off returns the file byte for byte" same "$S" "$TMP/orig"
@@ -289,6 +347,115 @@ chk "L: runhmd's subcommand list names it" grep -qx 'compact-window' "$REPO/pack
 chk "L: hmd --update asks through the same step" grep -q 'ask_compact_window || true' "$REPO/bin/heimdall-autoupdate"
 chk "L: the README names the command" grep -q 'hmd compact-window on' "$REPO/README.md"
 chk "L: the npm README copy is the same file" cmp -s "$REPO/README.md" "$REPO/packages/runheimdall/README.md"
+
+# ---- M. a second settings file (CLAUDE_CONFIG_DIR changed): the first record and backup stay, and each file is undone on its own -----------------------------------
+valueof() { "$PY" -I "$TMP/chk.py" value "$1"; }
+cwat()    { local dir="$1"; shift; scrub env CLAUDE_CONFIG_DIR="$dir" "$CW" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }   # as cw, with CLAUDE_CONFIG_DIR=$dir
+new_home; mkdir -p "$H/second"; S2="$H/second/settings.json"
+printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; printf '%s' "$COMPACT" >"$S2"; cp "$S2" "$TMP/orig2"
+cw on --yes
+cwat "$H/second" on --yes --tokens 250k
+eq "M: on against a second settings file: exit 0, each file carries its own value" "0|300000|250000" "$RC|$(value)|$(valueof "$S2")"
+eq "M: each file keeps its own record and backup: the second did not overwrite the first (4 files)" 4 "$(state)"
+cwat "$H/second" status
+eq "M: status of the second file says hmd set it, and names the first" "1|1" "$(grep -c 'set by hmd' "$OUT")|$(grep -c -F '~/.claude/settings.json' "$OUT")"
+cw status
+eq "M: status of the first file says hmd set it, and names the second" "1|1" "$(grep -c 'set by hmd' "$OUT")|$(grep -c -F '~/second/settings.json' "$OUT")"
+cwat "$H/second" off --yes
+eq "M: off in the second environment restores the second file, byte for byte" "0|ABSENT|same" "$RC|$(valueof "$S2")|$(same "$S2" "$TMP/orig2" && echo same)"
+eq "M: ... and leaves the first file, its record and its backup alone" "300000|2" "$(value)|$(state)"
+cwat "$H/second" off --yes
+eq "M: off there again: nothing to undo, and it names the first file that still carries the key" "0|1|1" "$RC|$(grep -c 'nothing to undo' "$OUT")|$(grep -c -F '~/.claude/settings.json' "$OUT")"
+cw off --yes
+eq "M: off in the first environment restores the first file, byte for byte, the record and the backup gone" "0|ABSENT|same|0" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; ln -s "$H/.claude" "$H/linkdir"
+cwat "$H/linkdir" on --yes
+cw status
+eq "M: keyed by the canonical path: set through a symlinked config directory, the real one finds the record (status)" "0|1" "$RC|$(grep -c 'set by hmd' "$OUT")"
+cw off --yes
+eq "M: ... and off" "0|ABSENT|same|0" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+
+# ---- N. the file changed while hmd was working: nothing is written over the other change -------------------------------------------------------------------------
+# drive.py runs the tool in this process and, at the chosen moment, has another writer save the settings file (what the writer does to it: see drive.py).
+racing()       { local point="$1" kind="$2"; shift 2; scrub "$PY" -I "$TMP/drive.py" race "$CW" "$S" "$point" "$kind" -- "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }
+leftovers()    { ls -a "$(dirname "$S")" | grep -c 'hmd-compact-window'; }                 # temp files hmd left in the settings directory
+plus_newline() { { cat "$1"; printf '\n'; } >"$2"; }                                       # $2 := $1 and one more newline: what the other writer leaves
+for kind in inplace swap twin; do
+  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; plus_newline "$TMP/orig" "$TMP/theirs"
+  racing write "$kind" on --yes
+  eq "N/$kind: on, the file saved by another writer during the write: exit 1, says it changed" "1|1" "$RC|$(grep -c 'changed while hmd was working' "$ERR")"
+  eq "N/$kind: no record, no backup, no temp file left behind" "0|0" "$(state)|$(leftovers)"
+  if [ "$kind" = twin ]; then expect="$TMP/orig"; else expect="$TMP/theirs"; fi
+  chk "N/$kind: the file is as the other writer left it, nothing of hmd's in it" same "$S" "$expect"
+done
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; cw on --yes; plus_newline "$S" "$TMP/theirs"
+racing write inplace off --yes
+eq "N: off, the file saved by another writer during the write: exit 1, says it changed, the record is kept" "1|1|2" "$RC|$(grep -c 'changed while hmd was working' "$ERR")|$(state)"
+chk "N: ... and the other writer's change is in the file" same "$S" "$TMP/theirs"
+cw off --yes
+plus_newline "$TMP/orig" "$TMP/theirs"
+eq "N: run again, off goes through: the key only, the other change stays, the record is gone" "0|ABSENT|0" "$RC|$(value)|$(state)"
+chk "N: ... the file is the original plus the other writer's change" same "$S" "$TMP/theirs"
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; cw on --yes
+racing write inplace on --yes --tokens 400000
+eq "N: an update of hmd's own value that aborts: exit 1, the value is still the first one" "1|300000" "$RC|$(value)"
+cw off --yes
+plus_newline "$TMP/orig" "$TMP/theirs"
+eq "N: ... and the earlier record is still true: off undoes to the very first state, keeping the other change" "0|ABSENT|same" "$RC|$(value)|$(same "$S" "$TMP/theirs" && echo same)"
+new_home; rmdir "$H/.claude"; cw on --yes; plus_newline "$S" "$TMP/theirs"
+racing prompt inplace off --yes
+eq "N: off of the file hmd created, saved by another writer while the person was deciding: exit 1, the file is not removed" "1|1|yes" "$RC|$(grep -c 'changed while hmd was working' "$ERR")|$([ -e "$S" ] && echo yes || echo no)"
+chk "N: ... and it holds the other writer's change" same "$S" "$TMP/theirs"
+
+# ---- O. a record that cannot be read or used: said plainly, nothing changed, the record not damaged by the attempt ------------------------------------------------
+make_unreadable() { chmod 000 "$1"; if [ -r "$1" ]; then chmod 600 "$1"; rm -f "$1"; mkdir "$1"; fi; }   # chmod 000, or (root reads through it) a directory in its place: the same OSError
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; cw on --yes; cp "$S" "$TMP/after-on"
+REC="$(rec)"; cp "$REC" "$TMP/record"; make_unreadable "$REC"
+for verb in "status" "on --yes" "off --yes"; do
+  cw $verb
+  eq "O: [$verb] with a record that cannot be read: exit 1" 1 "$RC"
+  chk "O: [$verb] says it cannot read the record, and which" grep -q "cannot read .*state.json" "$ERR"
+  chk "O: [$verb] left the settings file alone" same "$S" "$TMP/after-on"
+done
+cwat "$H/second" on --yes
+eq "O: the unreadable record is its own file's problem: on for another settings file goes through" 0 "$RC"
+cwat "$H/second" status
+eq "O: ... and its status works, without naming the file whose record cannot be read" "0|0" "$RC|$(grep -c 'also set it' "$OUT")"
+rm -rf "$REC"; cp "$TMP/record" "$REC"
+for bad_record in 'not json' '[1]' '{"schema": 2}' '{"schema": 1}' '{"schema": 1, "settings": 7}'; do
+  printf '%s' "$bad_record" >"$REC"
+  cw off --yes
+  eq "O: the record [$bad_record] cannot be used: exit 1, says so and how to clear it" "1|1|1" "$RC|$(grep -c 'cannot be used' "$ERR")|$(grep -c 'remove it by hand' "$ERR")"
+  chk "O: [$bad_record] left the settings file alone" same "$S" "$TMP/after-on"
+done
+sed 's|"settings": ".*"|"settings": "/elsewhere/settings.json"|' "$TMP/record" >"$REC"
+cw off --yes
+eq "O: a record that names another settings file is not this file's: exit 1, says so" "1|1" "$RC|$(grep -c 'another settings file' "$ERR")"
+chk "O: ... and the settings file is left alone" same "$S" "$TMP/after-on"
+cp "$TMP/record" "$REC"; cw off --yes
+eq "O: the record put back, off undoes it: the attempts above damaged nothing" "0|ABSENT|same" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)"
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; cw on --yes; cp "$S" "$TMP/after-on"
+BAK="$(bak)"; cp "$BAK" "$TMP/backup"; make_unreadable "$BAK"
+cw off --yes
+eq "O: off with a backup that cannot be read: exit 1, names the backup, no traceback" "1|1|0" "$RC|$(grep -c 'cannot read .*settings.json.bak' "$ERR")|$(grep -c Traceback "$ERR")"
+chk "O: ... and the settings file is left alone" same "$S" "$TMP/after-on"
+rm -rf "$BAK"; cp "$TMP/backup" "$BAK"; cw off --yes
+eq "O: the backup put back, off undoes it" "0|ABSENT|same" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)"
+
+# ---- P. an offer nobody answers: it gives up after the wait, writes nothing and is not recorded as answered, so it is asked again ----------------------------------
+new_home
+scrub env HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S=1 "$PY" -I "$TMP/pty_drive.py" - -- "$CW" offer >"$OUT" 2>"$ERR"; RC=$?
+eq "P: nobody answers: the offer gives up after the 1 s seam, exit 0, the question was shown once" "0|1" "$RC|$(grep -c '\[y/N\]' "$OUT")"
+eq "P: nothing was written and the unanswered offer is not recorded" "no|no" "$([ -e "$S" ] && echo yes || echo no)|$([ -e "$H/.heimdall/compact-window/offered" ] && echo yes || echo no)"
+cwpty n offer
+eq "P: so the next offer asks again, and a no is kept" "0|1|1" "$RC|$(grep -c '\[y/N\]' "$OUT")|$(grep -c '^declined ' "$H/.heimdall/compact-window/offered")"
+for seam in 7 0.5; do
+  eq "P: the seam [$seam] shortens the wait" "$seam" "$(scrub env HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S="$seam" "$PY" -I "$TMP/drive.py" wait "$CW" 2>&1)"
+done
+for seam in abc 0 -3 nan inf 1e9 ''; do
+  eq "P: the seam [$seam] is ignored: the wait stays 300 s" 300 "$(scrub env HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S="$seam" "$PY" -I "$TMP/drive.py" wait "$CW" 2>&1)"
+done
+eq "P: with no seam the wait is 300 s" 300 "$(scrub "$PY" -I "$TMP/drive.py" wait "$CW" 2>&1)"
 
 echo
 echo "compact-window: $PASS passed, $FAIL failed"
