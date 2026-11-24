@@ -7,15 +7,51 @@
 # UserPromptSubmit hook fires fresh on EVERY prompt — it puts the directive
 # right where the model decides what to do, so it can't drift past it.
 #
-# Heuristic only — no LLM call, ~1ms. Biases toward detection: a false
+# Heuristic only — no LLM call, a few ms. Biases toward detection: a false
 # "multi-part" on a single task just makes the model spawn one agent (cheap).
 # Missing a real multi-part task is the expensive failure we're preventing.
 #
-# Reads PreToolUse-style JSON on stdin: {"prompt": "..."}.
+# Reads the UserPromptSubmit JSON on stdin: {"prompt": "...", "session_id": "..."}.
 # On multi-part detection, prints JSON with hookSpecificOutput.additionalContext
 # which Claude Code injects as context for the upcoming turn.
+#
+# TWO GUARDS ON THE INJECTION (2026-11-24; docs/analysis/2026-11-22-token-utilization-next.md
+# lever 7: 637 injections of ~850 chars = $13.06, because the directive stays in context for the
+# rest of the session). They sit AROUND the detection below; the detection is unchanged.
+#
+# 1. SYSTEM TURNS ARE NOT USER TASKS. A background-task <task-notification>, a "[SYSTEM
+#    NOTIFICATION - NOT USER INPUT]", an <agent-message>, a <cross-session-message> and a
+#    <system-reminder> reach this hook as a prompt too, and their bodies (lists, "fix", "test")
+#    scored "~10 independent subtasks". Measured on one orchestrator transcript: 589 of 644
+#    injections fired on such a turn. A prompt that STARTS with one of these (after leading
+#    whitespace, any case) is skipped before anything else, state included. A real prompt that
+#    only mentions the tag further in is still detected. The prefixes are the harness wrappers of
+#    bin/lib/companion_ui_publish.py SKIP_PROMPT_PREFIXES, minus <command-name and <local-command
+#    (a typed slash command is a real task).
+#
+# 2. ONCE PER K PROMPTS. The directive is an attachment that persists, so repeating it a few
+#    prompts later adds ~210 tokens to every later request and no information. Once a session has
+#    been shown it, it is shown again only when K prompts have passed since (K =
+#    HMD_PARALLEL_GATE_EVERY, default 5; =1 restores the old every-prompt behaviour) or at once
+#    when the detected subtask count rises above the one last shown. Every real prompt counts
+#    toward K, trivial ones included, since each adds context between the directive and the next
+#    decision. Why 5: replayed on the same transcript's 258 real prompts (54 of them detected),
+#    K=3 injects 44, K=5 35, K=8 30, K=10 27 (rise rule on); past 5 each step buys little and
+#    the directive drifts further from the turn it should steer. System turns do not count.
+#
+#    State: $HEIMDALL_HOME/parallel-gate/<session_id>, one line "<prompts since the last
+#    injection> <subtask count of the last injection>" (0 = none yet), the pattern of the
+#    fix-chain counter in bin/heimdall-precheck-agent. A new session sweeps records untouched
+#    for 7 days (the bound hmd_finished_agents.py keeps).
+#
+# FAILS OPEN, AND SILENT: this hook only ever adds a nudge, so every error means no injection and
+# the exit status is always 0: no jq, a payload with no usable session_id (never a shared key: a
+# throttle shared across sessions would let one silence another), a state dir that cannot be
+# written (injecting without a record would repeat on every prompt), a record that does not
+# parse (it is rewritten, that prompt is not injected).
 
 set -euo pipefail
+trap 'exit 0' EXIT
 
 INPUT=$(cat 2>/dev/null || echo '{}')
 
@@ -24,6 +60,38 @@ PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // empty' 2>/dev/null || echo "")
 
 # Lowercase copy for matching
 LOWER=$(printf '%s' "$PROMPT" | tr '[:upper:]' '[:lower:]')
+
+# Guard 1: a system turn is not a user task (header). Prefix match on the trimmed prompt.
+LEAD="${LOWER%%[![:space:]]*}"
+case "${LOWER#"$LEAD"}" in
+  "<task-notification"*|"[system notification"*|"<agent-message"*|"<cross-session-message"*|"<system-reminder"*) exit 0 ;;
+esac
+
+# Guard 2, state half: count this prompt before any early exit below, so every real prompt counts toward K.
+PG_K="${HMD_PARALLEL_GATE_EVERY:-5}"
+case "$PG_K" in ''|0*|*[!0-9]*|???????*) PG_K=5 ;; esac
+
+PG_SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || echo "")
+case "$PG_SID" in ''|.*|*[!A-Za-z0-9._-]*) exit 0 ;; esac
+
+PG_DIR="${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}/parallel-gate"
+PG_FILE="$PG_DIR/$PG_SID"
+pg_isnum() { case "${1:-}" in ''|*[!0-9]*|???????*) return 1 ;; esac; }
+pg_save() { { [ -d "$PG_DIR" ] || mkdir -p "$PG_DIR"; printf '%s %s\n' "$1" "$2" >"$PG_FILE"; } 2>/dev/null; }
+
+pg_since=0
+pg_last=0
+if [ -f "$PG_FILE" ]; then
+  read -r pg_since pg_last 2>/dev/null <"$PG_FILE" || true
+  if ! { pg_isnum "$pg_since" && pg_isnum "$pg_last"; }; then
+    pg_save 0 0 || true
+    exit 0
+  fi
+else
+  find "$PG_DIR" -type f -mtime +7 -delete 2>/dev/null || true
+fi
+pg_since=$((pg_since + 1))
+pg_save "$pg_since" "$pg_last" || exit 0
 
 # Skip trivial prompts (greetings, single short questions, status checks)
 WORD_COUNT=$(printf '%s' "$PROMPT" | wc -w | tr -d ' ')
@@ -70,6 +138,10 @@ if [ "$score" -lt 2 ]; then exit 0; fi
 parts=$score
 [ "$parts" -gt 10 ] && parts=10
 [ "$parts" -lt 2 ] && parts=2
+
+# Guard 2, decision half: stay silent while the model still holds a directive for at least this many subtasks and fewer than K prompts have passed.
+if [ "$pg_last" -gt 0 ] && [ "$pg_since" -lt "$PG_K" ] && [ "$parts" -le "$pg_last" ]; then exit 0; fi
+pg_save 0 "$parts" || exit 0
 
 DIRECTIVE="⚡ MULTI-PART TASK DETECTED (~${parts} independent subtasks).
 
