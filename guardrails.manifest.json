@@ -71,6 +71,9 @@
     {"id": "parallelism-tracker-read", "kind": "guard", "tier": "recommended", "layer": "hook", "hook": "parallelism-tracker-read",
      "fails": "open", "operator_env": null, "proof": "test/tool-loop-detector.test.sh",
      "why": "counts Read, Grep and Glob calls for the parallelism grade"},
+    {"id": "plan-slice-hint", "kind": "guard", "tier": "recommended", "layer": "hook", "hook": "plan-slice-hint",
+     "fails": "open", "operator_env": "HMD_PLAN_SLICE=off", "proof": "test/plan-slice.test.sh",
+     "why": "a subagent that Reads a whole plan file (6 KB or more, no offset or limit) is told, as additionalContext and never a deny, where its task's section is: bin/heimdall-plan-slice slice"},
 
     {"id": "agent-precheck", "kind": "guard", "tier": "core", "layer": "hook", "hook": "agent-precheck",
      "fails": "open", "operator_env": null, "proof": "test/agent-name-gate.test.sh",

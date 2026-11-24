@@ -124,7 +124,11 @@ heimdall-capsule deps w2        # → the closure ids only
 
 A spawned agent's brief = task spec + the referenced symbol entries + the
 hydrated capsule closure + an invariants ref. **Never** the plan, prior
-conversation, or restated criteria.
+conversation, or restated criteria. The one exception is `--plan FILE`: it
+inlines the section of `--task <id>` (its files and acceptance criteria,
+capped at 8000 chars, cut by `bin/heimdall-plan-slice`) and nothing else of the
+plan, so the agent never Reads the plan whole; an id the plan lacks is an
+unresolved ref (exit **1**).
 
 ```bash
 heimdall-brief build --task 3.2 --spec "implement book diff" \

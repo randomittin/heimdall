@@ -186,6 +186,7 @@ bin/heimdall-pack-build
 bin/heimdall-persona
 bin/heimdall-phone-control
 bin/heimdall-phone-deny
+bin/heimdall-plan-slice
 bin/heimdall-plan-verify
 bin/heimdall-ponytail-ab
 bin/heimdall-portable-brief
@@ -407,6 +408,7 @@ bin/lib/hmd_kill_guard.py
 bin/lib/hmd_model_prices.py
 bin/lib/hmd_nofollow_write.py
 bin/lib/hmd_pair_optin.py
+bin/lib/hmd_plan_slice.py
 bin/lib/hmd_plan_verify.py
 bin/lib/hmd_private_state.py
 bin/lib/hmd_profile.py

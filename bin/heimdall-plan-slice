@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# heimdall-plan-slice -- give a spawned agent ONLY its task's section of a plan, and tell one that is about to read the whole file where its slice is:
+# `slice` and `list` (what `heimdall-brief build --plan` calls and what an agent runs itself) and `hint` (the PreToolUse hook on Read). Why, the task
+# shapes it reads, the rule and the exit codes: the header of bin/lib/hmd_plan_slice.py, which holds the behaviour. This file is only the launcher.
+#
+# OFF SWITCH. HMD_PLAN_SLICE=off (also 0, false, no) in the environment Claude Code runs in makes `hint` exit 0 at once. `slice` and `list` are
+# commands somebody asked for and are never switched off. The hook can also be switched off by id: `hmd guardrails off plan-slice-hint`.
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+INPUT=""
+if [ "${1:-}" = hint ]; then
+  case "${HMD_PLAN_SLICE:-}" in off | OFF | 0 | false | no) exit 0 ;; esac
+  # The hook fires on every Read of every agent and nearly none names a plan, so python starts only when a cheap substring test says it could:
+  # a subagent's payload carries "agent_id" and a plan's path carries PLAN or /plans/. Never stricter than the library's own test, which decides.
+  INPUT="$(cat 2>/dev/null || true)"
+  case "$INPUT" in *'"agent_id"'*) ;; *) exit 0 ;; esac
+  case "$INPUT" in *PLAN* | */plans/*) ;; *) exit 0 ;; esac
+fi
+
+# The interpreter the way bin/heimdall-read-dedup resolves it (bin/lib/hmd-python.sh: a version-manager shim costs ~145 ms a call).
+PY=""
+if [ -r "$BIN_DIR/lib/hmd-python.sh" ]; then
+  . "$BIN_DIR/lib/hmd-python.sh" 2>/dev/null
+  if type hmd_python >/dev/null 2>&1; then PY="$(hmd_python 2>/dev/null || true)"; fi
+fi
+[ -n "$PY" ] || PY="$(command -v python3 2>/dev/null || true)"
+if [ -z "$PY" ]; then
+  # A hook never breaks a session: with no interpreter `hint` ends here, quietly, and the Read goes through.
+  [ "${1:-}" = hint ] && exit 0
+  echo "heimdall-plan-slice: python3 not found" >&2
+  exit 1
+fi
+if [ "${1:-}" = hint ]; then
+  printf '%s' "$INPUT" | "$PY" -I -S "$BIN_DIR/lib/hmd_plan_slice.py" hint
+  exit 0
+fi
+exec "$PY" -I -S "$BIN_DIR/lib/hmd_plan_slice.py" "$@"
