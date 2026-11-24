@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# heimdall-read-dedup -- stub a Read that returns what the same agent already holds in context: the PostToolUse hook (`post-read`) and
+# `clear --session ID` (the PreCompact hook runs it). Why, the payload fields, the rule, the state and its bounds: the header of
+# bin/lib/hmd_read_dedup.py, which holds the behaviour. This file is only the launcher.
+#
+# OFF SWITCH. HMD_READ_DEDUP=off (also 0, false, no) in the environment Claude Code runs in makes `post-read` exit 0 at once: no stub
+# and nothing recorded. `clear` is never switched off: forgetting reads is always safe, and a compaction that happened while the hook
+# was off must not leave state behind for when it is on again. The hook can also be switched off by id: `hmd guardrails off read-dedup`.
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+if [ "${1:-}" = post-read ]; then
+  case "${HMD_READ_DEDUP:-}" in off | OFF | 0 | false | no) exit 0 ;; esac
+fi
+
+# The interpreter the way bin/heimdall-ctx-meter resolves it (bin/lib/hmd-python.sh: a version-manager shim costs ~145 ms a call).
+PY=""
+if [ -r "$BIN_DIR/lib/hmd-python.sh" ]; then
+  . "$BIN_DIR/lib/hmd-python.sh" 2>/dev/null
+  if type hmd_python >/dev/null 2>&1; then PY="$(hmd_python 2>/dev/null || true)"; fi
+fi
+[ -n "$PY" ] || PY="$(command -v python3 2>/dev/null || true)"
+if [ -z "$PY" ]; then
+  # A hook never breaks a session: with no interpreter the verbs end here, quietly, and the original output stands.
+  case "${1:-}" in post-read | clear) exit 0 ;; esac
+  echo "heimdall-read-dedup: python3 not found" >&2
+  exit 1
+fi
+exec "$PY" -I -S "$BIN_DIR/lib/hmd_read_dedup.py" "$@"

@@ -242,6 +242,16 @@
       "remote_toggle": false
     },
     {
+      "event": "PostToolUse",
+      "index": 7,
+      "id": "read-dedup",
+      "description": "Replaces a Read whose content is byte-identical to the same agent's last Read of that path, offset and limit (state per session_id + agent_id) with a one-line stub through PostToolUse updatedToolOutput: 'unchanged since your earlier read of <path> (lines a-b); content is already in your context'. Probed on Claude Code 2.1.331: the rewrite reaches a subagent's Read, and that payload carries agent_id. Hashes only (never content, never the path) in $HEIMDALL_HOME/read-dedup/<session>.<agent>.json, 0700/0600, capped per agent, pruned after 24 h idle. Never stubs after a compaction: the existing PreCompact hook (precompact-checkpoint) clears the session first, and a compact_boundary written to the main or the agent's own transcript since the read blocks the stub with no hook at all; an unreadable transcript never stubs. A re-read right after a stub is answered in full. Fail-open: any error leaves the original output, exit 0. Off: HMD_READ_DEDUP=off, or heimdall-hooks disable read-dedup (hmd guardrails off read-dedup).",
+      "matcher": "Read",
+      "fingerprint": "278fe13ac3fa9b0d0d1b8c26031eae9f41d62226dff3e2b70d5327634b94ae20",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "PostToolUseFailure",
       "index": 0,
       "id": "finished-agents-close-failed",
