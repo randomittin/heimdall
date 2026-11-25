@@ -106,8 +106,8 @@
 # context (docs/analysis/2026-11-22-token-utilization-next.md §1). It is also the
 # cheapest moment to compact. So when the gap since the session's last activity is at
 # least HMD_CTX_IDLE_S (3300 s, a margin under the hour) AND the reading is at least the
-# ceiling (150K: no new threshold), `notice` tells the model to suggest /hmd:continue or
-# /compact. A nudge only: it never blocks.
+# ceiling (150K: no new threshold), `notice` tells the model to suggest /hmd:save (it ends on the
+# /compact line to paste) or /compact. A nudge only: it never blocks.
 #   - LAST ACTIVITY is read from the transcript the hook payload names (transcript_path),
 #     not from the published reading: the status bar re-renders every 2 s
 #     (refreshInterval) even when nothing happens, so a reading's ts never goes old while
@@ -651,7 +651,7 @@ tell_cliff() { # <tokens> <CLIFF_NEAR|CLIFF>
 }
 
 tell_cold() { # <tokens> <idle seconds>
-  _tell_model "$(printf '[heimdall] CACHE COLD: idle %s, so this turn re-writes all %s context tokens at cache-write price. Suggest the user run /hmd:continue (or /compact) before continuing.' "$(_span "$2")" "$(_commas "$1")")"
+  _tell_model "$(printf '[heimdall] CACHE COLD: idle %s, so this turn re-writes all %s context tokens at cache-write price. Suggest the user run /hmd:save (it ends on the /compact line to paste) before continuing.' "$(_span "$2")" "$(_commas "$1")")"
 }
 
 # ── idle return — the prompt cache went cold while the session sat there ──────────

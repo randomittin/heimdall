@@ -9,7 +9,7 @@
 
 WHY. A long session pays for its whole history on every turn. Measured on one long hmd session (docs/analysis/2026-11-22-token-utilization-next.md, lever 1:
 a replay of that session, not a promise), compacting at 300,000 tokens instead of letting the context grow toward 900,000 would have cut about 40% of the
-main-thread spend. The price is real too: older detail is summarized sooner (the /hmd:continue handoff and the SessionStart compact re-inject carry the thread).
+main-thread spend. The price is real too: older detail is summarized sooner (the /hmd:save handoff and the SessionStart compact re-inject carry the thread).
 
 THE BASH CAP (--bash-cap). A second setting with every guarantee below, on a record and a backup of its own. Claude Code hands a successful Bash command's output to the model inline up to
 30,000 characters; what is past that is saved to a file and the model gets a short preview and the path (it reads the file when it needs the rest). `--bash-cap [CHARS]` lowers that limit

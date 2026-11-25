@@ -107,7 +107,7 @@ minisign -Vp release/heimdall-signing.pub -m heimdall-install.sh -x install.sh.m
 
 ## Fewer tokens on long sessions: `hmd compact-window`
 
-A long session re-reads its whole history on every turn, so its cost piles up at large contexts. In one measured 72-day hmd session about 75% of the main-thread spend happened above 300,000 tokens of context, and a replay with the agent's native auto-compact window at 300,000 came out about 40% cheaper. That is one session and a replay, not a promise: older detail is summarized sooner, and `/hmd:continue` plus the compact re-inject carry the thread across.
+A long session re-reads its whole history on every turn, so its cost piles up at large contexts. In one measured 72-day hmd session about 75% of the main-thread spend happened above 300,000 tokens of context, and a replay with the agent's native auto-compact window at 300,000 came out about 40% cheaper. That is one session and a replay, not a promise: older detail is summarized sooner, and `/hmd:save` plus the compact re-inject carry the thread across.
 
 `hmd compact-window on` sets that one key, `autoCompactWindow`, in `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR` is honored; 300,000 by default, `--tokens 250k` to change it). It writes only after your yes (`--yes` when a script is the one asking; with no terminal and no `--yes` it exits 3, "consent required"), backs the file up first, leaves every other byte alone, and never replaces a value you set yourself unless you pass `--force`. `hmd compact-window off` puts the file back exactly as it was, and `hmd compact-window status` shows where you stand. The installer and `hmd --update` ask once, at a terminal, and never in a script or a pipe.
 

@@ -1,17 +1,17 @@
 {
-  "digest": "56d810e6e7091ff2e2bc8e43932731581168e049abe0eb70b22a13a90ea67ee3",
+  "digest": "c4292bb30c0e665d853f8f065f58dcd8b90ecf1a012b1963f42f0980e1219658",
   "info": {
     "git_trees": {
       "agents": "c38b8a6e3cb3c115de2a1688ffd5b41dc7d74e2a",
-      "commands": "100f7a1ca0d0cfdca442e4ae2bd28c5b43748652",
-      "hooks": "c5d896dc0cf97e35766456baf493f59141124db9",
+      "commands": "d9a2ec7815a60e8edb78ad1a7446c6aea2538214",
+      "hooks": "9a67c6b81bfc2f9ff64f36516ab5beed2cb301a6",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
-      "skills": "7d0f2ae4964dc8f9af6773ffc91e60fb71cb101b"
+      "skills": "08948eb622334057b5d11e9393d21255656207de"
     },
-    "recorded_utc": "2026-11-24T20:54:03Z",
+    "recorded_utc": "2026-11-25T03:26:51Z",
     "summary": {
       "agents": 17,
-      "bytes": 652586,
+      "bytes": 653850,
       "commands": 20,
       "hooks_run": 17,
       "hooks_skipped": 7,
@@ -196,12 +196,12 @@
         "sha256": "6ec5ee615455ed9db7f290cf785462c0735668e5161f166f880b090c293cd559"
       },
       "commands/continue.md": {
-        "bytes": 5513,
+        "bytes": 975,
         "frontmatter": {
-          "bytes": 508,
-          "sha256": "1c25d886c0487667199363d4a12fcecdadc8049751f637f0af5bb6f8df2ff887"
+          "bytes": 222,
+          "sha256": "02aeccd650e0a54eabec9938ac8428be26fa66a56c740a5e6495cb5186b3aed0"
         },
-        "sha256": "42df1004d14c18acec9a7b144adab4c85bdc12b121db1836ff4e1ca9d7d024ec"
+        "sha256": "86f5ddee36bad12fdbae81b627093ad8eafca087fcfadef7effef8646b3224b2"
       },
       "commands/debloat.md": {
         "bytes": 4642,
@@ -300,12 +300,12 @@
         "sha256": "1e34d9650393650114b5a90ca45734856ab289fbb55187fdd4031b096ed723a6"
       },
       "commands/save.md": {
-        "bytes": 7268,
+        "bytes": 12962,
         "frontmatter": {
-          "bytes": 278,
-          "sha256": "e6fc4203e6add9d499cde32d0760b1bd94dc548a50de66ea7bda57fe5a3880d0"
+          "bytes": 458,
+          "sha256": "f10f4846efe8df3542f8aaaaacabd71296f2a78961d328830e79dffc9f8cbb13"
         },
-        "sha256": "b82478544ad425bb891d164b79cf7fe82d1cbae5a7e0a232bdc109b4a5f935e5"
+        "sha256": "c6ac3e4322fd04aa6dd3b35db0191c4da89cc87de3a07c2d99b2de7baad93c94"
       },
       "commands/status.md": {
         "bytes": 1474,
@@ -384,12 +384,12 @@
         "sha256": "ebfd93c4401c332fa54058f456bec5cf7a2aba08f1205d6ece6a07c8b6b8f655"
       },
       "skills/heimdall/SKILL.md": {
-        "bytes": 12015,
+        "bytes": 12125,
         "frontmatter": {
           "bytes": 593,
           "sha256": "20852633ca5061eeef3a1384a3f3831f7c49acd98c115730ff309bbbc44dc627"
         },
-        "sha256": "83d1516cf364a2f4a796fe24e60b7ca431799c0bdcee0528e763cc02f5e539d5"
+        "sha256": "5b289c01feaf4ba5f4f42ce3293a0c3d1821b2a7e02d2c04d91247bf143e34a4"
       },
       "skills/heimdall/references/agent-templates.md": {
         "bytes": 18394,
@@ -428,8 +428,8 @@
         "sha256": "608e31a374bbe0d426cb8b28e2d85a1480a7e950174ad70a815a0d3528dcfa5b"
       },
       "skills/heimdall/references/planning-pipeline.md": {
-        "bytes": 14134,
-        "sha256": "c0da4ed495f5f015ffe1d956859f0ea296da38cd85df9f75308fd306a7cc3a31"
+        "bytes": 14132,
+        "sha256": "d4c22f6a9b00df2b3a7b0fcea349517f51c562c05ce266b2b69e6957f2adf35b"
       },
       "skills/heimdall/references/plugin-autoinstall.md": {
         "bytes": 6282,

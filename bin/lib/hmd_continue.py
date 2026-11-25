@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-r"""heimdall-continue -- /compact and /continue in one move (stdlib only).
+r"""heimdall-continue -- the handoff half of /hmd:save: write the handoff, print the /compact line, re-inject the handoff after the compaction (stdlib only).
 
 WHY. No skill, command or hook can run /compact or /clear: only the user types them. PreCompact cannot inject context. SessionStart with
 source "compact" can (hookSpecificOutput.additionalContext). So "compact, then carry on with full context" is three jobs, and this tool does the
 two that are not the user's: it WRITES a handoff before the compaction and INJECTS it after. The third, typing the line, stays with the user.
+
+WHO CALLS IT. /hmd:save (commands/save.md) is the one command that calls `write`: its save and its handoff are one move, so this is the single code path
+that writes CHECKPOINT.md's measured block and CONTINUE.md. /hmd:continue is a deprecated alias of /hmd:save and never calls this tool itself.
 
 Usage:
   heimdall-continue write  [--repo DIR]
@@ -304,7 +307,7 @@ def checkpoint_pass(root, note):
 
 
 def render_note(note, fields, facts, problems, stamp, window):
-    out = ["# Continue note - %s (written by /hmd:continue)" % stamp, ""]
+    out = ["# Continue note - %s (written by /hmd:save)" % stamp, ""]
     out.append("Re-injected once, after the first compaction within %d min of this note. Act on the next step first." % window)
     out.append("")
     if note["goal"]:
@@ -317,7 +320,7 @@ def render_note(note, fields, facts, problems, stamp, window):
             out += ["", "## " + title] + ["- " + item for item in note[key]]
     if note["extra"]:
         out += ["", "(+%d more items were over the limit of %d per list and were not kept)" % (note["extra"], MAX_ITEMS)]
-    out += ["", "### What must never be lost (the resume contract, as /hmd:continue saw it)"]
+    out += ["", "### What must never be lost (the resume contract, as /hmd:save saw it)"]
     if fields is None:
         out.append("- Checkpoint unavailable: %s. Run `heimdall-checkpoint write` and read .planning/CHECKPOINT.md before relying on this note." % "; ".join(problems))
     else:
@@ -409,7 +412,7 @@ def unproven(root, hid, written):
     if rec is None:
         return why
     if rec.get("v") != RECORD_VERSION or rec.get("repo") != root or rec.get("id") != hid or rec.get("written_ts") != written:
-        return "its id and time do not match the record /hmd:continue kept for this repository"
+        return "its id and time do not match the record /hmd:save kept for this repository"
     return tracked_reason(root)
 
 
@@ -448,7 +451,7 @@ def cmd_write(args):
     else:
         say("[heimdall-continue] it is re-injected once, after the first compaction within %d min" % window)
     line = focus_line(note)
-    say("[heimdall-continue] paste this as your next message (%d of %d chars; only you can run /compact):" % (len(line), LINE_CAP))
+    say("[heimdall-continue] paste to compact with the thread kept; ignore to just save (only you can run /compact):")
     say(line)
     return PARTIAL if problems or (holds and window) else OK
 
@@ -521,7 +524,7 @@ def cmd_inject(args):
     if why is not None:
         warn("[heimdall-continue] %s/%s not injected: %s" % (REL, NAME, why))
         return OK
-    parts = ["[heimdall] /hmd:continue handoff (written %s ago), re-injected once because this session was just compacted:" % ago(max(0, now - written)),
+    parts = ["[heimdall] /hmd:save handoff (written %s ago), re-injected once because this session was just compacted:" % ago(max(0, now - written)),
              scrub(body).strip("\n")]
     context = "\n\n".join(parts)
     if len(context) > INJECT_CAP:
@@ -533,12 +536,12 @@ def cmd_inject(args):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="heimdall-continue", description="/compact and /continue in one move: write the handoff, print the line to paste, re-inject the handoff after compaction.")
+    parser = argparse.ArgumentParser(prog="heimdall-continue", description="the handoff half of /hmd:save: write the handoff, print the /compact line to paste, re-inject the handoff after compaction.")
     sub = parser.add_subparsers(dest="action", required=True)
     wr = sub.add_parser("write", help="the note on stdin: checkpoint, write .planning/CONTINUE.md, print ONE /compact line")
     wr.add_argument("--repo", default="", help="the project dir (default: $CLAUDE_PROJECT_DIR, else the cwd)")
     sub.add_parser("focus", help="the note on stdin: print the /compact line only")
-    inj = sub.add_parser("inject", help="the SessionStart(compact) side: print the hook JSON for a fresh, unconsumed handoff that /hmd:continue wrote here and git does not track")
+    inj = sub.add_parser("inject", help="the SessionStart(compact) side: print the hook JSON for a fresh, unconsumed handoff that /hmd:save wrote here and git does not track")
     inj.add_argument("--repo", default="", help="the project dir (default: $CLAUDE_PROJECT_DIR, else the cwd)")
     inj.add_argument("--source", default="", help="the SessionStart source; default: the \"source\" of the hook payload on stdin")
     args = parser.parse_args(argv)

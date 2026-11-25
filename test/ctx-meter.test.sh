@@ -58,7 +58,7 @@
 #      instant the boundary itself cannot be verified.
 #   S. IDLE RETURN                — a session back after the prompt cache's hour with >=150K
 #      in context is told ONCE, in one model-visible line, that this turn re-writes it all
-#      and that /hmd:continue or /compact first is nearly free. Silent when the gap is short,
+#      and that /hmd:save (which ends on the /compact line) or /compact first is nearly free. Silent when the gap is short,
 #      the context small, or the gap cannot be established.
 #
 # Usage:  bash test/ctx-meter.test.sh    (exit 0 = every proof holds)
@@ -819,7 +819,7 @@ fi
 # tier notice cannot see it (the context did not grow, the cache expired) and a return is the
 # cheapest moment to compact. THE RULE: gap since the last main-thread assistant entry of the
 # transcript the payload names >= HMD_CTX_IDLE_S (3300 s) AND the session's reading >= the
-# ceiling (150K) -> ONE model line suggesting /hmd:continue or /compact; silent otherwise,
+# ceiling (150K) -> ONE model line suggesting /hmd:save (the compact line comes with it) or /compact; silent otherwise,
 # including whenever the gap cannot be established. "Now" is HMD_CTX_NOW, so a 3,700 s gap
 # costs no 3,700 s here.
 sec "S. IDLE RETURN — cache cold AND context >= 150K -> ONE model line to compact; silent otherwise:"
@@ -857,8 +857,10 @@ hasre "$S_TXT" '^\[heimdall\] CACHE COLD' && ok "3,700 s idle at 200,000 tok -> 
 hasre "$S_TXT" 'idle 61 min'   && ok "it states the real gap (3,700 s = 61 min), computed, not canned" \
                                || bad "the line does not state the gap: '$S_TXT'"
 has   "$S_TXT" '200,000'       && ok "it names what this turn re-writes (200,000 tokens)" || bad "the line omits the reading: '$S_TXT'"
-{ has "$S_TXT" '/compact' && has "$S_TXT" '/hmd:continue'; } \
-                               && ok "it suggests /hmd:continue or /compact" || bad "the line suggests neither remedy: '$S_TXT'"
+{ has "$S_TXT" '/compact' && has "$S_TXT" '/hmd:save'; } \
+                               && ok "it suggests /hmd:save (which prints the /compact line) or /compact" || bad "the line suggests neither remedy: '$S_TXT'"
+has   "$S_TXT" '/hmd:continue' && bad "the line still sends the user to the deprecated /hmd:continue: '$S_TXT'" \
+                               || ok "it does not name the deprecated /hmd:continue"
 [ "$(lines_of "$OUT")" = 1 ] && [ "$(lines_of "$S_TXT")" = 1 ] && [ "${#S_TXT}" -le 300 ] \
   && ok "ONE short line (${#S_TXT} chars)" || bad "not one short line (${#S_TXT} chars): '$S_TXT'"
 [ "$RC" = 0 ] && ok "exit 0" || bad "exit $RC"
