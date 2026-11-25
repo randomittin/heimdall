@@ -35,8 +35,9 @@ or cannot say (a tracked file is the repository's text, not the person's), a lin
 a terminal) in a project is kept in $HEIMDALL_HOME/compact-window/<id>.compact-now.consent (<id> a digest of the project's settings file, as for the records) and covers the later ones in THAT project only; `revoke`, run inside it, forgets it
 and puts every armed trigger back. Every session in the project, and every subagent still running in this one, that makes a request while it is armed compacts too; a session in another repository does not: the window is as short as the hooks allow.
 
-WHAT IT WRITES. One key per command: `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000), with --bash-cap `bashOutputMaxChars` (a character count) or, with
---compact-now, `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (a string, as every env value is), in the user-level settings.json of the agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. A symlink there is followed (the file it points to is edited and the link stays).
+WHAT IT WRITES. One key per command: `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000) or, with --bash-cap, `bashOutputMaxChars` (a character count), in the user-level settings.json of the
+agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json (a symlink there is followed: the file it points to is edited and the link stays); with --compact-now, `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (a string, as every env value is) in
+the PROJECT's .claude/settings.local.json instead (above), a file no link may lead to, and never in the user-level one.
 The key is added to, or replaced in, the TEXT of the file, never by re-serializing the document, so every other byte survives: key order, indentation, escapes,
 the trailing newline. The write is a temp file in the same directory and a rename; the file is read again as the last step before the rename, and when it is no longer
 the one that was read (other bytes, or another file in its place) nothing is written and the exit status is 1. A file that is not a JSON object (or names the key
@@ -53,7 +54,7 @@ on      back up the settings file ($HEIMDALL_HOME/compact-window/<id>.settings.j
         <id>.compact-now.settings.json.bak, <id>.compact-now.state.json).
         A value of the person's own that differs from the one asked for is never replaced unless --force is given (exit 4); a value hmd wrote itself is updated in place and
         still undoes to the state before hmd.
-off     put the key back as hmd found it, in the settings file of this environment: removed when it was absent (the file removed when hmd created it), the old value
+off     put the key back as hmd found it, in the settings file of this environment (--compact-now: of this project): removed when it was absent (the file removed when hmd created it, and the .claude directory with it when hmd made that too), the old value
         when --force had replaced one. When the file is still byte-for-byte what hmd wrote and the other settings hmd keeps in it are not set, the backup is restored verbatim; when
         something else changed the file since, or another setting is still there (the backup also holds that setting's earlier state), only the key is reverted and the rest is
         kept: the key is cut out exactly as it was added, so the last `off` leaves the file as it was before any. A file hmd created is removed by the last `off`, whichever of the
@@ -63,12 +64,12 @@ off     put the key back as hmd found it, in the settings file of this environme
         with its own CLAUDE_CONFIG_DIR.
 release put every armed compact-now trigger back, in whichever settings file hmd armed it: the verb the hooks and the timer run. It never asks and prints nothing on stdout (a SessionStart hook's
         stdout reaches the model); a value that is no longer hmd's is the person's and is left, the record cleared. Exit 0 unless a file could not be restored (1).
-revoke  forget the standing yes to the compact-now trigger, and put an armed trigger back.
+revoke  forget the standing yes to the compact-now trigger in this project (run it inside the repository), and put every armed trigger back.
 offer   the one-time question install and update ask at a terminal about the window: nothing is printed, read or written without a terminal on stdin and stdout, a setting that is
         already there is never asked about, and an answer (yes or no) is kept in $HEIMDALL_HOME/compact-window/offered so it is asked once. Always exits 0.
         HEIMDALL_NO_COMPACT_WINDOW_OFFER=1 silences it. A question left unanswered for 300 seconds is dropped, and not recorded, so it is asked again later;
         HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S=<seconds> shortens that wait (the test seam: a number above 0 and below 300, anything else is ignored).
-status  the setting file, then the window, the cap and the trigger: the value in the file and whether hmd put it there, and any other settings file hmd set the key in. Exit 1 only when the file cannot be used.
+status  the settings file and the project's file, then the window, the cap and the trigger: the value in the file and whether hmd put it there, and any other settings file hmd set the key in. Exit 1 only when the settings file cannot be used.
 
 UPDATING FROM 2.4.12. That release kept ONE record and ONE backup for the whole machine, state.json and settings.json.bak. The first time `status`, `on` or `off` runs they are moved
 to the names of the settings file the record names (its real path, which the record is rewritten to say), so a yes given to 2.4.12 still has its `off`, `status` and `on --tokens`.
@@ -77,7 +78,7 @@ exit 1 with nothing moved, like any other.
 
 Exit 0 done or nothing to do. 1 a file that cannot be used or written (nothing was changed; stderr says why). 2 usage. 3 consent required (nothing was written).
 4 refused: the key holds a value that is not hmd's (for the cap also: a BASH_MAX_OUTPUT_LENGTH of the person's own), --force overrides (never for the trigger).
-5 unavailable: the compact-now trigger cannot work here (the build, or automatic compaction is off); nothing was written. stdlib only.
+5 unavailable: the compact-now trigger cannot work here (the build, automatic compaction is off, or the project's file cannot be used); nothing was written. stdlib only; the project's file is vetted with bin/lib/hmd_nofollow_write.py, beside this tool.
 """
 import argparse
 import collections
@@ -98,6 +99,8 @@ import time
 OFFER_WAIT_S = 300   # an offer left unanswered this long is not asked again that run, and not recorded as answered
 OFFER_WAIT_ENV = "HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S"   # the test seam: a shorter wait, in seconds
 STATE_FILE, BACKUP_FILE, OFFERED_FILE, CONSENT_FILE = "state.json", "settings.json.bak", "offered", "compact-now.consent"
+PROJECT_REL, GIT_BUDGET_S = (".claude", "settings.local.json"), 5   # the project's file the trigger is armed in; the seconds a question to git may take
+NO_PROJECT = "there is no project to arm it in: CLAUDE_PROJECT_DIR is unset and the working directory is not in a git work tree"
 EXIT_FAILED, EXIT_USAGE, EXIT_CONSENT, EXIT_REFUSED, EXIT_UNAVAILABLE = 1, 2, 3, 4, 5
 WHITESPACE = " \t\n\r"
 DECODER = json.JSONDecoder()
