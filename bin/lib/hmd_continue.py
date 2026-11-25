@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-r"""heimdall-continue -- /compact and /continue in one move (stdlib only).
+r"""heimdall-continue -- the handoff half of /hmd:save: write the handoff, print the /compact line, re-inject the handoff after the compaction (stdlib only).
 
 WHY. No skill, command or hook can run /compact or /clear: only the user types them. PreCompact cannot inject context. SessionStart with
 source "compact" can (hookSpecificOutput.additionalContext). So "compact, then carry on with full context" is three jobs, and this tool does the
 two that are not the user's: it WRITES a handoff before the compaction and INJECTS it after. The third, typing the line, stays with the user.
+
+WHO CALLS IT. /hmd:save (commands/save.md) is the one command that calls `write`: its save and its handoff are one move, so this is the single code path
+that writes CHECKPOINT.md's measured block and CONTINUE.md. /hmd:continue is a deprecated alias of /hmd:save and never calls this tool itself.
 
 Usage:
   heimdall-continue write  [--repo DIR]
@@ -304,7 +307,7 @@ def checkpoint_pass(root, note):
 
 
 def render_note(note, fields, facts, problems, stamp, window):
-    out = ["# Continue note - %s (written by /hmd:continue)" % stamp, ""]
+    out = ["# Continue note - %s (written by /hmd:save)" % stamp, ""]
     out.append("Re-injected once, after the first compaction within %d min of this note. Act on the next step first." % window)
     out.append("")
     if note["goal"]:
