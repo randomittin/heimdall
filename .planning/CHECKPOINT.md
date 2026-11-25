@@ -1,11 +1,11 @@
 <!-- heimdall-auto-checkpoint:begin -->
-## Auto-checkpoint — 2026-11-25T06:02:06Z
+## Auto-checkpoint — 2026-11-25T11:06:41Z
 
 > Written automatically at session end (mechanical, no LLM). Run `/hmd:save`
 > for a richer human/LLM-authored handoff — it enriches this same file.
 
 - **Branch:** main
-- **HEAD:** f29ebbe6
+- **HEAD:** ab6cb53d
 - **Phase:** unknown
 - **Active goal:** none
 - **Uncommitted files:** 0
@@ -18,11 +18,11 @@
 - **In progress:** phase=unknown · goal=none · compaction (auto) at 2026-11-10T12:36:23Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-11-22T01:29:50Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-11-22T13:27:33Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-11-23T05:15:23Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-11-23T07:47:44Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail wentcompaction (auto) at 2026-11-25T00:21:38Z session 0e12831c-b9f2-4238-ad95-43a28e7409d2 — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail went · in flight: 0 uncommitted files
 - **Gated decisions:** push gate FAILING — nothing may be pushed until it clearsOperator-only (item 15): push local commits to origin; runhmd.dev DNS; GitHub App registration; npm publish runhmd only after hmd attack is released; hmd receipt keygen + commit release/runhmd-receipt.pub; relay deploy (canary URL assumes hmd-relay-canary.therishabh16.workers.dev, else set RELAY_URL).
 - **Held branches:** worktree-agent-a02e0b61662c89dd2 (1 commit(s) not on main, at /Users/rj/Downloads/heimdall/.claude/worktrees/agent-a02e0b61662c89dd2)worktree-agent-a21537b121081222d (5 commit(s) not on main, at /Users/rj/Downloads/heimdall/.claude/worktrees/agent-a21537b121081222d)perf-app-pair (4 commit(s) not on main)perf-attach (1 commit(s) not on main)perf-mutants (4 commit(s) not on main)perf-shell-heavy (1 commit(s) not on main)perf-view (1 commit(s) not on main)readme-launch (2 commit(s) not on main)worktree-agent-a01812998a16c79bf (2 commit(s) not on main)worktree-agent-a0b3b29e1ead39351 (5 commit(s) not on main)worktree-agent-a3236595ab3b3adbd (1 commit(s) not on main)worktree-agent-a4ddcfc5c10a426d1 (4 commit(s) not on main)worktree-agent-a540397c1f134aa66 (1 commit(s) not on main)worktree-agent-a58aa859c281c70a8 (13 commit(s) not on main)worktree-agent-a5e40bbcd8616400e (6 commit(s) not on main)worktree-agent-a748f2d5d2d8b8d87 (1 commit(s) not on main)worktree-agent-a757edcc7298ab070 (3 commit(s) not on main)worktree-agent-a9af528198b7e6a9f (8 commit(s) not on main)worktree-agent-ab644b92c05a00b17 (1 commit(s) not on main)worktree-agent-af5ad2fe39acaf38e (1 commit(s) not on main)
-- **Unpushed:** 0 commit(s) unpushed on main (HEAD f29ebbe6, upstream origin/main)
+- **Unpushed:** 0 commit(s) unpushed on main (HEAD ab6cb53d, upstream origin/main)
 - **Open warnings:** hmdapp app-side needed: refusal ack must parse detail=='non-increasing-seq' + numeric last; phone register_push loop = 99% of 5,200 acks/day; restart hmd app connect for push-test + WebSocket hmd leg; launch-brief handbacks not yet written to hmdapp/docs.⚠ push gate is RED⚠ 2 worktree(s) flagged dirty or unmerged
 - **Refuted claims:** module-consent-waiver's 7 failures were real defects → they were starvation artifacts from my own stray load generators; solo run is 65/0the OmniRoute gateway is wedged at the HTTP layer → it is a webpack DEV server recompiling per request; it answered / with 307 after 141.78sthe 6 sweep reds on f166096a were code regressions → 5 were timing budgets under external load 18-45 (A/B: main faster than fd256c80), 1 was a 30-day reachability exemption that expired on 2026-09-21
 
-### Worktree ledger — nothing-lost proof (25 of 68 worktree(s) scanned (+43 more not scanned))
+### Worktree ledger — nothing-lost proof (25 of 74 worktree(s) scanned (+49 more not scanned))
 > Base ref: `main`. Clean = zero uncommitted files AND HEAD merged into base.
 
 - 23/25 clean, 2 flagged — rescue these before restarting:
@@ -72,7 +72,7 @@
 - `bswmgilp1` shell — "Re-run the open-agents suite once after the test-only fix" (3d ago) → TaskStop task_id=bswmgilp1
 - `af02f8e8f22ba971c` agent — "security: open-agents scanner trust + checkpoint redaction" (3d ago) → TaskStop task_id=af02f8e8f22ba971c
 - `bjxb5kp9r` shell — "Re-run the two suites whose files changed since the last run" (3d ago) → TaskStop task_id=bjxb5kp9r
-- (+374 more: heimdall-agents orphans)
+- (+394 more: heimdall-agents orphans)
 
 ### This session's edited files (edit-tracker — git log cannot attribute these)
 ```
@@ -594,23 +594,23 @@
 ### Gate state (push-gate verdict — FAILING)
 > RED — do not push until this clears. Detail:
 ```
-LINT WAIVED: 2.4.8: 21 shellcheck warnings (15 SC2034 unused vars, SC2163 intentional export of kv string, SC2010, SC2120, SC2154, SC1090), 0 errors, 19 in test files; fixes ride the next batch (waived 2026-11-25T05:56:55Z) -- the lint evidence is NOT passing (findings: 24 lint finding(s) in the last run)
-GATE FAILED: sweep receipt is STALE — receipt HEAD e2559570a5296b733d8d12c406c55ea599782e37 != current HEAD f29ebbe6fd4d48dbcea03dbbeb0052a7a652a4aa (commits landed since the sweep ran, including non-hook-owned paths: .claude-plugin/plugin.json,README.md,VERSION). Run: bash test/run-all.sh --since-green
-GATE FAILED: no use-case journey receipt vouches for HEAD either: STALE: the use-case journey receipt is for 136759dae911, HEAD is f29ebbe6fd4d (commits landed since the journeys ran, including paths that are not the hooks' own: .claude-plugin/plugin.json, .planning/BACKLOG.md, .planning/CHECKPOINT.md and 214 more). Run: bash test/use-cases/run.sh (a green full run on a clean, committed tree writes /Users/rj/Downloads/heimdall/.heimdall/receipts/use-cases.json, which this gate takes in place of a full sweep; only a release needs the sweep).
+LINT WAIVED: 2.4.8: 21 shellcheck warnings (15 SC2034 unused vars, SC2163 intentional export of kv string, SC2010, SC2120, SC2154, SC1090), 0 errors, 19 in test files; fixes ride the next batch (waived 2026-11-25T11:02:00Z) -- the lint evidence is NOT passing (findings: 24 lint finding(s) in the last run)
+GATE FAILED: sweep receipt is STALE — receipt HEAD 522e30194b14ef2c7d1775aa699c961028a102ba != current HEAD ab6cb53d3b6251c0c363ff6334e6f893c1383096 (commits landed since the sweep ran, including non-hook-owned paths: .claude-plugin/plugin.json,README.md,VERSION). Run: bash test/run-all.sh --since-green
+GATE FAILED: no use-case journey receipt vouches for HEAD either: STALE: the use-case journey receipt is for 136759dae911, HEAD is ab6cb53d3b62 (commits landed since the journeys ran, including paths that are not the hooks' own: .claude-plugin/plugin.json, .planning/BACKLOG.md, .planning/CHECKPOINT.md and 221 more). Run: bash test/use-cases/run.sh (a green full run on a clean, committed tree writes /Users/rj/Downloads/heimdall/.heimdall/receipts/use-cases.json, which this gate takes in place of a full sweep; only a release needs the sweep).
 Quality gates not met. Push blocked.
 ```
 
 ### Recent commits
-- f29ebbe6 chore(release): v2.4.14
-- e2559570 journal: [COMMUNICATION] chore(planning): backlog 2.4.14 review + flake items, checkpoint
-- afce497a chore(planning): backlog 2.4.14 review + flake items, checkpoint
-- b877e0db Merge branch 'worktree-agent-ad1245e81796cb2ab'
-- 3dd4e646 Merge branch 'worktree-agent-aade26503760db8ce'
-- 7b06cb8d Merge branch 'worktree-agent-a6134bc1592dece07'
-- f10b6182 chore(lean): re-record the lean-context-parity baseline for the merged /hmd:save prompt text
-- 7155ec9c journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] chore(release): v2.4.13
-- c71b25a1 docs(save): every reference to /hmd:continue now points at /hmd:save
-- c9cad733 journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] chore(release): v2.4.13
+- ab6cb53d chore(release): v2.4.15
+- 522e3019 fix(relay-client): clear paired before the record goes, so no reader makes a legacy ghost of an ending client
+- bd410eb3 journal: [COMMUNICATION] chore(planning): 2.4.15 review notes, close fixed backlog items
+- 2d5a3f41 chore(planning): 2.4.15 review notes, close fixed backlog items
+- d0f48b93 journal: [COMMUNICATION] Merge branch 'worktree-agent-ad5df65a29df5dee8'
+- c3708beb Merge branch 'worktree-agent-ad5df65a29df5dee8'
+- f29a65cb Merge branch 'worktree-agent-a26f92e9624107543'
+- 17abdb5a Merge branch 'worktree-agent-af8943ad0ddb0ed05'
+- 6fdd166d Merge branch 'worktree-agent-a9372b645954c073e'
+- da600b74 Merge branch 'worktree-agent-a1a8e4333d4a3c9bf'
 
 ### Resume
 Runnable, in order:
