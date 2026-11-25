@@ -1,13 +1,13 @@
 ---
 name: save
-description: Save work state, then compact automatically. Creates/updates .planning/ (CHECKPOINT.md, STATE.md, settings.json) and the continue handoff (CONTINUE.md), then arms Claude Code's own auto-compact (a temporary settings change the person agrees to once; `--no-compact` only saves) so the next request compacts with the thread kept, and ends with ONE `/compact <focus>` line as the fallback. NOT a rewind. Run at a milestone, before closing a session or /compact, or when the context meter nags. `/hmd:continue` is a deprecated alias.
+description: Save work state, then compact automatically. Creates/updates .planning/ (CHECKPOINT.md, STATE.md, settings.json) and the continue handoff (CONTINUE.md), then arms Claude Code's own auto-compact (a temporary change to this repository's `.claude/settings.local.json` that the person agrees to once per repository; `--no-compact` only saves) so the next request compacts with the thread kept, and ends with ONE `/compact <focus>` line as the fallback. NOT a rewind. Run at a milestone, before closing a session or /compact, or when the context meter nags. `/hmd:continue` is a deprecated alias.
 ---
 
 # Save — Checkpoint Current State, Then Compact Automatically
 
 Create or update ALL `.planning/` state files so the next `heimdall` run resumes exactly where you left off, write the continue handoff, and let Claude Code compact on its own with the thread kept (with the person's one-time yes; the `/compact` line is the fallback). One command does both jobs: `/hmd:save` and `/hmd:continue` used to be two, and `/hmd:continue` is now a deprecated alias of this one.
 
-**A command, skill or hook cannot run `/compact` or `/clear` — only the user types them. Never try to run it. What the one tool call below does instead is arm Claude Code's own auto-compact (a temporary change to the env block of the user-level settings.json that the person said yes to once, put back by itself), so the next request compacts. The printed `/compact` line is the fallback for everything that cannot be armed: the user pastes it, or ignores it to just save.**
+**A command, skill or hook cannot run `/compact` or `/clear` — only the user types them. Never try to run it. What the one tool call below does instead is arm Claude Code's own auto-compact (a temporary change to the env block of THIS repository's `.claude/settings.local.json`, never the user-level settings that every session on the machine reads, that the person said yes to once for this repository, put back by itself), so the next request compacts. The printed `/compact` line is the fallback for everything that cannot be armed: the user pastes it, or ignores it to just save.**
 
 ## What to save
 
