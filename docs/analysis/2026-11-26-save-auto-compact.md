@@ -110,6 +110,9 @@ later, read from `CLAUDE_CODE_EXECPATH`; otherwise print the paste line as befor
 
 ## Chosen mechanism and what it requires
 
+> Amended by the review follow-up at the end of this note: the arming goes to the project's `.claude/settings.local.json`, not the user-level file
+> (a user-level arming reaches every session on the machine).
+
 `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` in the user-level `settings.json`, set for a short time through the existing
 `heimdall-compact-window` backup, record and consent machinery:
 
@@ -127,3 +130,44 @@ later, read from `CLAUDE_CODE_EXECPATH`; otherwise print the paste line as befor
 - Reload latency (the watcher plus the ConfigChange hook gate) means the compaction can land on the first request after the save turn,
   not inside it. Either way the user pastes nothing.
 - No live end-to-end run was done. If a build ever stops honouring the override, the armed state expires and the paste line still works.
+
+## Review follow-up (2026-11-26): arm the project's `.claude/settings.local.json`, never the user file
+
+The review of the first implementation found a HIGH: `on --compact-now` armed the override in the USER-level `settings.json`, so every Claude Code
+session on the machine, in any repo, compacted for up to 5 minutes. The reading above says the env re-apply "walks every settings source"; this
+section checks whether the project-level local file (`<project>/.claude/settings.local.json`: untracked, the person's own) is applied mid-session
+and ungated, so the arming can be confined to the one repository.
+
+Method: the RUNNING build, 2.1.330 (`CLAUDE_CODE_EXECPATH`; offsets `@N` below are in that binary), byte-offset reads of the embedded JS through a
+pattern search over the mapped file (no strings dump was written to disk). No live end-to-end probe (it needs the account and a real settings edit).
+
+**Verdict: LIVE, and not gated for an ordinary interactive session.** A project source takes the same re-apply path as the user file.
+
+| # | Question | Finding (2.1.330) |
+|---|----------|-------------------|
+| 1 | Is the file watched? | Yes. The settings change detector builds its watch list from every source but `flagSettings` (`pt`, `@293907172`: `for(let p of Ts){if(p==="flagSettings")continue;let h=_n(p);...if(p==="projectSettings"\|\|p==="localSettings")O.add(h)}`), plus the launch-directory local file (`A_()`, row 6); `we(path)` (`@293909486`) maps a path back to `localSettings`. A directory that does not exist yet is watched through its parent until it appears (`pendingDirs`, "Settings directory ... appeared; watching it"), so a `.claude/` made by the arming is picked up. |
+| 2 | Does a change reload? | Yes, behind the ConfigChange hook gate: "Detected change to <file>", then `Oe(source, file)` (a hook may block it: "ConfigChange hook blocked change to <file>"), then the source is reloaded (`@293904534`). |
+| 3 | Is the new env applied to the running process? | Yes. The state-diff handler (`@310186160`): `if(e.settings!==o.settings){...if(e.settings.env!==o.settings.env\|\|Bji())zGo(),...}`. `zGo` (`@310167297`) runs `w1()`, the full `applyConfigEnvironmentVariables` (`@293433294`): `for(let L of Ko())` over the enabled sources, each through `filterSettingsEnv`, then `Object.assign(process.env, ...)`. `Qee(L)` is `new Set(["projectSettings","localSettings"]).has(L)` (`@288742900`): for those two the assignment is bracketed by the repository marker (`zQi`), which only keeps the value out of CHILD process environments; the variable is still set in the agent's own `process.env`, which is where the threshold reads it (b'). |
+| 4 | Does the project-scope filter drop it? | No. `ot`, the project-scope pass, drops a key only when `HTr(name)` holds: a member of the 204-name set `_ks` (`@293393331`) or a prefix in `Qe` (`["CLAUDE_AX_"]` in this build). Neither names `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (the set holds no `AUTOCOMPACT` or `AUTO_COMPACT` name). The variable is in the SAFE set `A_` (`@288755456`; `ROe(name) = A_.has(NAME) \|\| ...`, `@288763775`), the list the pre-trust pass `applySafeConfigEnvironmentVariables` (`@293430591`) applies. |
+| 5 | Trust gating | The mid-session re-apply is skipped unless the folder's trust dialog was accepted: `zGo(o=Yi)` returns when `!o()`, and `Yi` (`@291694837`) is `trustAccepted` or the persisted `projects[<root>].hasTrustDialogAccepted` of the folder or a parent. An interactive session cannot run in a folder whose dialog was not accepted, so this holds for the cases that matter; in a folder that was not trusted the arming would silently do nothing and the expiry timer would clean it up. The "short list of variables only" cut (`asFromAFolderNobodyTrusted`) applies only to a served folder or a non-interactive run with `--ignore-persisted-trust` (`aut`, `@289847872`), not to a terminal session. |
+| 6 | Which file is `localSettings`? | `<root>/.claude/settings.local.json` with `root` = the launch's local-settings store root, else `projectConfigDir`, else `bB(cwd, canonicalGitRoot)`: the canonical git root of the launch directory when the ownership probe passes (root, `.git` and `.claude` owned by the same user), else the launch directory (`PKn`, `@289728910`). When the launch directory differs from that root, `<launch dir>/.claude/settings.local.json` is read as well (`Uo`, `oOe`). So the file at the git toplevel is read by a session started at the root or in a subdirectory of it. |
+| 7 | A tracked or linked file | Claude Code classifies the file itself (`lN`, `uN`, `Py`, near `@291697590`): a symlink at `.claude` or at the file, a `.claude/.git`, or an lstat error other than ENOENT counts as `tracked`; otherwise `git ls-files --error-unmatch -- ':(icase).claude/settings.local.json'` (2 s): exit 0 is `tracked_in_index`, 1 `untracked`, 128 "not a git repository" `indeterminate`, anything else `tracked`. A tracked file is the repository's text, not the person's; what Claude Code does differently for it was not traced, and hmd does not write to one in any case. |
+| 8 | Take-back | As in b': `putBackUnsuppliedAutoCompactEnv` (`@293423208`) walks every source (`Ko().map(keptSettingsEnv ...)`) and puts the variable back to its startup value, or removes it, once no source supplies it. When a source that supplied it reports settings errors (`QT(source).some(rF)`, the predicate was not traced) the put-back is deferred (`autoCompactPutBackOwed`) and re-tried on the next change. |
+
+### Decision
+
+1. `on --compact-now` arms ONLY `<project>/.claude/settings.local.json`. `<project>` is `$CLAUDE_PROJECT_DIR` (set for hooks; this session's Bash tool
+   environment does not carry it), else the git toplevel of the cwd. The user-level file is never written for the trigger.
+2. It is refused (exit 5, nothing written, the printed `/compact` line stays the way) when git tracks the file or cannot say, when `.claude` or the file
+   is a symlink or not a plain regular file, or when no project can be found: the classes Claude Code itself calls `tracked` (row 7).
+3. The records already hold `settings` per path, so release, the expiry timer and `status` work per file, and a `release` run from any directory finds
+   every armed file.
+4. The person's yes is per repository: the consent stamp is keyed by the project root, so a yes given in one repository arms no other.
+5. `--tokens` and `--bash-cap` stay user-level: they are settings keys, not env entries, and the project file is not theirs to take.
+6. `commands/save.md` says the arming affects sessions in this repository only, and, when the arming was released before the compaction began (another
+   session starting, the expiry), tells the person to paste the line.
+
+Residual risks, carried into the report: another session in the SAME repository still compacts while the file is armed (and so does a subagent of this
+session); a session whose settings root is another directory (a different launch directory, a worktree started elsewhere) does not read the file, so
+the arming does nothing and the paste line is still printed; the folder's trust must have been accepted and no ConfigChange hook may block the reload;
+whether `--setting-sources` can leave `local` out of `Ko()` was not traced; no live end-to-end run was done.
