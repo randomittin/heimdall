@@ -25,6 +25,13 @@
 #   4. TAG + GitHub RELEASE (only AFTER R9 passes — release only verified-clean history):
 #      git tag vX.Y.Z, push the tag, publish a Release whose notes are DERIVED from this
 #      repo's conventional commits (bin/generate-changelog), attach the minisign signature.
+#   4b. SITE PINS — once the Release is live (the tag is on origin, so the digest a page pins can be
+#      checked against the bytes the tag serves): re-render every version pin and the install.sh
+#      sha256 in the marketing-site checkout (heimdall-site: $HEIMDALL_SITE_DIR, else ../heimdall-site),
+#      REFUSE unless every pinned digest is the sha256 of `git show <tag>:install.sh`, stage only the
+#      tracked files that carry those pins, commit them TOGETHER with netlify.toml, run
+#      `bin/heimdall-repo-checks run --repo <site>` (the receipt the push gate needs), push main.
+#      A site problem never costs the npm publish below: it is reported last, with a non-zero exit.
 #   5. NPM PUBLISH — publish the npx wrappers (packages/runheimdall AND packages/runhmd: one
 #      release, two npm names, one shared install.sh pin) to the registry, so `npx runheimdall`
 #      and `npx runhmd` resolve to the version this ship just cut. Publishing used to live
@@ -99,7 +106,8 @@ ship.sh — bump, scan, push, verify, and release in one step.
   release/ship.sh --check      local secret scan + show pending commits, do NOT push/bump
   release/ship.sh --dry-run    print the EXACT gh release + npm publish commands, publish NOTHING
   release/ship.sh --release-only  publish the version already in the manifest (recover a
-                               ship that died between the bump commit and the tag)
+                               ship that died between the bump commit and the tag) and
+                               pin the site to it (idempotent: re-run it to finish a site pin)
   release/ship.sh --npm-only   publish the version already in the manifest to npm ONLY —
                                no bump, no tag, no push (recover npm drift, e.g. npm stuck
                                at 2.0.5 while the manifest ships 2.2.6)
@@ -631,7 +639,8 @@ sync_release_artifacts() {
   local tag="$1"
   local sync="${SHIP_SYNC_RELEASE:-${REPO_ROOT:-$PWD}/release/sync-release.sh}"
   [ -x "$sync" ] || [ -f "$sync" ] || die "sync_release_artifacts: $sync not found — cannot sync release artifacts for $tag"
-  bash "$sync" "$tag" || die "sync_release_artifacts: release/sync-release.sh $tag failed — artifacts would drift from the tag"
+  # --no-site-commit: netlify.toml is rewritten in the site checkout but NOT committed or pushed here — at the bump no tag exists yet. release_site_pins commits it with the pins.
+  bash "$sync" "$tag" --no-site-commit || die "sync_release_artifacts: release/sync-release.sh $tag failed — artifacts would drift from the tag"
   git add "${REPO_ROOT:-$PWD}/packages/runheimdall/package.json" \
           "${REPO_ROOT:-$PWD}/packages/runheimdall/README.md" \
           "${REPO_ROOT:-$PWD}/packages/runhmd/package.json" \
@@ -640,6 +649,187 @@ sync_release_artifacts() {
           "${REPO_ROOT:-$PWD}/install.sh" \
           "$PLUGIN_MANIFEST" 2>/dev/null || true
   ok "synced release artifacts (npx wrapper, vanity 302) → $tag"
+}
+
+# ── Site pins: heimdall-site carries the release too ─────────────────────────
+# runheimdall.dev is served from the SEPARATE heimdall-site repo, whose pages carry hand-typed pins: the version, and the sha256 of the install.sh that
+# the install one-liner checks. bin/heimdall-render-version rewrites them in the site checkout and release/sync-release.sh bumps netlify.toml beside
+# them, but nothing committed any of it except netlify.toml, so every release left 15 dirty files behind and the pages kept advertising the previous
+# release until a human committed them. release_site_pins is the missing half. It runs AFTER the tag is pushed and the Release is published, not at the
+# bump, because the bump cannot meet two of its needs: the digest a page pins must be the sha256 of the bytes the TAG serves (checkable only once the
+# tag exists), and the site's own checks fetch that tag from GitHub (gates/install-digest.sh) and ask for the latest Release (gates/release-sync.sh),
+# so they can only be green now. Every command in it is exit-checked on purpose: the main flow calls it where errexit is ignored.
+
+# site_dir — the heimdall-site checkout, or nothing. The order release/sync-release.sh uses, so both act on ONE checkout: an explicit HEIMDALL_SITE_DIR
+# is authoritative and never falls through (a mistyped override must not retarget the production site), else the sibling ../heimdall-site, else the
+# known local checkout.
+site_dir() {
+  local root="${REPO_ROOT:-$PWD}" d=""
+  if [ -n "${HEIMDALL_SITE_DIR:-}" ]; then
+    d="$HEIMDALL_SITE_DIR"
+  elif [ -d "$root/../heimdall-site" ]; then
+    d="$root/../heimdall-site"
+  elif [ -n "${HOME:-}" ] && [ -d "$HOME/Downloads/heimdall-site" ]; then
+    d="$HOME/Downloads/heimdall-site"
+  fi
+  if [ -n "$d" ] && [ -d "$d" ]; then ( cd "$d" && pwd ); fi
+  return 0
+}
+
+# site_prereq_problem <site> — why this checkout cannot take the pins: one line on stdout and return 1, or nothing and return 0.
+site_prereq_problem() {
+  local site="$1" root="${REPO_ROOT:-$PWD}" branch
+  local renderer="${SHIP_RENDERER:-$root/bin/heimdall-render-version}"
+  local checks="${SHIP_REPO_CHECKS:-$root/bin/heimdall-repo-checks}"
+  branch="$(git -C "$site" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+  if [ "$branch" != "main" ]; then
+    printf '%s is on %s, not on main: the pins are pushed to main, the branch the host deploys' "$site" "${branch:-a detached HEAD}"
+    return 1
+  fi
+  if ! git -C "$site" cat-file -e "HEAD:.heimdall/repo-checks.json" 2>/dev/null; then
+    printf '%s declares no checks at HEAD (.heimdall/repo-checks.json), so there is no receipt to record for the push gate' "$site"
+    return 1
+  fi
+  [ -x "$renderer" ] || { printf 'the renderer %s is missing or not executable' "$renderer"; return 1; }
+  [ -x "$checks" ] || { printf 'the repo-checks tool %s is missing or not executable' "$checks"; return 1; }
+  command -v python3 >/dev/null 2>&1 || { printf 'python3 is not installed (bin/heimdall-repo-checks needs it)'; return 1; }
+  return 0
+}
+
+# The 64-hex digests a SHA256 pin governs, one per line: every run on a line that carries an inline HEIMDALL:PIN:<kinds> marker with SHA256 among its
+# kinds, and every run from a HEIMDALL:PIN:<kinds>:BEGIN marker (SHA256 among the kinds) to HEIMDALL:PIN:END, the marker lines included. A FROZEN pin is
+# left alone, as bin/heimdall-render-version leaves it. The kinds class is [A-Z0-9,] because SHA256 carries digits, and the 64-hex pattern is built by
+# repetition because an awk that ignores {64} would match nothing — and a check that matches nothing is a false green. It reads the pins the way the
+# renderer WRITES them, but it is its own parser: a gate that asked the renderer what it pinned would agree with a renderer that pinned the wrong thing.
+# shellcheck disable=SC2016 # awk source text: $0 is awk's own field, so the single quotes are deliberate
+SITE_DIGEST_AWK='
+BEGIN { hex = ""; for (i = 0; i < 64; i++) hex = hex "[0-9a-fA-F]" }
+{
+  gov = ""
+  if (match($0, /HEIMDALL:PIN:[A-Z0-9,]+:BEGIN/)) { gov = substr($0, RSTART, RLENGTH); region = gov }
+  else if ($0 ~ /HEIMDALL:PIN:END/) { region = "" }
+  else if (match($0, /HEIMDALL:PIN:[A-Z0-9,]+/)) { gov = substr($0, RSTART, RLENGTH) }
+  else { gov = region }
+  if (gov !~ /SHA256/ || gov ~ /FROZEN/) next
+  rest = $0
+  while (match(rest, hex)) { print substr(rest, RSTART, RLENGTH); rest = substr(rest, RSTART + RLENGTH) }
+}'
+
+site_pinned_digests() { awk "$SITE_DIGEST_AWK" "$1"; }   # <file> — the digests its SHA256 pins carry
+
+# site_pin_only_change <site> <path> — 0 iff the work-tree copy of <path> differs from HEAD in nothing but version numbers and sha256 digests (line
+# breaks aside): the blanking release_commit_pins_only applies to the release commit. A pin commit goes to production on push, so it must not carry
+# the site owner's other uncommitted edits to the same page along with it.
+site_pin_only_change() {
+  git -C "$1" cat-file -e "HEAD:$2" 2>/dev/null || return 1
+  cmp -s <(git -C "$1" show "HEAD:$2" 2>/dev/null | sed -E "$RELEASE_PIN_BLANK" | tr -d '\n') \
+         <(sed -E "$RELEASE_PIN_BLANK" "$1/$2" 2>/dev/null | tr -d '\n')
+}
+
+# release_site_pins <tag> — the Release of <tag> is live: pin heimdall-site to it. In order, refusing (die) at the first thing that is wrong:
+#   1. the site must be on main and able to record a check receipt; no checkout at all is a WARN (a missing site never blocks a plugin ship);
+#   2. the digest every page must pin is read from the TAG (`git show <tag>:install.sh`), never the working tree, whose install.sh may have moved on;
+#   3. bin/heimdall-render-version re-renders every version pin and sha256 in the site; every tracked file that carries a pin is then checked: each
+#      digest it pins must BE that digest, and some file must pin one at all — otherwise nothing is committed;
+#   4. only the tracked pin-bearing files and netlify.toml that differ from HEAD are staged, and each may differ in nothing but versions and digests;
+#      they are committed together; an untracked file (package-lock.json) is never touched;
+#   5. when HEAD is ahead of origin/main (this commit, or an earlier run whose push failed): bin/heimdall-repo-checks run, whose receipt the push
+#      gate demands, and only then git push. Red checks leave the commit local, unpushed.
+release_site_pins() {
+  local tag="$1" root="${REPO_ROOT:-$PWD}" site problem tmp want out rel line first ahead n_digest=0
+  local renderer="${SHIP_RENDERER:-$root/bin/heimdall-render-version}"
+  local checks="${SHIP_REPO_CHECKS:-$root/bin/heimdall-repo-checks}"
+  local -a cands=() paths=() changed=()
+  step "Site pins ($tag) — pin heimdall-site, commit it with netlify.toml, run its checks, push"
+  printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || die "site pins: '$tag' is not a vX.Y.Z tag"
+
+  site="$(site_dir)"
+  if [ -z "$site" ]; then
+    warn "no heimdall-site checkout (set HEIMDALL_SITE_DIR, or place it at ../heimdall-site): the site was NOT pinned to $tag and still serves the previous release."
+    warn "  once the checkout is there, re-run (idempotent):  release/ship.sh --release-only"
+    return 0
+  fi
+  if ! git -C "$site" rev-parse --git-dir >/dev/null 2>&1; then
+    warn "$site is not a git repository: the site was NOT pinned to $tag (nothing to commit or push)."
+    return 0
+  fi
+  problem="$(site_prereq_problem "$site")" || die "site pins: $problem"
+
+  # What the tag serves: the digest every page must pin.
+  git -C "$root" cat-file -e "refs/tags/$tag:install.sh" 2>/dev/null \
+    || die "site pins: $tag holds no install.sh, so there is no digest for the site to pin"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/heimdall-site-pin.XXXXXX")" || die "site pins: mktemp failed"
+  git -C "$root" show "refs/tags/$tag:install.sh" > "$tmp" || { rm -f "$tmp"; die "site pins: cannot read install.sh of $tag"; }
+  want="$(sha256_of "$tmp")" || { rm -f "$tmp"; die "site pins: cannot hash install.sh (neither sha256sum nor shasum is installed)"; }
+  rm -f "$tmp"
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "site pins: '$want' is not a sha256 digest"
+
+  # The renderer pins plugin.json's version; the digest above is the tag's. They must be one release.
+  out="$("$renderer" --print)" || die "site pins: '$renderer --print' failed"
+  [ "$out" = "${tag#v}" ] \
+    || die "site pins: the renderer pins plugin.json's version ($out) but this release is $tag, so the version and the digest would describe different releases"
+
+  out="$(HEIMDALL_SITE_DIR="$site" "$renderer" 2>&1)" || { printf '%s\n' "$out" >&2; die "site pins: rendering the pins failed — nothing was committed"; }
+  printf '%s\n' "$out" | sed 's/^/  /'
+  out="$(HEIMDALL_SITE_DIR="$site" "$renderer" --list-pins)" || die "site pins: cannot list the pin-bearing files"
+  while IFS= read -r line; do
+    case "$line" in
+      "$site"/*)
+        rel="${line#"$site"/}"
+        if git -C "$site" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then cands+=("$rel"); fi ;;
+    esac
+  done <<<"$out"
+  [ "${#cands[@]}" -gt 0 ] || die "site pins: no tracked file of $site carries a HEIMDALL:PIN marker, so the renderer pinned nothing"
+
+  for rel in "${cands[@]}"; do
+    out="$(site_pinned_digests "$site/$rel")" || die "site pins: cannot read $rel"
+    if [ -n "$out" ]; then
+      line="$(printf '%s\n' "$out" | grep -vxF "$want" || true)"
+      if [ -n "$line" ]; then
+        first="${line%%$'\n'*}"
+        die "site pins: $rel pins install.sh sha256 $first, but $tag holds $want — refusing to commit or push a digest that does not describe the tag's install.sh (the install one-liner would abort at shasum -c)"
+      fi
+      n_digest=$((n_digest + 1))
+    elif grep -Eq 'HEIMDALL:PIN:[A-Z0-9,]*SHA256' "$site/$rel"; then
+      die "site pins: $rel carries a SHA256 pin marker but pins no digest under it"
+    fi
+  done
+  [ "$n_digest" -gt 0 ] || die "site pins: no tracked site file pins an install.sh digest, so none could be verified against $tag"
+
+  paths=(netlify.toml "${cands[@]}")
+  out="$(git -C "$site" -c core.quotepath=off diff --name-only HEAD -- "${paths[@]}")" || die "site pins: git diff failed in $site"
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then changed+=("$line"); fi
+  done <<<"$out"
+  if [ "${#changed[@]}" -eq 0 ]; then
+    ok "heimdall-site already pins $tag: nothing to commit"
+  else
+    for rel in "${changed[@]}"; do
+      site_pin_only_change "$site" "$rel" \
+        || die "site pins: $rel differs from HEAD in more than version numbers and sha256 digests — refusing to commit edits that are not the release's own; commit or stash them in $site, then re-run: release/ship.sh --release-only"
+    done
+    git -C "$site" add -- "${changed[@]}" || die "site pins: git add failed in $site"
+    git -C "$site" commit -q -m "chore: pin site to $tag (version pins, install.sh sha256, /install redirect)" \
+        -m "Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>" -- "${changed[@]}" \
+      || die "site pins: git commit failed in $site"
+    ok "committed ${#changed[@]} site file(s) pinned to $tag, netlify.toml with the pages ($(git -C "$site" rev-parse --short HEAD))"
+  fi
+
+  ahead=1
+  if git -C "$site" rev-parse -q --verify "refs/remotes/origin/main" >/dev/null 2>&1; then
+    ahead="$(git -C "$site" rev-list --count "origin/main..HEAD")" || die "site pins: cannot compare HEAD with origin/main in $site"
+  fi
+  if [ "$ahead" -eq 0 ]; then
+    ok "heimdall-site: origin/main already has HEAD — nothing to push"
+    return 0
+  fi
+  "$checks" run --repo "$site" \
+    || die "site pins: heimdall-site's own checks did not pass (above) — NOT pushing. The pin commit is local in $site; fix the cause, then re-run: release/ship.sh --release-only"
+  ok "heimdall-site's own checks are green: the push gate has its receipt"
+  git -C "$site" push origin main \
+    || die "site pins: pushing heimdall-site main failed (above) — the pin commit is local in $site; re-run: release/ship.sh --release-only"
+  ok "pushed heimdall-site main: the host deploys the $tag pins"
+  return 0
 }
 
 # ── npm publication (the npx wrapper) ────────────────────────────────────────
@@ -1310,6 +1500,7 @@ if [ "$RELEASE_ONLY" -eq 1 ]; then
   publish_release "$TAG" "$RO_NOTES"
   sign_release_artifact "$TAG" "$TMP_DIR/tagged/install.sh"
   publish_release_manifest "$TAG" "$TMP_DIR/tagged/install.sh"
+  release_site_pins "$TAG"
   printf '\n%s%s✓ Released %s%s — https://github.com/randomittin/heimdall/releases/tag/%s\n' \
     "$G" "$B" "$TAG" "$R" "$TAG"
   exit 0
@@ -1515,6 +1706,13 @@ if [ -n "$TAG" ]; then
   printf '\n%s%s✓ Released %s%s — https://github.com/randomittin/heimdall/releases/tag/%s\n' \
     "$G" "$B" "$TAG" "$R" "$TAG"
 
+  # ── 5b. Site pins — the Release is live, so heimdall-site can pin it (see release_site_pins) ─────────
+  # Run in a subshell, so a refusal (die) ends only this step: the npm publish below is the one thing a site
+  # problem must never cost. The failure is reported after npm, as the last word of the ship, with a non-zero
+  # exit: a ship is not green over a site that still advertises the previous release.
+  SITE_PIN_FAILED=0
+  ( release_site_pins "$TAG" ) || SITE_PIN_FAILED=1
+
   # ── 6. npm publish (the npx wrapper) ───────────────────────────────────────
   # ORDERING — this is LAST, after the tag is pushed and the Release is live, on purpose. The
   # wrapper's package.json bakes in installScriptUrl = raw.../<TAG>/install.sh and that tag's
@@ -1527,5 +1725,9 @@ if [ -n "$TAG" ]; then
   # a hard, non-zero failure with a named recovery path — never a warn-and-exit-0.
   if [ "$DO_NPM" -eq 1 ]; then
     publish_npm_all "$NEW_VERSION"
+  fi
+
+  if [ "$SITE_PIN_FAILED" -eq 1 ]; then
+    die "the site pin step FAILED (above): the Release is live, but heimdall-site still serves the previous release. Fix the cause, then re-run (idempotent): release/ship.sh --release-only"
   fi
 fi

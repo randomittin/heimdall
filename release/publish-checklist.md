@@ -54,6 +54,20 @@ curl -fsSL https://github.com/randomittin/heimdall/releases/latest/download/rele
 - [ ] `release-manifest.json` is attached to the vX.Y.Z Release, and its `.tag` and `.install_sha256`
       match the digest `sync-release.sh` printed.
 
+## 2c. Pin the marketing site (heimdall-site) to the new tag
+
+`release/ship.sh` does this itself once the Release is live. By hand, from the plugin repo:
+
+```
+HEIMDALL_SITE_DIR=/path/to/heimdall-site bin/heimdall-render-version    # every version pin + the install.sh sha256
+git -C /path/to/heimdall-site add <the tracked pin-bearing files> netlify.toml
+git -C /path/to/heimdall-site commit -m "chore: pin site to vX.Y.Z"
+bin/heimdall-repo-checks run --repo /path/to/heimdall-site              # the receipt the push gate needs
+git -C /path/to/heimdall-site push origin main
+```
+
+- [ ] Every digest the site pins equals `git show vX.Y.Z:install.sh | shasum -a 256`; `package-lock.json` is not in the commit.
+
 ## 3. Publish the npx wrappers (TWO packages, one pin)
 
 `release/ship.sh --dry-run` prints both (name, version, pinned tag + sha256, files, command)

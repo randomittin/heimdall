@@ -36,6 +36,20 @@ v<tag>`) and `git push origin main` so Netlify auto-deploys. It is idempotent
 (re-running the same tag is a no-op) and asserts the rewritten `to` URL tag byte-equals
 the release tag before writing — a mismatch is a real drift bug and hard-fails.
 
+**When `release/ship.sh` runs it, the commit moves.** `ship.sh` calls `sync-release.sh`
+with `--no-site-commit` (netlify.toml is rewritten, nothing is committed or pushed at
+the bump, when no tag exists yet) and, once the tag is pushed and the Release is
+published, pins the whole site (`release_site_pins`): `bin/heimdall-render-version`
+re-renders every version pin and the `install.sh` sha256 in the site; ship.sh
+**refuses (non-zero)** unless every pinned digest equals `git show <tag>:install.sh |
+shasum -a 256`; it stages only the tracked files that carry a pin (never untracked
+ones such as `package-lock.json`, and never an edit that is not a version or a
+digest), commits them **together with `netlify.toml`**, runs
+`bin/heimdall-repo-checks run --repo <site>` (the receipt the push gate requires) and
+only then pushes `main`. A site problem never costs the npm publish: it is reported
+last, with a non-zero exit, and `release/ship.sh --release-only` re-runs it
+(idempotent).
+
 **Locating the site checkout.** `sync-release.sh` finds `heimdall-site` via, in order:
 
 1. the `HEIMDALL_SITE_DIR` environment override (point it anywhere), else
