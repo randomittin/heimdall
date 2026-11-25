@@ -24,6 +24,10 @@
 #      journal write and no crash.
 #  11. Collateral: every other hooks.json event key is still present and
 #      non-empty (this edit must not disturb unrelated hooks).
+#  12. Chain stop: a commit whose subject starts with `journal:` (the output of
+#      heimdall-journal add itself) is never journaled. HEAD stays put, no nested
+#      `journal: [X] journal: [X] ...` subject appears, and the next real commit
+#      is still journaled.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -86,13 +90,14 @@ TMPDIR_SAVE="$TMPDIR"
 export TMPDIR="$SANDBOX/tmp"; mkdir -p "$TMPDIR"
 export HEIMDALL_HAID="testwriter"
 
-run_hook() { # <bash-command-string>
+run_hook_in() { # <project-dir> <bash-command-string>
   local payload
-  payload="$(jq -cn --arg c "$1" '{tool_name:"Bash", tool_input:{command:$c}}')"
+  payload="$(jq -cn --arg c "$2" '{tool_name:"Bash", tool_input:{command:$c}}')"
   export CLAUDE_PLUGIN_ROOT="$PLUGIN"
-  export CLAUDE_PROJECT_DIR="$PROJECT"
+  export CLAUDE_PROJECT_DIR="$1"
   printf '%s' "$payload" | bash "$HOOK_CMD_FILE"
 }
+run_hook() { run_hook_in "$PROJECT" "$1"; } # <bash-command-string>
 
 journal_dir="$PROJECT/.planning/journal"
 entry_count() { [ -d "$journal_dir" ] && grep -rc '^## ' "$journal_dir"/*.md 2>/dev/null | awk -F: '{s+=$2} END{print s+0}' || echo 0; }
@@ -129,6 +134,41 @@ N3="$(entry_count)"
 CONTENT2="$(cat "$journal_dir"/*.md 2>/dev/null)"
 printf '%s' "$CONTENT2" | grep -q "This is the real body text, not the subject." && ok "non-empty commit body preserved verbatim" || bad "non-empty commit body preserved verbatim" "present" "absent"
 printf '%s' "$CONTENT2" | grep -q "commit $SHA2" && ok "second entry evidence names the second SHA" || bad "second entry evidence names the second SHA" "present" "absent"
+
+# --- 12: chain stop — a journal commit at HEAD is never journaled -----------
+# The loop this guards needs auto-commit ON (the journal commit is what lands on HEAD and gets
+# re-read), so it runs in its own project: $PROJECT's opt-out above exists for the dedup case.
+CHAIN="$SANDBOX/chain"
+mkdir -p "$CHAIN"
+git -C "$CHAIN" init -q
+git -C "$CHAIN" config user.email "sandbox@test.local"
+git -C "$CHAIN" config user.name "Sandbox"
+echo "seed" > "$CHAIN/seed.txt"
+git -C "$CHAIN" add seed.txt
+git -C "$CHAIN" commit -q -m "chore: seed"
+echo "release" > "$CHAIN/release.txt"
+git -C "$CHAIN" add release.txt
+git -C "$CHAIN" commit -q -m "chore(release): v9.9.9"
+run_hook_in "$CHAIN" "git commit -m 'chore(release): v9.9.9'" >/dev/null 2>&1
+SUBJ_J1="$(git -C "$CHAIN" log -1 --format=%s)"
+if [ "$SUBJ_J1" = "journal: [COMMUNICATION] chore(release): v9.9.9" ]; then ok "real commit is journaled as one journal commit"; else bad "real commit is journaled as one journal commit" "journal: [COMMUNICATION] chore(release): v9.9.9" "$SUBJ_J1"; fi
+
+# Two more git-commit-shaped calls that land no commit: HEAD is still the unrecorded journal commit.
+HEAD_J1="$(git -C "$CHAIN" rev-parse HEAD)"
+run_hook_in "$CHAIN" "git commit -m 'nothing staged'" >/dev/null 2>&1
+run_hook_in "$CHAIN" "git commit -m 'nothing staged'" >/dev/null 2>&1
+HEAD_AFTER="$(git -C "$CHAIN" rev-parse HEAD)"
+if [ "$HEAD_AFTER" = "$HEAD_J1" ]; then ok "a journal commit at HEAD is not journaled again"; else bad "a journal commit at HEAD is not journaled again" "$HEAD_J1" "$HEAD_AFTER ($(git -C "$CHAIN" log -1 --format=%s))"; fi
+NESTED="$(git -C "$CHAIN" log --format=%s | grep -c '^journal: \[COMMUNICATION\] journal:')"
+if [ "$NESTED" -eq 0 ]; then ok "no nested journal subject anywhere in the log"; else bad "no nested journal subject anywhere in the log" 0 "$NESTED"; fi
+
+# The skip is scoped to journal commits: the next real commit is journaled as usual.
+echo "next" > "$CHAIN/next.txt"
+git -C "$CHAIN" add next.txt
+git -C "$CHAIN" commit -q -m "feat: next change"
+run_hook_in "$CHAIN" "git commit -m 'feat: next change'" >/dev/null 2>&1
+SUBJ_NEXT="$(git -C "$CHAIN" log -1 --format=%s)"
+if [ "$SUBJ_NEXT" = "journal: [COMMUNICATION] feat: next change" ]; then ok "a real commit after the skipped journal commit is still journaled"; else bad "a real commit after the skipped journal commit is still journaled" "journal: [COMMUNICATION] feat: next change" "$SUBJ_NEXT"; fi
 
 # --- 10: fail-open cases ---------------------------------------------------
 export CLAUDE_PLUGIN_ROOT="$PLUGIN"
