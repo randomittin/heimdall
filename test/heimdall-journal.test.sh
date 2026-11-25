@@ -44,6 +44,11 @@
 #   P. EVIDENCE LINE    — --evidence renders a **Evidence:** line in the entry.
 #   Q. ALL FOUR TYPES   — finding/decision/correction/communication all accepted.
 #   R. SYNTAX           — bash -n clean.
+#   S. NESTED PREFIX    — leading `journal: [X] ` prefixes are stripped from the subject, so a
+#                          journal commit's own subject fed back in cannot nest: the entry header
+#                          and the commit subject carry the bare subject; only a LEADING prefix
+#                          goes; a prefix-only subject is rejected as empty; the length cap
+#                          judges the stripped subject.
 #
 # Falsifiability (quoted in the implementing commit): the type-validation branch was
 # temporarily mutated to accept any string, which turned section E red (bad type no
@@ -302,6 +307,47 @@ rm -rf "$P"
 # ─────────────────────────────────────────────────────────────────────────────
 echo "R. SYNTAX — bash -n clean on heimdall-journal:"
 if bash -n "$JRNL"; then ok "bash -n clean"; else bad "syntax error in $JRNL"; fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "S. NESTED PREFIX — leading 'journal: [X] ' prefixes are stripped from the subject:"
+P="$(make_project)"
+# Hooks off, as in section C: grade this tool's own commit message.
+git -C "$P" config core.hooksPath "$P/.git/no-hooks"
+FILE="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add communication "journal: [COMMUNICATION] journal: [COMMUNICATION] chore(release): v9.9.9" --body "a journal commit's own subject, fed back in")"; RC=$?
+if [ "$RC" -eq 0 ]; then ok "add accepts a prefix-nested subject"; else bad "exit=$RC on a prefix-nested subject"; fi
+if grep -Eq '^## [0-9T:Z-]+ — \[COMMUNICATION\] chore\(release\): v9\.9\.9$' "$FILE"; then
+  ok "entry header carries the bare subject"
+else
+  bad "entry header kept a nested prefix:
+$(cat "$FILE" 2>/dev/null)"
+fi
+SUBJ="$(git -C "$P" log -1 --format=%s)"
+if [ "$SUBJ" = "journal: [COMMUNICATION] chore(release): v9.9.9" ]; then ok "commit subject carries exactly one journal prefix"; else bad "commit subject nested: $SUBJ"; fi
+# Only a LEADING prefix goes: the same text mid-subject is content and survives.
+FILE="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "see journal: [FINDING] entry from yesterday" --body "text in the middle of a subject is content, not a prefix")"
+if grep -Fq '[FINDING] see journal: [FINDING] entry from yesterday' "$FILE"; then
+  ok "a 'journal: [X]' in the middle of a subject is kept verbatim"
+else
+  bad "mid-subject text was altered:
+$(cat "$FILE" 2>/dev/null)"
+fi
+# The 200-char cap judges the stripped subject: nine prefixes are 225 chars on their own.
+DEEP="$(printf 'journal: [COMMUNICATION] %.0s' 1 2 3 4 5 6 7 8 9)deep chain subject"
+FILE="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add communication "$DEEP" --body "nine nested prefixes, past the length cap on raw size")"; RC=$?
+if [ "$RC" -eq 0 ]; then ok "length cap judges the stripped subject (nine prefixes accepted)"; else bad "exit=$RC: a deep prefix chain was rejected on raw length"; fi
+if grep -Eq '^## [0-9T:Z-]+ — \[COMMUNICATION\] deep chain subject$' "$FILE"; then
+  ok "deep chain stripped to the bare subject"
+else
+  bad "deep chain not fully stripped:
+$(cat "$FILE" 2>/dev/null)"
+fi
+rm -rf "$P"
+# A subject that is nothing but prefixes has no real subject left: rejected like an empty one.
+P="$(make_project)"
+OUT="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add communication "journal: [COMMUNICATION] " --body "y" 2>&1)"; RC=$?
+if [ "$RC" -eq 2 ]; then ok "a prefix-only subject is rejected as empty (exit 2)"; else bad "exit=$RC (want 2): $OUT"; fi
+if [ -d "$P/.planning/journal" ]; then bad "journal dir created despite a prefix-only subject"; else ok "no journal dir created"; fi
+rm -rf "$P"
 
 echo ""
 echo "heimdall-journal.test.sh: $PASS passed, $FAIL failed."

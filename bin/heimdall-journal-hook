@@ -107,6 +107,12 @@ cmd_commit() {
     local subject body
     subject="$(git log -1 --format=%s "$sha" 2>/dev/null)"
     [ -n "$subject" ] || exit 0
+    # A journal commit is this hook's own OUTPUT, never its input. `heimdall-journal add` leaves
+    # HEAD on `journal: [TYPE] <subject>`; the next git-commit-shaped Bash call finds that HEAD
+    # unrecorded, journals its subject, and nests one more prefix per round trip (7 deep on main,
+    # stopped only by the 200-char subject cap). $sha was claimed above, so later calls exit at
+    # the dedup check and never reach this line.
+    case "$subject" in journal:*) exit 0 ;; esac
     body="$(git log -1 --format=%b "$sha" 2>/dev/null)"
     [ -n "$body" ] || body="$subject"
 

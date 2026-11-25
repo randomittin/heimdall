@@ -31,6 +31,9 @@
 #                          truncated, nothing partially written. On success,
 #                          appends the entry, then makes ONE scoped commit
 #                          (git add of the journal file only) unless opted out.
+#                          Leading `journal: [X] ` prefixes are stripped from
+#                          the subject first, so feeding a journal commit's own
+#                          subject back in cannot nest another prefix.
 #   today [--haid HAID]    print today's file for the resolved (or given) writer.
 #   tail [N]               print the last N entries (default 10) across ALL
 #                          writers' files, oldest-to-newest.
@@ -80,7 +83,7 @@ BODY_MAX=4000
 EVIDENCE_MAX=2000
 SUBJECT_MAX=200
 
-usage() { sed -n '2,73p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'; }
 
 _timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 _toplevel()  { git rev-parse --show-toplevel 2>/dev/null; }
@@ -184,6 +187,12 @@ cmd_add() {
     echo "heimdall-journal: add: invalid type '$type_in' — want finding|decision|correction|communication ('refuted' aliases to correction)" >&2
     return 2
   }
+
+  # Strip leading `journal: [X] ` prefixes: the commit below is itself `journal: [TYPE] <subject>`,
+  # so a journal commit's subject fed back in would nest another one per round trip. Before the
+  # checks below: a prefix-only subject then counts as missing, and the cap judges the real one.
+  local prefix_re='^journal: \[[A-Za-z]+\] '
+  while [[ "$subject" =~ $prefix_re ]]; do subject="${subject#"${BASH_REMATCH[0]}"}"; done
 
   [ -n "$subject" ] || { echo "heimdall-journal: add: subject required" >&2; return 2; }
   case "$subject" in *$'\n'*) echo "heimdall-journal: add: subject must be a single line" >&2; return 2 ;; esac
