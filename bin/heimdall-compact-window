@@ -983,8 +983,12 @@ def cmd_release(args):
 
 def cmd_revoke(args):
     code = release_all()
-    remove(consent_stamp())
-    say("forgot your yes to the compact-now trigger%s: it will ask again" % ("" if code == 0 else " (an armed trigger could not be put back: see stderr)"))
+    root = project_root()
+    if root is None:
+        warn("%s: run revoke inside the repository whose yes you want to take back. Nothing was forgotten" % NO_PROJECT.replace("to arm it in", "to forget a yes for"))
+        return code or EXIT_USAGE
+    remove(consent_stamp(os.path.realpath(os.path.join(root, *PROJECT_REL))))
+    say("forgot your yes to the compact-now trigger in %s%s: it will ask again there" % (tilde(root), "" if code == 0 else " (an armed trigger could not be put back: see stderr)"))
     return code
 
 
@@ -1000,12 +1004,31 @@ def cmd_watch(args):
     return release_all(args.arm)
 
 
+def lever_rows(lever, doc, record):
+    """The rows `status` shows for one lever: its value in `doc` and who set it, the other settings files hmd set it in, and the environment variable of the agent that bears on the same thing."""
+    ours = record is not None and doc.value_text == lever.text(record["written"])
+    if doc.member is None:
+        say("%-9s %s" % (lever.slot, lever.unset))
+    else:
+        until = ""
+        if lever.transient and ours and isinstance(record.get("expires_at"), int):
+            until = "; %s %s" % ("EXPIRED at" if record["expires_at"] <= time.time() else "expires at", utc_stamp(record["expires_at"]))
+        say("%-9s %s (%s)" % (lever.slot, doc.value_text,
+                              "set by hmd%s; `%s` undoes it" % (until, lever.command("off")) if ours else "your own setting; hmd did not set it"))
+    for other in other_records(lever, doc.path):
+        say("%-9s hmd also set it in %s; %s" % ("elsewhere", tilde(other), undo_elsewhere(lever)))
+    if os.environ.get(lever.env_var):
+        say("%-9s %s=%s is also set in this environment%s" % ("env", lever.env_var, os.environ[lever.env_var],
+                                                              "; the agent ignores it while %s is set" % lever.key if lever.shadows and not lever.transient else ""))
+
+
 def cmd_status(args):
     try:
         seen = []
         for lever in LEVERS:
-            doc = Doc(settings_path(), lever)
-            seen.append((lever, doc, load_state(lever, doc.path)))
+            if not lever.project:
+                doc = Doc(settings_path(), lever)
+                seen.append((lever, doc, load_state(lever, doc.path)))
         offered = read_bytes(os.path.join(state_dir(), OFFERED_FILE))
     except Unusable as exc:
         warn(str(exc))
@@ -1013,21 +1036,24 @@ def cmd_status(args):
     first = seen[0][1]
     say("%-9s %s%s" % ("settings", tilde(first.path), "" if first.raw is not None else " (does not exist yet)"))
     for lever, doc, record in seen:
-        ours = record is not None and doc.value_text == lever.text(record["written"])
-        if doc.member is None:
-            say("%-9s %s" % (lever.slot, lever.unset))
+        lever_rows(lever, doc, record)
+    root, given = project_root(), False
+    if root is None:
+        say("%-9s none found (CLAUDE_PROJECT_DIR is unset and the working directory is not in a git work tree): the trigger arms a project's %s" % ("project", "/".join(PROJECT_REL)))
+        say("%-9s not armed here" % TRIGGER.slot)
+        for other in other_records(TRIGGER, ""):
+            say("%-9s hmd also set it in %s; %s" % ("elsewhere", tilde(other), undo_elsewhere(TRIGGER)))
+    else:
+        try:
+            doc = Doc(os.path.join(root, *PROJECT_REL), TRIGGER)
+            record = load_state(TRIGGER, doc.path)
+        except Unusable as exc:
+            say("%-9s %s" % (TRIGGER.slot, "cannot be read: %s" % exc))
         else:
-            until = ""
-            if lever.transient and ours and isinstance(record.get("expires_at"), int):
-                until = "; %s %s" % ("EXPIRED at" if record["expires_at"] <= time.time() else "expires at", utc_stamp(record["expires_at"]))
-            say("%-9s %s (%s)" % (lever.slot, doc.value_text,
-                                  "set by hmd%s; `%s` undoes it" % (until, lever.command("off")) if ours else "your own setting; hmd did not set it"))
-        for other in other_records(lever, doc.path):
-            say("%-9s hmd also set it in %s; undo that one with its own CLAUDE_CONFIG_DIR, %s" % ("elsewhere", tilde(other), lever.command("off")))
-        if os.environ.get(lever.env_var):
-            say("%-9s %s=%s is also set in this environment%s" % ("env", lever.env_var, os.environ[lever.env_var],
-                                                                  "; the agent ignores it while %s is set" % lever.key if lever.shadows and not lever.transient else ""))
-    say("%-9s %s" % ("consent", "given for the compact-now trigger (`hmd compact-window revoke` takes it back)" if has_standing_consent() else "asked before the compact-now trigger is first armed"))
+            say("%-9s %s%s" % ("project", tilde(doc.path), "" if doc.raw is not None else " (does not exist yet)"))
+            lever_rows(TRIGGER, doc, record)
+            given = has_standing_consent(doc.path)
+    say("%-9s %s" % ("consent", "given for this project (`hmd compact-window revoke` takes it back)" if given else "asked before the trigger is first armed in a project"))
     answer = (offered or b"").decode("utf-8", "replace").split()
     say("%-9s %s" % ("offer", answer[0] if answer else "not asked yet"))
     return 0

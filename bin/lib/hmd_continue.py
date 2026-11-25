@@ -4,9 +4,9 @@ r"""heimdall-continue -- the handoff half of /hmd:save: write the handoff, print
 WHY. No skill, command or hook can run /compact or /clear: only the user types them. PreCompact cannot inject context. SessionStart with
 source "compact" can (hookSpecificOutput.additionalContext). So "compact, then carry on with full context" is three jobs, and this tool does the
 two that are not the user's: it WRITES a handoff before the compaction and INJECTS it after. The third, typing the line, stays with the user, with one way round it: `write` ARMS
-Claude Code's own auto-compact (bin/heimdall-compact-window on --compact-now: a transient, consented change to the env block of the user-level settings.json that makes the next
-request compact, put back by the PreCompact and SessionStart hooks, an expiry timer or `off`; the evidence is docs/analysis/2026-11-26-save-auto-compact.md), and the line stays
-as the fallback for everything that cannot be armed (no yes yet, a Claude Code older than 2.1.329, automatic compaction off, a value of the person's own in the way).
+Claude Code's own auto-compact (bin/heimdall-compact-window on --compact-now: a transient, consented change to the env block of THIS repository's .claude/settings.local.json, never the user-level settings.json that
+every session on the machine reads, which makes the next request compact, put back by the PreCompact and SessionStart hooks, an expiry timer or `off`; the evidence is docs/analysis/2026-11-26-save-auto-compact.md), and the line stays
+as the fallback for everything that cannot be armed (no yes yet for this repository, a Claude Code older than 2.1.329, automatic compaction off, a value of the person's own in the way, git tracking the file or a link in its way).
 
 WHO CALLS IT. /hmd:save (commands/save.md) is the one command that calls `write`: its save and its handoff are one move, so this is the single code path
 that writes CHECKPOINT.md's measured block and CONTINUE.md. /hmd:continue is a deprecated alias of /hmd:save and never calls this tool itself.
@@ -445,8 +445,8 @@ def arm_compaction(root):
             say("[heimdall-continue] %s" % clean(said[-1], 400))
         return True
     if rc == 3:
-        warn("[heimdall-continue] auto-compact NOT armed: it needs the person's yes once (it adds env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE to ~/.claude/settings.json for a few minutes and puts "
-             "it back by itself). Ask them; on yes run `%s on --compact-now --yes`, which arms it now and is never asked again. Until then the /compact line below is the way" % tool)
+        warn("[heimdall-continue] auto-compact NOT armed: it needs the person's yes once for this repository (it adds env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE to this repository's .claude/settings.local.json for a few minutes and puts "
+             "it back by itself; no other repository is touched). Ask them; on yes run `%s on --compact-now --yes`, which arms it now and is not asked again in this repository. Until then the /compact line below is the way" % tool)
         return False
     warn("[heimdall-continue] auto-compact not armed (%s); the /compact line below is the way" % (last_line(err) or "exit %d" % rc))
     return False
