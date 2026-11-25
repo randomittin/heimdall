@@ -841,24 +841,24 @@ chk "S2: ...what the other tool added is kept" grep -q '"addedLater"' "$S"
 chk "S2: ...and off says only the key was reverted" grep -q "only the key was reverted" "$OUT"
 new_home; printf '{"env": 5}' >"$S"; cp "$S" "$TMP/orig"
 cwt on --compact-now --yes
-eq "S2: an env that is not an object is never touched: exit 1, the file as it was, nothing recorded" "1|same|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
+eq "S2: an env that is not an object is never touched: exit 1, the file as it was, nothing recorded" "1|yes|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
 
 # a value of the person's own is never replaced
 new_home; printf '{\n  "env": {\n    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"\n  }\n}\n' >"$S"; cp "$S" "$TMP/orig"
 cwt on --compact-now --yes
-eq "S3: a value of the person's own in the env block: exit 4, the file untouched, no record, no yes remembered" "4|same|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
+eq "S3: a value of the person's own in the env block: exit 4, the file untouched, no record, no yes remembered" "4|yes|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
 chk "S3: stderr says it is theirs" grep -q "your own setting" "$ERR"
 cwt on --compact-now --yes --force
-eq "S3: --force is not accepted with the trigger: usage error, exit 2, the file untouched" "2|same" "$RC|$(yn same "$S" "$TMP/orig")"
+eq "S3: --force is not accepted with the trigger: usage error, exit 2, the file untouched" "2|yes" "$RC|$(yn same "$S" "$TMP/orig")"
 new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
 scrub env CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60 HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
-eq "S3: a CLAUDE_AUTOCOMPACT_PCT_OVERRIDE of the person's own in the environment is refused too: exit 4, untouched, nothing recorded" "4|same|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
+eq "S3: a CLAUDE_AUTOCOMPACT_PCT_OVERRIDE of the person's own in the environment is refused too: exit 4, untouched, nothing recorded" "4|yes|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
 
 # the build and automatic compaction must be able to honour it: otherwise exit 5 and nothing is written
 new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
 for v in 2.1.328 2.1.9 1.9.999 "" "not-a-version"; do
   CCV="$v" cwt on --compact-now --yes
-  eq "S4: Claude Code [$v] cannot take the override back, or cannot be told: exit 5, nothing written, no record, no yes remembered" "5|same|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
+  eq "S4: Claude Code [$v] cannot take the override back, or cannot be told: exit 5, nothing written, no record, no yes remembered" "5|yes|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
 done
 CCV=2.1.328 cwt on --compact-now --yes
 chk "S4: the reason names the first build that takes it back (2.1.329)" grep -qF "2.1.329" "$ERR"
@@ -879,26 +879,26 @@ cwx "$TMP/cc/new"
 eq "S4: any other layout is asked (--version): a binary that answers 2.1.331 (Claude Code) arms" '0|"1"' "$RC|$(tval)"
 cwt off --compact-now --yes
 cwx "$TMP/cc/old"
-eq "S4: ...one that answers 2.1.327 is refused: exit 5, untouched" "5|same" "$RC|$(yn same "$S" "$TMP/orig")"
+eq "S4: ...one that answers 2.1.327 is refused: exit 5, untouched" "5|yes" "$RC|$(yn same "$S" "$TMP/orig")"
 cwx "$TMP/cc/node"
 eq "S4: ...one that is not claude (node answers with its own version) is refused: exit 5" 5 "$RC"
 cwx "relative/claude"
 eq "S4: a CLAUDE_CODE_EXECPATH that is not absolute is refused: exit 5" 5 "$RC"
 scrub env HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
-eq "S4: no CLAUDE_CODE_EXECPATH and no seam (not inside a session; the claude on PATH may be another build, so it is not asked): exit 5, untouched" "5|same" "$RC|$(yn same "$S" "$TMP/orig")"
+eq "S4: no CLAUDE_CODE_EXECPATH and no seam (not inside a session; the claude on PATH may be another build, so it is not asked): exit 5, untouched" "5|yes" "$RC|$(yn same "$S" "$TMP/orig")"
 new_home; printf '{\n  "autoCompactEnabled": false\n}\n' >"$S"; cp "$S" "$TMP/orig"
 cwt on --compact-now --yes
-eq "S4: autoCompactEnabled false in the settings: exit 5, untouched, nothing recorded" "5|same|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
+eq "S4: autoCompactEnabled false in the settings: exit 5, untouched, nothing recorded" "5|yes|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
 new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
 for name in DISABLE_AUTO_COMPACT DISABLE_COMPACT; do
   scrub env "$name=1" HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
-  eq "S4: $name=1 in the environment (automatic compaction is off): exit 5, untouched" "5|same" "$RC|$(yn same "$S" "$TMP/orig")"
+  eq "S4: $name=1 in the environment (automatic compaction is off): exit 5, untouched" "5|yes" "$RC|$(yn same "$S" "$TMP/orig")"
 done
 
 # consent: asked once
 new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
 cwt on --compact-now
-eq "S5: no terminal, no --yes and no earlier yes: exit 3, the file untouched, nothing recorded" "3|same|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
+eq "S5: no terminal, no --yes and no earlier yes: exit 3, the file untouched, nothing recorded" "3|yes|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
 chk "S5: stderr gives the command to run again with --yes" grep -qF "on --compact-now --yes" "$ERR"
 cwt on --compact-now --yes
 cwt off --compact-now --yes
@@ -915,7 +915,7 @@ eq "S5: a person at a terminal who says yes: armed, and the yes is remembered" '
 cwt off --compact-now --yes
 new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
 cwptyt n on --compact-now
-eq "S5: a person at a terminal who says no: exit 3, untouched, no yes remembered" "3|same|no" "$RC|$(yn same "$S" "$TMP/orig")|$(yn consented)"
+eq "S5: a person at a terminal who says no: exit 3, untouched, no yes remembered" "3|yes|no" "$RC|$(yn same "$S" "$TMP/orig")|$(yn consented)"
 new_home; printf '%s' "$COMPACT" >"$S"
 cwt on --compact-now --yes
 cwt revoke
@@ -938,14 +938,14 @@ new_home; mkdir -p "$H/second"; printf '%s' "$COMPACT" >"$H/second/settings.json
 scrub env CLAUDE_CONFIG_DIR="$H/second" HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
 eq "S6: the trigger armed in a second settings file (another CLAUDE_CONFIG_DIR)" 0 "$RC"
 cwt release
-eq "S6: release run with the default config dir still puts it back in the file it was armed in, byte for byte" "0|same|0" "$RC|$(yn same "$H/second/settings.json" "$TMP/orig2")|$(tstate)"
+eq "S6: release run with the default config dir still puts it back in the file it was armed in, byte for byte" "0|yes|0" "$RC|$(yn same "$H/second/settings.json" "$TMP/orig2")|$(tstate)"
 
 # expiry: nothing compacted and no hook ran
 new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
 scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_TTL_S=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
-eq "S7: armed with a one-second life (the timer left running): exit 0, armed" '0|"1"' "$RC|$(tval)"
-for _ in $(seq 1 60); do [ "$(tval)" = ABSENT ] && break; sleep 0.2; done
-eq "S7: nobody compacted and no hook ran: the expiry timer put the file back by itself, byte for byte" "ABSENT|same|0" "$(tval)|$(yn same "$S" "$TMP/orig")|$(tstate)"
+eq "S7: armed with a one-second life (the timer left running): exit 0 and says so (the file is not read back: on a loaded machine the timer may already have run)" "0|1" "$RC|$(grep -c '^armed: ' "$OUT")"
+for _ in $(seq 1 150); do [ "$(tval)" = ABSENT ] && [ "$(tstate)" = 0 ] && break; sleep 0.2; done
+eq "S7: nobody compacted and no hook ran: the expiry timer put the file back by itself, byte for byte" "ABSENT|yes|0" "$(tval)|$(yn same "$S" "$TMP/orig")|$(tstate)"
 new_home; printf '%s' "$PRETTY" >"$S"
 cwt on --compact-now --yes
 cw status
@@ -1015,12 +1015,12 @@ for src in startup resume clear compact; do
   new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
   cwt on --compact-now --yes
   runhook compact-now-release-start "{\"hook_event_name\":\"SessionStart\",\"source\":\"$src\"}"
-  eq "S9: a SessionStart ($src) puts the trigger back: exit 0, nothing on stdout, the file byte for byte, the record gone" "0|0|same|0" "$RC|$(nbytes "$OUT")|$(yn same "$S" "$TMP/orig")|$(tstate)"
+  eq "S9: a SessionStart ($src) puts the trigger back: exit 0, nothing on stdout, the file byte for byte, the record gone" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$S" "$TMP/orig")|$(tstate)"
 done
 new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
 cwt on --compact-now --yes
 runhook compact-now-release-precompact '{"hook_event_name":"PreCompact","trigger":"auto"}'
-eq "S9: a PreCompact (before the summary is written) puts it back: exit 0, nothing on stdout, the file byte for byte" "0|0|same|0" "$RC|$(nbytes "$OUT")|$(yn same "$S" "$TMP/orig")|$(tstate)"
+eq "S9: a PreCompact (before the summary is written) puts it back: exit 0, nothing on stdout, the file byte for byte" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$S" "$TMP/orig")|$(tstate)"
 runhook compact-now-release-start '{"hook_event_name":"SessionStart","source":"startup"}'
 eq "S9: a hook with nothing armed is a quiet no-op" "0|0|0" "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")"
 new_home; printf '%s' "$PRETTY" >"$S"

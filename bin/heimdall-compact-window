@@ -30,7 +30,7 @@ an expiry timer (a detached `watch` process; HEIMDALL_COMPACT_NOW_TTL_S seconds,
 running Claude Code is older than 2.1.329 or its version is unknown (read from CLAUDE_CODE_EXECPATH, the session's own binary, not the one on PATH; HEIMDALL_COMPACT_NOW_CC_VERSION is the test seam), or when
 automatic compaction is off (autoCompactEnabled false, DISABLE_AUTO_COMPACT or DISABLE_COMPACT). The person's yes is the window's, given once: the first `on --compact-now --yes` (or a yes at a terminal) is kept in
 $HEIMDALL_HOME/compact-window/compact-now.consent and covers the later ones; `revoke` forgets it and puts an armed trigger back. Every session that shares the settings file re-applies the override while it is
-armed, so another session that makes a request in that window compacts too: the window is as short as the hooks allow.
+armed, so another session, or a subagent still running in this one, that makes a request in that window compacts too: the window is as short as the hooks allow.
 
 WHAT IT WRITES. One key per command: `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000), with --bash-cap `bashOutputMaxChars` (a character count) or, with
 --compact-now, `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (a string, as every env value is), in the user-level settings.json of the agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. A symlink there is followed (the file it points to is edited and the link stays).
@@ -145,7 +145,7 @@ CAP = Lever(
 TRIGGER = Lever(
     key="CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", slot="trigger", what="the one-shot compaction trigger", unit="percent of the window", default=1, low=1, high=99,
     accepts="1", select=" --compact-now", value_flag="", infix="compact-now.",
-    cost="the agent compacts the conversation on its next request once it has reloaded the file (a threshold of {}% of the window); every session that shares this file and makes a request "
+    cost="the agent compacts the conversation on its next request once it has reloaded the file (a threshold of {}% of the window); every session that shares this file, and every subagent still running in this one, that makes a request "
          "meanwhile compacts too; hmd puts the file back when a compaction starts, on any session start, or when the minutes are up; needs Claude Code 2.1.329 or later",
     unset="not armed (`hmd compact-window on --compact-now` arms it for a few minutes, with your yes; /hmd:save does it)",
     live=lambda percent: "", env_var="CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", shadows=True, parent="env", quote=True, transient=True)
