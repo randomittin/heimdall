@@ -1660,7 +1660,13 @@ class RelayClient:
         return True
 
     def _remove_pairing_traces(self):
-        """What the pairing left that outlives a bind: the statusline's marker and the phone's record."""
+        """What the pairing left that outlives a bind: the status file's `paired`, the statusline's marker and the phone's record."""
+        # `paired` goes FIRST. To bin/lib/hmd_devices.py a live client that no record names and whose status file says `paired` is one older than the
+        # records (UPGRADE WHILE PAIRED), so from the removal of the record below until this process has exited -- milliseconds, or longer on a loaded
+        # machine -- any reader of the records would make one for it: a legacy record, which no revoke removes and which holds every push token in
+        # the store, so the next phone to be forgotten keeps its token. Written before anything goes, the status file never says it.
+        self.paired = False
+        self.write_status()
         self._remove_paired_marker()
         self._unmark_registered()  # an end the relay announced reaches here without a shutdown: no code of this client is registered any more
         self._forget_device()

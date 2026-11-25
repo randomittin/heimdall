@@ -20,6 +20,10 @@ what is marked or gone, and a client that got through anyway ends itself, revoki
       later, even when the connect's own client died a moment before (its supervisor was about to respawn it)
   X8  a SIGKILL of the laptop client mid-stream, with frames flowing: the supervisor resumes the SAME relay session (no re-pair), the phone keeps
       receiving, every seq after the kill is above every seq before it, and no (key, nonce) is reused
+  X9  a client that has torn its pairing down -- revoked, its device record removed -- and is still alive for a moment (its exit takes a while) is
+      not made a record again by a reader: `hmd_devices.py list` in that moment lists nothing, and leaves no record behind. A live client that no
+      record names and whose status file says `paired` is read as one older than the records, and a record is made for it -- a legacy one, which no
+      revoke removes and which holds every push token in the store: a disconnect of several phones left one record and one token behind
 """
 import json
 import os
@@ -57,6 +61,21 @@ with L._locked():
         L._write_meta(acct, dict(L._read_meta(acct), revoking=True))
     else:
         L._discard_unlocked(root, sid)
+'''
+DEVICES_LIB = os.path.join(LIB, "hmd_devices.py")
+# What keeps a client alive after its shutdown is done (X9): a sitecustomize its interpreter imports through PYTHONPATH and that sleeps at exit -- in
+# the relay client only; every other python the client starts ends at once. The moment in which a client is alive and has no record is a few
+# milliseconds on its own, and as long as this makes it for a test.
+TAIL = '''
+import atexit, os, sys, time
+
+
+def _tail():
+    if sys.argv and os.path.basename(sys.argv[0]) == "heimdall-relay-client":
+        time.sleep(float(os.environ.get("HMD_TEST_EXIT_TAIL_S", "0")))
+
+
+atexit.register(_tail)
 '''
 
 
@@ -101,7 +120,7 @@ def scenario_mark_before_any_revoke():
             return len(paths) == 2 and all(read_json(p).get("revoking") is True for p in paths)
 
         # what is proved is the ORDER -- every login is marked while the first relay revoke is still in flight (it takes 8 s) -- not a stopwatch on
-        # the disconnect's start (a few process starts: seconds on a loaded machine, and six scenarios now run at once): a disconnect that revokes first
+        # the disconnect's start (a few process starts: seconds on a loaded machine, and the scenarios now run at once): a disconnect that revokes first
         # is seen marked only after a revoke has returned, so `in_flight` fails it, whatever this bound is
         marked = H.wait_until(both_marked, 30.0, 0.1)
         in_flight = relay.revokes == []
@@ -155,6 +174,34 @@ def scenario_client_guard():
               alive and rc == 0 and not relay.sessions[sid3]["revoked"])
     finally:
         H.kill_leftovers(c1, c2, c3)
+        relay.close()
+        sb.drop()
+
+
+def scenario_no_ghost_record():
+    sb, relay = H.Sandbox(), H.Relay()
+    os.environ.update(HEIMDALL_HOME=sb.hh, HMD_SESSION_LOGIN_STORE="file")
+    c1 = None
+    try:
+        tail = os.path.join(sb.tmp, "tail")
+        os.makedirs(tail)
+        with open(os.path.join(tail, "sitecustomize.py"), "w", encoding="utf-8") as f:
+            f.write(TAIL)
+        # the client ends itself through its login guard, as in X2 -- and then takes ten seconds to exit
+        c1, sid, _k1 = H.bind_phone(sb, relay, tag="c1", HMD_SESSION_LOGIN_CHECK_S="0.3", PYTHONPATH=tail, HMD_TEST_EXIT_TAIL_S="10")
+        bound = len(sb.device_records()) == 1
+        mark(sb.repo, sid)
+        forgot = H.wait_until(lambda: not sb.device_records(), 30)  # the client has revoked and taken its own record out: what is left of it is its exit
+        listed = subprocess.run([sys.executable, DEVICES_LIB, "list", "--repo", sb.repo], env=sb.env(), capture_output=True, text=True, timeout=120)
+        alive = c1.proc.poll() is None  # still in its exit: the reader above did look at a live client that has no record
+        gone = H.wait_until(lambda: c1.proc.poll() is not None, 60)
+        left = [os.path.basename(p) for p in sb.device_records()]
+        check("X9", "a client that has torn its pairing down (revoked, its record removed) and is alive for a moment longer is not made a record again by "
+                    "a reader: `hmd_devices.py list` lists nothing then, and no record is left once the client has gone "
+                    "(bound %s, removed %s, alive %s, listed %r, gone %s, left %r)" % (bound, bool(forgot), alive, listed.stdout.strip(), bool(gone), left),
+              bound and bool(forgot) and alive and listed.returncode == 0 and listed.stdout.strip() == "[]" and bool(gone) and left == [])
+    finally:
+        H.kill_leftovers(c1)
         relay.close()
         sb.drop()
 
@@ -363,10 +410,10 @@ def scenario_midstream_kill():
 # The scenarios share nothing: each has its own sandbox (HOME, repo, HEIMDALL_HOME), its own loopback relay on a port the OS hands out, its
 # own processes (found by the name of its private temp directory) and its own clock -- and nearly all of their time goes to waiting (a slow
 # relay, a store lock held, five looks of a supervisor). Run one after another they took 126 s; so with no scenario named, main() runs
-# each in a process of its own, all six at once (pair_code_harness.report_children), and prints what each printed in the order they are
+# each in a process of its own, all at once (pair_code_harness.report_children), and prints what each printed in the order they are
 # declared, under one tally. A scenario whose process ends without a tally (killed, crashed) is one failed check that says so.
 SCENARIOS = (scenario_mark_before_any_revoke, scenario_client_guard, scenario_claim_rechecks, scenario_stack, scenario_nothing_survives,
-             scenario_midstream_kill)
+             scenario_midstream_kill, scenario_no_ghost_record)
 
 
 def main():

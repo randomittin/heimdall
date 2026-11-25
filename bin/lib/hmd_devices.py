@@ -38,6 +38,11 @@ hash of the client's pid and the bind time. The client never refreshes the recor
 and, while its client runs, every token in the store that no other record claims; and it is revoked with TERM (see `signal`), the one
 signal that client handles.
 
+A CLIENT THAT KEEPS RECORDS is never taken for one of those: when it ends it clears `paired` in the status file BEFORE it removes its record
+(bin/heimdall-relay-client, _remove_pairing_traces). A live client that no record names and whose status says `paired` reads as one older than the
+records, so a reader between that removal and the end of its process would make a record for it -- one that is never removed and that holds every
+push token in the store.
+
 A REVOKE IS FINAL. forget() removes the push tokens first -- the record is what names them, so tokens that cannot be removed leave it and
 the revoke is reported as failed, never as done -- and then the record. A legacy record is not removed but rewritten as a tombstone
 (`revoked`): it is made from files its client left, and a removed one would be made again for as long as that client runs or its files
