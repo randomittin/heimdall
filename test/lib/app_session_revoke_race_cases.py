@@ -8,7 +8,8 @@ in one hold of the store lock, before a window, a client or the relay is touched
 what is marked or gone, and a client that got through anyway ends itself, revoking its session, once its login is marked or gone.
   X1  `hmd app disconnect` marks EVERY login before the first relay call returns (the relay is slow): none is left unmarked, and so claimable,
       while an earlier one is being revoked
-  X2  a live client ends itself, and revokes its relay session, when its stored login is marked `revoking` (the stop that missed it)
+  X2  a live client ends itself, and revokes its relay session, when its stored login is marked `revoking` (the stop that missed it) -- and the
+      process outlives that revoke: a relay slow to answer it does not cut the client off before it has revoked and said `session_ended`
   X3  ... and when the login is gone (discarded, forgotten, deleted)
   X4  ... but not when the store merely cannot be read: an unreadable file is no reason to end a phone's session
   X5  a `--resume-only` client started BEFORE the mark / the forget never claims after it: it waits for the store lock, finds the login marked or
@@ -123,11 +124,21 @@ def scenario_client_guard():
     c1 = c2 = c3 = None
     try:
         c1, sid1, _k1 = H.bind_phone(sb, relay, tag="c1", **env)
+        # A relay that takes two seconds to answer the revoke, as a real one can: the client's state loop wakes within a quarter of a second of the
+        # stop, so a process that exits under its own revoke is caught on EVERY run here -- not only on a machine so loaded that the revoke's round
+        # trip is slower than that wake-up, which is where the same race showed up as a flake.
+        relay.revoke_delay = 2
         mark(sb.repo, sid1)
-        gone = H.wait_until(lambda: c1.proc.poll() is not None, 20)
-        ended = c1.event("session_ended", 2) or {}
-        check("X2", "a live client ends itself, and revokes its relay session, once its stored login is marked `revoking` (no signal sent)",
-              bool(gone) and c1.proc.poll() == 0 and relay.sessions[sid1]["revoked"] and ended.get("reason") == "local-disconnect")
+        # What is waited on is the client's own end -- an event, with a deadline far past the 0.3 s look -- never a fixed pause. A client that ends
+        # itself does it in order (revoke confirmed, `session_ended` printed, exit), so once it is gone every line it printed is in its output file.
+        gone = H.wait_until(lambda: c1.proc.poll() is not None, 60)
+        ended = next((e for e in c1.events() if e.get("event") == "session_ended"), {})
+        rc1, revoked = c1.proc.poll(), relay.sessions[sid1]["revoked"]
+        relay.revoke_delay = 0
+        check("X2", "a live client ends itself, and revokes its relay session, once its stored login is marked `revoking` (no signal sent) -- and "
+                    "the process outlives a slow revoke, so it has revoked and said `session_ended` by the time it exits "
+                    "(exit %s, revoked %s, session_ended %r)" % (rc1, revoked, ended.get("reason")),
+              bool(gone) and rc1 == 0 and revoked and ended.get("reason") == "local-disconnect")
         c2, sid2, _k2 = H.bind_phone(sb, relay, tag="c2", **env)
         os.remove(login_path(sb.logins(), sid2))
         gone = H.wait_until(lambda: c2.proc.poll() is not None, 20)
