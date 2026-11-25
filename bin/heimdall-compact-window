@@ -22,15 +22,18 @@ own, in this environment or in the "env" block of the settings file, is therefor
 (about 10,000 characters) is not governed by the cap. `off` undoes the window only and `off --bash-cap` the cap only, in either order.
 
 THE COMPACT-NOW TRIGGER (--compact-now). A third setting, a transient one, so /hmd:save can compact without the person pasting /compact (no command, skill or hook can run it). Claude Code re-applies
-the "env" block of settings.json to a running session when the file changes, reads CLAUDE_AUTOCOMPACT_PCT_OVERRIDE on every auto-compact check, and takes it back when no settings source supplies it any more
-(2.1.329 and later; the evidence is docs/analysis/2026-11-26-save-auto-compact.md). `on --compact-now` therefore adds env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "1" (a threshold of 1% of the window: the next
-request compacts), with the window's guarantees (a text-exact edit, a backup, a record; a value of the person's own is never replaced and --force is not accepted), and hmd puts it back by itself:
+the "env" block of a settings file to a running session when the file changes (the project's .claude/settings.local.json included, once the folder's trust was accepted), reads CLAUDE_AUTOCOMPACT_PCT_OVERRIDE on every auto-compact check,
+and takes it back when no settings source supplies it any more (2.1.329 and later; the evidence is docs/analysis/2026-11-26-save-auto-compact.md). `on --compact-now` therefore adds env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "1" (a threshold of 1%
+of the window: the next request compacts) to the PROJECT's .claude/settings.local.json and never to the user-level settings.json, which every Claude Code session on the machine, in any repository, reads. The project is $CLAUDE_PROJECT_DIR
+(Claude Code sets it for hooks), else the top of the git work tree the working directory is in. It has the window's guarantees (a text-exact edit, a backup, a record; a value of the person's own, in the environment or in a settings file the
+project's local one outranks, is never replaced and --force is not accepted), and hmd puts it back by itself:
 `release` (the hooks compact-now-release-start, on every SessionStart, and compact-now-release-precompact, which fires BEFORE the summary is written so the smaller context cannot compact again),
 an expiry timer (a detached `watch` process; HEIMDALL_COMPACT_NOW_TTL_S seconds, default 300), or `off --compact-now`. It is refused (exit 5, nothing written; the /compact line stays the way) when the
-running Claude Code is older than 2.1.329 or its version is unknown (read from CLAUDE_CODE_EXECPATH, the session's own binary, not the one on PATH; HEIMDALL_COMPACT_NOW_CC_VERSION is the test seam), or when
-automatic compaction is off (autoCompactEnabled false, DISABLE_AUTO_COMPACT or DISABLE_COMPACT). The person's yes is the window's, given once: the first `on --compact-now --yes` (or a yes at a terminal) is kept in
-$HEIMDALL_HOME/compact-window/compact-now.consent and covers the later ones; `revoke` forgets it and puts an armed trigger back. Every session that shares the settings file re-applies the override while it is
-armed, so another session, or a subagent still running in this one, that makes a request in that window compacts too: the window is as short as the hooks allow.
+running Claude Code is older than 2.1.329 or its version is unknown (read from CLAUDE_CODE_EXECPATH, the session's own binary, not the one on PATH; HEIMDALL_COMPACT_NOW_CC_VERSION is the test seam), when
+automatic compaction is off (autoCompactEnabled false in the project's local or shared settings or in the user-level one, DISABLE_AUTO_COMPACT or DISABLE_COMPACT), or when the project's file cannot carry it: there is no project, git tracks the file
+or cannot say (a tracked file is the repository's text, not the person's), a link is anywhere on the way to it, or it is not a plain file with one link. The person's yes is given per repository: the first `on --compact-now --yes` (or a yes at
+a terminal) in a project is kept in $HEIMDALL_HOME/compact-window/<id>.compact-now.consent (<id> a digest of the project's settings file, as for the records) and covers the later ones in THAT project only; `revoke`, run inside it, forgets it
+and puts every armed trigger back. Every session in the project, and every subagent still running in this one, that makes a request while it is armed compacts too; a session in another repository does not: the window is as short as the hooks allow.
 
 WHAT IT WRITES. One key per command: `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000), with --bash-cap `bashOutputMaxChars` (a character count) or, with
 --compact-now, `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (a string, as every env value is), in the user-level settings.json of the agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. A symlink there is followed (the file it points to is edited and the link stays).
