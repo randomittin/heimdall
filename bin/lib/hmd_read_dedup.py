@@ -50,12 +50,23 @@ The stub names itself and how to get the text back, and keeps the shape of the R
     unchanged since your earlier read of <path> (lines a-b); content is already in your context [hmd read-dedup stub: ...]
 
 THE OUTLINE. An unsliced Read (no offset, no limit) of a python or shell file of more than OUTLINE_MIN_LINES lines by a SUBAGENT is answered
-with its first OUTLINE_HEAD_LINES lines, a note and the file's outline (first line-last line, kind, name; at most OUTLINE_MAX_SYMBOLS):
-    <the first 100 lines>
-    [hmd read-outline: <path> has N lines; this Read shows lines 1-100 and an outline of the file, not the whole file. Read again with
-    offset/limit, or Read with limit 100000 for the whole file]
-    outline (lines kind name):
-    12-40 function parse_args
+with a one-line header, the file's outline ([L<first line>-<last line>] kind name: the symbol's REAL source lines; at most
+OUTLINE_MAX_SYMBOLS rows) and then the file's first OUTLINE_HEAD_LINES lines. What the model reads, for a capped outline (the header, 80
+rows and a count of the rest: 82 lines above line 1; the header is ONE line, wrapped here):
+     -81  [hmd read-outline: outline, not file content; Read with offset/limit or re-Read for full text. <path> has N lines. Lines
+          numbered 0 or below are the outline, [L<first>-<last>] being a symbol's real source lines; lines 1-100 are the file's own]
+     -80  [L12-40] function parse_args
+       0  +37 more symbols (Read a range to see them)
+       1  <line 1 of the file>
+     100  <line 100 of the file>
+NUMBERING. PROBED 2026-11-25 on Claude Code 2.1.332 (claude -p, a throwaway PostToolUse hook returning updatedToolOutput for a Read, the
+session transcript read back): Claude Code renders file.content as "<n><TAB><line>" for EVERY line, n counting up from file.startLine; a
+startLine of 0 and of -3 are honoured as they are, numLines is not used, and no shape leaves a line unnumbered. The first version put the
+rows after the head, where they came out numbered 101 and up: line numbers of the file that held no such lines, which can mislead a later
+Edit or Read range. So the outline goes ABOVE the head and startLine is 1 minus the lines above it: the head is numbered 1-100 exactly as
+in the file, every outline line is numbered 0 or below, which no line of a file is, and each row carries the real lines in its own text.
+hookSpecificOutput.additionalContext (unnumbered, its own attachment) is not used: the header has to travel with the head, and a second
+channel is a second way to lose the outline. A Read whose result does not start at line 1 is left alone, so "as in the file" always holds.
 The outline is what `bin/heimdall-graph outline` serves: the extractors of bin/lib/symbolgraph.py (python: ast; shell: its state machine),
 run on the one file in the payload instead of an index of the repository, which a hook with a 10 s budget cannot afford, and with no cache
 written. Nothing else is parsed: javascript needs tree-sitter, which a `python -S` hook cannot import, and the graph indexes no other
@@ -64,9 +75,10 @@ language. Never a trap, never a guess:
     before: a mark under a hash of the path, and the dedup record of the whole read, say so. The outlined read is not recorded as a read of
     the content, so the whole file that follows is the one the stub rule remembers;
   * not the main thread (4 Reads in 72 days there), not a slice, not a Read cut short (fewer lines returned than the file has: the outline
-    would miss the end), not a test file or a path under test/, tests/, __tests__/, evals/ or fixtures/ (a straight-line script has no
-    outline worth reading), not a file with under OUTLINE_MIN_SYMBOLS symbols, not a result that would be no shorter, not a language the
-    graph does not parse, not a file its parser cannot read; any error leaves the original output;
+    would miss the end), not a result that starts anywhere but line 1 (the head could not be numbered as in the file; all 47 unsliced Reads
+    of the newest local transcripts start there), not a test file or a path under test/, tests/, __tests__/, evals/ or fixtures/ (a
+    straight-line script has no outline worth reading), not a file with under OUTLINE_MIN_SYMBOLS symbols, not a result that would be no
+    shorter, not a language the graph does not parse, not a file its parser cannot read; any error leaves the original output;
   * the two behaviours are independent: HMD_READ_OUTLINE=off (also 0, false, no) turns the outline off, HMD_READ_DEDUP=on turns the stub on;
     the launcher starts no interpreter when the outline is off and the stub is not on. `hmd guardrails off read-dedup` turns the hook off.
 THRESHOLD, measured on the data of the analysis (171 subagent files of session 0e12831c: 1,853 Reads, 875 unsliced, 11.9M of 18.7M
@@ -141,8 +153,11 @@ CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f  ]+")
 
 STUB = ("unchanged since your earlier read of %s (lines %d-%d); content is already in your context "
         "[hmd read-dedup stub: Read the same range again to get the full text]")
-OUTLINE_NOTE = ("[hmd read-outline: %s has %d lines; this Read shows lines 1-%d and an outline of the file, not the whole file. "
-                "Read again with offset/limit, or Read with limit 100000 for the whole file]")
+OUTLINE_NOTE = ("[hmd read-outline: outline, not file content; Read with offset/limit or re-Read for full text. %s has %d lines. "
+                "Lines numbered 0 or below are the outline, [L<first>-<last>] being a symbol's real source lines; "
+                "lines 1-%d are the file's own]")
+OUTLINE_ROW = "[L%d-%d] %s %s"
+OUTLINE_MORE = "+%d more symbols (Read a range to see them)"
 
 
 def state_root():
@@ -426,22 +441,27 @@ def outline_rows(path, content):
 
 
 def outline_text(path, content, total, rows):
+    """(text, startLine) of the answer: the one-line header, the outline, then the file's first OUTLINE_HEAD_LINES lines.
+
+    Claude Code numbers every line of file.content from startLine and cannot be told to skip one (NUMBERING in the header of this file),
+    so the outline goes ABOVE the head and startLine is 1 minus the lines above it: the head is numbered from 1 as in the file, the
+    outline from below 0 up to 0, which no line of a file is. Every line above the head holds no newline (the path and each name lose
+    theirs in CONTROL_RE), or the count that startLine rests on would be wrong."""
     shown = CONTROL_RE.sub(" ", path).strip()[:MAX_SHOWN_PATH]
-    lines = ["\n".join(content.split("\n")[:OUTLINE_HEAD_LINES]), OUTLINE_NOTE % (shown, total, OUTLINE_HEAD_LINES),
-             "outline (lines kind name):"]
-    for first, last, kind, name in rows[:OUTLINE_MAX_SYMBOLS]:
-        lines.append("%d-%d %s %s" % (first, last, kind, CONTROL_RE.sub(" ", name)))
+    above = [OUTLINE_NOTE % (shown, total, OUTLINE_HEAD_LINES)]
+    above += [OUTLINE_ROW % (first, last, kind, CONTROL_RE.sub(" ", name)) for first, last, kind, name in rows[:OUTLINE_MAX_SYMBOLS]]
     if len(rows) > OUTLINE_MAX_SYMBOLS:
-        lines.append("+%d more symbols (Read a range to see them)" % (len(rows) - OUTLINE_MAX_SYMBOLS))
-    return "\n".join(lines)
+        above.append(OUTLINE_MORE % (len(rows) - OUTLINE_MAX_SYMBOLS))
+    return "\n".join(above + content.split("\n")[:OUTLINE_HEAD_LINES]), 1 - len(above)
 
 
 def outline_decide(read):
-    """The hook output for an unsliced Read of a big source file by a subagent: its head and outline. None lets the Read stand."""
+    """The hook output for an unsliced Read of a big source file by a subagent: its outline and head. None lets the Read stand."""
     body, path, content = read["body"], read["path"], read["content"]
-    total, count = body.get("totalLines"), body.get("numLines")
+    total, count, first_line = body.get("totalLines"), body.get("numLines"), body.get("startLine")
     if (not read["subagent"] or read["offset"] is not None or read["limit"] is not None or type(total) is not int
-            or type(count) is not int or total <= OUTLINE_MIN_LINES or count < total or skipped_path(path)):
+            or type(count) is not int or type(first_line) is not int or first_line != 1 or total <= OUTLINE_MIN_LINES
+            or count < total or skipped_path(path)):
         return None
     try:
         rows = outline_rows(path, content)
@@ -450,7 +470,7 @@ def outline_decide(read):
         return None
     if rows is None or len(rows) < OUTLINE_MIN_SYMBOLS:
         return None
-    text = outline_text(path, content, total, rows)
+    text, start = outline_text(path, content, total, rows)
     if len(text) >= len(content):
         return None
     key, mark = request_key(path, None, None), digest("outline\0" + path)
@@ -463,7 +483,7 @@ def outline_decide(read):
             return None  # this agent read the file whole before, or was shown its outline: the whole file is what it gets now
         entries[mark] = {"w": 1}
         commit(root, name, entries, first_of_agent)
-    return rewritten(read["response"], text)
+    return rewritten(read["response"], text, start)
 
 
 # -- the hook ------------------------------------------------------------------------------------------------------------------------
@@ -488,12 +508,13 @@ def stub_text(path, body, content):
     return STUB % (shown, start, start + count - 1)
 
 
-def rewritten(response, text):
-    """The Read result with `text` as its content, in the shape of the original: only content, numLines and startLine change."""
+def rewritten(response, text, start=1):
+    """The Read result with `text` as its content, in the shape of the original: only content, numLines and startLine change. Claude Code
+    numbers the lines of `text` from `start`."""
     shaped = json.loads(json.dumps(response))
     shaped["file"]["content"] = text
     shaped["file"]["numLines"] = text.count("\n") + 1
-    shaped["file"]["startLine"] = 1
+    shaped["file"]["startLine"] = start
     return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": shaped}}
 
 

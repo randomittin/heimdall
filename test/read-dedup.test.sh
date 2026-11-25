@@ -27,10 +27,13 @@
 #                    uses, and a rewind or branch (the newest entry no longer descends from the entry that carried the first read).
 #                    Prose that merely quotes a marker, a fork that is not a rewind and plain growth do not block it. A read whose
 #                    tool call cannot be found in the transcript is never stubbed.
-#   12  outline      an unsliced Read of a big (over 500 lines) python or shell file by a SUBAGENT is answered with its first 100
-#                    lines and its outline, once: the second plain Read gets the whole file and dedup takes over from there. Never
-#                    the main thread, a slice, a short file, another language, a test file, a Read cut short, a file with under 3
-#                    symbols. HMD_READ_OUTLINE=off turns the outline off; HMD_READ_DEDUP=off leaves it on.
+#   12  outline      an unsliced Read of a big (over 500 lines) python or shell file by a SUBAGENT is answered with its outline and its
+#                    first 100 lines, once: the second plain Read gets the whole file and dedup takes over from there. Claude Code
+#                    numbers EVERY line of file.content from startLine, so the outline is put ABOVE the head and startLine is set to
+#                    put the file's line 1 at 1: the head keeps its real numbers, every outline line is numbered 0 or below (no line of
+#                    a file is), and each row carries the symbol's real source lines ([L12-40]). Never the main thread, a slice, a
+#                    short file, another language, a test file, a Read cut short, a result that does not start at line 1, a file with
+#                    under 3 symbols. HMD_READ_OUTLINE=off turns the outline off; HMD_READ_DEDUP=off leaves it on.
 #   13  defaults     the STUB is opt-in (HMD_READ_DEDUP=on, also 1, true, yes; sections 2-12 run with it on) and the OUTLINE is on by
 #                    default (measured: 7.4% of subagent Read characters, 0.01% for identical re-reads); neither switch touches the other;
 #                    with the outline off and the stub not on nothing is recorded
@@ -385,6 +388,24 @@ outlined() {
     and (.hookSpecificOutput.updatedToolOutput.file.content | contains("[hmd read-outline:"))' >/dev/null 2>&1
 }
 out_content() { printf '%s' "$OUT" | jq -r '.hookSpecificOutput.updatedToolOutput.file.content'; }
+# RENDER -- the Read result in $OUT the way Claude Code 2.1.332 hands it to the model (probed 2026-11-25: a PostToolUse hook returned
+# updatedToolOutput, the session transcript was read back): every line of file.content becomes "<n><TAB><line>" with n counting up from
+# file.startLine; a startLine of 0 or below is honoured as it is, numLines is not used, nothing can be left unnumbered. One {n, v} a line.
+RENDER='.hookSpecificOutput.updatedToolOutput.file | .startLine as $s | (.content | split("\n")) | to_entries | map({n: ($s + .key), v: .value})'
+# numbered_true HEAD -- rendered, the file's first 100 lines (HEAD) are numbered 1-100 exactly as in the file, and every line above them
+# is numbered 0 or below with no gap, so no outline line can pass for a line of the file
+numbered_true() {
+  printf '%s' "$OUT" | jq -e --arg head "$1" "$RENDER"' | (map(select(.n >= 1)) | (map(.n) == [range(1; 101)]) and ((map(.v) | join("\n")) == $head))
+    and (map(select(.n < 1)) | length >= 2 and (map(.n) | max) == 0)' >/dev/null 2>&1
+}
+# real_rows SRCFILE DEF_AWK LAST_AWK -- reads an outline text on stdin and prints "<rows> <wrong>": a row "[L<first>-<last>] function <name>" is wrong
+# unless line <first> of SRCFILE is the symbol's opening (DEF_AWK, an awk expression over the name $3) and line <last> its end (LAST_AWK, over $2)
+real_rows() {
+  sed -n 's/^\[L\([0-9]*\)-\([0-9]*\)\] function \(.*\)$/\1 \2 \3/p' | awk -v src="$1" '
+    BEGIN { while ((getline l < src) > 0) L[++n] = l }
+    { rows++; if (!('"$2"' ) || !('"$3"')) wrong++ }
+    END { print rows + 0, wrong + 0 }'
+}
 BIGPY="/work/src/big.py"
 PYBIG="$(pybody 702)"                          # 117 functions
 SHBIG="$(shbody 12 50)"                        # 600 lines, 12 functions
@@ -395,16 +416,23 @@ reread o1 ag1 "$BIGPY" "$PYBIG"
 if [ "$RC" = 0 ] && outlined; then ok "an unsliced Read of a 702-line python file by a subagent is answered with its head and outline"
 else bad "an unsliced Read of a 702-line python file by a subagent is outlined" "rc=$RC out=$(printf '%.200s' "$OUT")"; fi
 C1="$(out_content)"
-case "$C1" in "$H100"*) ok "the head is the file's first 100 lines, verbatim" ;; *) bad "the head is the first 100 lines" "got: $(printf '%.120s' "$C1")" ;; esac
+case "$C1" in *"$H100") ok "the file's first 100 lines are verbatim and come last: the outline sits above them" ;; *) bad "the file's first 100 lines are verbatim and come last" "got: $(printf '%.160s' "$C1")" ;; esac
 case "$C1" in *"$L101"*) bad "line 101 is not in what the model gets" ;; *) ok "line 101 is not in what the model gets (the rest is reached with offset/limit)" ;; esac
-case "$C1" in *"[hmd read-outline: $BIGPY has 702 lines;"*"Read again with offset/limit, or Read with limit 100000 for the whole file]"*) ok "the note names the file and its length and says exactly how to get the whole text" ;;
-  *) bad "the note says how to get the whole text" "got: $C1" ;; esac
-case "$C1" in *"1-6 function fn_1"*"475-480 function fn_80"*"+37 more symbols"*) ok "the outline lists span, kind and name, capped at 80, the rest counted" ;; *) bad "the outline lists spans, kinds and names" "got: $C1" ;; esac
+case "$(printf '%s\n' "$C1" | head -n 1)" in "[hmd read-outline: outline, not file content; Read with offset/limit or re-Read for full text. $BIGPY has 702 lines"*"]")
+  ok "the first line is a one-line header: outline, not file content; how to get the full text; the file and its length" ;;
+  *) bad "the first line is the one-line header" "got: $(printf '%.300s' "$C1")" ;; esac
+[ "$(printf '%s\n' "$C1" | grep -c 'outline, not file content')" = 1 ] && ok "the header is said once: no other line repeats it" || bad "the header is said once" "got: $C1"
+case "$C1" in *"[L1-6] function fn_1"*"[L475-480] function fn_80"*"+37 more symbols"*) ok "the outline lists the real source lines, kind and name, capped at 80, the rest counted" ;; *) bad "the outline lists real lines, kinds and names" "got: $C1" ;; esac
 case "$C1" in *"fn_81"*) bad "nothing past the cap is listed" ;; *) ok "nothing past the cap is listed" ;; esac
-if printf '%s' "$OUT" | jq -e '.hookSpecificOutput.updatedToolOutput.file | .totalLines == 702 and .startLine == 1 and .filePath == "'"$BIGPY"'"
+printf '%s\n' "$PYBIG" > "$TMP/big.py.src"
+RR="$(printf '%s\n' "$C1" | real_rows "$TMP/big.py.src" 'L[$1] == "def " $3 "(x):"' 'L[$2] ~ /^    return y \+ /')"
+[ "$RR" = "80 0" ] && ok "every outline row carries the REAL lines of its symbol: line <first> of the file is its def, line <last> its end (80 rows checked)" || bad "outline rows carry the real source lines" "rows and wrong: $RR"
+if printf '%s' "$OUT" | jq -e '.hookSpecificOutput.updatedToolOutput.file | .totalLines == 702 and .startLine == -81 and .filePath == "'"$BIGPY"'"
     and (.content | length) < '"${#PYBIG}"' and .numLines == (.content | split("\n") | length)' >/dev/null 2>&1; then
-  ok "the Read result shape is kept: totalLines survives, numLines counts the lines now returned, and the text is shorter"
-else bad "the Read result shape is kept" "out=$(printf '%.300s' "$OUT")"; fi
+  ok "the Read result shape is kept: totalLines survives, numLines counts the lines now returned, the text is shorter, startLine is -81 (header, 80 rows, the count of the rest)"
+else bad "the Read result shape is kept, startLine = 1 - the lines above the head" "startLine=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.updatedToolOutput.file.startLine') out=$(printf '%.200s' "$OUT")"; fi
+numbered_true "$H100" && ok "as Claude Code numbers it: the file's first 100 lines are 1-100 as in the file, every outline line is 0 or below, so no outline row passes for a file line" \
+  || bad "rendered, the head is 1-100 and the outline 0 and below" "startLine=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.updatedToolOutput.file.startLine')"
 reread o1 ag1 "$BIGPY" "$PYBIG"
 passes_through && ok "the second plain Read of that file gets the whole file (an outline is never repeated: no trap)" || bad "the second plain Read gets the whole file" "out=$(printf '%.200s' "$OUT")"
 reread o1 ag1 "$BIGPY" "$PYBIG"
@@ -432,12 +460,22 @@ FEW="$(awk 'BEGIN { print "def a():\n    return 1\n\ndef b():\n    return 2"; fo
 reread o1 ag1 /work/src/flat.py "$FEW"
 passes_through && ok "a file with under 3 symbols has nothing to navigate by: it comes whole" || bad "a file with few symbols comes whole" "out=$(printf '%.200s' "$OUT")"
 reread o1 ag1 /work/bin/tool.sh "$SHBIG"
-if outlined; then case "$(out_content)" in *"1-50 function fn_1"*"551-600 function fn_12"*) ok "a 600-line shell file is outlined (the graph's shell extractor: kind function, true spans)" ;; *) bad "a shell file's outline" "got: $(out_content)" ;; esac
+if outlined; then
+  CSH="$(out_content)"
+  case "$CSH" in *"[L1-50] function fn_1"*"[L551-600] function fn_12"*) ok "a 600-line shell file is outlined (the graph's shell extractor: kind function, true spans)" ;; *) bad "a shell file's outline" "got: $CSH" ;; esac
+  printf '%s\n' "$SHBIG" > "$TMP/big.sh.src"
+  RS="$(printf '%s\n' "$CSH" | real_rows "$TMP/big.sh.src" 'L[$1] == $3 "() {"' 'L[$2] == "}"')"
+  [ "$RS" = "12 0" ] && ok "shell rows carry the real lines too: line <first> opens the function, line <last> is its closing brace (12 rows checked)" || bad "shell rows carry the real source lines" "rows and wrong: $RS"
+  numbered_true "$(printf '%s\n' "$SHBIG" | head -n 100)" && ok "with no 'more symbols' row (12 symbols) the numbering holds as well: file lines 1-100 as in the file, the outline 0 and below" \
+    || bad "uncapped outline: head 1-100, outline 0 and below" "startLine=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.updatedToolOutput.file.startLine')"
 else bad "a 600-line shell file is outlined" "out=$(printf '%.200s' "$OUT")"; fi
 reread o1 ag1 /work/bin/heimdall-tool "$(printf '#!/usr/bin/env bash\n%s' "$SHBIG")"
 outlined && ok "an extensionless executable is read as the graph reads it, by its shebang" || bad "a shebang file is outlined" "out=$(printf '%.200s' "$OUT")"
 reread o1 ag1 /work/bin/plain-tool "$SHBIG"
 passes_through && ok "an extensionless file with no shebang is not a language the graph knows: whole" || bad "no shebang, no outline" "out=$(printf '%.200s' "$OUT")"
+NOT_FROM_1="$(payload o1 ag1 /work/src/mid.py "$PYBIG" | jq -c '.tool_response.file.startLine = 7')"
+fire "$CMD_READ" "$NOT_FROM_1"
+passes_through && ok "an unsliced Read whose result does not start at line 1 is left alone (the head could not be numbered as in the file)" || bad "a result that does not start at line 1 is left alone" "out=$(printf '%.200s' "$OUT")"
 WHOLE=0
 reread o1 ag1 /work/src/cut.py "$PYBIG"
 passes_through && ok "a Read cut short (fewer lines returned than the file has) is left alone: the outline would miss the end" || bad "a cut Read is left alone" "out=$(printf '%.200s' "$OUT")"
