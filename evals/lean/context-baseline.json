@@ -1,17 +1,17 @@
 {
-  "digest": "1d9186bbe0dcb88f1f42d365c55dd1cf281983bd7d013cc92702e42cdf5c3ffb",
+  "digest": "eabf88436aa447268587c3205dae2710fd562e90ac737b0a7c22ec4233de976a",
   "info": {
     "git_trees": {
       "agents": "c38b8a6e3cb3c115de2a1688ffd5b41dc7d74e2a",
-      "commands": "88843b8ff3a5e09b21202bd67e49f3a5f6e61d1b",
-      "hooks": "e5058eb414a747b80838d5cbaa6f8bba410cef13",
+      "commands": "35806076db491d49d6d9f3942b15bccd38841223",
+      "hooks": "a6562c56766a71d60cc2c2b7f29688eb8ceaa901",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
       "skills": "08948eb622334057b5d11e9393d21255656207de"
     },
-    "recorded_utc": "2026-11-25T20:20:51Z",
+    "recorded_utc": "2026-11-25T21:07:33Z",
     "summary": {
       "agents": 17,
-      "bytes": 658073,
+      "bytes": 659674,
       "commands": 20,
       "hooks_run": 17,
       "hooks_skipped": 8,
@@ -300,12 +300,12 @@
         "sha256": "1e34d9650393650114b5a90ca45734856ab289fbb55187fdd4031b096ed723a6"
       },
       "commands/save.md": {
-        "bytes": 17179,
+        "bytes": 18780,
         "frontmatter": {
-          "bytes": 562,
-          "sha256": "537d2919f02356e6fab4edfacf93f429619e8e578590ecc9f83444b40524f0bf"
+          "bytes": 624,
+          "sha256": "6331e085426e887310c008971ca419049c5760fb244541ab0ebbf872681355ed"
         },
-        "sha256": "226df2cb7973b524c8c00896437600558ad0e72ecb2d657db0c2acd2bd9ac674"
+        "sha256": "14a3410ec3fd8df74fe393ecf84cfce91270f36fc63ad69cc27e5b316e6f4288"
       },
       "commands/status.md": {
         "bytes": 1474,
