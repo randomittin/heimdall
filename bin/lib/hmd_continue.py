@@ -451,7 +451,7 @@ def cmd_write(args):
     else:
         say("[heimdall-continue] it is re-injected once, after the first compaction within %d min" % window)
     line = focus_line(note)
-    say("[heimdall-continue] paste to compact with the thread kept; ignore to just save (only you can run /compact):")
+    say("[heimdall-continue] paste to compact with the thread kept; ignore to just save (%d of %d chars; only you can run /compact):" % (len(line), LINE_CAP))
     say(line)
     return PARTIAL if problems or (holds and window) else OK
 
