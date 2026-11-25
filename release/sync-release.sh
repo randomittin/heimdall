@@ -2,7 +2,7 @@
 #
 # sync-release.sh — sync the Heimdall release artifacts to one tag.
 #
-#   release/sync-release.sh <TAG> [--dry]
+#   release/sync-release.sh <TAG> [--dry] [--no-site-commit]
 #
 # One tag in, five artifacts re-pointed/re-rendered so they resolve to
 # byte-identical install.sh bytes (and a byte-identical README):
@@ -22,7 +22,11 @@
 #                 randomittin/heimdall-site repo — bumped, committed, and pushed
 #                 in lockstep so the vanity URL never drifts to a stale tag; a
 #                 missing site checkout WARNs, never fails the release. See
-#                 release/HOSTING.md and test/ship-netlify.test.sh)
+#                 release/HOSTING.md and test/ship-netlify.test.sh). release/ship.sh
+#                 passes --no-site-commit: netlify.toml is still rewritten, but its
+#                 commit and push move to ship.sh, which makes them once the Release
+#                 is live, in ONE commit with the site's version pins and install.sh
+#                 sha256 (ship.sh release_site_pins).
 #
 # install-ux v2 guarantee: the redirect and the npx wrapper MUST resolve to
 # byte-identical scripts. This script ASSERTS that itself — it computes the
@@ -57,9 +61,11 @@ RAW_BASE="https://raw.githubusercontent.com/${REPO_PATH}"
 # ── Args ─────────────────────────────────────────────────────────────────────
 TAG=""
 DRY=0
+SITE_COMMIT=1
 for arg in "$@"; do
   case "$arg" in
     --dry|--dry-run) DRY=1 ;;
+    --no-site-commit) SITE_COMMIT=0 ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -73,7 +79,7 @@ for arg in "$@"; do
 done
 
 if [ -z "$TAG" ]; then
-  echo "usage: release/sync-release.sh <TAG> [--dry]" >&2
+  echo "usage: release/sync-release.sh <TAG> [--dry] [--no-site-commit]" >&2
   exit 2
 fi
 
@@ -356,7 +362,9 @@ else
   # only. Idempotent: an unchanged file -> no commit. The commit is PATH-SCOPED to
   # netlify.toml so we never bundle the site owner's OTHER staged work; a push
   # failure (offline / no creds) WARNs with the manual command, it does NOT die.
-  if [ "$DRY" -eq 0 ]; then
+  if [ "$DRY" -eq 0 ] && [ "$SITE_COMMIT" -eq 0 ]; then
+    echo "  = netlify.toml rewritten, NOT committed (--no-site-commit): release/ship.sh commits it with the site's version pins once the Release is live"
+  elif [ "$DRY" -eq 0 ]; then
     if ! git -C "$SITE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
       echo "  ! $SITE_DIR is not a git repo — bumped the file but cannot commit/push it" >&2
       netlify_manual_hint
