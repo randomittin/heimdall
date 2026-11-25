@@ -1,20 +1,20 @@
 {
-  "digest": "5c2aa11d39d99aa316693e16f0366cc22465e23065ed0113d1f1084c52af3fd5",
+  "digest": "1d9186bbe0dcb88f1f42d365c55dd1cf281983bd7d013cc92702e42cdf5c3ffb",
   "info": {
     "git_trees": {
       "agents": "c38b8a6e3cb3c115de2a1688ffd5b41dc7d74e2a",
-      "commands": "91abc6e2f76f63027c1183e8e5f30122ae3845dc",
-      "hooks": "9a67c6b81bfc2f9ff64f36516ab5beed2cb301a6",
+      "commands": "88843b8ff3a5e09b21202bd67e49f3a5f6e61d1b",
+      "hooks": "e5058eb414a747b80838d5cbaa6f8bba410cef13",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
       "skills": "08948eb622334057b5d11e9393d21255656207de"
     },
-    "recorded_utc": "2026-11-25T06:24:48Z",
+    "recorded_utc": "2026-11-25T20:20:51Z",
     "summary": {
       "agents": 17,
-      "bytes": 654242,
+      "bytes": 658073,
       "commands": 20,
       "hooks_run": 17,
-      "hooks_skipped": 7,
+      "hooks_skipped": 8,
       "skill_files": 37
     },
     "tool": "bin/lib/lean_context_parity.py"
@@ -300,12 +300,12 @@
         "sha256": "1e34d9650393650114b5a90ca45734856ab289fbb55187fdd4031b096ed723a6"
       },
       "commands/save.md": {
-        "bytes": 13348,
+        "bytes": 17179,
         "frontmatter": {
-          "bytes": 458,
-          "sha256": "f10f4846efe8df3542f8aaaaacabd71296f2a78961d328830e79dffc9f8cbb13"
+          "bytes": 562,
+          "sha256": "537d2919f02356e6fab4edfacf93f429619e8e578590ecc9f83444b40524f0bf"
         },
-        "sha256": "186b917d934f95c12b5c4b937700f5886821d5b2d1c2e3131742e9e9a63bb5a8"
+        "sha256": "226df2cb7973b524c8c00896437600558ad0e72ecb2d657db0c2acd2bd9ac674"
       },
       "commands/status.md": {
         "bytes": 1474,
@@ -664,6 +664,13 @@
         "run": false,
         "skipped": "prunes agent worktrees from a detached process"
       },
+      "SessionStart/17-compact-now-release-start": {
+        "command_sha256": "e27fa4cdfd11a5fcb445577b3d7f423f2ea9c1843052c95354c173f88c292032",
+        "id": "compact-now-release-start",
+        "matcher": null,
+        "run": false,
+        "skipped": "not vetted for sandbox execution"
+      },
       "UserPromptSubmit/00-parallel-gate": {
         "command_sha256": "c871d149072927f291c1913d2f3eb87f079d0f7bd6665fa30fc2a61e1eb43388",
         "exit": 0,
@@ -744,19 +751,19 @@
     },
     "hooks_json": {
       "hooks/hooks.json": {
-        "bytes": 40286,
+        "bytes": 41425,
         "events": {
           "PostToolUse": 8,
           "PostToolUseFailure": 1,
-          "PreCompact": 1,
+          "PreCompact": 2,
           "PreToolUse": 11,
           "SessionEnd": 3,
-          "SessionStart": 17,
+          "SessionStart": 18,
           "Stop": 7,
           "SubagentStop": 4,
           "UserPromptSubmit": 7
         },
-        "sha256": "68e5284030914d286998416cc3534df124ee650d609151ff7a29dad991a6d3c8"
+        "sha256": "5ae1781f925a77e8dd8ecfa887c56a6ffe944edbf9e7655fef0245c74829c4f0"
       }
     },
     "settings": {

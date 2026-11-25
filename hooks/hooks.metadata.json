@@ -442,6 +442,16 @@
       "remote_toggle": false
     },
     {
+      "event": "SessionStart",
+      "index": 17,
+      "id": "compact-now-release-start",
+      "description": "Puts back the one-shot compaction trigger /hmd:save arms (bin/heimdall-compact-window on --compact-now: env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE in the user-level settings.json) on any session start, whatever the source, so an arming that never produced a compaction cannot outlive its session. Runs heimdall-compact-window release only when an arming record exists under $HEIMDALL_HOME/compact-window (one ls otherwise); stdout and stderr cut off (a SessionStart hook's stdout reaches the model); a value the person changed meanwhile is left alone. Disabling it leaves the PreCompact release and the expiry timer as the ways back.",
+      "matcher": "",
+      "fingerprint": "c5ed88bb0bbd5975ba6d4e7c0f378925f5f258660e4b27064012fa9efdaabafa",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "SubagentStop",
       "index": 0,
       "id": "subagent-metric",
@@ -588,6 +598,16 @@
       "description": "Auto-checkpoint .planning/CHECKPOINT.md before compaction rewrites context (fail-open, stdout suppressed)",
       "matcher": "",
       "fingerprint": "11b64790a32cf076d9b5525a789ccc9630f0c59c1c31ce476a3565b9a719753c",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
+      "event": "PreCompact",
+      "index": 1,
+      "id": "compact-now-release-precompact",
+      "description": "Puts back the one-shot compaction trigger the moment a compaction starts, BEFORE the summary is written, so the smaller context cannot compact again and the other sessions that share the settings file stop re-applying it. Same command and guarantees as compact-now-release-start (one ls when nothing is armed, silent, fail-open). Disabling it leaves the SessionStart release and the expiry timer as the ways back.",
+      "matcher": "",
+      "fingerprint": "1876a7dc3e38b0915eb695a9d56f6e190eae572afb60b8f3f80ed7133163d65b",
       "locked": false,
       "remote_toggle": false
     }

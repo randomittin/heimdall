@@ -3,17 +3,24 @@ r"""heimdall-continue -- the handoff half of /hmd:save: write the handoff, print
 
 WHY. No skill, command or hook can run /compact or /clear: only the user types them. PreCompact cannot inject context. SessionStart with
 source "compact" can (hookSpecificOutput.additionalContext). So "compact, then carry on with full context" is three jobs, and this tool does the
-two that are not the user's: it WRITES a handoff before the compaction and INJECTS it after. The third, typing the line, stays with the user.
+two that are not the user's: it WRITES a handoff before the compaction and INJECTS it after. The third, typing the line, stays with the user, with one way round it: `write` ARMS
+Claude Code's own auto-compact (bin/heimdall-compact-window on --compact-now: a transient, consented change to the env block of the user-level settings.json that makes the next
+request compact, put back by the PreCompact and SessionStart hooks, an expiry timer or `off`; the evidence is docs/analysis/2026-11-26-save-auto-compact.md), and the line stays
+as the fallback for everything that cannot be armed (no yes yet, a Claude Code older than 2.1.329, automatic compaction off, a value of the person's own in the way).
 
 WHO CALLS IT. /hmd:save (commands/save.md) is the one command that calls `write`: its save and its handoff are one move, so this is the single code path
 that writes CHECKPOINT.md's measured block and CONTINUE.md. /hmd:continue is a deprecated alias of /hmd:save and never calls this tool itself.
 
 Usage:
-  heimdall-continue write  [--repo DIR]
+  heimdall-continue write  [--repo DIR] [--no-compact]
         the note on stdin. Records the next step and the gated items through the existing notes seam (`heimdall-checkpoint note`), takes a fresh
         checkpoint (`heimdall-checkpoint write`, the existing writer), writes .planning/CONTINUE.md (the note + the checkpoint's "What must never be
         lost" block as it stood) and prints ONE ready-to-paste line, `/compact <focus>`, as the LAST line of stdout. The line is under 1500 chars
         however much state it is given: decisions are dropped first, then agents, then gated items; the next step is kept whole.
+        Inside a Claude Code session (CLAUDE_CODE_SESSION_ID) it then also tries to ARM the compaction (above), so the person pastes nothing: only when the
+        checkpoint was saved and the handoff will be re-injected (compacting without it would lose the thread), and never with --no-compact. Arming
+        is best-effort and changes neither the exit status nor the last line: a missing yes, an old build, automatic compaction off, a value of the person's own
+        all say why on stderr and leave the line as the way.
   heimdall-continue focus
         the note on stdin; prints the `/compact <focus>` line and nothing else (no checkpoint, nothing written).
   heimdall-continue inject [--repo DIR] [--source S]
@@ -88,6 +95,8 @@ GIT_BUDGET_S = 5  # how long `git ls-files` may take before the handoff is refus
 LINE_CAP = 1500  # chars of the pasted line, "/compact " included
 INJECT_CAP = 9000  # chars of additionalContext (the harness caps hook context at 10000)
 DEFAULT_WINDOW_MIN = 30
+CW_NAME = "heimdall-compact-window"  # the tool that arms Claude Code's own auto-compact (a sibling of this launcher's bin directory)
+CW_BUDGET_S = 30  # `on --compact-now` may ask the session's binary for its version (10 s) and start the expiry timer
 SKEW_S = 120  # a clock this far ahead still reads as now; further is a planted date
 MAX_FILE = 1 << 20
 MAX_NOTE = 1 << 16
@@ -421,6 +430,28 @@ def cmd_focus(args):
     return OK
 
 
+def arm_compaction(root):
+    """Ask bin/heimdall-compact-window to arm Claude Code's own auto-compact (the transient `on --compact-now` change, put back by itself) so the person pastes nothing. True when it is armed. Says
+    what happened: on stdout when armed, on stderr when not, with the exact command to run when the only thing missing is the person's yes."""
+    tool = sibling(CW_NAME)
+    if tool is None:
+        warn("[heimdall-continue] auto-compact not armed: bin/%s was not found beside this tool; the /compact line below is the way" % CW_NAME)
+        return False
+    rc, out, err = run([tool, "on", "--compact-now"], root, CW_BUDGET_S)
+    if rc == 0:
+        said = [ln.strip() for ln in out.split("\n") if ln.strip()]
+        say("[heimdall-continue] auto-compact armed: Claude Code compacts on its next request and the handoff comes back by itself")
+        if said:
+            say("[heimdall-continue] %s" % clean(said[-1], 400))
+        return True
+    if rc == 3:
+        warn("[heimdall-continue] auto-compact NOT armed: it needs the person's yes once (it adds env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE to ~/.claude/settings.json for a few minutes and puts "
+             "it back by itself). Ask them; on yes run `%s on --compact-now --yes`, which arms it now and is never asked again. Until then the /compact line below is the way" % tool)
+        return False
+    warn("[heimdall-continue] auto-compact not armed (%s); the /compact line below is the way" % (last_line(err) or "exit %d" % rc))
+    return False
+
+
 def cmd_write(args):
     note = parse_note(read_note_text())
     root = repo_root(args.repo)
@@ -450,8 +481,18 @@ def cmd_write(args):
              % ("; ".join(holds), REL, NAME))
     else:
         say("[heimdall-continue] it is re-injected once, after the first compaction within %d min" % window)
+    armed = False
+    if args.no_compact or not os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        pass   # asked to only save, or not inside a Claude Code session: there is nothing to compact
+    elif problems or holds or window == 0:
+        warn("[heimdall-continue] auto-compact NOT armed: the handoff would not come back after the compaction (see above); the /compact line below is the way, and the call is yours")
+    else:
+        armed = arm_compaction(root)
     line = focus_line(note)
-    say("[heimdall-continue] paste to compact with the thread kept; ignore to just save (%d of %d chars; only you can run /compact):" % (len(line), LINE_CAP))
+    if armed:
+        say("[heimdall-continue] auto-compact is armed; if it has not started, paste to compact with the thread kept (%d of %d chars; only you can run /compact):" % (len(line), LINE_CAP))
+    else:
+        say("[heimdall-continue] paste to compact with the thread kept; ignore to just save (%d of %d chars; only you can run /compact):" % (len(line), LINE_CAP))
     say(line)
     return PARTIAL if problems or (holds and window) else OK
 
@@ -540,6 +581,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="action", required=True)
     wr = sub.add_parser("write", help="the note on stdin: checkpoint, write .planning/CONTINUE.md, print ONE /compact line")
     wr.add_argument("--repo", default="", help="the project dir (default: $CLAUDE_PROJECT_DIR, else the cwd)")
+    wr.add_argument("--no-compact", action="store_true", help="only save: do not arm Claude Code's auto-compact (the /compact line is still printed)")
     sub.add_parser("focus", help="the note on stdin: print the /compact line only")
     inj = sub.add_parser("inject", help="the SessionStart(compact) side: print the hook JSON for a fresh, unconsumed handoff that /hmd:save wrote here and git does not track")
     inj.add_argument("--repo", default="", help="the project dir (default: $CLAUDE_PROJECT_DIR, else the cwd)")
