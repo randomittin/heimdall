@@ -13,6 +13,6 @@ disable-model-invocation: true
 1. **First, print exactly this one-line notice:**
    `'/hmd:continue' is now '/hmd:save' — same behavior. Please switch.`
 
-2. Then do exactly what `/hmd:save` does: invoke the `hmd:save` skill with the Skill tool and follow it to its last output, the `/compact` line. This file has no steps and no tool call of its own, so one code path writes CHECKPOINT.md and CONTINUE.md.
+2. Then do exactly what `/hmd:save` does: run `/hmd:save`, or follow `commands/save.md` step by step, through to its last output, the `/compact` line. This file has no steps and no tool call of its own, so one code path writes CHECKPOINT.md and CONTINUE.md.
 
 Going forward, use `/hmd:save`.

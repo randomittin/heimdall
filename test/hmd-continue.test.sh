@@ -9,8 +9,8 @@
 # context, and SessionStart with source "compact" CAN (hookSpecificOutput.additionalContext). So the
 # feature is the parts below, and this file grades each head-on:
 #   1. THE COMMAND  commands/save.md is the one command (valid, calls bin/heimdall-continue write ONCE, after the files it writes and before
-#                   the git commit, keeps the handoff out of git); commands/continue.md is a thin alias with no steps or tool call of
-#                   its own, so a single code path writes CHECKPOINT.md and CONTINUE.md.
+#                   the git commit, which stages the whole repo from any directory but keeps the handoff out of git); commands/continue.md
+#                   is a thin alias with no steps or tool call of its own, so a single code path writes CHECKPOINT.md and CONTINUE.md.
 #   2. THE LINE     `heimdall-continue focus` prints ONE `/compact <focus>` line that carries the next
 #                   step and stays under the cap, however much state it is given.
 #   3. THE WRITE    `heimdall-continue write` takes a fresh checkpoint (the existing writer), records the
@@ -162,10 +162,29 @@ if [ "$(grep -cF 'bin/heimdall-continue" write' "$CMD" 2>/dev/null)" = "1" ] && 
 else
   bad "1f. the heimdall-continue write call is missing, repeated, or out of order (checkpoint section line '$L_CKPT', call '$L_WRITE', commit '$L_COMMIT')"
 fi
-if grep -qF "':!.planning/CONTINUE.md'" "$CMD" 2>/dev/null; then
-  ok "1g. the git checkpoint leaves .planning/CONTINUE.md out of the commit (a handoff git tracks is never re-injected)"
+# 1g. THE GIT CHECKPOINT, as the command writes it: the `git add` line taken out of commands/save.md and run as written from a SUBDIRECTORY of a scratch
+# repo (a save is often made from where the session sits, not from the repo root). It must stage the WHOLE repo (an edit at the root, a deletion and a new
+# file in a sibling directory) and leave only the handoff out: git must not track .planning/CONTINUE.md, or it is never re-injected.
+PG="$(mk_project stagepath)"
+mkdir -p "$PG/sub" "$PG/other"
+printf 'v1\n' > "$PG/sub/in.txt"
+printf 'v1\n' > "$PG/other/gone.txt"
+git -C "$PG" add sub/in.txt other/gone.txt && git -C "$PG" commit -qm "seed" --no-verify
+printf 'v2\n' > "$PG/README.md"
+rm "$PG/other/gone.txt"
+printf 'new\n' > "$PG/other/new.txt"
+printf 'ckpt\n' > "$PG/.planning/CHECKPOINT.md"
+printf 'handoff\n' > "$PG/.planning/CONTINUE.md"
+STAGE_CALL="$(grep -m1 '^git add ' "$CMD" | sed 's/ && git commit.*//')"
+( cd "$PG/sub" && bash -c "$STAGE_CALL" ) >"$TMPROOT/gout" 2>"$TMPROOT/gerr"; rc=$?
+GST="$(git -C "$PG" status --porcelain -uall)"
+if [ -n "$STAGE_CALL" ] && [ "$rc" = "0" ] \
+   && printf '%s\n' "$GST" | grep -qxF 'M  README.md' && printf '%s\n' "$GST" | grep -qxF 'D  other/gone.txt' \
+   && printf '%s\n' "$GST" | grep -qxF 'A  other/new.txt' && printf '%s\n' "$GST" | grep -qxF 'A  .planning/CHECKPOINT.md' \
+   && printf '%s\n' "$GST" | grep -qxF '?? .planning/CONTINUE.md'; then
+  ok "1g. the git checkpoint, run from a subdirectory, stages the whole repo (an edit, a deletion and a new file outside it, the rest of .planning/) and leaves .planning/CONTINUE.md out"
 else
-  bad "1g. the git checkpoint can stage .planning/CONTINUE.md: add the ':!.planning/CONTINUE.md' pathspec"
+  bad "1g. the git checkpoint did not stage the whole repo minus the handoff (rc=$rc, call found: $([ -n "$STAGE_CALL" ] && echo yes || echo no)): $(head -c 200 "$TMPROOT/gerr") / $(printf '%s' "$GST" | tr '\n' '|')"
 fi
 CALLERS="$(grep -lF 'bin/heimdall-continue' "$REPO"/commands/*.md 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')"
 if [ "$CALLERS" = "save.md " ]; then
@@ -180,11 +199,12 @@ if [ -f "$ALIAS" ] && [ "$(sed -n 1p "$ALIAS")" = "---" ] && [ "$(sed -n 2p "$AL
 else
   bad "1i. commands/continue.md is missing or its frontmatter is not --- / name: continue / description: Deprecated alias for /hmd:save ... / disable-model-invocation: true / ---"
 fi
-if grep -qF "'/hmd:continue' is now '/hmd:save'" "$ALIAS" 2>/dev/null && grep -qF 'Skill tool' "$ALIAS" 2>/dev/null && grep -qF 'hmd:save' "$ALIAS" 2>/dev/null \
+if grep -qF "'/hmd:continue' is now '/hmd:save'" "$ALIAS" 2>/dev/null && grep -qF 'run `/hmd:save`' "$ALIAS" 2>/dev/null && grep -qF 'follow `commands/save.md`' "$ALIAS" 2>/dev/null \
+   && ! grep -qiE 'skill tool|hmd:save.{0,2} skill' "$ALIAS" 2>/dev/null \
    && ! grep -qE 'heimdall-(continue|checkpoint)|HMD_NOTE' "$ALIAS" 2>/dev/null; then
-  ok "1j. the alias prints the one-line rename notice and hands over to /hmd:save through the Skill tool: no steps, no tool call, no second copy of the logic"
+  ok "1j. the alias prints the one-line rename notice and hands over to /hmd:save as the plugin command it is (run /hmd:save, or follow commands/save.md), not as a 'skill' called through the Skill tool: no steps, no tool call, no second copy of the logic"
 else
-  bad "1j. commands/continue.md lacks the rename notice / the hand-over to hmd:save, or still carries steps or a tool call of its own"
+  bad "1j. commands/continue.md lacks the rename notice / the hand-over to /hmd:save (run /hmd:save, or follow commands/save.md), still calls it a skill or names the Skill tool, or carries steps or a tool call of its own"
 fi
 if [ -x "$CONT" ] && [ -f "$REPO/bin/lib/hmd_continue.py" ] && bash -n "$CONT" 2>/dev/null \
    && python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$REPO/bin/lib/hmd_continue.py" 2>/dev/null; then
@@ -386,11 +406,14 @@ else
   bad "3m. a tracked handoff was not reported at write time (rc=$rc): $(head -c 300 "$TMPROOT/ierr0")"
 fi
 
-# the one line before the /compact line says what pasting it does (and that ignoring it just saves)
-if [ "$(tail -n 2 "$TMPROOT/wout" | sed -n 1p)" != "" ] && tail -n 2 "$TMPROOT/wout" | sed -n 1p | grep -qF 'paste to compact with the thread kept; ignore to just save'; then
-  ok "3n. the line printed right before the /compact line says: paste to compact with the thread kept; ignore to just save"
+# the one line before the /compact line says what pasting it does (and that ignoring it just saves) and how long the line is against its cap
+# (WLINE is the /compact line 3f took off stdout, so the count here is measured by the shell, not echoed back from the tool)
+EXPL="$(tail -n 2 "$TMPROOT/wout" | sed -n 1p)"
+if [ -n "$EXPL" ] && printf '%s\n' "$EXPL" | grep -qF 'paste to compact with the thread kept; ignore to just save' \
+   && printf '%s\n' "$EXPL" | grep -qF "${#WLINE} of 1500 chars"; then
+  ok "3n. the line printed right before the /compact line says: paste to compact with the thread kept; ignore to just save, and gives the line's size: ${#WLINE} of 1500 chars"
 else
-  bad "3n. the line before the /compact line is not the one-line explanation: $(tail -n 2 "$TMPROOT/wout" | sed -n 1p)"
+  bad "3n. the line before the /compact line is not the one-line explanation with the line's size (want '${#WLINE} of 1500 chars'): $EXPL"
 fi
 
 # THE /hmd:save PATH, as the command writes it: the very tool call commands/save.md tells the model to make, taken out of that file and run as written
