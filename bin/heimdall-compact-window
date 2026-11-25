@@ -39,7 +39,9 @@ on      back up the settings file ($HEIMDALL_HOME/compact-window/<id>.settings.j
 off     put the key back as hmd found it, in the settings file of this environment: removed when it was absent (the file removed when hmd created it), the old value
         when --force had replaced one. When the file is still byte-for-byte what hmd wrote and the other setting is not also set in it by hmd, the backup is restored verbatim; when
         something else changed the file since, or the other setting is still there (the backup also holds that setting's earlier state), only the key is reverted and the rest is
-        kept: the key is cut out exactly as it was added, so the last `off` leaves the file as it was before either. A value that is no longer the one hmd wrote is the person's
+        kept: the key is cut out exactly as it was added, so the last `off` leaves the file as it was before either. A file hmd created is removed by the last `off`, whichever of the two
+        settings made it (the record of the one set second says so too, while the file is still what the first made alone), when nothing but that key is left in it, byte for byte: a file
+        the person made or changed stays, with what is theirs. A value that is no longer the one hmd wrote is the person's
         by now: exit 4 unless --force. Without a record for this settings file there is nothing to undo here; any other settings file hmd set the key in is named, to be undone
         with its own CLAUDE_CONFIG_DIR.
 offer   the one-time question install and update ask at a terminal about the window: nothing is printed, read or written without a terminal on stdin and stdout, a setting that is
@@ -211,6 +213,12 @@ def remove(path):
         os.unlink(path)
 
 
+def new_file(key, value):
+    """The text of the settings file hmd creates when there is none: the one key, indented two spaces, a newline at the end. `off` compares a file with it before it removes one: a file
+    that is nothing but this key, byte for byte, holds nothing of anybody else's."""
+    return '{\n  "%s": %s\n}\n' % (key, value)
+
+
 class Doc:
     """One settings.json, read once: its text, and where each top-level member sits in it (character spans), so an edit changes nothing but the one key `key`."""
 
@@ -268,7 +276,7 @@ class Doc:
     def with_key(self, value):
         """The text with the key set to `value` (its JSON text): replaced where it is, else added as the last member in the layout the file already has."""
         if self.text is None:
-            return '{\n  "%s": %s\n}\n' % (self.key, value)
+            return new_file(self.key, value)
         found = self.member
         if found is not None:
             return self.text[:found[3]] + value + self.text[found[4]:]
@@ -402,6 +410,27 @@ def forget(lever, settings):
         remove(path)
 
 
+def file_created(record):
+    """Whether hmd made the settings file the record describes: the record says so itself (file_created); one written before records did made it when the file was not there."""
+    return record.get("file_created", not record["had_file"])
+
+
+def file_still_hmds(lever, doc):
+    """Whether the file `doc` read is one hmd made, through the other lever, and nobody has touched since: that lever's record says hmd made it and the file is still exactly what that
+    lever alone makes. The record of `lever`, written now, carries it (file_created), so whichever of the two comes off last removes the file: its own record could only say "the file was
+    there" (hmd made it a moment before). A record that cannot be used says nothing, and never holds `on` back."""
+    for other in LEVERS:
+        if other is lever:
+            continue
+        try:
+            record = read_record(other, state_files(other, doc.path)[0], doc.path)
+        except Unusable:
+            continue
+        if record is not None and file_created(record) and doc.raw == new_file(other.key, record["written"]).encode("utf-8"):
+            return True
+    return False
+
+
 def interactive():
     """A person can be asked: a terminal on stdin and on stdout, the gate every consent in hmd uses."""
     return sys.stdin.isatty() and sys.stdout.isatty()
@@ -499,8 +528,9 @@ def cmd_on(args):
     if ours:
         written = dict(record, written=value, sha256_after=sha256(new))
     else:
-        written = {"schema": 1, "settings": doc.path, "had_file": doc.raw is not None, "had_key": found is not None, "previous_raw": current,
-                   "written": value, "sha256_after": sha256(new), "set_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        written = {"schema": 1, "settings": doc.path, "had_file": doc.raw is not None, "file_created": doc.raw is None or file_still_hmds(lever, doc),
+                   "had_key": found is not None, "previous_raw": current, "written": value, "sha256_after": sha256(new),
+                   "set_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     try:
         if not ours:
             if doc.raw is None:
@@ -552,11 +582,15 @@ def cmd_off(args):
         return EXIT_CONSENT
     # The backup is the file as it was when THIS lever was set. While the other lever still has a record for the file, a restore of it could take away (or bring back) a
     # setting that lever wrote or removed since, so the key is reverted alone: the cut is the exact inverse of the append, and the last one off leaves the file as it was.
+    # A file hmd made goes with the last one off, whichever lever made it, and only while nothing but this lever's key is left in it, byte for byte (new_file): a file of the person's own,
+    # or one they added to, is never that text. The hash in a record cannot say it: it is of the file as this lever last wrote it, which for the lever set second still held the other's
+    # key, and after an update in place it holds whatever the person had put in the file by then.
     sibling = any(os.path.lexists(state_files(other, doc.path)[0]) for other in LEVERS if other is not lever)
     try:
         backup = read_bytes(state_files(lever, doc.path)[1]) if record["had_file"] else None
-        exact = not sibling and sha256(doc.raw) == record["sha256_after"] and (backup is not None or not record["had_file"])
-        if exact and not record["had_file"]:
+        bare = not sibling and file_created(record) and doc.raw == new_file(lever.key, record["written"]).encode("utf-8")
+        exact = bare or (not sibling and backup is not None and sha256(doc.raw) == record["sha256_after"])
+        if bare:
             ensure_unchanged(doc)
             remove(doc.path)
         elif exact:

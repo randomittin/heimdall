@@ -32,13 +32,15 @@
 #   R  the Bash output cap, a second lever with the window's guarantees on a record and a backup of its own (`on --bash-cap [CHARS]`, key bashOutputMaxChars, 16000 by default, clamped by the
 #      agent to 4000-128000; named from Claude Code 2.1.331 and its documentation, where the key, not the variable BASH_MAX_OUTPUT_LENGTH, limits the output Claude receives inline): a round
 #      trip on three layouts, the text-exact append, values and their range, a value of the person's own (exit 4, --force, already the wanted one), consent (exit 3 and the command to run
-#      again, a person at a terminal), both levers in one file turned off in either order and after the first was updated (the other's key survives every off), a BASH_MAX_OUTPUT_LENGTH of
+#      again, a person at a terminal), both levers in one file turned off in either order and after the first was updated (the other's key survives every off), the file hmd created for
+#      either lever removed by whichever off comes last, in every order of setting and of undoing, and never a file the person made or touched (the record of the lever set second carries who
+#      made the file; a file that was there is restored byte for byte), a BASH_MAX_OUTPUT_LENGTH of
 #      the person's own (env block, environment: exit 4; empty is unset; the window is never held back), status rows and the other-settings-file listing kept apart per lever, the write
 #      race, a record that cannot be used, --help
 #
 # HERMETIC. HOME, HEIMDALL_HOME and the settings file are throwaway for every scenario; CLAUDE_CONFIG_DIR is unset; nothing reads or writes the operator's ~/.claude
 # or ~/.heimdall. CW_BIN=<file> points the suite at another copy of the tool (a mutant, for the break-it check).
-# budget: about 24 s solo: roughly 300 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git; 100 in R, the Bash cap), about twenty on a pty, one on a pty that waits out the 1 s seam. No network.
+# budget: about 27 s solo: roughly 340 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git; 140 in R, the Bash cap), about twenty on a pty, one on a pty that waits out the 1 s seam. No network.
 # EXIT: 0 = every assertion passes; 1 = any FAIL.
 set -uo pipefail
 
@@ -672,6 +674,46 @@ cw off --bash-cap --yes; cw on --yes; cw off --bash-cap --yes
 eq "R: off --bash-cap with only the window set: nothing to undo for the cap, the window stays" "0|1|300000|2" "$RC|$(grep -c 'nothing to undo' "$OUT")|$(value)|$(wstate)"
 cw off --yes
 
+# a settings file hmd created for one of the two goes with whichever off comes last, in every order of setting and of undoing: the record of the setting made second would say "the file was
+# there" (it was, hmd made it a moment ago), so it carries who made the file (file_created). A file the person made or touched is never removed, and one that was there is restored byte for byte.
+there()   { [ -e "$S" ] && echo yes || echo no; }
+hmdkeys() { grep -o -E '"(autoCompactWindow|bashOutputMaxChars)"' "$S" 2>/dev/null | tr -d '"\n'; }    # the keys of the two settings in the file, run together; empty when there are none or no file
+claims()  { cat "$H"/.heimdall/compact-window/*state.json | grep -c "\"file_created\": $1"; }           # the records that say hmd made the file (true) or did not (false)
+for first in window cap; do
+  for undo in window cap; do
+    new_home; rmdir "$H/.claude"
+    if [ "$first" = window ]; then cw on --yes; cw on --bash-cap --yes; else cw on --bash-cap --yes; cw on --yes; fi
+    eq "R/made/$first-first/$undo-first: both records say hmd made the file" 2 "$(claims true)"
+    if [ "$undo" = window ]; then cw off --yes; left=bashOutputMaxChars; else cw off --bash-cap --yes; left=autoCompactWindow; fi
+    eq "R/made/$first-first/$undo-first: the first off takes its key only: the file stays, the other setting's key alone in it" "yes|$left" "$(there)|$(hmdkeys)"
+    if [ "$undo" = window ]; then cw off --bash-cap --yes; else cw off --yes; fi
+    eq "R/made/$first-first/$undo-first: the last off removes the file hmd created, every record and backup with it" "0|no|0" "$RC|$(there)|$(state)"
+  done
+done
+for undo in window cap; do   # the person adds to the file hmd made after both settings were set: it is theirs now, only hmd's keys go
+  new_home; rmdir "$H/.claude"; cw on --yes; cw on --bash-cap --yes
+  "$PY" -I "$TMP/chk.py" reserialize "$S"
+  if [ "$undo" = window ]; then cw off --yes; cw off --bash-cap --yes; else cw off --bash-cap --yes; cw off --yes; fi
+  eq "R/made/$undo-first: a file the person added to is theirs: it stays with what they added, and none of hmd's keys" "yes||1|0" "$(there)|$(hmdkeys)|$(grep -c '"addedLater"' "$S")|$(state)"
+done
+new_home; rmdir "$H/.claude"; cw on --yes
+printf '{\n}\n' >"$S"; cp "$S" "$TMP/orig"   # the person puts a file of their own in place of the one hmd made, before the second setting
+cw on --bash-cap --yes
+eq "R/own: a file that is not the one hmd made is not carried as hmd's: the second record says hmd did not make it (the first still says it made the one it replaced)" "1|1" "$(claims true)|$(claims false)"
+cw off --yes; cw off --bash-cap --yes
+eq "R/own: ... so the last off restores the person's file byte for byte, and does not remove it" "yes|same|0" "$(there)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+for undo in window cap; do   # a file that was there, the cap set first: restored byte for byte, whichever comes off first
+  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+  cw on --bash-cap --yes; cw on --yes
+  eq "R/own/cap-first/$undo-first: neither record says hmd made the file" 2 "$(claims false)"
+  if [ "$undo" = window ]; then cw off --yes; cw off --bash-cap --yes; else cw off --bash-cap --yes; cw off --yes; fi
+  eq "R/own/cap-first/$undo-first: the file that was there is restored byte for byte, not removed, nothing kept" "yes|same|0" "$(there)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+done
+new_home; rmdir "$H/.claude"; cw on --yes   # a record written before records said who made the file: it made it when the file was not there
+"$PY" -I -c 'import json, sys; p = sys.argv[1]; r = json.load(open(p)); r.pop("file_created", None); open(p, "w").write(json.dumps(r, indent=2) + "\n")' "$(rec)"
+cw off --yes
+eq "R/made: a record with no file_created still removes the file when it was not there before the key" "0|no|0" "$RC|$(there)|$(state)"
+
 # a BASH_MAX_OUTPUT_LENGTH of the person's own: the agent ignores it once the key is set, so it is a value of theirs
 new_home; printf '{\n  "env": {\n    "BASH_MAX_OUTPUT_LENGTH": "60000"\n  }\n}\n' >"$S"; cp "$S" "$TMP/orig"
 cw on --bash-cap --yes
@@ -728,7 +770,7 @@ cw off --bash-cap --yes
 eq "R: a cap record that cannot be used: exit 1, says so and which key" "1|1|1" "$RC|$(grep -c 'cannot be used' "$ERR")|$(grep -c 'bashOutputMaxChars' "$ERR")"
 chk "R: ... the settings file is left alone" same "$S" "$TMP/after-on"
 cw on --yes
-eq "R: the window never reads the cap's record: on goes through" "0|300000" "$RC|$(value)"
+eq "R: a cap record that cannot be used does not hold the window back (it carries nothing, and on never fails for it): on goes through" "0|300000" "$RC|$(value)"
 
 cw --help
 chk "R: --help documents --bash-cap" grep -qF -- "--bash-cap" "$OUT"
