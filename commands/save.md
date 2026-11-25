@@ -155,10 +155,10 @@ HMD_NOTE
 A save never starts the full sweep (`CLAUDE.md` "When the full gate runs"): the full run is recommended to the developer immediately before a merge operation, not at a checkpoint, and it runs only when the developer says so. Do not run the project's full test command (`commands.test` in settings.json) here. If a full run already finished on this tree because the developer chose it, note its result under Resume Instructions; otherwise write "no full run yet, recommend it before the merge" there, so the next session knows nothing has graded the tree. A save of unfinished work notes the same, and nothing more.
 
 ```bash
-git add -A -- ':/' ':!/.planning/CONTINUE.md' && git commit -m "heimdall: checkpoint — [brief description]"
+git add -A -- ':/' && git reset -q -- ':/.planning/CONTINUE.md' && git commit -m "heimdall: checkpoint — [brief description]"
 ```
 
-The handoff stays out of the commit on purpose: git must not track `.planning/CONTINUE.md`, or it is never re-injected. `':/'` is git's repo-root anchor, and so is the leading `/` of the exclusion, so the whole repo is staged from whatever directory the session sits in; a plain `.` would stage only that directory's subtree and read the exclusion relative to it.
+The handoff stays out of the commit on purpose: git must not track `.planning/CONTINUE.md`, or it is never re-injected. `':/'` is git's repo-root anchor, so the whole repo is staged from whatever directory the session sits in (a plain `.` would stage only that directory's subtree), and the `git reset` takes the handoff back out of the index. Keep it a `reset`: an exclusion pathspec on `git add` that names a gitignored handoff makes git exit 1, and the `&& git commit` never runs.
 
 ### 7. Hand over the line
 

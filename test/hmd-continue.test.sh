@@ -9,8 +9,9 @@
 # context, and SessionStart with source "compact" CAN (hookSpecificOutput.additionalContext). So the
 # feature is the parts below, and this file grades each head-on:
 #   1. THE COMMAND  commands/save.md is the one command (valid, calls bin/heimdall-continue write ONCE, after the files it writes and before
-#                   the git commit, which stages the whole repo from any directory but keeps the handoff out of git); commands/continue.md
-#                   is a thin alias with no steps or tool call of its own, so a single code path writes CHECKPOINT.md and CONTINUE.md.
+#                   the git commit, which stages the whole repo from any directory, keeps the handoff out of git and still lands when the
+#                   handoff is gitignored); commands/continue.md is a thin alias with no steps or tool call of its own, so a single code
+#                   path writes CHECKPOINT.md and CONTINUE.md.
 #   2. THE LINE     `heimdall-continue focus` prints ONE `/compact <focus>` line that carries the next
 #                   step and stays under the cap, however much state it is given.
 #   3. THE WRITE    `heimdall-continue write` takes a fresh checkpoint (the existing writer), records the
@@ -162,9 +163,10 @@ if [ "$(grep -cF 'bin/heimdall-continue" write' "$CMD" 2>/dev/null)" = "1" ] && 
 else
   bad "1f. the heimdall-continue write call is missing, repeated, or out of order (checkpoint section line '$L_CKPT', call '$L_WRITE', commit '$L_COMMIT')"
 fi
-# 1g. THE GIT CHECKPOINT, as the command writes it: the `git add` line taken out of commands/save.md and run as written from a SUBDIRECTORY of a scratch
-# repo (a save is often made from where the session sits, not from the repo root). It must stage the WHOLE repo (an edit at the root, a deletion and a new
-# file in a sibling directory) and leave only the handoff out: git must not track .planning/CONTINUE.md, or it is never re-injected.
+# 1g. THE GIT CHECKPOINT, as the command writes it: the staging part of the `git add` line in commands/save.md (everything before its `&& git commit`), run as
+# written from a SUBDIRECTORY of a scratch repo (a save is often made from where the session sits, not from the repo root). It must stage the WHOLE repo (an
+# edit at the root, a deletion and a new file in a sibling directory) and leave only the handoff out: git must not track .planning/CONTINUE.md, or it is never
+# re-injected. 1k below runs the whole line, commit included, with the handoff gitignored.
 PG="$(mk_project stagepath)"
 mkdir -p "$PG/sub" "$PG/other"
 printf 'v1\n' > "$PG/sub/in.txt"
@@ -185,6 +187,47 @@ if [ -n "$STAGE_CALL" ] && [ "$rc" = "0" ] \
   ok "1g. the git checkpoint, run from a subdirectory, stages the whole repo (an edit, a deletion and a new file outside it, the rest of .planning/) and leaves .planning/CONTINUE.md out"
 else
   bad "1g. the git checkpoint did not stage the whole repo minus the handoff (rc=$rc, call found: $([ -n "$STAGE_CALL" ] && echo yes || echo no)): $(head -c 200 "$TMPROOT/gerr") / $(printf '%s' "$GST" | tr '\n' '|')"
+fi
+# 1k. THE SAME LINE WITH THE HANDOFF GITIGNORED (this repo's own setting: .gitignore has .planning/CONTINUE.md; or a repo that ignores the whole .planning/). A
+# `git add` pathspec that NAMES an ignored file makes git exit 1 ("The following paths are ignored"), and the `&& git commit` after it never runs: the save is lost
+# exactly where the handoff is kept out of git on purpose. So the WHOLE documented line, commit included, is run as written from a SUBDIRECTORY of a scratch repo
+# for each way of ignoring the handoff: it must exit 0 and land its commit, with the edit made outside that subdirectory in the commit and the handoff not.
+CHECKPOINT_LINE="$(grep -m1 '^git add ' "$CMD")"
+NOHOOKS="$TMPROOT/nohooks"; mkdir -p "$NOHOOKS"
+ign_save() { # $1: the .gitignore rule that hides the handoff, $2: scratch project name. Sets IGN_RC, IGN_SUBJ, IGN_FILES, IGN_DISK, IGN_ERR.
+  local d
+  d="$(mk_project "$2")"
+  git -C "$d" config core.hooksPath "$NOHOOKS"   # hermetic: no hook or signing setup of the operator's own sees the scratch commit
+  git -C "$d" config commit.gpgsign false
+  mkdir -p "$d/sub"
+  printf 'v1\n' > "$d/sub/in.txt"
+  printf '%s\n' "$1" > "$d/.gitignore"
+  git -C "$d" add .gitignore sub/in.txt && git -C "$d" commit -qm "seed" --no-verify
+  printf 'v2\n' > "$d/README.md"
+  printf 'ckpt\n' > "$d/.planning/CHECKPOINT.md"
+  printf 'handoff\n' > "$d/.planning/CONTINUE.md"
+  ( cd "$d/sub" && bash -c "$CHECKPOINT_LINE" ) >/dev/null 2>"$TMPROOT/$2.err"; IGN_RC=$?
+  IGN_ERR="$(head -c 160 "$TMPROOT/$2.err" | tr '\n' ' ')"
+  IGN_SUBJ="$(git -C "$d" log -1 --format=%s)"
+  IGN_FILES="$(git -C "$d" diff-tree --no-commit-id --name-only -r HEAD)"
+  IGN_DISK="$([ -f "$d/.planning/CONTINUE.md" ] && echo yes || echo no)"
+}
+ign_all=1; ign_note=""
+for spec in 'file:.planning/CONTINUE.md' 'dir:.planning/'; do
+  ign_save "${spec#*:}" "ignsave-${spec%%:*}"
+  case "$IGN_SUBJ" in 'heimdall: checkpoint'*) subj_ok=1 ;; *) subj_ok=0 ;; esac
+  if [ -n "$CHECKPOINT_LINE" ] && [ "$IGN_RC" = "0" ] && [ "$subj_ok" = "1" ] && [ "$IGN_DISK" = "yes" ] \
+     && printf '%s\n' "$IGN_FILES" | grep -qxF 'README.md' && ! printf '%s\n' "$IGN_FILES" | grep -qxF '.planning/CONTINUE.md'; then
+    :
+  else
+    ign_all=0
+    ign_note="$ign_note [ignore '${spec#*:}': rc=$IGN_RC, HEAD is '$IGN_SUBJ' with: $(printf '%s' "$IGN_FILES" | tr '\n' ' '); git said: $IGN_ERR]"
+  fi
+done
+if [ "$ign_all" = "1" ]; then
+  ok "1k. with the handoff gitignored (the file, or the whole .planning/) the documented line, commit included, exits 0 from a subdirectory and lands its commit: the edit outside it in, the handoff out"
+else
+  bad "1k. the documented checkpoint line died or committed the wrong files with the handoff gitignored:$ign_note"
 fi
 CALLERS="$(grep -lF 'bin/heimdall-continue' "$REPO"/commands/*.md 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')"
 if [ "$CALLERS" = "save.md " ]; then
