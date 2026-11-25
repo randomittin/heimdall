@@ -851,16 +851,23 @@ def cmd_on(args):
         return EXIT_FAILED
     if lever.transient:
         if not standing:
-            remember_consent()
+            remember_consent(doc.path)
         start_timer(written["arm_id"], written["expires_at"])
         say("armed: %s is %s in the env block of %s (arm %s)" % (lever.key, wanted, tilde(doc.path), written["arm_id"]))
-        say("Claude Code compacts on its next request once it has reloaded the file. It is put back by itself: when a compaction starts, on any session start, or at %s (%d s); by hand: %s"
+        say("In this project only: Claude Code compacts on its next request once it has reloaded the file. It is put back by itself: when a compaction starts, on any session start, or at %s (%d s); by hand: %s"
             % (utc_stamp(written["expires_at"]), written["expires_at"] - int(time.time()), lever.command("off")))
         return 0
     say("set %s to %s %s in %s" % (lever.key, format(value, ","), lever.unit, tilde(doc.path)))
     say("backup %s; undo: %s" % (tilde(backup), lever.command("off")))
     say("It applies to sessions started from now on%s." % lever.live(value))
     return 0
+
+
+def undo_elsewhere(lever):
+    """How to undo a key hmd set in another settings file: with that file's own CLAUDE_CONFIG_DIR, or, for the project trigger, from inside its project (or with `release`, which puts every armed trigger back)."""
+    if lever.project:
+        return "undo that one from inside its project, %s, or put every armed trigger back with `hmd compact-window release`" % lever.command("off")
+    return "undo that one with its own CLAUDE_CONFIG_DIR, %s" % lever.command("off")
 
 
 def undo(lever, settings, yes, force, release=False):
@@ -871,7 +878,7 @@ def undo(lever, settings, yes, force, release=False):
         if record is None:
             say("hmd did not set %s in %s: nothing to undo" % (lever.key, tilde(settings)))
             for other in other_records(lever, settings):
-                say("hmd did set it in %s: undo that one with its own CLAUDE_CONFIG_DIR, %s" % (tilde(other), lever.command("off")))
+                say("hmd did set it in %s: %s" % (tilde(other), undo_elsewhere(lever)))
             return 0
         doc = Doc(settings, lever)
     except Unusable as exc:
@@ -906,6 +913,9 @@ def undo(lever, settings, yes, force, release=False):
         if bare:
             ensure_unchanged(doc)
             remove(doc.path)
+            if record.get("dir_created"):
+                with contextlib.suppress(OSError):   # the .claude directory hmd made for the file goes with it, unless something else has been put in it (rmdir refuses a directory that is not empty)
+                    os.rmdir(os.path.dirname(doc.path))
         elif exact:
             replace_settings(doc, backup)
         else:
@@ -921,7 +931,16 @@ def undo(lever, settings, yes, force, release=False):
 
 
 def cmd_off(args):
-    return undo(args.lever, os.path.realpath(settings_path()), args.yes, args.force)
+    lever = args.lever
+    if not lever.project:
+        return undo(lever, os.path.realpath(settings_path()), args.yes, args.force)
+    root = project_root()
+    if root is None:
+        say("hmd did not arm %s here: %s" % (lever.key, NO_PROJECT))
+        for other in other_records(lever, ""):
+            say("hmd did set it in %s: %s" % (tilde(other), undo_elsewhere(lever)))
+        return 0
+    return undo(lever, os.path.realpath(os.path.join(root, *PROJECT_REL)), args.yes, args.force)
 
 
 def armed_settings(arm=None):
