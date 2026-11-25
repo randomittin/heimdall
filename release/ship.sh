@@ -726,19 +726,68 @@ site_pin_only_change() {
          <(sed -E "$RELEASE_PIN_BLANK" "$1/$2" 2>/dev/null | tr -d '\n')
 }
 
+# bounded_run <seconds> <command...> — run the command; once <seconds> have passed, stop it and everything it started and return 124 (timeout(1)'s
+# status), else return its own status. A stock Mac has no timeout(1), and a perl alarm reaches one process only (the postmortem in
+# bin/heimdall-statusline), so this is python3, which the site pin step already requires. TERM first (git removes its own lock files and temp packs on
+# it), KILL two seconds later. The command gets its own session and no stdin: it can never sit waiting on a prompt.
+# shellcheck disable=SC2016 # python source text: the single quotes are deliberate
+BOUNDED_RUN_PY='
+import os, signal, subprocess, sys
+child = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, start_new_session=True)
+try:
+    code = child.wait(timeout=int(sys.argv[1]))
+except BaseException as stop:
+    os.killpg(child.pid, signal.SIGTERM)
+    try:
+        child.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+    code = 124 if isinstance(stop, subprocess.TimeoutExpired) else 130
+sys.exit(code)'
+
+bounded_run() { python3 -I -c "$BOUNDED_RUN_PY" "$@"; }
+
+# site_fetch_origin <site> — bring origin/main of <site> up to date, so that what is counted as unpushed is what origin lacks NOW, not at the last fetch.
+# Bounded by SHIP_SITE_FETCH_TIMEOUT whole seconds (default 60): a hung remote must end this step, not wedge the ship. It dies, the site untouched, when
+# origin cannot be fetched at all: without origin/main there is no telling what a push would send.
+site_fetch_origin() {
+  local site="$1" secs="${SHIP_SITE_FETCH_TIMEOUT:-60}" rc=0
+  [[ "$secs" =~ ^[1-9][0-9]*$ ]] || die "site pins: SHIP_SITE_FETCH_TIMEOUT='$secs' is not a whole number of seconds"
+  bounded_run "$secs" git -C "$site" fetch --quiet --no-tags origin "+refs/heads/main:refs/remotes/origin/main" || rc=$?
+  if [ "$rc" -eq 124 ]; then
+    die "site pins: fetching origin of $site did not finish within ${secs}s — nothing was changed in $site. Fix the connection (or raise SHIP_SITE_FETCH_TIMEOUT), then re-run: release/ship.sh --release-only"
+  elif [ "$rc" -ne 0 ]; then
+    die "site pins: cannot fetch origin of $site (above) — nothing was changed in $site. Fix the cause, then re-run: release/ship.sh --release-only"
+  fi
+}
+
+# site_foreign_commits <site> <pin subject> — the commits main of <site> holds that origin/main lacks and that are not a pin commit (one whose subject is
+# exactly <pin subject>): "<short sha> <subject>" lines, newest first, or nothing. Run it after site_fetch_origin: origin/main is only as current as that.
+site_foreign_commits() {
+  local out line
+  out="$(git -C "$1" log --format='%h %s' "origin/main..HEAD")" || return 1
+  while IFS= read -r line; do
+    if [ -n "$line" ] && [ "${line#* }" != "$2" ]; then printf '%s\n' "$line"; fi
+  done <<<"$out"
+}
+
 # release_site_pins <tag> — the Release of <tag> is live: pin heimdall-site to it. In order, refusing (die) at the first thing that is wrong:
 #   1. the site must be on main and able to record a check receipt; no checkout at all is a WARN (a missing site never blocks a plugin ship);
-#   2. the digest every page must pin is read from the TAG (`git show <tag>:install.sh`), never the working tree, whose install.sh may have moved on;
-#   3. bin/heimdall-render-version re-renders every version pin and sha256 in the site; every tracked file that carries a pin is then checked: each
+#   2. origin is fetched (bounded), and main must hold no commit origin lacks that is not a pin commit of this release: the push sends every one of
+#      them and the host deploys main, so the site owner's unpushed work would go live with the pins. Nothing in the site is touched when it REFUSES;
+#   3. the digest every page must pin is read from the TAG (`git show <tag>:install.sh`), never the working tree, whose install.sh may have moved on;
+#   4. bin/heimdall-render-version re-renders every version pin and sha256 in the site; every tracked file that carries a pin is then checked: each
 #      digest it pins must BE that digest, and some file must pin one at all — otherwise nothing is committed;
-#   4. only the tracked pin-bearing files and netlify.toml that differ from HEAD are staged, and each may differ in nothing but versions and digests;
+#   5. only the tracked pin-bearing files and netlify.toml that differ from HEAD are staged, and each may differ in nothing but versions and digests;
 #      they are committed together; an untracked file (package-lock.json) is never touched;
-#   5. when HEAD is ahead of origin/main (this commit, or an earlier run whose push failed): bin/heimdall-repo-checks run, whose receipt the push
+#   6. when HEAD is ahead of origin/main (this commit, or an earlier run whose push failed): bin/heimdall-repo-checks run, whose receipt the push
 #      gate demands, and only then git push. Red checks leave the commit local, unpushed.
 release_site_pins() {
   local tag="$1" root="${REPO_ROOT:-$PWD}" site problem tmp want out rel line first ahead n_digest=0
   local renderer="${SHIP_RENDERER:-$root/bin/heimdall-render-version}"
   local checks="${SHIP_REPO_CHECKS:-$root/bin/heimdall-repo-checks}"
+  local pin_subject="chore: pin site to $tag (version pins, install.sh sha256, /install redirect)"
   local -a cands=() paths=() changed=()
   step "Site pins ($tag) — pin heimdall-site, commit it with netlify.toml, run its checks, push"
   printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || die "site pins: '$tag' is not a vX.Y.Z tag"
@@ -754,6 +803,18 @@ release_site_pins() {
     return 0
   fi
   problem="$(site_prereq_problem "$site")" || die "site pins: $problem"
+
+  # The push below sends EVERY commit main holds that origin lacks, and the host deploys main: a commit of the site owner's own, unpushed (work not meant for
+  # production yet), would go live with the pins. So, before anything in the site is touched, fetch origin (what is counted is what origin lacks NOW) and refuse
+  # while main holds a commit origin lacks that is not a pin commit of this release. A pin commit an earlier run left local (red checks, a failed push) is the
+  # release's own, and the re-run sends it.
+  site_fetch_origin "$site"
+  out="$(site_foreign_commits "$site" "$pin_subject")" || die "site pins: cannot list the commits of $site that origin/main lacks"
+  if [ -n "$out" ]; then
+    warn "$site holds commits that origin/main lacks and that are not the pin commit of $tag:"
+    printf '%s\n' "$out" | sed 's/^/      /'
+    die "site pins: refusing — pushing main would send the commit(s) above to production along with the pins. Nothing was changed in $site: push them yourself (or move them off main), then re-run: release/ship.sh --release-only"
+  fi
 
   # What the tag serves: the digest every page must pin.
   git -C "$root" cat-file -e "refs/tags/$tag:install.sh" 2>/dev/null \
@@ -809,16 +870,14 @@ release_site_pins() {
         || die "site pins: $rel differs from HEAD in more than version numbers and sha256 digests — refusing to commit edits that are not the release's own; commit or stash them in $site, then re-run: release/ship.sh --release-only"
     done
     git -C "$site" add -- "${changed[@]}" || die "site pins: git add failed in $site"
-    git -C "$site" commit -q -m "chore: pin site to $tag (version pins, install.sh sha256, /install redirect)" \
+    git -C "$site" commit -q -m "$pin_subject" \
         -m "Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>" -- "${changed[@]}" \
       || die "site pins: git commit failed in $site"
     ok "committed ${#changed[@]} site file(s) pinned to $tag, netlify.toml with the pages ($(git -C "$site" rev-parse --short HEAD))"
   fi
 
-  ahead=1
-  if git -C "$site" rev-parse -q --verify "refs/remotes/origin/main" >/dev/null 2>&1; then
-    ahead="$(git -C "$site" rev-list --count "origin/main..HEAD")" || die "site pins: cannot compare HEAD with origin/main in $site"
-  fi
+  # origin/main was fetched above, and everything it lacks is now a pin commit of this release: the whole of what the push sends.
+  ahead="$(git -C "$site" rev-list --count "origin/main..HEAD")" || die "site pins: cannot compare HEAD with origin/main in $site"
   if [ "$ahead" -eq 0 ]; then
     ok "heimdall-site: origin/main already has HEAD — nothing to push"
     return 0
