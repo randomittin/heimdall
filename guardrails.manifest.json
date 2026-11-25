@@ -178,7 +178,7 @@
     {"id": "inbox-wake-arm-start", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "inbox-wake-arm-start",
      "why": "starts the inbox watcher so an idle session is woken by a phone message"},
     {"id": "continue-inject", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "continue-inject",
-     "why": "re-injects the /hmd:continue handoff once after a compaction"},
+     "why": "re-injects the /hmd:save handoff once after a compaction"},
     {"id": "agents-auto-prune", "kind": "feature", "tier": "recommended", "layer": "hook", "hook": "agents-auto-prune",
      "operator_env": "HMD_AUTO_PRUNE=off", "proof": "test/agents-auto-prune.test.sh",
      "why": "once a day, in the background, compresses (never deletes) the transcripts of subagents finished more than 14 days ago; on by default, one line per run in $HEIMDALL_HOME/logs/agents-prune.log"},

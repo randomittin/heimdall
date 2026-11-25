@@ -936,7 +936,7 @@ cmd_note() { # <kind> <text...>
 
 # While test/run-all.sh holds this checkout's sweep lock, `write` writes NOTHING (the Sweep-safe paragraph of the CONTRACT above says why, and why it skips
 # rather than parks). hmd_sweep_live (bin/lib/hmd_sweep_live.sh) answers; exit 5 is the caller's half, this line the human's: it names the pid, and the
-# PreCompact hook and /hmd:continue repeat it.
+# PreCompact hook and /hmd:save repeat it.
 _defer_for_sweep() { # <project_dir> -> 0, after saying so on stderr, when a live sweep of this checkout forbids a write; 1 otherwise
   local pid
   pid="$(hmd_sweep_live "$1" 2>/dev/null)" || return 1

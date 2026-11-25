@@ -71,7 +71,7 @@ You spawn agents. You close them. Nobody asks you to.
 - `/hmd:status` — Show current project state
 - `/hmd:maintain` — Toggle maintainer mode
 - `/hmd:reflect` — Force conflict reflection pass
-- `/hmd:continue` — Save, then print the one `/compact <focus>` line to paste; the handoff (goal, next step, in-flight agents, decisions, gated items) comes back once after the compaction. Nothing can run `/compact` for the user
+- `/hmd:save` — Save state to `.planning/`, write the continue handoff, then print the one `/compact <focus>` line to paste (ignore it to just save); the handoff (goal, next step, in-flight agents, decisions, gated items) comes back once after the compaction. Nothing can run `/compact` for the user; `/hmd:continue` is a deprecated alias
 
 ## Reference Documentation
 

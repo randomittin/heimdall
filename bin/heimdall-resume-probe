@@ -41,9 +41,9 @@
 # not red for its absence (context-sync is opt-out by design). A gate that cries wolf
 # on ordinary work gets switched off, and then it protects nobody.
 #
-# NOT THIS HOOK'S BUSINESS: THE /hmd:continue HANDOFF
-# ---------------------------------------------------
-# The handoff /hmd:continue leaves for the compaction restart is re-injected by a SessionStart hook of its
+# NOT THIS HOOK'S BUSINESS: THE /hmd:save HANDOFF
+# -----------------------------------------------
+# The handoff /hmd:save leaves for the compaction restart is re-injected by a SessionStart hook of its
 # own (id continue-inject, matcher "compact", hooks/hooks.json), never from here: this probe only grades the
 # memory stack and prints one verdict, so `heimdall-hooks disable resume-probe` cannot take the handoff
 # with it, and a restart can never be handed the handoff twice.
