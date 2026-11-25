@@ -44,7 +44,16 @@
 #      re-run pushes it once they are green; a site off main REFUSES before any file
 #      is touched; an absent site WARNs and the ship continues;
 #  13. the wiring: ship.sh calls it after the Release and before the npm publish, and
-#      calls sync-release with --no-site-commit.
+#      calls sync-release with --no-site-commit;
+#  14. an unpushed commit of the site owner's besides the pin commit REFUSES, listed, before
+#      anything is rewritten, committed, checked or pushed (a push sends every local commit
+#      origin lacks, and the host deploys main); once it is landed, the pin commit alone is
+#      checked and pushed;
+#  15. origin is fetched before the unpushed commits are counted: a stale origin/main neither
+#      hides nor invents them;
+#  16. a bound that is not a number, an origin that is gone and an origin that hangs past the
+#      bound each REFUSE the same way, untouched; once origin answers, the same site is pinned
+#      and pushed.
 #
 # Hermetic: sync-release.sh is copied into a throwaway fake plugin repo with the
 # minimal artifacts it requires, so a real (non-dry) run — including the site
@@ -351,7 +360,7 @@ EOF
   printf '{"lockfileVersion":3}\n' > "$s/package-lock.json"   # untracked, as in the real site
 }
 
-# The REAL bin/heimdall-repo-checks behind a recorder: what the site's HEAD and its origin hold at the moment the checks run.
+# The REAL bin/heimdall-repo-checks behind a recorder: what the site's HEAD, its origin and its origin/main ref hold at the moment the checks run.
 PROBE="$WORK/repo-checks-probe"
 cat > "$PROBE" <<'PROBE_SH'
 #!/usr/bin/env bash
@@ -364,6 +373,7 @@ done
   printf 'args=%s\n' "$*"
   printf 'site_head=%s\n' "$(git -C "$repo" rev-parse HEAD)"
   printf 'bare_main=%s\n' "$(git -C "$PROBE_BARE" rev-parse refs/heads/main)"
+  printf 'tracking=%s\n' "$(git -C "$repo" rev-parse refs/remotes/origin/main)"
 } >> "$PROBE_LOG"
 exec "$PROBE_REAL" "$@"
 PROBE_SH
@@ -527,7 +537,8 @@ else
 fi
 
 PIN_SITE4="$WORK/pin-site4"; PIN_BARE4="$WORK/pin-site4.git"
-make_pin_site "$PIN_SITE4" "$PIN_BARE4" "false"
+S4_GREEN="$WORK/s4-checks-green"   # the site's one check passes once this file exists
+make_pin_site "$PIN_SITE4" "$PIN_BARE4" "test -e $S4_GREEN"
 S4_HEAD0="$(site_head "$PIN_SITE4")"; S4_BARE0="$(bare_main "$PIN_BARE4")"
 run_site_pins "$PIN_PLUG" "$PIN_SITE4" "$PIN_BARE4" "$WORK/s4.out"
 s4_rc=$?
@@ -537,17 +548,17 @@ if [ "$s4_rc" -eq 1 ] && grep -Fq 'NOT pushing' "$WORK/s4.out" && [ "$(bare_main
 else
   bad "red site checks did not stop the push (rc=$s4_rc)"; tail_out "$WORK/s4.out"
 fi
-# The site's owner fixes the check; the re-run finds nothing to commit, but the local commits are unpushed: it checks and pushes them.
-printf '{"schema":1,"checks":[{"name":"pins","cmd":"%s"}]}\n' "$PASS_CHECK" > "$PIN_SITE4/.heimdall/repo-checks.json"
-git -C "$PIN_SITE4" commit -q -am "fix: the check" || exit 2
+# The cause is fixed without a commit (the file appears): the re-run finds nothing to commit, but the pin commit of the first run is still local and unpushed,
+# and it is the release's own, so it checks and pushes it. (A fix that IS a commit of the owner's is an unpushed commit that is not a pin: case 14.)
+: > "$S4_GREEN"
 S4_HEAD1="$(site_head "$PIN_SITE4")"
 run_site_pins "$PIN_PLUG" "$PIN_SITE4" "$PIN_BARE4" "$WORK/s4b.out"
 s4b_rc=$?
 if [ "$s4b_rc" -eq 0 ] && [ "$(bare_main "$PIN_BARE4")" = "$S4_HEAD1" ] && [ "$(site_head "$PIN_SITE4")" = "$S4_HEAD1" ] \
    && "$CHECKS_SRC" status --repo "$PIN_SITE4" --pushes "$S4_HEAD1" >/dev/null 2>&1; then
-  ok "re-run after the fix: the unpushed commits are checked (green) and pushed"
+  ok "re-run after the fix: the unpushed pin commit is checked (green) and pushed"
 else
-  bad "the re-run did not push the unpushed commits (rc=$s4b_rc)"; tail_out "$WORK/s4b.out"
+  bad "the re-run did not push the unpushed pin commit (rc=$s4b_rc)"; tail_out "$WORK/s4b.out"
 fi
 
 PIN_SITE5="$WORK/pin-site5"; PIN_BARE5="$WORK/pin-site5.git"
@@ -599,6 +610,105 @@ check_wiring() {
   fi
 }
 check_wiring
+
+# ── Cases 14-16: the push is the pin commit's alone, counted against a FRESH origin ──
+# `git push origin main` sends every local commit origin lacks, and the host deploys main: the site owner's own unpushed commits would go live with the pins.
+# So release_site_pins fetches origin first (bounded) and REFUSES, before it touches the site, while main holds an unpushed commit that is not a pin commit.
+
+# site_untouched <site> <head> <bare> <its main> <out> — nothing was rewritten, committed, checked or pushed: the site sits at <head> with only its untracked
+# package-lock.json, the origin still holds <its main>, and the site's checks never ran (no probe log).
+site_untouched() {
+  [ "$(site_head "$1")" = "$2" ] && [ "$(bare_main "$3")" = "$4" ] && [ ! -e "$5.probe" ] \
+    && [ "$(git -C "$1" status --porcelain)" = '?? package-lock.json' ]
+}
+
+# ── Case 14: an unpushed commit of the owner's besides the pin commit REFUSES and is listed; once it is landed, the pin commit alone is pushed ──
+PIN_SITE7="$WORK/pin-site7"; PIN_BARE7="$WORK/pin-site7.git"
+make_pin_site "$PIN_SITE7" "$PIN_BARE7" "$PASS_CHECK"
+printf 'Draft notes, not for production yet.\n' >> "$PIN_SITE7/CLAUDE.md"
+git -C "$PIN_SITE7" commit -q -am "wip: unreviewed notes" || exit 2
+S7_OWNER="$(site_head "$PIN_SITE7")"; S7_BARE0="$(bare_main "$PIN_BARE7")"
+run_site_pins "$PIN_PLUG" "$PIN_SITE7" "$PIN_BARE7" "$WORK/s7.out"
+s7_rc=$?
+if [ "$s7_rc" -eq 1 ] && grep -Fq "$(git -C "$PIN_SITE7" log -1 --format='%h %s' "$S7_OWNER")" "$WORK/s7.out" \
+   && site_untouched "$PIN_SITE7" "$S7_OWNER" "$PIN_BARE7" "$S7_BARE0" "$WORK/s7.out"; then
+  ok "an unpushed commit of the site owner's REFUSES (exit 1) and is listed: nothing rewritten, committed, checked or pushed"
+else
+  bad "an unpushed commit besides the pin commit did not refuse cleanly (rc=$s7_rc)"; tail_out "$WORK/s7.out"
+fi
+git -C "$PIN_SITE7" push -q origin main || exit 2   # the owner lands their commit
+run_site_pins "$PIN_PLUG" "$PIN_SITE7" "$PIN_BARE7" "$WORK/s7b.out"
+s7b_rc=$?
+S7_HEAD1="$(site_head "$PIN_SITE7")"
+if [ "$s7b_rc" -eq 0 ] && [ "$(git -C "$PIN_SITE7" rev-parse "$S7_HEAD1^")" = "$S7_OWNER" ] && [ "$(bare_main "$PIN_BARE7")" = "$S7_HEAD1" ] \
+   && grep -Fxq "bare_main=$S7_OWNER" "$WORK/s7b.out.probe" && "$CHECKS_SRC" status --repo "$PIN_SITE7" --pushes "$S7_HEAD1" >/dev/null 2>&1; then
+  ok "once the owner's commit is landed, the pin commit alone is checked (origin still at the owner's commit) and pushed: pin only -> push"
+else
+  bad "the pin commit alone was not pushed after the owner landed theirs (rc=$s7b_rc)"; tail_out "$WORK/s7b.out"; cat "$WORK/s7b.out.probe" >&2 2>/dev/null
+fi
+
+# ── Case 15: origin is fetched BEFORE the unpushed commits are counted — a stale origin/main neither hides nor invents them ──
+# Origin already holds the owner's commit (pushed from another machine) but this checkout's origin/main ref lags: counted against that ref the commit would
+# look unpushed and be refused. The fetch makes the ref what origin holds NOW, so the pin commit is the only one origin lacks.
+PIN_SITE8="$WORK/pin-site8"; PIN_BARE8="$WORK/pin-site8.git"
+make_pin_site "$PIN_SITE8" "$PIN_BARE8" "$PASS_CHECK"
+S8_BASE="$(site_head "$PIN_SITE8")"
+printf 'Owner notes, already on origin.\n' >> "$PIN_SITE8/CLAUDE.md"
+git -C "$PIN_SITE8" commit -q -am "docs: owner notes" || exit 2
+S8_OWNER="$(site_head "$PIN_SITE8")"
+git -C "$PIN_SITE8" push -q origin main || exit 2
+git -C "$PIN_SITE8" update-ref refs/remotes/origin/main "$S8_BASE" || exit 2   # the ref lags what origin holds
+run_site_pins "$PIN_PLUG" "$PIN_SITE8" "$PIN_BARE8" "$WORK/s8.out"
+s8_rc=$?
+S8_HEAD1="$(site_head "$PIN_SITE8")"
+if [ "$s8_rc" -eq 0 ] && [ "$(git -C "$PIN_SITE8" rev-parse "$S8_HEAD1^")" = "$S8_OWNER" ] && [ "$(bare_main "$PIN_BARE8")" = "$S8_HEAD1" ] \
+   && grep -Fxq "tracking=$S8_OWNER" "$WORK/s8.out.probe"; then
+  ok "origin is fetched first: with a stale origin/main the owner's commit is not refused, and the checks ran against the origin/main origin really holds"
+else
+  bad "a stale origin/main was counted as it stood (rc=$s8_rc)"; tail_out "$WORK/s8.out"; cat "$WORK/s8.out.probe" >&2 2>/dev/null
+fi
+
+# ── Case 16: an origin that cannot be fetched REFUSES, untouched — a bound that is no number, an origin that is gone, an origin that hangs past the bound ──
+PIN_SITE9="$WORK/pin-site9"; PIN_BARE9="$WORK/pin-site9.git"
+make_pin_site "$PIN_SITE9" "$PIN_BARE9" "$PASS_CHECK"
+S9_HEAD0="$(site_head "$PIN_SITE9")"; S9_BARE0="$(bare_main "$PIN_BARE9")"
+SHIP_SITE_FETCH_TIMEOUT=soon run_site_pins "$PIN_PLUG" "$PIN_SITE9" "$PIN_BARE9" "$WORK/s9a.out"
+s9a_rc=$?
+if [ "$s9a_rc" -eq 1 ] && grep -Fq "SHIP_SITE_FETCH_TIMEOUT='soon' is not a whole number of seconds" "$WORK/s9a.out" \
+   && site_untouched "$PIN_SITE9" "$S9_HEAD0" "$PIN_BARE9" "$S9_BARE0" "$WORK/s9a.out"; then
+  ok "a fetch bound that is not a whole number of seconds REFUSES (exit 1), untouched"
+else
+  bad "a bad SHIP_SITE_FETCH_TIMEOUT did not refuse cleanly (rc=$s9a_rc)"; tail_out "$WORK/s9a.out"
+fi
+git -C "$PIN_SITE9" remote set-url origin "$WORK/gone.git" || exit 2
+run_site_pins "$PIN_PLUG" "$PIN_SITE9" "$PIN_BARE9" "$WORK/s9b.out"
+s9b_rc=$?
+if [ "$s9b_rc" -eq 1 ] && grep -Fq 'cannot fetch origin of' "$WORK/s9b.out" \
+   && site_untouched "$PIN_SITE9" "$S9_HEAD0" "$PIN_BARE9" "$S9_BARE0" "$WORK/s9b.out"; then
+  ok "an origin that is gone REFUSES (exit 1): nothing is pinned on a guess about what origin holds"
+else
+  bad "an unreachable origin did not refuse cleanly (rc=$s9b_rc)"; tail_out "$WORK/s9b.out"
+fi
+HANG_UPLOAD_PACK="$WORK/hang-upload-pack"
+printf '#!/bin/sh\nexec sleep 30\n' > "$HANG_UPLOAD_PACK" && chmod +x "$HANG_UPLOAD_PACK" || exit 2
+git -C "$PIN_SITE9" remote set-url origin "$PIN_BARE9" || exit 2
+git -C "$PIN_SITE9" config remote.origin.uploadpack "$HANG_UPLOAD_PACK" || exit 2   # origin takes the connection and never answers
+SHIP_SITE_FETCH_TIMEOUT=1 run_site_pins "$PIN_PLUG" "$PIN_SITE9" "$PIN_BARE9" "$WORK/s9c.out"
+s9c_rc=$?
+if [ "$s9c_rc" -eq 1 ] && grep -Fq 'did not finish within 1s' "$WORK/s9c.out" \
+   && site_untouched "$PIN_SITE9" "$S9_HEAD0" "$PIN_BARE9" "$S9_BARE0" "$WORK/s9c.out"; then
+  ok "an origin that hangs is cut off at the bound (exit 1), untouched"
+else
+  bad "a hung origin did not refuse at the bound (rc=$s9c_rc)"; tail_out "$WORK/s9c.out"
+fi
+git -C "$PIN_SITE9" config --unset remote.origin.uploadpack || exit 2
+run_site_pins "$PIN_PLUG" "$PIN_SITE9" "$PIN_BARE9" "$WORK/s9d.out"
+s9d_rc=$?
+if [ "$s9d_rc" -eq 0 ] && [ "$(site_head "$PIN_SITE9")" != "$S9_HEAD0" ] && [ "$(bare_main "$PIN_BARE9")" = "$(site_head "$PIN_SITE9")" ]; then
+  ok "once origin answers again, the same site is pinned and pushed"
+else
+  bad "the site was not pinned and pushed once origin answered (rc=$s9d_rc)"; tail_out "$WORK/s9d.out"
+fi
 
 echo ""
 echo "ship-netlify.test.sh: $PASS passed, $FAIL failed."
