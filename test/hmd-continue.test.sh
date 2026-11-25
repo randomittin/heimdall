@@ -478,11 +478,12 @@ else
   bad "3p. the documented call did not end on one /compact line with the explanation above it: $(tail -n 3 "$TMPROOT/sout" | head -c 400)"
 fi
 
-# ── 3q-3x. write ARMS Claude Code's own auto-compact when it can, so the person pastes nothing; the /compact line stays the last line and the way when it cannot ─
-# The tool tree is a scratch copy holding the REAL hmd_continue.py and the REAL bin/heimdall-compact-window, with a fast stand-in for the checkpoint writer (the real one takes
-# about 4 s a run and is exercised by 3a-3p): `note` succeeds, `write` leaves a CHECKPOINT.md with the six fields hmd_continue reads back. The Claude Code session is in the environment
-# (CLAUDE_CODE_SESSION_ID), the build is one that takes the override back, no expiry timer is started, and the settings file is a scratch one: nothing here reads or writes the real ~/.claude.
-echo "3q-3x. write arms the auto-compact"
+# ── 3q-3z. write ARMS Claude Code's own auto-compact when it can, so the person pastes nothing; the /compact line stays the last line and the way when it cannot ─
+# The tool tree is a scratch copy holding the REAL hmd_continue.py, the REAL bin/heimdall-compact-window and the helper it vets the project's file with (hmd_nofollow_write), with a fast stand-in for the checkpoint writer (the real
+# one takes about 4 s a run and is exercised by 3a-3p): `note` succeeds, `write` leaves a CHECKPOINT.md with the six fields hmd_continue reads back. The Claude Code session is in the environment (CLAUDE_CODE_SESSION_ID), the build
+# is one that takes the override back, no expiry timer is started, and the settings are scratch ones: nothing here reads or writes the real ~/.claude. The arming goes to THIS repository's .claude/settings.local.json (the project
+# the call sits in: the scratch project), never to the user-level settings.json (SETF), which every session on the machine reads: every case checks that file was not written.
+echo "3q-3z. write arms the auto-compact"
 ARMT="$TMPROOT/armtree"; mkdir -p "$ARMT/bin/lib"
 cp "$CONT" "$ARMT/bin/heimdall-continue"; cp "$REPO/bin/heimdall-compact-window" "$ARMT/bin/heimdall-compact-window"
 cp "$REPO/bin/lib/hmd_continue.py" "$REPO/bin/lib/hmd_nofollow_write.py" "$REPO/bin/lib/hmd_relay_approval.py" "$REPO/bin/lib/hmd_private_state.py" "$ARMT/bin/lib/"
@@ -499,91 +500,102 @@ esac
 exit 2
 SH
 chmod +x "$ARMT/bin/heimdall-continue" "$ARMT/bin/heimdall-compact-window" "$ARMT/bin/heimdall-checkpoint"
-CFGDIR="$TMPROOT/cfg"; mkdir -p "$CFGDIR"; SETF="$CFGDIR/settings.json"
-CW_STAMP="$HEIMDALL_HOME/compact-window/compact-now.consent"
+CFGDIR="$TMPROOT/cfg"; mkdir -p "$CFGDIR"; SETF="$CFGDIR/settings.json"   # the USER-level settings file: the arming must never write it
+CWENV=(CLAUDE_CODE_SESSION_ID=test-session HEIMDALL_COMPACT_NOW_CC_VERSION=2.1.330 HEIMDALL_COMPACT_NOW_NO_TIMER=1 CLAUDE_CONFIG_DIR="$CFGDIR")
+projf() { printf '%s/.claude/settings.local.json' "$PROJ"; }   # the file the arming goes to: the project's own
 awrite() { # [VAR=value ...]: PROJ is written to, as a session of a build that takes the override back; AOUT, AERR and ARC afterwards
-  note_of | env CLAUDE_CODE_SESSION_ID=test-session HEIMDALL_COMPACT_NOW_CC_VERSION=2.1.330 HEIMDALL_COMPACT_NOW_NO_TIMER=1 CLAUDE_CONFIG_DIR="$CFGDIR" "$@" \
-    "$ARMT/bin/heimdall-continue" write --repo "$PROJ" $WEXTRA >"$TMPROOT/aout" 2>"$TMPROOT/aerr"; ARC=$?
+  note_of | env "${CWENV[@]}" "$@" "$ARMT/bin/heimdall-continue" write --repo "$PROJ" $WEXTRA >"$TMPROOT/aout" 2>"$TMPROOT/aerr"; ARC=$?
   ALINE="$(grep -E '^/compact ' "$TMPROOT/aout")"
+}
+give_yes() { # the person's yes for PROJ, given the way /hmd:save asks for it (`on --compact-now --yes` in the project), the trigger then put back
+  ( cd "$PROJ" && env "${CWENV[@]}" "$ARMT/bin/heimdall-compact-window" on --compact-now --yes && env "${CWENV[@]}" "$ARMT/bin/heimdall-compact-window" release ) >/dev/null 2>&1
 }
 trigger_val() { python3 -I -c 'import json,sys
 try:
     e = json.load(open(sys.argv[1])).get("env")
 except OSError:
     e = None
-print(json.dumps(e["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) if isinstance(e, dict) and "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in e else "ABSENT")' "$SETF"; }
+print(json.dumps(e["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) if isinstance(e, dict) and "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in e else "ABSENT")' "$(projf)"; }
 line_ok() { [ -n "$ALINE" ] && [ "$(grep -cE '^/compact ' "$TMPROOT/aout")" = "1" ] && [ "$(tail -n 1 "$TMPROOT/aout")" = "$ALINE" ] && [ "${#ALINE}" -le 1500 ]; }
 WEXTRA=""
 
-rm -f "$SETF" "$CW_STAMP"; PROJ="$(mk_project arm1)"; awrite
-if [ "$ARC" = "0" ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact NOT armed' "$TMPROOT/aerr" \
-   && grep -qF "$ARMT/bin/heimdall-compact-window on --compact-now --yes" "$TMPROOT/aerr" && tail -n 2 "$TMPROOT/aout" | sed -n 1p | grep -qF 'ignore to just save'; then
-  ok "3q. no yes given yet: write exits 0, arms nothing, writes no settings, says what to ask and the exact command to run on yes, and the line is still the last one with its usual explanation"
+rm -f "$SETF"; PROJ="$(mk_project arm1)"; awrite
+if [ "$ARC" = "0" ] && [ ! -e "$(projf)" ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact NOT armed' "$TMPROOT/aerr" \
+   && grep -qF "$ARMT/bin/heimdall-compact-window on --compact-now --yes" "$TMPROOT/aerr" && grep -qF 'this repository' "$TMPROOT/aerr" && tail -n 2 "$TMPROOT/aout" | sed -n 1p | grep -qF 'ignore to just save'; then
+  ok "3q. no yes given for this repository yet: write exits 0, arms nothing, writes no settings (neither the project's nor the user-level file), says what to ask and the exact command to run on yes, and the line is still the last one with its usual explanation"
 else
-  bad "3q. a write with no yes mishandled the arming (rc=$ARC, settings written: $([ -e "$SETF" ] && echo yes || echo no)): $(head -c 400 "$TMPROOT/aerr")"
+  bad "3q. a write with no yes mishandled the arming (rc=$ARC, settings written: $([ -e "$(projf)" ] && echo project) $([ -e "$SETF" ] && echo user)): $(head -c 400 "$TMPROOT/aerr")"
 fi
 
-rm -f "$SETF"; mkdir -p "$HEIMDALL_HOME/compact-window"; printf 'yes 2026-11-26T00:00:00Z\n' >"$CW_STAMP"
-PROJ="$(mk_project arm2)"; awrite
-if [ "$ARC" = "0" ] && [ "$(trigger_val)" = '"1"' ] && line_ok && grep -qF 'auto-compact armed' "$TMPROOT/aout" && ! grep -qF 'NOT armed' "$TMPROOT/aerr" \
+PROJ="$(mk_project arm2)"; give_yes; awrite
+if [ "$ARC" = "0" ] && [ "$(trigger_val)" = '"1"' ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact armed' "$TMPROOT/aout" && ! grep -qF 'NOT armed' "$TMPROOT/aerr" \
    && tail -n 2 "$TMPROOT/aout" | sed -n 1p | grep -qF 'auto-compact is armed; if it has not started, paste to compact with the thread kept'; then
-  ok "3r. with the person's yes on record: write arms (env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is \"1\"), exits 0, says so, and the /compact line stays the last line as the fallback with its own explanation"
+  ok "3r. with the person's yes on record for this repository: write arms the PROJECT's .claude/settings.local.json (env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is \"1\"), never the user-level settings.json, exits 0, says so, and the /compact line stays the last line as the fallback with its own explanation"
 else
-  bad "3r. a write with a yes on record did not arm cleanly (rc=$ARC, trigger=$(trigger_val)): $(head -c 300 "$TMPROOT/aout") // $(head -c 300 "$TMPROOT/aerr")"
+  bad "3r. a write with a yes on record did not arm cleanly (rc=$ARC, trigger=$(trigger_val), user-level file written: $([ -e "$SETF" ] && echo yes || echo no)): $(head -c 300 "$TMPROOT/aout") // $(head -c 300 "$TMPROOT/aerr")"
 fi
 CLAUDE_CONFIG_DIR="$CFGDIR" "$ARMT/bin/heimdall-compact-window" release >"$TMPROOT/rout" 2>&1; rrc=$?
-if [ "$rrc" = "0" ] && [ ! -s "$TMPROOT/rout" ] && [ ! -e "$SETF" ]; then
-  ok "3s. release (what the hooks run) puts it back: exit 0, nothing printed, the settings file hmd made for it gone again"
+if [ "$rrc" = "0" ] && [ ! -s "$TMPROOT/rout" ] && [ ! -e "$(projf)" ] && [ ! -d "$PROJ/.claude" ] && [ ! -e "$SETF" ]; then
+  ok "3s. release (what the hooks run) puts it back, from any directory: exit 0, nothing printed, the settings file hmd made for it gone again, and the .claude directory it made with it"
 else
-  bad "3s. release did not put the trigger back (rc=$rrc, settings: $(cat "$SETF" 2>/dev/null | head -c 200)): $(head -c 200 "$TMPROOT/rout")"
+  bad "3s. release did not put the trigger back (rc=$rrc, project file: $(cat "$(projf)" 2>/dev/null | head -c 200)): $(head -c 200 "$TMPROOT/rout")"
 fi
 
-rm -f "$SETF"; PROJ="$(mk_project arm3)"; WEXTRA="--no-compact"; awrite; WEXTRA=""
-if [ "$ARC" = "0" ] && [ ! -e "$SETF" ] && line_ok && ! grep -qF 'auto-compact' "$TMPROOT/aout" "$TMPROOT/aerr" && tail -n 2 "$TMPROOT/aout" | sed -n 1p | grep -qF 'ignore to just save'; then
+PROJ="$(mk_project arm3)"; give_yes; WEXTRA="--no-compact"; awrite; WEXTRA=""
+if [ "$ARC" = "0" ] && [ ! -e "$(projf)" ] && [ ! -e "$SETF" ] && line_ok && ! grep -qF 'auto-compact' "$TMPROOT/aout" "$TMPROOT/aerr" && tail -n 2 "$TMPROOT/aout" | sed -n 1p | grep -qF 'ignore to just save'; then
   ok "3t. --no-compact only saves, even with a yes on record: nothing armed, no settings written, no word about auto-compact, the usual line"
 else
   bad "3t. --no-compact still armed or talked about it (rc=$ARC): $(head -c 300 "$TMPROOT/aerr")"
 fi
 
-rm -f "$SETF"; PROJ="$(mk_project arm4)"; awrite CLAUDE_CODE_SESSION_ID=
-if [ "$ARC" = "0" ] && [ ! -e "$SETF" ] && line_ok && ! grep -qF 'auto-compact' "$TMPROOT/aout" "$TMPROOT/aerr"; then
+PROJ="$(mk_project arm4)"; give_yes; awrite CLAUDE_CODE_SESSION_ID=
+if [ "$ARC" = "0" ] && [ ! -e "$(projf)" ] && [ ! -e "$SETF" ] && line_ok && ! grep -qF 'auto-compact' "$TMPROOT/aout" "$TMPROOT/aerr"; then
   ok "3u. outside a Claude Code session (no CLAUDE_CODE_SESSION_ID) there is nothing to compact: nothing armed, no settings written, no word about it"
 else
   bad "3u. a write outside a session touched the auto-compact (rc=$ARC): $(head -c 300 "$TMPROOT/aerr")"
 fi
 
-rm -f "$SETF"; PROJ="$(mk_project arm5)"; awrite HMD_CONTINUE_WINDOW_MIN=0
-if [ "$ARC" = "0" ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact NOT armed: the handoff would not come back' "$TMPROOT/aerr"; then
+PROJ="$(mk_project arm5)"; give_yes; awrite HMD_CONTINUE_WINDOW_MIN=0
+if [ "$ARC" = "0" ] && [ ! -e "$(projf)" ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact NOT armed: the handoff would not come back' "$TMPROOT/aerr"; then
   ok "3v. the handoff would not be re-injected (HMD_CONTINUE_WINDOW_MIN=0): not armed, no settings written, said why: compacting without it would lose the thread"
 else
-  bad "3v. a write whose handoff will not come back still armed (rc=$ARC, settings written: $([ -e "$SETF" ] && echo yes || echo no)): $(head -c 300 "$TMPROOT/aerr")"
+  bad "3v. a write whose handoff will not come back still armed (rc=$ARC, settings written: $([ -e "$(projf)" ] && echo yes || echo no)): $(head -c 300 "$TMPROOT/aerr")"
 fi
-rm -f "$SETF"; PROJ="$(mk_project arm6)"
+PROJ="$(mk_project arm6)"
 printf 'old\n' >"$PROJ/.planning/CONTINUE.md"; git -C "$PROJ" add -f .planning/CONTINUE.md; git -C "$PROJ" commit -qm "track the handoff" --no-verify
-awrite
-if [ "$ARC" = "3" ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact NOT armed: the handoff would not come back' "$TMPROOT/aerr" && grep -qF 'git tracks' "$TMPROOT/aerr"; then
+give_yes; awrite
+if [ "$ARC" = "3" ] && [ ! -e "$(projf)" ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact NOT armed: the handoff would not come back' "$TMPROOT/aerr" && grep -qF 'git tracks' "$TMPROOT/aerr"; then
   ok "3w. git tracks the handoff: exit 3 as before, not armed, no settings written, the line is still printed"
 else
   bad "3w. a tracked handoff still got the compaction armed (rc=$ARC): $(head -c 300 "$TMPROOT/aerr")"
 fi
 
-rm -f "$SETF"; PROJ="$(mk_project arm7)"; awrite HEIMDALL_COMPACT_NOW_CC_VERSION=2.1.328
-if [ "$ARC" = "0" ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact not armed' "$TMPROOT/aerr" && grep -qF '2.1.329' "$TMPROOT/aerr"; then
+PROJ="$(mk_project arm7)"; give_yes; awrite HEIMDALL_COMPACT_NOW_CC_VERSION=2.1.328
+if [ "$ARC" = "0" ] && [ ! -e "$(projf)" ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact not armed' "$TMPROOT/aerr" && grep -qF '2.1.329' "$TMPROOT/aerr"; then
   ok "3x. a Claude Code older than 2.1.329 (it would keep the override after it is removed): not armed, no settings written, the reason names 2.1.329, the line is the way"
 else
   bad "3x. an old build was armed or the reason is missing (rc=$ARC): $(head -c 300 "$TMPROOT/aerr")"
 fi
 printf '{"env": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"}}' >"$SETF"; cp "$SETF" "$TMPROOT/own.json"; PROJ="$(mk_project arm8)"; awrite
-if [ "$ARC" = "0" ] && cmp -s "$SETF" "$TMPROOT/own.json" && line_ok && grep -qF 'your own setting' "$TMPROOT/aerr"; then
-  ok "3y. a CLAUDE_AUTOCOMPACT_PCT_OVERRIDE of the person's own in the settings is never replaced: not armed, the file byte for byte, the line is the way"
+if [ "$ARC" = "0" ] && cmp -s "$SETF" "$TMPROOT/own.json" && [ ! -e "$(projf)" ] && line_ok && grep -qF 'your own setting' "$TMPROOT/aerr"; then
+  ok "3y. a CLAUDE_AUTOCOMPACT_PCT_OVERRIDE of the person's own in the user-level settings (the project's file would shadow it) is never replaced: not armed, that file byte for byte, nothing written in the project, the line is the way"
 else
   bad "3y. a value of the person's own was replaced or not reported (rc=$ARC): $(head -c 300 "$TMPROOT/aerr")"
 fi
-rm -f "$SETF" "$CW_STAMP"
-if grep -qF -- '--no-compact' "$CMD" && grep -qF 'on --compact-now --yes' "$CMD" && grep -qiE 'asked once|ask(s|ed)? (them|the user)' "$CMD"; then
-  ok "3z. commands/save.md tells the model about --no-compact and the one question that precedes arming (with the command to run on yes)"
+rm -f "$SETF"
+PROJ="$(mk_project arm9)"; mkdir -p "$PROJ/.claude"; printf '{}\n' >"$(projf)"; git -C "$PROJ" add -f .claude/settings.local.json; git -C "$PROJ" commit -qm "ship local settings" --no-verify
+cp "$(projf)" "$TMPROOT/tracked.json"; awrite
+if [ "$ARC" = "0" ] && cmp -s "$(projf)" "$TMPROOT/tracked.json" && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact not armed' "$TMPROOT/aerr" && grep -qF 'git tracks' "$TMPROOT/aerr"; then
+  ok "3y2. a project whose .claude/settings.local.json git tracks (the repository's text, not the person's) is never armed: that file byte for byte, the user-level file not written, the line is the way"
 else
-  bad "3z. commands/save.md does not document --no-compact, the consent question and its command"
+  bad "3y2. a tracked project file was armed or the reason is missing (rc=$ARC): $(head -c 300 "$TMPROOT/aerr")"
+fi
+if grep -qF -- '--no-compact' "$CMD" && grep -qF 'on --compact-now --yes' "$CMD" && grep -qiE 'asked once|ask(s|ed)? (them|the user)' "$CMD" \
+   && grep -qF 'sessions in this repository only' "$CMD" && ! grep -qF '~/.claude/settings.json' "$CMD" && grep -qF 'released before the compaction began' "$CMD" \
+   && grep -qF 'heimdall-compact-window" status' "$CMD" && grep -qF "':/.claude/settings.local.json'" "$CMD"; then
+  ok "3z. commands/save.md tells the model about --no-compact and the one question that precedes arming (with the command to run on yes), says the arming affects sessions in this repository only and never names the user-level file, tells it to check status and say plainly when the arming was released before the compaction, and keeps the armed file out of the checkpoint commit"
+else
+  bad "3z. commands/save.md does not document --no-compact, the per-repository consent question and its command, the status check and the released-before-compaction message, or the commit exclusion"
 fi
 
 # ── helpers for the hook and the helper cases (P holds a fresh, recorded, untracked handoff from the real write) ─
