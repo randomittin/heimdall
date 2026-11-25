@@ -673,16 +673,36 @@ def parse_chars(text):
     return parse_amount(CAP, text)
 
 
+def read_object(path):
+    """The top-level object of the settings file `path`, only read; {} when it is not there, cannot be read or is not a JSON object (such a file names no setting, and nothing here edits it)."""
+    try:
+        with open(path, "rb") as handle:
+            document = json.loads(handle.read())
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def env_homes(lever, doc):
+    """(path, document) of every settings file whose env block may hold a value of the person's own for lever.env_var: the file the key is set in and, for a project-scoped key, the two files that file outranks (the project's shared
+    .claude/settings.json and the user-level settings.json), where a value would be shadowed for as long as the key is set."""
+    homes = [(doc.path, doc.document)]
+    if lever.project:
+        homes += [(path, read_object(path)) for path in (os.path.join(os.path.dirname(doc.path), "settings.json"), settings_path())]
+    return homes
+
+
 def own_rival(lever, doc):
-    """(its value, where it is) of an environment variable of the person's own that setting the key would make the agent ignore: set in this environment, or in the "env" block of the settings
-    file. None when the lever shadows no variable, or the person set none (an empty one is unset to the agent too)."""
+    """(its value, where it is) of an environment variable of the person's own that setting the key would make the agent ignore: set in this environment, or in the "env" block of a settings file
+    (env_homes). None when the lever shadows no variable, or the person set none (an empty one is unset to the agent too)."""
     if not lever.shadows:
         return None
     if os.environ.get(lever.env_var):
         return os.environ[lever.env_var], "this environment"
-    block = doc.document.get("env")
-    if isinstance(block, dict) and block.get(lever.env_var) not in (None, ""):
-        return json.dumps(block[lever.env_var]), "the env block of %s" % tilde(doc.path)
+    for path, document in env_homes(lever, doc):
+        block = document.get("env")
+        if isinstance(block, dict) and block.get(lever.env_var) not in (None, ""):
+            return json.dumps(block[lever.env_var]), "the env block of %s" % tilde(path)
     return None
 
 
@@ -719,8 +739,11 @@ def trigger_unavailable(doc):
     for name in ("DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"):
         if os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on"):
             return "%s is set in this environment: automatic compaction is off" % name
-    if doc.document.get("autoCompactEnabled") is False:
-        return "autoCompactEnabled is false in %s: automatic compaction is off" % tilde(doc.path)
+    shared = os.path.join(os.path.dirname(doc.path), "settings.json")
+    for path, document in ((doc.path, doc.document), (shared, read_object(shared)), (settings_path(), read_object(settings_path()))):   # the most specific file that names the key decides
+        value = document.get("autoCompactEnabled")
+        if isinstance(value, bool):
+            return "autoCompactEnabled is false in %s: automatic compaction is off" % tilde(path) if value is False else None
     return None
 
 
@@ -744,8 +767,12 @@ def start_timer(arm_id, expires_at):
 
 def cmd_on(args):
     lever, value = args.lever, args.value
+    target, why = lever_target(lever)
+    if why is not None:
+        warn("the compact-now trigger is not available: %s. Nothing was written (the compact line is the way)" % why)
+        return EXIT_UNAVAILABLE
     try:
-        doc = Doc(settings_path(), lever)
+        doc = Doc(target, lever)
         record = load_state(lever, doc.path)
     except Unusable as exc:
         warn(str(exc))
@@ -779,7 +806,7 @@ def cmd_on(args):
         return EXIT_REFUSED
     backup = state_files(lever, doc.path)[1]
     now = "not set" if found is None else "%s (%s)" % (current, "set by hmd earlier" if ours else "yours; --force replaces it")
-    standing = lever.transient and not args.yes and has_standing_consent()   # the yes given before covers this one
+    standing = lever.transient and not args.yes and has_standing_consent(doc.path)   # the yes given before, in this project, covers this one
     if standing:
         args.yes = True
     where = "%s (only the key %s%s; every other byte stays as it is)" % (tilde(doc.path), lever.key, " in %s" % lever.parent if lever.parent else "")
@@ -791,7 +818,7 @@ def cmd_on(args):
         "  undo    %s" % lever.command("off"),
         "  cost    %s" % lever.cost.format(format(value, ","))]
     if lever.transient:
-        details.append("  asked   once: your yes covers the next ones too; `hmd compact-window revoke` takes it back")
+        details.append("  asked   once per project: your yes covers the next ones in this project only; `hmd compact-window revoke`, run inside it, takes it back")
     if rival is not None:
         details.append("  note    %s is %s in %s; the agent ignores it while the key is set" % (lever.env_var, rival[0], rival[1]))
     if not consent(args, "this writes %s" % tilde(doc.path), details, lever.command("on", value, args.force)):
@@ -804,6 +831,7 @@ def cmd_on(args):
                    "had_key": found is not None, "previous_raw": current, "written": value, "sha256_after": sha256(new), "set_at": utc_stamp()}
     if lever.transient:
         written.setdefault("parent_created", doc.parent_absent)   # kept across a re-arm: the parent object was made by the first one
+        written.setdefault("dir_created", not os.path.isdir(os.path.dirname(doc.path)))   # ... and so was the .claude directory, which goes with the file hmd made
         written.update(arm_id=os.urandom(4).hex(), expires_at=int(time.time()) + trigger_ttl(), session=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     try:
         if not ours:
