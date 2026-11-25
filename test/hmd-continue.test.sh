@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # test/hmd-continue.test.sh
 #
-# Proof for /hmd:continue -- /compact and /continue in one move.
+# Proof for /hmd:save -- ONE command that saves the checkpoint, writes the continue handoff and ends on the /compact line to paste.
+# /hmd:continue is its deprecated alias (the way /hmd:level aliases /hmd:autonomy). The tool behind both is bin/heimdall-continue,
+# which is why this file keeps that name.
 #
 # A command, skill or hook can NOT run /compact (only the user types it), PreCompact cannot inject
 # context, and SessionStart with source "compact" CAN (hookSpecificOutput.additionalContext). So the
 # feature is the parts below, and this file grades each head-on:
-#   1. THE COMMAND  commands/continue.md exists and is valid, and bin/heimdall-continue is its tool.
+#   1. THE COMMAND  commands/save.md is the one command (valid, calls bin/heimdall-continue write ONCE, after the files it writes and before
+#                   the git commit, keeps the handoff out of git); commands/continue.md is a thin alias with no steps or tool call of
+#                   its own, so a single code path writes CHECKPOINT.md and CONTINUE.md.
 #   2. THE LINE     `heimdall-continue focus` prints ONE `/compact <focus>` line that carries the next
 #                   step and stays under the cap, however much state it is given.
 #   3. THE WRITE    `heimdall-continue write` takes a fresh checkpoint (the existing writer), records the
@@ -36,7 +40,8 @@ set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONT="$REPO/bin/heimdall-continue"
-CMD="$REPO/commands/continue.md"
+CMD="$REPO/commands/save.md"
+ALIAS="$REPO/commands/continue.md"
 HOOKS="$REPO/hooks/hooks.json"
 META="$REPO/hooks/hooks.metadata.json"
 HOOKSCLI="$REPO/bin/heimdall-hooks"
@@ -84,7 +89,7 @@ mk_project() {
 now_s() { date +%s; }
 phys()  { (cd "$1" && pwd -P); }
 
-GOAL='ship /hmd:continue: compact, then resume with full context'
+GOAL='ship /hmd:save: save, then compact and resume with full context'
 NEXT='run test/hmd-continue.test.sh once, then commit feat(skill) with the CHANGELOG bullet'
 AGENT='coder: docs sweep | /tmp/wt/agent-docs | running, 3 files edited'
 DECISION='the handoff is one file, .planning/CONTINUE.md, written through the no-follow helper'
@@ -127,17 +132,59 @@ echo "hmd-continue"
 
 # ── 1. the command and its tool exist and are valid ─────────────────────────
 echo "1. command + tool"
-if [ -f "$CMD" ] && [ "$(sed -n 1p "$CMD")" = "---" ] && [ "$(sed -n 2p "$CMD")" = "name: continue" ] \
+if [ -f "$CMD" ] && [ "$(sed -n 1p "$CMD")" = "---" ] && [ "$(sed -n 2p "$CMD")" = "name: save" ] \
    && sed -n 3p "$CMD" | grep -qE '^description: .{80,}' && [ "$(sed -n 4p "$CMD")" = "---" ]; then
-  ok "1a. commands/continue.md has the frontmatter every command has (name: continue, a real description)"
+  ok "1a. commands/save.md has the frontmatter every command has (name: save, a real description)"
 else
-  bad "1a. commands/continue.md missing or its frontmatter is not --- / name: continue / description: ... / ---"
+  bad "1a. commands/save.md missing or its frontmatter is not --- / name: save / description: ... / ---"
 fi
 if grep -qF 'bin/heimdall-continue" write' "$CMD" 2>/dev/null && grep -qF '/compact' "$CMD" 2>/dev/null \
    && grep -qiE 'paste' "$CMD" 2>/dev/null && grep -qE 'cannot run `?/compact|can.t run `?/compact|cannot run /compact' "$CMD" 2>/dev/null; then
   ok "1b. the command drives heimdall-continue write, tells the user to paste the /compact line, and says it cannot run /compact itself"
 else
-  bad "1b. commands/continue.md does not call heimdall-continue write / mention paste / state that a command cannot run /compact"
+  bad "1b. commands/save.md does not call heimdall-continue write / mention paste / state that a command cannot run /compact"
+fi
+miss=""
+for part in 'STATE.md' 'CHECKPOINT.md' 'settings.json' 'CONTINUE.md' 'continue-inject'; do
+  grep -qF -- "$part" "$CMD" 2>/dev/null || miss="$miss [$part]"
+done
+if [ -z "$miss" ] && grep -qiE 'paste to compact with the thread kept; ignore to just save' "$CMD" 2>/dev/null; then
+  ok "1e. the ONE command covers what both used to: STATE.md, CHECKPOINT.md, settings.json, CONTINUE.md, the re-inject hook, and the one-line 'paste to compact with the thread kept; ignore to just save'"
+else
+  bad "1e. commands/save.md does not cover the whole job (missing:$miss) or lacks the 'paste to compact with the thread kept; ignore to just save' line"
+fi
+L_WRITE="$(grep -nF 'bin/heimdall-continue" write' "$CMD" 2>/dev/null | head -1 | cut -d: -f1)"
+L_COMMIT="$(grep -n 'git commit' "$CMD" 2>/dev/null | head -1 | cut -d: -f1)"
+L_CKPT="$(grep -n '^### 2\. ' "$CMD" 2>/dev/null | head -1 | cut -d: -f1)"
+if [ "$(grep -cF 'bin/heimdall-continue" write' "$CMD" 2>/dev/null)" = "1" ] && [ -n "$L_WRITE" ] && [ -n "$L_COMMIT" ] && [ -n "$L_CKPT" ] \
+   && [ "$L_CKPT" -lt "$L_WRITE" ] && [ "$L_WRITE" -lt "$L_COMMIT" ]; then
+  ok "1f. the one tool call is made once, after CHECKPOINT.md is written by hand and before the git commit (so the commit holds the final files)"
+else
+  bad "1f. the heimdall-continue write call is missing, repeated, or out of order (checkpoint section line '$L_CKPT', call '$L_WRITE', commit '$L_COMMIT')"
+fi
+if grep -qF "':!.planning/CONTINUE.md'" "$CMD" 2>/dev/null; then
+  ok "1g. the git checkpoint leaves .planning/CONTINUE.md out of the commit (a handoff git tracks is never re-injected)"
+else
+  bad "1g. the git checkpoint can stage .planning/CONTINUE.md: add the ':!.planning/CONTINUE.md' pathspec"
+fi
+CALLERS="$(grep -lF 'bin/heimdall-continue' "$REPO"/commands/*.md 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')"
+if [ "$CALLERS" = "save.md " ]; then
+  ok "1h. save.md is the only command file that names the tool: a single code path writes CHECKPOINT.md and CONTINUE.md"
+else
+  bad "1h. command files naming bin/heimdall-continue: '$CALLERS' (want exactly 'save.md ')"
+fi
+if [ -f "$ALIAS" ] && [ "$(sed -n 1p "$ALIAS")" = "---" ] && [ "$(sed -n 2p "$ALIAS")" = "name: continue" ] \
+   && sed -n 3p "$ALIAS" | grep -qE '^description: Deprecated alias for /hmd:save.{40,}' && [ "$(sed -n 4p "$ALIAS")" = "disable-model-invocation: true" ] \
+   && [ "$(sed -n 5p "$ALIAS")" = "---" ]; then
+  ok "1i. commands/continue.md is still a command: name: continue, 'Deprecated alias for /hmd:save', user-typed only (like commands/level.md)"
+else
+  bad "1i. commands/continue.md is missing or its frontmatter is not --- / name: continue / description: Deprecated alias for /hmd:save ... / disable-model-invocation: true / ---"
+fi
+if grep -qF "'/hmd:continue' is now '/hmd:save'" "$ALIAS" 2>/dev/null && grep -qF 'Skill tool' "$ALIAS" 2>/dev/null && grep -qF 'hmd:save' "$ALIAS" 2>/dev/null \
+   && ! grep -qE 'heimdall-(continue|checkpoint)|HMD_NOTE' "$ALIAS" 2>/dev/null; then
+  ok "1j. the alias prints the one-line rename notice and hands over to /hmd:save through the Skill tool: no steps, no tool call, no second copy of the logic"
+else
+  bad "1j. commands/continue.md lacks the rename notice / the hand-over to hmd:save, or still carries steps or a tool call of its own"
 fi
 if [ -x "$CONT" ] && [ -f "$REPO/bin/lib/hmd_continue.py" ] && bash -n "$CONT" 2>/dev/null \
    && python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$REPO/bin/lib/hmd_continue.py" 2>/dev/null; then
@@ -337,6 +384,32 @@ if [ "$rc" = "3" ] && grep -qE '^/compact ' "$TMPROOT/tout" && grep -q 'will NOT
   ok "3m. a handoff git already tracks: write says it will NOT be re-injected because git tracks it (the line is still printed)"
 else
   bad "3m. a tracked handoff was not reported at write time (rc=$rc): $(head -c 300 "$TMPROOT/ierr0")"
+fi
+
+# the one line before the /compact line says what pasting it does (and that ignoring it just saves)
+if [ "$(tail -n 2 "$TMPROOT/wout" | sed -n 1p)" != "" ] && tail -n 2 "$TMPROOT/wout" | sed -n 1p | grep -qF 'paste to compact with the thread kept; ignore to just save'; then
+  ok "3n. the line printed right before the /compact line says: paste to compact with the thread kept; ignore to just save"
+else
+  bad "3n. the line before the /compact line is not the one-line explanation: $(tail -n 2 "$TMPROOT/wout" | sed -n 1p)"
+fi
+
+# THE /hmd:save PATH, as the command writes it: the very tool call commands/save.md tells the model to make, taken out of that file and run as written
+# (CLAUDE_PLUGIN_ROOT on this checkout, a scratch project as the working directory), so a doc that drifts from the tool turns this red.
+PS="$(mk_project savepath)"
+SAVE_CALL="$(awk '/heimdall-continue" write <<.HMD_NOTE./ { on = 1 } on { print } on && /^HMD_NOTE$/ { exit }' "$CMD")"
+( cd "$PS" && CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$PS" bash -c "$SAVE_CALL" ) >"$TMPROOT/sout" 2>"$TMPROOT/serr"; rc=$?
+if [ -n "$SAVE_CALL" ] && [ "$rc" = "0" ] && [ -f "$PS/.planning/CHECKPOINT.md" ] && [ -f "$PS/.planning/CONTINUE.md" ] \
+   && grep -qF -- 'next: the exact next step' "$PS/.planning/CHECKPOINT.md" && grep -q 'the exact next step' "$PS/.planning/CONTINUE.md"; then
+  ok "3o. the tool call as commands/save.md documents it writes CHECKPOINT.md and CONTINUE.md in one go, the note in both (exit 0)"
+else
+  bad "3o. the tool call taken from commands/save.md did not write both files (rc=$rc, call found: $([ -n "$SAVE_CALL" ] && echo yes || echo no)): $(head -c 300 "$TMPROOT/serr")"
+fi
+SLINE="$(grep -E '^/compact ' "$TMPROOT/sout")"
+if [ "$(grep -cE '^/compact ' "$TMPROOT/sout")" = "1" ] && [ -n "$SLINE" ] && [ "$(tail -n 1 "$TMPROOT/sout")" = "$SLINE" ] && [ "${#SLINE}" -le 1500 ] \
+   && tail -n 2 "$TMPROOT/sout" | sed -n 1p | grep -qF 'ignore to just save'; then
+  ok "3p. ...and prints exactly one /compact line (${#SLINE} chars) as its LAST line, the explanation just above it"
+else
+  bad "3p. the documented call did not end on one /compact line with the explanation above it: $(tail -n 3 "$TMPROOT/sout" | head -c 400)"
 fi
 
 # ── helpers for the hook and the helper cases (P holds a fresh, recorded, untracked handoff from the real write) ─
