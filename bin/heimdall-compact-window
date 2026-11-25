@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""heimdall-compact-window -- raise the coding agent's native auto-compact window, when the person says yes, and undo it exactly.
+"""heimdall-compact-window -- raise the coding agent's native auto-compact window, or lower its Bash output cap, when the person says yes, and undo it exactly.
 
     heimdall-compact-window status
-    heimdall-compact-window on  [--tokens N] [--yes] [--force]
-    heimdall-compact-window off [--yes] [--force]
+    heimdall-compact-window on  [--tokens N | --bash-cap [CHARS]] [--yes] [--force]
+    heimdall-compact-window off [--bash-cap] [--yes] [--force]
     heimdall-compact-window offer
     heimdall-compact-window -h | --help
 
@@ -11,8 +11,16 @@ WHY. A long session pays for its whole history on every turn. Measured on one lo
 a replay of that session, not a promise), compacting at 300,000 tokens instead of letting the context grow toward 900,000 would have cut about 40% of the
 main-thread spend. The price is real too: older detail is summarized sooner (the /hmd:continue handoff and the SessionStart compact re-inject carry the thread).
 
-WHAT IT WRITES. One key, `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000), in the user-level settings.json
-of the agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. A symlink there is followed (the file it points to is edited and the link stays).
+THE BASH CAP (--bash-cap). A second setting with every guarantee below, on a record and a backup of its own. Claude Code hands a successful Bash command's output to the model inline up to
+30,000 characters; what is past that is saved to a file and the model gets a short preview and the path (it reads the file when it needs the rest). `--bash-cap [CHARS]` lowers that limit
+(default 16,000; 4,000 to 128,000, as 12000 or 12k), so a verbose build or test log costs less context per call; the price is a Read when the rest is needed. The key is `bashOutputMaxChars`
+(Claude Code 2.1.261 or later). It, not the environment variable BASH_MAX_OUTPUT_LENGTH, is what limits the output the model receives inline: the variable only sizes the window the output is read
+back through, and the agent ignores it once the key is set (named from the 2.1.331 bundle and the documentation, settings-reference, bashOutputMaxChars). A BASH_MAX_OUTPUT_LENGTH of the person's
+own, in this environment or in the "env" block of the settings file, is therefore a value of theirs that `on --bash-cap` never covers without --force (exit 4). A failed command's own excerpt
+(about 10,000 characters) is not governed by the cap. `off` undoes the window only and `off --bash-cap` the cap only, in either order.
+
+WHAT IT WRITES. One key per command: `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000) or, with --bash-cap, `bashOutputMaxChars` (a character count),
+in the user-level settings.json of the agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. A symlink there is followed (the file it points to is edited and the link stays).
 The key is added to, or replaced in, the TEXT of the file, never by re-serializing the document, so every other byte survives: key order, indentation, escapes,
 the trailing newline. The write is a temp file in the same directory and a rename; the file is read again as the last step before the rename, and when it is no longer
 the one that was read (other bytes, or another file in its place) nothing is written and the exit status is 1. A file that is not a JSON object (or names the key
@@ -20,21 +28,25 @@ twice) is never touched.
 
 CONSENT. Nothing is written without the person's yes, the contract of `hmd prove` and `hmd skills install`: `--yes` says it was already given; at a terminal
 (stdin and stdout) the change is shown and `Proceed? [y/N]` is asked; anywhere else nothing is written and the exit status is 3, "consent required": ask the
-person, then run the same command again with --yes. `status` never writes. A run with nothing to change (already set, nothing to undo) never asks.
+person, then run the same command again with --yes (the message gives it, the setting and the value included). `status` never writes. A run with nothing to change
+(already set, nothing to undo) never asks.
 
 on      back up the settings file ($HEIMDALL_HOME/compact-window/<id>.settings.json.bak, mode 0600), record what was there before (the record, <id>.state.json, beside
         it), then set the key. <id> is a digest of the settings file's real path: every settings file (every CLAUDE_CONFIG_DIR) keeps a pair of its own, so setting
-        the key in a second one never costs the first its undo. A value of the person's own that differs from the one asked for is never replaced unless --force is
-        given (exit 4); a value hmd wrote itself is updated in place and still undoes to the state before hmd.
+        the key in a second one never costs the first its undo, and the cap keeps a pair of its own beside the window's (<id>.bash-cap.settings.json.bak, <id>.bash-cap.state.json).
+        A value of the person's own that differs from the one asked for is never replaced unless --force is given (exit 4); a value hmd wrote itself is updated in place and
+        still undoes to the state before hmd.
 off     put the key back as hmd found it, in the settings file of this environment: removed when it was absent (the file removed when hmd created it), the old value
-        when --force had replaced one. When the file is still byte-for-byte what hmd wrote, the backup is restored verbatim; when something else changed the file
-        since, only the key is reverted and the rest is kept. A value that is no longer the one hmd wrote is the person's by now: exit 4 unless --force. Without a
-        record for this settings file there is nothing to undo here; any other settings file hmd set the key in is named, to be undone with its own CLAUDE_CONFIG_DIR.
-offer   the one-time question install and update ask at a terminal: nothing is printed, read or written without a terminal on stdin and stdout, a setting that is
+        when --force had replaced one. When the file is still byte-for-byte what hmd wrote and the other setting is not also set in it by hmd, the backup is restored verbatim; when
+        something else changed the file since, or the other setting is still there (the backup also holds that setting's earlier state), only the key is reverted and the rest is
+        kept: the key is cut out exactly as it was added, so the last `off` leaves the file as it was before either. A value that is no longer the one hmd wrote is the person's
+        by now: exit 4 unless --force. Without a record for this settings file there is nothing to undo here; any other settings file hmd set the key in is named, to be undone
+        with its own CLAUDE_CONFIG_DIR.
+offer   the one-time question install and update ask at a terminal about the window: nothing is printed, read or written without a terminal on stdin and stdout, a setting that is
         already there is never asked about, and an answer (yes or no) is kept in $HEIMDALL_HOME/compact-window/offered so it is asked once. Always exits 0.
         HEIMDALL_NO_COMPACT_WINDOW_OFFER=1 silences it. A question left unanswered for 300 seconds is dropped, and not recorded, so it is asked again later;
         HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S=<seconds> shortens that wait (the test seam: a number above 0 and below 300, anything else is ignored).
-status  the setting file, the value in it and whether hmd put it there, and any other settings file hmd set the key in. Exit 1 only when the file cannot be used.
+status  the setting file, then the window and the cap: the value in the file and whether hmd put it there, and any other settings file hmd set the key in. Exit 1 only when the file cannot be used.
 
 UPDATING FROM 2.4.12. That release kept ONE record and ONE backup for the whole machine, state.json and settings.json.bak. The first time `status`, `on` or `off` runs they are moved
 to the names of the settings file the record names (its real path, which the record is rewritten to say), so a yes given to 2.4.12 still has its `off`, `status` and `on --tokens`.
@@ -42,28 +54,61 @@ A record of another settings file becomes that file's, never this one's; a recor
 exit 1 with nothing moved, like any other.
 
 Exit 0 done or nothing to do. 1 a file that cannot be used or written (nothing was changed; stderr says why). 2 usage. 3 consent required (nothing was written).
-4 refused: the key holds a value that is not hmd's, --force overrides. stdlib only.
+4 refused: the key holds a value that is not hmd's (for the cap also: a BASH_MAX_OUTPUT_LENGTH of the person's own), --force overrides. stdlib only.
 """
 import argparse
+import collections
 import contextlib
 import datetime
 import hashlib
 import json
+import math
 import os
 import select
 import stat
 import sys
 import tempfile
 
-KEY = "autoCompactWindow"
-DEFAULT_TOKENS = 300000
-MIN_TOKENS = 100000
 OFFER_WAIT_S = 300   # an offer left unanswered this long is not asked again that run, and not recorded as answered
 OFFER_WAIT_ENV = "HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S"   # the test seam: a shorter wait, in seconds
 STATE_FILE, BACKUP_FILE, OFFERED_FILE = "state.json", "settings.json.bak", "offered"
 EXIT_FAILED, EXIT_USAGE, EXIT_CONSENT, EXIT_REFUSED = 1, 2, 3, 4
 WHITESPACE = " \t\n\r"
 DECODER = json.JSONDecoder()
+
+
+class Lever(collections.namedtuple("Lever", "key slot what unit default low high accepts select value_flag infix cost unset live env_var shadows")):
+    """One key of the agent's settings that hmd sets with the person's yes and undoes exactly. Everything below works on a lever; these fields are all that differs between two.
+    key: the top-level member of settings.json. slot: its row in `status`. what, unit: how consent names it, and what its value counts. default, low, high: the value `on` writes when none is
+    given, and the range `on` accepts (high may be infinity); accepts: the usage error for a value outside it. select, value_flag: the flag after the verb that picks the lever (none for the
+    window) and the flag before its value. infix: in the names of its record and backup, so every lever keeps a pair of its own. cost: the consent line that says what it costs ({} is the value).
+    unset: what `status` says while the key is absent. live: what follows "applies to sessions started from now on", from the value. env_var: the environment variable of the agent that bears on
+    the same thing, which `status` shows. shadows: once the key is set the agent ignores that variable, so one of the person's own is a value of theirs `on` does not cover without --force."""
+    __slots__ = ()
+
+    def command(self, verb, value=None, force=False):
+        """The command line that does `verb` for this lever, as the person would type it (the value only when it is not the default)."""
+        line = "hmd compact-window %s%s" % (verb, self.select)
+        if value is not None and value != self.default:
+            line += "%s %d" % (self.value_flag, value)
+        return line + (" --force" if force else "")
+
+
+WINDOW = Lever(
+    key="autoCompactWindow", slot="window", what="the auto-compact window", unit="tokens", default=300000, low=100000, high=math.inf,
+    accepts="a token count of 100,000 or more (digits, or a number and k: 250000, 250k)", select="", value_flag=" --tokens", infix="",
+    cost="older detail is summarized sooner; the saving measured on one long session was about 40% of main-thread spend",
+    unset="not set (the agent's own default applies; `hmd compact-window on` sets it, with your yes)",
+    live=lambda tokens: " (`/autocompact %dk` sets it in a running one)" % (tokens // 1000) if tokens % 1000 == 0 else "",
+    env_var="CLAUDE_CODE_AUTO_COMPACT_WINDOW", shadows=False)
+CAP = Lever(
+    key="bashOutputMaxChars", slot="bash cap", what="the Bash output cap", unit="characters", default=16000, low=4000, high=128000,
+    accepts="a character count from 4,000 to 128,000 (digits, or a number and k: 12000, 12k)", select=" --bash-cap", value_flag="", infix="bash-cap.",
+    cost="output past {} characters (30,000 is the agent's default) comes back as a preview and a file path, not inline: a long log costs less context per call, "
+         "and a Read when the rest is needed; needs Claude Code 2.1.261 or later",
+    unset="at the agent's own default, 30,000 characters inline (`hmd compact-window on --bash-cap` lowers it, with your yes)",
+    live=lambda chars: "", env_var="BASH_MAX_OUTPUT_LENGTH", shadows=True)
+LEVERS = (WINDOW, CAP)
 
 
 class Unusable(Exception):
@@ -97,11 +142,11 @@ def settings_path():
     return os.path.join(config, "settings.json")
 
 
-def state_files(settings):
-    """(record, backup): the two files `on` keeps for one settings file, named by a digest of its canonical path (Doc.path). A second settings file (another
-    CLAUDE_CONFIG_DIR) gets a pair of its own, so setting the key there never takes the first one's undo away."""
+def state_files(lever, settings):
+    """(record, backup): the two files `on` keeps for one lever of one settings file, named by a digest of its canonical path (Doc.path). A second settings file (another
+    CLAUDE_CONFIG_DIR) gets a pair of its own, and so does the second lever of one file, so setting one never takes the other's undo away."""
     stem = sha256(os.fsencode(settings))[:16]
-    return os.path.join(state_dir(), "%s.%s" % (stem, STATE_FILE)), os.path.join(state_dir(), "%s.%s" % (stem, BACKUP_FILE))
+    return tuple(os.path.join(state_dir(), "%s.%s%s" % (stem, lever.infix, name)) for name in (STATE_FILE, BACKUP_FILE))
 
 
 def offer_wait():
@@ -167,12 +212,14 @@ def remove(path):
 
 
 class Doc:
-    """One settings.json, read once: its text, and where each top-level member sits in it (character spans), so an edit changes nothing but the one key."""
+    """One settings.json, read once: its text, and where each top-level member sits in it (character spans), so an edit changes nothing but the one key `key`."""
 
-    def __init__(self, link):
+    def __init__(self, link, key):
+        self.key = key
         self.path = os.path.realpath(link)   # a symlinked settings.json is edited where it points
         self.raw, self.identity = read_file(self.path)
         self.text = None
+        self.document = {}                   # the parsed object, only read: every edit is made on the text
         self.members = []                    # (key, key_start, key_end, value_start, value_end)
         self.open_at = self.close_at = 0
         if self.raw is None:
@@ -184,9 +231,10 @@ class Doc:
             raise Unusable("%s is not valid JSON, so it was left alone (%s)" % (self.path, exc))
         if not isinstance(document, dict):
             raise Unusable("%s does not hold a JSON object, so it was left alone" % self.path)
+        self.document = document
         self.scan()
-        if sum(1 for member in self.members if member[0] == KEY) > 1:
-            raise Unusable("%s names %s more than once, so it was left alone" % (self.path, KEY))
+        if sum(1 for member in self.members if member[0] == key) > 1:
+            raise Unusable("%s names %s more than once, so it was left alone" % (self.path, key))
 
     def skip(self, at):
         while self.text[at] in WHITESPACE:
@@ -209,7 +257,7 @@ class Doc:
 
     @property
     def member(self):
-        return next((member for member in self.members if member[0] == KEY), None)
+        return next((member for member in self.members if member[0] == self.key), None)
 
     @property
     def value_text(self):
@@ -220,12 +268,12 @@ class Doc:
     def with_key(self, value):
         """The text with the key set to `value` (its JSON text): replaced where it is, else added as the last member in the layout the file already has."""
         if self.text is None:
-            return '{\n  "%s": %s\n}\n' % (KEY, value)
+            return '{\n  "%s": %s\n}\n' % (self.key, value)
         found = self.member
         if found is not None:
             return self.text[:found[3]] + value + self.text[found[4]:]
         if not self.members:
-            return self.text[:self.open_at + 1] + '\n  "%s": %s\n' % (KEY, value) + self.text[self.close_at:]
+            return self.text[:self.open_at + 1] + '\n  "%s": %s\n' % (self.key, value) + self.text[self.close_at:]
         first, last = self.members[0], self.members[-1]
         head = self.text[self.open_at:first[1]]
         lead = self.text[self.text.rfind("\n", 0, first[1]) + 1:first[1]]
@@ -233,11 +281,11 @@ class Doc:
             separator = (",\r\n" if "\r\n" in head else ",\n") + lead
         else:
             separator = ", "
-        return self.text[:last[4]] + separator + json.dumps(KEY) + self.text[first[2]:first[3]] + value + self.text[last[4]:]
+        return self.text[:last[4]] + separator + json.dumps(self.key) + self.text[first[2]:first[3]] + value + self.text[last[4]:]
 
     def without_key(self):
         """The text with the key's member cut out, its comma and the layout between it and its neighbour with it."""
-        index = next(i for i, member in enumerate(self.members) if member[0] == KEY)
+        index = next(i for i, member in enumerate(self.members) if member[0] == self.key)
         _, key_start, _, _, value_end = self.members[index]
         if len(self.members) == 1:
             return self.text[:self.open_at + 1] + self.text[self.close_at:]
@@ -259,11 +307,11 @@ def replace_settings(doc, data):
     write_atomic(doc.path, data, before_rename=lambda: ensure_unchanged(doc))
 
 
-def unusable_record(path, reason):
-    return Unusable("%s cannot be used (%s); remove it by hand once you no longer want hmd to track %s" % (path, reason, KEY))
+def unusable_record(lever, path, reason):
+    return Unusable("%s cannot be used (%s); remove it by hand once you no longer want hmd to track %s" % (path, reason, lever.key))
 
 
-def read_record(path, settings=None):
+def read_record(lever, path, settings=None):
     """The record in `path`, None when there is none; Unusable when it cannot be read or used, or, given `settings`, when it is the record of another settings file."""
     raw = read_bytes(path)
     if raw is None:
@@ -278,7 +326,7 @@ def read_record(path, settings=None):
         if settings is not None and record["settings"] != settings:
             raise ValueError("it is the record of another settings file")
     except (ValueError, RecursionError) as exc:
-        raise unusable_record(path, exc)
+        raise unusable_record(lever, path, exc)
     return record
 
 
@@ -291,18 +339,19 @@ def migrate_legacy():
     looks, the old pair is moved to the names of the settings file its record names, so a yes given to 2.4.12 still has its `off`, `status` and `on --tokens` after the update. The pair goes
     to the file the record NAMES, spelled as its real path (the record is rewritten to say so), never to the one being asked about: a record of another settings file stays that file's.
     The backup moves first and the record last, so a move that was interrupted is finished by the next run; a record already in place for that file is the newer one, and the old pair
-    is left where it is. Unusable when the old record cannot be read or used, or the pair cannot be moved: nothing is lost, and the verb fails the way it does for any record it cannot use."""
+    is left where it is. Unusable when the old record cannot be read or used, or the pair cannot be moved: nothing is lost, and the verb fails the way it does for any record it cannot use.
+    2.4.12 had the window and nothing else, so the pair is the window's."""
     old_record, old_backup = os.path.join(state_dir(), STATE_FILE), os.path.join(state_dir(), BACKUP_FILE)
-    record = read_record(old_record)
+    record = read_record(WINDOW, old_record)
     if record is None:
         return
     try:
         if not os.path.isabs(record["settings"]):
             raise ValueError("its settings is not an absolute path")
         owner = os.path.realpath(record["settings"])
-        new_record, new_backup = state_files(owner)
+        new_record, new_backup = state_files(WINDOW, owner)
     except ValueError as exc:
-        raise unusable_record(old_record, exc)
+        raise unusable_record(WINDOW, old_record, exc)
     if os.path.lexists(new_record):
         return
     try:
@@ -315,22 +364,25 @@ def migrate_legacy():
         raise Unusable("cannot move the record and backup 2.4.12 kept (%s) to the names of the settings file they describe: %s" % (tilde(old_record), exc))
 
 
-def load_state(settings):
-    """The record `on` left for the settings file `settings` (its canonical path), None when there is none; Unusable when there is one that cannot be used. A pair 2.4.12 kept
-    under the old names is moved to its settings file's names first (migrate_legacy)."""
-    migrate_legacy()
-    return read_record(state_files(settings)[0], settings)
+def load_state(lever, settings):
+    """The record `on` left for `lever` in the settings file `settings` (its canonical path), None when there is none; Unusable when there is one that cannot be used. A pair 2.4.12 kept
+    under the old names (the window's) is moved to its settings file's names first (migrate_legacy)."""
+    if lever is WINDOW:
+        migrate_legacy()
+    return read_record(lever, state_files(lever, settings)[0], settings)
 
 
-def put_record(settings, record):
-    write_atomic(state_files(settings)[0], record_bytes(record), 0o700)
+def put_record(lever, settings, record):
+    write_atomic(state_files(lever, settings)[0], record_bytes(record), 0o700)
 
 
-def other_records(settings):
-    """The settings files, other than `settings`, that hmd set the key in and still holds a record for (a 2.4.12 pair is listed once load_state has moved it to its own names, which
-    every verb that calls this does first). A record that cannot be read or used is left out: it is reported when its own settings file is the one asked about."""
+def other_records(lever, settings):
+    """The settings files, other than `settings`, that hmd set the key of `lever` in and still holds a record for (a 2.4.12 pair is listed once load_state has moved it to its own names, which
+    every verb that calls this does first). A record that cannot be read or used is left out: it is reported when its own settings file is the one asked about. The records of the other
+    lever have another suffix, and a stem is 16 hex digits with no dot in them: they are never listed here."""
+    suffix = "." + lever.infix + STATE_FILE
     try:
-        names = sorted(name for name in os.listdir(state_dir()) if name.endswith("." + STATE_FILE))
+        names = sorted(name for name in os.listdir(state_dir()) if name.endswith(suffix) and "." not in name[:-len(suffix)])
     except OSError:
         return []
     found = []
@@ -344,9 +396,9 @@ def other_records(settings):
     return found
 
 
-def forget(settings):
-    """Drop the record and the backup of the settings file `settings`: there is nothing left to undo."""
-    for path in state_files(settings):
+def forget(lever, settings):
+    """Drop the record and the backup of `lever` in the settings file `settings`: there is nothing left to undo."""
+    for path in state_files(lever, settings):
         remove(path)
 
 
@@ -365,13 +417,12 @@ def ask(question, wait=None):
     return sys.stdin.readline().strip().lower() in ("y", "yes")
 
 
-def consent(args, summary, details):
-    """True when the write may go ahead: --yes, or an interactive yes. Otherwise False with nothing written and the way forward on stderr."""
+def consent(args, summary, details, command):
+    """True when the write may go ahead: --yes, or an interactive yes. Otherwise False with nothing written and the way forward on stderr: `command`, as it was typed, to run again with --yes."""
     if args.yes:
         return True
     if not interactive():
-        warn("consent required: %s. Nothing was written. Ask the person, then run the same command again with --yes: hmd compact-window %s --yes"
-             % (summary, args.verb))
+        warn("consent required: %s. Nothing was written. Ask the person, then run the same command again with --yes: %s --yes" % (summary, command))
         return False
     sys.stderr.write("\n".join(details) + "\n")
     if ask("Proceed? [y/N] "):
@@ -380,98 +431,131 @@ def consent(args, summary, details):
     return False
 
 
-def parse_tokens(text):
+def parse_amount(lever, text):
     digits, factor = (text[:-1], 1000) if text.lower().endswith("k") else (text, 1)
-    if not (digits.isascii() and digits.isdigit()) or int(digits) * factor < MIN_TOKENS:
-        raise argparse.ArgumentTypeError("%r is not a token count of %s or more (digits, or a number and k: 250000, 250k)" % (text, format(MIN_TOKENS, ",")))
+    if not (digits.isascii() and digits.isdigit()) or not lever.low <= int(digits) * factor <= lever.high:
+        raise argparse.ArgumentTypeError("%r is not %s" % (text, lever.accepts))
     return int(digits) * factor
 
 
+def parse_tokens(text):
+    return parse_amount(WINDOW, text)
+
+
+def parse_chars(text):
+    return parse_amount(CAP, text)
+
+
+def own_rival(lever, doc):
+    """(its value, where it is) of an environment variable of the person's own that setting the key would make the agent ignore: set in this environment, or in the "env" block of the settings
+    file. None when the lever shadows no variable, or the person set none (an empty one is unset to the agent too)."""
+    if not lever.shadows:
+        return None
+    if os.environ.get(lever.env_var):
+        return os.environ[lever.env_var], "this environment"
+    block = doc.document.get("env")
+    if isinstance(block, dict) and block.get(lever.env_var) not in (None, ""):
+        return json.dumps(block[lever.env_var]), "the env block of %s" % tilde(doc.path)
+    return None
+
+
 def cmd_on(args):
+    lever, value = args.lever, args.value
     try:
-        doc = Doc(settings_path())
-        record = load_state(doc.path)
+        doc = Doc(settings_path(), lever.key)
+        record = load_state(lever, doc.path)
     except Unusable as exc:
         warn(str(exc))
         return EXIT_FAILED
-    wanted = str(args.tokens)
+    wanted = str(value)
     found, current = doc.member, doc.value_text
     if current == wanted:
-        say("already set: %s is %s tokens in %s; nothing changed" % (KEY, format(args.tokens, ","), tilde(doc.path)))
+        say("already set: %s is %s %s in %s; nothing changed" % (lever.key, format(value, ","), lever.unit, tilde(doc.path)))
         return 0
     ours = record is not None and current == str(record["written"])
     if found is not None and not ours and not args.force:
-        warn("%s is already %s in %s: that is your own setting, so it was left alone. --force replaces it (hmd compact-window off then puts %s back)"
-             % (KEY, current, tilde(doc.path), current))
+        warn("%s is already %s in %s: that is your own setting, so it was left alone. --force replaces it (%s then puts %s back)"
+             % (lever.key, current, tilde(doc.path), lever.command("off"), current))
         return EXIT_REFUSED
-    backup = state_files(doc.path)[1]
+    rival = own_rival(lever, doc) if found is None else None
+    if rival is not None and not args.force:
+        warn("%s is %s in %s: that is your own setting, and the agent ignores it once %s is set, so it was left alone. --force sets the key anyway (%s then removes it again)"
+             % (lever.env_var, rival[0], rival[1], lever.key, lever.command("off")))
+        return EXIT_REFUSED
+    backup = state_files(lever, doc.path)[1]
     now = "not set" if found is None else "%s (%s)" % (current, "set by hmd earlier" if ours else "yours; --force replaces it")
-    if not consent(args, "this writes %s" % tilde(doc.path), [
-            "hmd compact-window on: set the auto-compact window to %s tokens." % format(args.tokens, ","),
-            "  file    %s (only the key %s; every other byte stays as it is)" % (tilde(doc.path), KEY),
-            "  now     %s" % now,
-            "  backup  %s" % tilde(backup),
-            "  undo    hmd compact-window off",
-            "  cost    older detail is summarized sooner; the saving measured on one long session was about 40% of main-thread spend"]):
+    details = [
+        "%s: set %s to %s %s." % (lever.command("on"), lever.what, format(value, ","), lever.unit),
+        "  file    %s (only the key %s; every other byte stays as it is)" % (tilde(doc.path), lever.key),
+        "  now     %s" % now,
+        "  backup  %s" % tilde(backup),
+        "  undo    %s" % lever.command("off"),
+        "  cost    %s" % lever.cost.format(format(value, ","))]
+    if rival is not None:
+        details.append("  note    %s is %s in %s; the agent ignores it while the key is set" % (lever.env_var, rival[0], rival[1]))
+    if not consent(args, "this writes %s" % tilde(doc.path), details, lever.command("on", value, args.force)):
         return EXIT_CONSENT
     new = doc.with_key(wanted).encode("utf-8")
     if ours:
-        written = dict(record, written=args.tokens, sha256_after=sha256(new))
+        written = dict(record, written=value, sha256_after=sha256(new))
     else:
         written = {"schema": 1, "settings": doc.path, "had_file": doc.raw is not None, "had_key": found is not None, "previous_raw": current,
-                   "written": args.tokens, "sha256_after": sha256(new), "set_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                   "written": value, "sha256_after": sha256(new), "set_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     try:
         if not ours:
             if doc.raw is None:
                 remove(backup)
             else:
                 write_atomic(backup, doc.raw, 0o700)
-        put_record(doc.path, written)
+        put_record(lever, doc.path, written)
         replace_settings(doc, new)
     except (OSError, Unusable) as exc:
         if not ours:
-            forget(doc.path)
+            forget(lever, doc.path)
         else:
             with contextlib.suppress(OSError):   # the file was not changed: its record goes back to describing it
-                put_record(doc.path, record)
+                put_record(lever, doc.path, record)
         warn("%s was not changed: %s" % (tilde(doc.path), exc))
         return EXIT_FAILED
-    say("set %s to %s tokens in %s" % (KEY, format(args.tokens, ","), tilde(doc.path)))
-    say("backup %s; undo: hmd compact-window off" % tilde(backup))
-    live = " (`/autocompact %dk` sets it in a running one)" % (args.tokens // 1000) if args.tokens % 1000 == 0 else ""
-    say("It applies to sessions started from now on%s." % live)
+    say("set %s to %s %s in %s" % (lever.key, format(value, ","), lever.unit, tilde(doc.path)))
+    say("backup %s; undo: %s" % (tilde(backup), lever.command("off")))
+    say("It applies to sessions started from now on%s." % lever.live(value))
     return 0
 
 
 def cmd_off(args):
+    lever = args.lever
     try:
         settings = os.path.realpath(settings_path())
-        record = load_state(settings)
+        record = load_state(lever, settings)
         if record is None:
-            say("hmd did not set %s in %s: nothing to undo" % (KEY, tilde(settings)))
-            for other in other_records(settings):
-                say("hmd did set it in %s: undo that one with its own CLAUDE_CONFIG_DIR, hmd compact-window off" % tilde(other))
+            say("hmd did not set %s in %s: nothing to undo" % (lever.key, tilde(settings)))
+            for other in other_records(lever, settings):
+                say("hmd did set it in %s: undo that one with its own CLAUDE_CONFIG_DIR, %s" % (tilde(other), lever.command("off")))
             return 0
-        doc = Doc(settings)
+        doc = Doc(settings, lever.key)
     except Unusable as exc:
         warn(str(exc))
         return EXIT_FAILED
     if doc.member is None:
-        forget(doc.path)
-        say("%s is not in %s any more: nothing to undo, the record is cleared" % (KEY, tilde(doc.path)))
+        forget(lever, doc.path)
+        say("%s is not in %s any more: nothing to undo, the record is cleared" % (lever.key, tilde(doc.path)))
         return 0
     if doc.value_text != str(record["written"]) and not args.force:
         warn("%s is %s in %s now, not the %s hmd set: it is yours by now, so it was left alone. --force puts back what was there before hmd"
-             % (KEY, doc.value_text, tilde(doc.path), format(record["written"], ",")))
+             % (lever.key, doc.value_text, tilde(doc.path), format(record["written"], ",")))
         return EXIT_REFUSED
     before = "its value of %s" % record["previous_raw"] if record["had_key"] else "removed (it was not set)"
     if not consent(args, "this writes %s" % tilde(doc.path), [
-            "hmd compact-window off: put %s in %s back as it was before hmd set it." % (KEY, tilde(doc.path)),
-            "  result  %s; nothing else in the file is touched" % before]):
+            "%s: put %s in %s back as it was before hmd set it." % (lever.command("off"), lever.key, tilde(doc.path)),
+            "  result  %s; nothing else in the file is touched" % before], lever.command("off", force=args.force)):
         return EXIT_CONSENT
+    # The backup is the file as it was when THIS lever was set. While the other lever still has a record for the file, a restore of it could take away (or bring back) a
+    # setting that lever wrote or removed since, so the key is reverted alone: the cut is the exact inverse of the append, and the last one off leaves the file as it was.
+    sibling = any(os.path.lexists(state_files(other, doc.path)[0]) for other in LEVERS if other is not lever)
     try:
-        backup = read_bytes(state_files(doc.path)[1]) if record["had_file"] else None
-        exact = sha256(doc.raw) == record["sha256_after"] and (backup is not None or not record["had_file"])
+        backup = read_bytes(state_files(lever, doc.path)[1]) if record["had_file"] else None
+        exact = not sibling and sha256(doc.raw) == record["sha256_after"] and (backup is not None or not record["had_file"])
         if exact and not record["had_file"]:
             ensure_unchanged(doc)
             remove(doc.path)
@@ -482,30 +566,37 @@ def cmd_off(args):
     except (OSError, Unusable) as exc:
         warn("%s was not changed: %s" % (tilde(doc.path), exc))
         return EXIT_FAILED
-    forget(doc.path)
-    say("restored %s: %s%s" % (tilde(doc.path), "back to %s" % record["previous_raw"] if record["had_key"] else "%s removed" % KEY,
-                              "" if exact else " (the file had changed since; only the key was reverted)"))
+    forget(lever, doc.path)
+    why = "the other setting hmd keeps in it stays" if sibling else "the file had changed since"
+    say("restored %s: %s%s" % (tilde(doc.path), "back to %s" % record["previous_raw"] if record["had_key"] else "%s removed" % lever.key,
+                              "" if exact else " (%s; only the key was reverted)" % why))
     return 0
 
 
 def cmd_status(args):
     try:
-        doc = Doc(settings_path())
-        record = load_state(doc.path)
+        seen = []
+        for lever in LEVERS:
+            doc = Doc(settings_path(), lever.key)
+            seen.append((lever, doc, load_state(lever, doc.path)))
         offered = read_bytes(os.path.join(state_dir(), OFFERED_FILE))
     except Unusable as exc:
         warn(str(exc))
         return EXIT_FAILED
-    ours = record is not None and doc.value_text == str(record["written"])
-    say("%-9s %s%s" % ("settings", tilde(doc.path), "" if doc.raw is not None else " (does not exist yet)"))
-    if doc.member is None:
-        say("%-9s not set (the agent's own default applies; `hmd compact-window on` sets it, with your yes)" % "window")
-    else:
-        say("%-9s %s (%s)" % ("window", doc.value_text, "set by hmd; `hmd compact-window off` undoes it" if ours else "your own setting; hmd did not set it"))
-    for other in other_records(doc.path):
-        say("%-9s hmd also set it in %s; undo that one with its own CLAUDE_CONFIG_DIR, hmd compact-window off" % ("elsewhere", tilde(other)))
-    if os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
-        say("%-9s CLAUDE_CODE_AUTO_COMPACT_WINDOW=%s is also set in this environment" % ("env", os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]))
+    first = seen[0][1]
+    say("%-9s %s%s" % ("settings", tilde(first.path), "" if first.raw is not None else " (does not exist yet)"))
+    for lever, doc, record in seen:
+        ours = record is not None and doc.value_text == str(record["written"])
+        if doc.member is None:
+            say("%-9s %s" % (lever.slot, lever.unset))
+        else:
+            say("%-9s %s (%s)" % (lever.slot, doc.value_text,
+                                  "set by hmd; `%s` undoes it" % lever.command("off") if ours else "your own setting; hmd did not set it"))
+        for other in other_records(lever, doc.path):
+            say("%-9s hmd also set it in %s; undo that one with its own CLAUDE_CONFIG_DIR, %s" % ("elsewhere", tilde(other), lever.command("off")))
+        if os.environ.get(lever.env_var):
+            say("%-9s %s=%s is also set in this environment%s" % ("env", lever.env_var, os.environ[lever.env_var],
+                                                                  "; the agent ignores it while %s is set" % lever.key if lever.shadows else ""))
     answer = (offered or b"").decode("utf-8", "replace").split()
     say("%-9s %s" % ("offer", answer[0] if answer else "not asked yet"))
     return 0
@@ -525,7 +616,7 @@ def cmd_offer(args):
     if os.path.exists(stamp):
         return 0
     try:
-        doc = Doc(settings_path())
+        doc = Doc(settings_path(), WINDOW.key)
     except Unusable:
         return 0   # a file this tool must not touch is not offered a write
     if doc.member is not None:
@@ -535,12 +626,12 @@ def cmd_offer(args):
                      "  hmd can set the agent's native auto-compact window to %s tokens (the key %s in %s).\n"
                      "  On one long session that would have cut about 40%% of main-thread spend; older detail is summarized sooner.\n"
                      "  The file is backed up first, nothing else in it changes, and `hmd compact-window off` puts it back.\n"
-                     % (format(DEFAULT_TOKENS, ","), KEY, tilde(doc.path)))
+                     % (format(WINDOW.default, ","), WINDOW.key, tilde(doc.path)))
     answer = ask("Set it now? [y/N] ", offer_wait())
     if answer is None:
         return 0
     if answer:
-        if cmd_on(argparse.Namespace(verb="on", yes=True, force=False, tokens=DEFAULT_TOKENS)) == 0:
+        if cmd_on(argparse.Namespace(verb="on", yes=True, force=False, lever=WINDOW, value=WINDOW.default)) == 0:
             answered("accepted")
         return 0
     answered("declined")
@@ -562,8 +653,18 @@ def main(argv):
         verb.add_argument("--yes", "-y", action="store_true")
         verb.add_argument("--force", action="store_true")
         if name == "on":
-            verb.add_argument("--tokens", type=parse_tokens, default=DEFAULT_TOKENS)
+            verb.add_argument("--tokens", type=parse_tokens)
+            verb.add_argument("--bash-cap", type=parse_chars, nargs="?", const=CAP.default)
+        else:
+            verb.add_argument("--bash-cap", action="store_true")
     parsed = parser.parse_args(args)
+    if parsed.verb == "on":
+        if parsed.tokens is not None and parsed.bash_cap is not None:
+            parser.error("--tokens sizes the auto-compact window and --bash-cap the Bash output cap: one setting per command")
+        parsed.lever = CAP if parsed.bash_cap is not None else WINDOW
+        parsed.value = parsed.bash_cap if parsed.bash_cap is not None else parsed.tokens or WINDOW.default
+    elif parsed.verb == "off":
+        parsed.lever = CAP if parsed.bash_cap else WINDOW
     return {"status": cmd_status, "on": cmd_on, "off": cmd_off, "offer": cmd_offer}[parsed.verb](parsed)
 
 

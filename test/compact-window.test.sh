@@ -29,10 +29,16 @@
 #      --force); the pair goes to the names of the settings file the record names (a symlinked spelling of this file's path included) and is never adopted for another one; a
 #      record that cannot be read or used is exit 1 with nothing moved; a record already in place for that file is never replaced; the move is idempotent and an interrupted
 #      one is finished by the next run
+#   R  the Bash output cap, a second lever with the window's guarantees on a record and a backup of its own (`on --bash-cap [CHARS]`, key bashOutputMaxChars, 16000 by default, clamped by the
+#      agent to 4000-128000; named from Claude Code 2.1.331 and its documentation, where the key, not the variable BASH_MAX_OUTPUT_LENGTH, limits the output Claude receives inline): a round
+#      trip on three layouts, the text-exact append, values and their range, a value of the person's own (exit 4, --force, already the wanted one), consent (exit 3 and the command to run
+#      again, a person at a terminal), both levers in one file turned off in either order and after the first was updated (the other's key survives every off), a BASH_MAX_OUTPUT_LENGTH of
+#      the person's own (env block, environment: exit 4; empty is unset; the window is never held back), status rows and the other-settings-file listing kept apart per lever, the write
+#      race, a record that cannot be used, --help
 #
 # HERMETIC. HOME, HEIMDALL_HOME and the settings file are throwaway for every scenario; CLAUDE_CONFIG_DIR is unset; nothing reads or writes the operator's ~/.claude
 # or ~/.heimdall. CW_BIN=<file> points the suite at another copy of the tool (a mutant, for the break-it check).
-# budget: about 16 s solo: roughly 200 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git), a dozen on a pty, one on a pty that waits out the 1 s seam. No network.
+# budget: about 24 s solo: roughly 300 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git; 100 in R, the Bash cap), about twenty on a pty, one on a pty that waits out the 1 s seam. No network.
 # EXIT: 0 = every assertion passes; 1 = any FAIL.
 set -uo pipefail
 
@@ -54,8 +60,9 @@ OUT="$TMP/out"; ERR="$TMP/err"; : >"$OUT"; : >"$ERR"
 [ -x "$CW" ] || { bad "the tool is executable: $CW"; exit 1; }
 
 cat >"$TMP/chk.py" <<'PYEOF'
-import json, sys
-KEY = "autoCompactWindow"
+import json, os, sys
+KEYS = os.environ.get("CHK_KEY", "autoCompactWindow").split(",")   # the lever(s) under test, comma separated; the value command reads the first
+KEY, VALUE = KEYS[0], os.environ.get("CHK_VALUE", "300000")
 def pairs(path):
     with open(path, encoding="utf-8") as fh:
         return json.load(fh, object_pairs_hook=list)
@@ -64,10 +71,10 @@ if cmd == "value":      # the key's value as JSON, or ABSENT
     found = [json.dumps(v) for k, v in pairs(args[0]) if k == KEY]
     print(found[0] if found else "ABSENT")
 elif cmd == "others":   # every other member, in order, at every level, is the same in both files
-    sys.exit(0 if [p for p in pairs(args[0]) if p[0] != KEY] == [p for p in pairs(args[1]) if p[0] != KEY] else 1)
+    sys.exit(0 if [p for p in pairs(args[0]) if p[0] not in KEYS] == [p for p in pairs(args[1]) if p[0] not in KEYS] else 1)
 elif cmd == "added":    # the pretty fixture plus the key, as text: one member appended before the closing brace, nothing else moved
     old, new = open(args[0], encoding="utf-8").read(), open(args[1], encoding="utf-8").read()
-    sys.exit(0 if new == old[:-len("\n}\n")] + ',\n  "' + KEY + '": 300000' + "\n}\n" else 1)
+    sys.exit(0 if new == old[:-len("\n}\n")] + ',\n  "' + KEY + '": ' + VALUE + "\n}\n" else 1)
 elif cmd == "reserialize":   # what another tool does to the file: re-serialize it and add a member of its own
     doc = json.load(open(args[0], encoding="utf-8"))
     doc["addedLater"] = {"by": "someone else"}
@@ -159,7 +166,7 @@ PYEOF
 
 H=""; S=""; N=0
 new_home() { N=$((N + 1)); H="$TMP/h$N"; mkdir -p "$H/.claude" "$H/.heimdall"; S="$H/.claude/settings.json"; }
-scrub() { env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u HEIMDALL_NO_COMPACT_WINDOW_OFFER HOME="$H" HEIMDALL_HOME="$H/.heimdall" "$@"; }
+scrub() { env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u BASH_MAX_OUTPUT_LENGTH -u HEIMDALL_NO_COMPACT_WINDOW_OFFER HOME="$H" HEIMDALL_HOME="$H/.heimdall" "$@"; }
 cw()    { scrub "$CW" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }                                 # no terminal
 cwpty() { local a="$1"; shift; scrub "$PY" -I "$TMP/pty_drive.py" "$a" -- "$CW" "$@" >"$OUT" 2>"$ERR"; RC=$?; }   # a person at a terminal who types $a
 value() { "$PY" -I "$TMP/chk.py" value "$S"; }
@@ -559,6 +566,172 @@ if [ "$RC" -eq 0 ]; then
   cw off --yes
   eq "Q: the next run finishes the move: off restores the file byte for byte, the pair gone" "0|ABSENT|same|0" "$RC|$(value)|$(same "$S" "$TMP/orig" && echo same)|$(state)"
 fi
+
+# ---- R. the Bash output cap: `on --bash-cap` sets bashOutputMaxChars with every guarantee of the window, on a record and a backup of its own --------------------------------
+# What the agent reads is the settings key bashOutputMaxChars: the output Claude receives inline, 30000 by default, clamped to 4000-128000, past it a preview and a file path. The variable
+# BASH_MAX_OUTPUT_LENGTH only sizes the read-back window and is ignored once the key is set, so a BASH_MAX_OUTPUT_LENGTH of the person's own is a value of theirs.
+CAPKEY=bashOutputMaxChars
+capval() { CHK_KEY=$CAPKEY "$PY" -I "$TMP/chk.py" value "$S"; }                                                                                              # the cap's value as JSON, or ABSENT
+cstate() { find "$H/.heimdall/compact-window" -type f \( -name '*.bash-cap.state.json' -o -name '*.bash-cap.settings.json.bak' \) 2>/dev/null | wc -l | tr -d ' '; }   # the cap's records and backups kept
+wstate() { echo $(( $(state) - $(cstate) )); }                                                                                                                # the window's
+crec()   { find "$H/.heimdall/compact-window" -type f -name '*.bash-cap.state.json' 2>/dev/null | head -n 1; }                                                 # the cap's record
+cbak()   { find "$H/.heimdall/compact-window" -type f -name '*.bash-cap.settings.json.bak' 2>/dev/null | head -n 1; }                                          # the cap's backup
+
+# round trip on three layouts
+for layout in PRETTY COMPACT TABS; do
+  new_home; printf '%s' "${!layout}" >"$S"; cp "$S" "$TMP/orig"
+  cw on --bash-cap --yes
+  eq "R/$layout: on --bash-cap --yes exits 0" 0 "$RC"
+  eq "R/$layout: the cap is 16000 and the window's key is not there" "16000|ABSENT" "$(capval)|$(value)"
+  chk "R/$layout: every other member is the same, in order, at every level" env CHK_KEY=$CAPKEY "$PY" -I "$TMP/chk.py" others "$TMP/orig" "$S"
+  eq "R/$layout: the cap keeps a record and a backup of its own, the window none" "2|0" "$(cstate)|$(wstate)"
+  chk "R/$layout: the backup is the file as it was, byte for byte" same "$(cbak)" "$TMP/orig"
+  cw off --bash-cap --yes
+  eq "R/$layout: off --bash-cap --yes exits 0" 0 "$RC"
+  chk "R/$layout: off returns the file byte for byte" same "$S" "$TMP/orig"
+  eq "R/$layout: the record and the backup are gone" 0 "$(state)"
+done
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; cw on --bash-cap --yes
+chk "R: the key was appended as one member in the file's own layout (text-exact), 1.50 and the 20-digit integer untouched" env CHK_KEY=$CAPKEY CHK_VALUE=16000 "$PY" -I "$TMP/chk.py" added "$TMP/orig" "$S"
+cw on --bash-cap 12k --yes;   eq "R: 12k is 12000, and hmd's own value is updated in place without --force" "0|12000" "$RC|$(capval)"
+cw on --bash-cap 128k --yes;  eq "R: 128000, the top of the range, is taken" "0|128000" "$RC|$(capval)"
+cw on --bash-cap 4000 --yes;  eq "R: 4000, the bottom of the range, is taken" "0|4000" "$RC|$(capval)"
+cw on --bash-cap 3999 --yes;  eq "R: below 4000: usage error, exit 2, the value stays" "2|4000" "$RC|$(capval)"
+cw on --bash-cap 129k --yes;  eq "R: above 128000: exit 2" "2|4000" "$RC|$(capval)"
+cw on --bash-cap lots --yes;  eq "R: not a number: exit 2" 2 "$RC"
+cw on --tokens 250k --bash-cap --yes; eq "R: --tokens with --bash-cap is one setting too many: exit 2, nothing written" "2|4000" "$RC|$(capval)"
+cw off --bash-cap --yes;      eq "R: off returns to the very first state" "0|ABSENT" "$RC|$(capval)"
+chk "R: byte for byte" same "$S" "$TMP/orig"
+
+# a value of the person's own
+new_home; printf '{\n  "a": 1,\n  "bashOutputMaxChars": 50000,\n  "z": 2\n}\n' >"$S"; cp "$S" "$TMP/orig"
+cw on --bash-cap --yes
+eq "R: a value of the person's own is refused: exit 4" 4 "$RC"
+chk "R: the file is untouched" same "$S" "$TMP/orig"
+eq "R: no record and no backup" 0 "$(state)"
+chk "R: stderr names --force and the command that puts the value back" grep -qF -- "--force replaces it (hmd compact-window off --bash-cap then puts 50000 back)" "$ERR"
+cw on --bash-cap 12k --yes
+eq "R: a different value does not get past the guard either" 4 "$RC"
+cw on --bash-cap --yes --force
+eq "R: --force replaces it" "0|16000" "$RC|$(capval)"
+cw off --bash-cap --yes
+eq "R: off puts the earlier value back" "0|50000" "$RC|$(capval)"
+chk "R: byte for byte" same "$S" "$TMP/orig"
+new_home; printf '{\n  "bashOutputMaxChars": 16000\n}\n' >"$S"; cp "$S" "$TMP/orig"
+cw on --bash-cap --yes
+eq "R: already the wanted value: exit 0, says so" "0|1" "$RC|$(grep -c 'already set' "$OUT")"
+chk "R: the file is untouched, with no backup or record" test "$(state)|$(same "$S" "$TMP/orig" && echo same)" = "0|same"
+cw off --bash-cap --yes
+eq "R: off with no record of hmd's own: nothing to undo, the person's value stays" "0|1|same" "$RC|$(grep -c 'nothing to undo' "$OUT")|$(same "$S" "$TMP/orig" && echo same)"
+
+# consent
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cw on --bash-cap 12k
+eq "R: no terminal and no --yes: exit 3, consent required" "3|1" "$RC|$(grep -c 'consent required' "$ERR")"
+chk "R: stderr gives the command to run again, the setting and the value kept" grep -qF -- "hmd compact-window on --bash-cap 12000 --yes" "$ERR"
+chk "R: nothing was written (file, backup, record)" test "$(state)|$(same "$S" "$TMP/orig" && echo same)" = "0|same"
+cw on --bash-cap --yes; cw off --bash-cap
+eq "R: off --bash-cap without --yes or a terminal: exit 3, the command names the setting, the key stays" "3|1|16000" "$RC|$(grep -cF -- 'hmd compact-window off --bash-cap --yes' "$ERR")|$(capval)"
+cw off --bash-cap --yes
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cwpty n on --bash-cap
+eq "R: a person at a terminal who says n: exit 3, nothing written" "3|0" "$RC|$(state)"
+chk "R: the question names the setting and its value" grep -qF -- "set the Bash output cap to 16,000 characters" "$OUT"
+chk "R: ... and the command that undoes it" grep -qF -- "undo    hmd compact-window off --bash-cap" "$OUT"
+cwpty y on --bash-cap
+eq "R: ... who says y: written" "0|16000" "$RC|$(capval)"
+cwpty n off --bash-cap
+eq "R: off --bash-cap, n: exit 3, the key stays" "3|16000" "$RC|$(capval)"
+cwpty y off --bash-cap
+eq "R: off --bash-cap, y: restored" "0|ABSENT" "$RC|$(capval)"
+chk "R: byte for byte" same "$S" "$TMP/orig"
+
+# both levers in one file: each is undone on its own, in either order
+for layout in PRETTY COMPACT; do
+  new_home; printf '%s' "${!layout}" >"$S"; cp "$S" "$TMP/orig"
+  cw on --yes; cw on --bash-cap --yes
+  eq "R/both/$layout: the window and the cap in one file: each its own key, its own record and backup" "300000|16000|2|2" "$(value)|$(capval)|$(wstate)|$(cstate)"
+  cw off --bash-cap --yes
+  eq "R/both/$layout: off --bash-cap takes only the cap: the window's key, record and backup stay" "300000|ABSENT|2|0" "$(value)|$(capval)|$(wstate)|$(cstate)"
+  cw off --yes
+  eq "R/both/$layout: ... and off then restores the file byte for byte" "same|0" "$(same "$S" "$TMP/orig" && echo same)|$(state)"
+  cw on --yes; cw on --bash-cap --yes; cw off --yes
+  eq "R/both/$layout: off takes only the window, set first: the cap's key, record and backup stay" "ABSENT|16000|0|2" "$(value)|$(capval)|$(wstate)|$(cstate)"
+  cw off --bash-cap --yes
+  eq "R/both/$layout: ... and off --bash-cap then restores the file byte for byte" "same|0" "$(same "$S" "$TMP/orig" && echo same)|$(state)"
+done
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cw on --yes; cw on --bash-cap --yes; cw on --yes --tokens 400k; cw off --yes
+eq "R/both: the window updated after the cap, then off: the cap's key survives (the window's backup, taken before the cap, is not put back)" "ABSENT|16000|0|2" "$(value)|$(capval)|$(wstate)|$(cstate)"
+cw off --bash-cap --yes
+eq "R/both: ... and off --bash-cap then restores the file byte for byte" "same|0" "$(same "$S" "$TMP/orig" && echo same)|$(state)"
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cw on --bash-cap --yes; cw off --yes
+eq "R: off with only the cap set: nothing to undo for the window, the cap stays" "0|1|16000|2" "$RC|$(grep -c 'nothing to undo' "$OUT")|$(capval)|$(cstate)"
+cw off --bash-cap --yes; cw on --yes; cw off --bash-cap --yes
+eq "R: off --bash-cap with only the window set: nothing to undo for the cap, the window stays" "0|1|300000|2" "$RC|$(grep -c 'nothing to undo' "$OUT")|$(value)|$(wstate)"
+cw off --yes
+
+# a BASH_MAX_OUTPUT_LENGTH of the person's own: the agent ignores it once the key is set, so it is a value of theirs
+new_home; printf '{\n  "env": {\n    "BASH_MAX_OUTPUT_LENGTH": "60000"\n  }\n}\n' >"$S"; cp "$S" "$TMP/orig"
+cw on --bash-cap --yes
+eq "R: BASH_MAX_OUTPUT_LENGTH in the env block of the settings file: exit 4, nothing written" "4|ABSENT|0" "$RC|$(capval)|$(state)"
+chk "R: ... named, with where it is" grep -qF -- 'BASH_MAX_OUTPUT_LENGTH is "60000" in the env block' "$ERR"
+chk "R: ... the file is untouched" same "$S" "$TMP/orig"
+cw on --bash-cap --yes --force
+eq "R: --force sets the key anyway" "0|16000" "$RC|$(capval)"
+cw off --bash-cap --yes
+eq "R: off removes it again, so the variable counts again: the file byte for byte" "0|ABSENT|same" "$RC|$(capval)|$(same "$S" "$TMP/orig" && echo same)"
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+scrub env BASH_MAX_OUTPUT_LENGTH=60000 "$CW" on --bash-cap --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "R: BASH_MAX_OUTPUT_LENGTH in this environment: exit 4, the file untouched, no state" "4|same|0" "$RC|$(same "$S" "$TMP/orig" && echo same)|$(state)"
+chk "R: ... named, with where it is" grep -qF -- "BASH_MAX_OUTPUT_LENGTH is 60000 in this environment" "$ERR"
+scrub env BASH_MAX_OUTPUT_LENGTH=60000 "$CW" on --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "R: the window is not held back by it: on goes through" "0|300000" "$RC|$(value)"
+new_home; printf '%s' "$PRETTY" >"$S"
+scrub env BASH_MAX_OUTPUT_LENGTH= "$CW" on --bash-cap --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "R: an empty BASH_MAX_OUTPUT_LENGTH is unset to the agent too: on goes through" "0|16000" "$RC|$(capval)"
+
+# status
+new_home; printf '%s' "$PRETTY" >"$S"
+cw status
+eq "R: status shows the cap at the agent's default and leaves the window's row alone" "0|1|1" "$RC|$(grep -c '^bash cap .*default' "$OUT")|$(grep -c 'not set' "$OUT")"
+cw on --bash-cap --yes; cw status
+eq "R: status after on --bash-cap: the cap row says hmd set it, the window row does not" "1|0" "$(grep '^bash cap' "$OUT" | grep -c 'set by hmd')|$(grep '^window' "$OUT" | grep -c 'set by hmd')"
+cw off --bash-cap --yes; printf '{"bashOutputMaxChars": 50000}' >"$S"; cw status
+eq "R: status of a cap value that is the person's own says so" 1 "$(grep '^bash cap' "$OUT" | grep -c 'your own setting')"
+scrub env BASH_MAX_OUTPUT_LENGTH=60000 "$CW" status </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "R: status names a BASH_MAX_OUTPUT_LENGTH set in this environment" "0|1" "$RC|$(grep '^env ' "$OUT" | grep -c 'BASH_MAX_OUTPUT_LENGTH=60000')"
+
+# a second settings file: the cap set there is listed for the cap and never for the window
+new_home; mkdir -p "$H/second"; S2="$H/second/settings.json"
+printf '%s' "$PRETTY" >"$S"; printf '%s' "$COMPACT" >"$S2"; cp "$S2" "$TMP/orig2"
+cwat "$H/second" on --bash-cap --yes
+eq "R: the cap set in a second settings file: exit 0, the first file has none" "0|ABSENT" "$RC|$(capval)"
+cw status
+eq "R: status here names the second file, for the cap" 1 "$(grep -cF '~/second/settings.json' "$OUT")"
+cw off --yes
+eq "R: off here (the window): nothing to undo, and the cap set elsewhere is not listed under it" "0|1|0" "$RC|$(grep -c 'nothing to undo' "$OUT")|$(grep -cF '~/second/settings.json' "$OUT")"
+cw off --bash-cap --yes
+eq "R: off --bash-cap here: nothing to undo, the second file is named with the command that undoes it" "0|1|1" "$RC|$(grep -c 'nothing to undo' "$OUT")|$(grep -cF 'off --bash-cap' "$OUT")"
+cwat "$H/second" off --bash-cap --yes
+eq "R: off --bash-cap with its own CLAUDE_CONFIG_DIR restores that file byte for byte, the pair gone" "0|same|0" "$RC|$(same "$S2" "$TMP/orig2" && echo same)|$(state)"
+
+# the file changed while hmd was working; a record that cannot be used
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"; plus_newline "$TMP/orig" "$TMP/theirs"
+racing write inplace on --bash-cap --yes
+eq "R: on --bash-cap, the file saved by another writer during the write: exit 1, says it changed, no record, backup or temp file left" "1|1|0|0" "$RC|$(grep -c 'changed while hmd was working' "$ERR")|$(state)|$(leftovers)"
+chk "R: ... and the file is as the other writer left it" same "$S" "$TMP/theirs"
+new_home; printf '%s' "$PRETTY" >"$S"; cw on --bash-cap --yes; cp "$S" "$TMP/after-on"
+printf 'not json' >"$(crec)"
+cw off --bash-cap --yes
+eq "R: a cap record that cannot be used: exit 1, says so and which key" "1|1|1" "$RC|$(grep -c 'cannot be used' "$ERR")|$(grep -c 'bashOutputMaxChars' "$ERR")"
+chk "R: ... the settings file is left alone" same "$S" "$TMP/after-on"
+cw on --yes
+eq "R: the window never reads the cap's record: on goes through" "0|300000" "$RC|$(value)"
+
+cw --help
+chk "R: --help documents --bash-cap" grep -qF -- "--bash-cap" "$OUT"
 
 echo
 echo "compact-window: $PASS passed, $FAIL failed"
