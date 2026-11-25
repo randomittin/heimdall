@@ -582,6 +582,8 @@ except (TypeError, ValueError):
     BACKOFF_BASE_MS = 2000
 BACKOFF_CAP_MS = 30000
 CONNECT_TIMEOUT_S = 15
+SHUTDOWN_WAIT_S = 2 * CONNECT_TIMEOUT_S + 5  # the longest main() holds the process for the login guard's shutdown: its revoke connects, then waits for
+                                              # the answer, each bounded by CONNECT_TIMEOUT_S -- a hung relay delays the exit by that, never forever
 STREAM_TIMEOUT_S = None  # unbounded connect + response-header wait for GET
                           # /stream -- the long-lived body that follows has
                           # its own bound, STREAM_IDLE_S below; this constant
@@ -1604,7 +1606,8 @@ class RelayClient:
         end the client when a disconnect has marked the login `revoking` or the login is GONE (discarded, forgotten, deleted): an orderly shutdown,
         which revokes its session at the relay. Every resume start already claims under the store lock and skips what is marked or gone; this is for
         the client that got its claim a moment earlier, or that no stop found (a client is found by its device record, which is written only after its
-        claim). A store that merely cannot be read (login_state "unreadable") is no reason to end anybody's session."""
+        claim). A store that merely cannot be read (login_state "unreadable") is no reason to end anybody's session. This shutdown runs on this daemon
+        thread, so main() waits for it (SHUTDOWN_WAIT_S) before the process exits: a daemon thread does not outlive the process."""
         while True:
             if self._login_kept and LOGIN_STORE is not None and not self._stopping:
                 state = LOGIN_STORE.login_state(self.root, self.session_id)
@@ -3501,7 +3504,8 @@ def main(argv=None):
         client.code_start()  # after the signal handlers: Ctrl-C while the window registers still revokes
 
     client.login_startup()
-    threading.Thread(target=client._login_guard, name="login-guard", daemon=True).start()  # a disconnect that marked this login ends this client
+    guard = threading.Thread(target=client._login_guard, name="login-guard", daemon=True)  # a disconnect that marked this login ends this client
+    guard.start()
     if ATTACH is not None:
         ATTACH.sweep(client.root)  # a picture past its TTL does not outlive a restart
 
@@ -3509,6 +3513,11 @@ def main(argv=None):
     stream_thread.start()
 
     client.run_state_loop()
+    if client._stopping:
+        # shutdown() sets stop_event first, which is what ended the loop above, and the login guard runs it on a daemon thread: the process would
+        # exit under that shutdown's revoke and its `session_ended` the moment this thread returned (a loaded machine loses that race). A stop by
+        # signal runs its shutdown on THIS thread and never gets here, so one under way now is the guard's: hold the process until it is done.
+        guard.join(SHUTDOWN_WAIT_S)
     if not client._stopping:  # a shutdown (the login guard's) has done its own: an unconfirmed revoke must not lose the login
         client._remove_pairing_traces()  # an end the relay announced (session_ended) comes here, not through shutdown()
         client._discard_login()          # ... and so does the end of a login the relay refused: the session is over, the stored login goes
