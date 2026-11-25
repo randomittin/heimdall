@@ -398,6 +398,15 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled compact-now-release-start && exit 0; ls \"${HEIMDALL_HOME:-$HOME/.heimdall}\"/compact-window/*.compact-now.state.json >/dev/null 2>&1 || exit 0; HOOK=\"$HMDP/bin/heimdall-compact-window\"; [ -x \"$HOOK\" ] && \"$HOOK\" release >/dev/null 2>&1; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SubagentStop": [
@@ -532,6 +541,15 @@
           {
             "type": "command",
             "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled precompact-checkpoint && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; PC=\"$PLUGIN/bin/heimdall-precompact-checkpoint\"; if [ -x \"$PC\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 15; exec @ARGV' \"$PC\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; else \"$PC\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; fi; fi; exit 0"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled compact-now-release-precompact && exit 0; ls \"${HEIMDALL_HOME:-$HOME/.heimdall}\"/compact-window/*.compact-now.state.json >/dev/null 2>&1 || exit 0; HOOK=\"$HMDP/bin/heimdall-compact-window\"; [ -x \"$HOOK\" ] && \"$HOOK\" release >/dev/null 2>&1; exit 0",
+            "timeout": 10
           }
         ]
       }

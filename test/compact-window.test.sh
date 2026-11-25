@@ -38,9 +38,17 @@
 #      the person's own (env block, environment: exit 4; empty is unset; the window is never held back), status rows and the other-settings-file listing kept apart per lever, the write
 #      race, a record that cannot be used, --help
 #
+#   S  the compact-now trigger, a transient third lever (`on --compact-now`: env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "1", so Claude Code compacts on its next request and /hmd:save can arm it instead of asking the person to
+#      paste /compact; the evidence is docs/analysis/2026-11-26-save-auto-compact.md): armed inside an existing env object, a new one, an empty one and a new file, text-exact, and put back byte for byte (key-only after another
+#      tool rewrote the file); a value of the person's own (the env block, the environment) is never replaced and --force is a usage error; refused with exit 5 and nothing written for a Claude Code older than 2.1.329 or
+#      whose version is unknown (the session's own binary, CLAUDE_CODE_EXECPATH, by its name or by asking it) and when automatic compaction is off; the person's yes is asked once (exit 3 and the command, a person at a
+#      terminal, remembered after a yes, forgotten by `revoke`, never recorded for an arm that was refused); `release` (what the hooks run) is quiet, puts it back wherever it was armed and leaves a value the person changed;
+#      the expiry timer puts it back when nothing else did, and status says EXPIRED for an arming whose time is up; re-arming; both levers in one file in either order; the real SessionStart (every source) and PreCompact
+#      hook commands from hooks.json release it and honour the operator's switch
+#
 # HERMETIC. HOME, HEIMDALL_HOME and the settings file are throwaway for every scenario; CLAUDE_CONFIG_DIR is unset; nothing reads or writes the operator's ~/.claude
 # or ~/.heimdall. CW_BIN=<file> points the suite at another copy of the tool (a mutant, for the break-it check).
-# budget: about 27 s solo: roughly 340 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git; 140 in R, the Bash cap), about twenty on a pty, one on a pty that waits out the 1 s seam. No network.
+# budget: about 36 s solo: roughly 440 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git; 140 in R, the Bash cap; 100 in S, the trigger), about twenty-two on a pty, one on a pty that waits out the 1 s seam, one wait of about 1 s for the expiry timer. No network.
 # EXIT: 0 = every assertion passes; 1 = any FAIL.
 set -uo pipefail
 
@@ -77,6 +85,9 @@ elif cmd == "others":   # every other member, in order, at every level, is the s
 elif cmd == "added":    # the pretty fixture plus the key, as text: one member appended before the closing brace, nothing else moved
     old, new = open(args[0], encoding="utf-8").read(), open(args[1], encoding="utf-8").read()
     sys.exit(0 if new == old[:-len("\n}\n")] + ',\n  "' + KEY + '": ' + VALUE + "\n}\n" else 1)
+elif cmd == "armed":    # the pretty fixture plus the trigger: one member appended inside its existing env object, nothing else moved
+    old, new = open(args[0], encoding="utf-8").read(), open(args[1], encoding="utf-8").read()
+    sys.exit(0 if new != old and new == old.replace('back"\n  },', 'back",\n    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "1"\n  },') else 1)
 elif cmd == "reserialize":   # what another tool does to the file: re-serialize it and add a member of its own
     doc = json.load(open(args[0], encoding="utf-8"))
     doc["addedLater"] = {"by": "someone else"}
@@ -168,7 +179,7 @@ PYEOF
 
 H=""; S=""; N=0
 new_home() { N=$((N + 1)); H="$TMP/h$N"; mkdir -p "$H/.claude" "$H/.heimdall"; S="$H/.claude/settings.json"; }
-scrub() { env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u BASH_MAX_OUTPUT_LENGTH -u HEIMDALL_NO_COMPACT_WINDOW_OFFER HOME="$H" HEIMDALL_HOME="$H/.heimdall" "$@"; }
+scrub() { env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u BASH_MAX_OUTPUT_LENGTH -u HEIMDALL_NO_COMPACT_WINDOW_OFFER -u CLAUDE_AUTOCOMPACT_PCT_OVERRIDE -u DISABLE_AUTO_COMPACT -u DISABLE_COMPACT -u CLAUDE_CODE_EXECPATH -u CLAUDE_CODE_SESSION_ID -u HEIMDALL_COMPACT_NOW_CC_VERSION -u HEIMDALL_COMPACT_NOW_TTL_S -u HEIMDALL_COMPACT_NOW_NO_TIMER HOME="$H" HEIMDALL_HOME="$H/.heimdall" "$@"; }
 cw()    { scrub "$CW" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }                                 # no terminal
 cwpty() { local a="$1"; shift; scrub "$PY" -I "$TMP/pty_drive.py" "$a" -- "$CW" "$@" >"$OUT" 2>"$ERR"; RC=$?; }   # a person at a terminal who types $a
 value() { "$PY" -I "$TMP/chk.py" value "$S"; }
@@ -774,6 +785,257 @@ eq "R: a cap record that cannot be used does not hold the window back (it carrie
 
 cw --help
 chk "R: --help documents --bash-cap" grep -qF -- "--bash-cap" "$OUT"
+
+# ---- S. the compact-now trigger: env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, armed for a few minutes, put back by itself ---------------------------------------------------------
+echo "S. the compact-now trigger"
+CCV="2.1.330"
+cwt()    { scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }   # a Claude Code that takes the override back, and no expiry timer
+cwptyt() { local a="$1"; shift; scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$PY" -I "$TMP/pty_drive.py" "$a" -- "$CW" "$@" >"$OUT" 2>"$ERR"; RC=$?; }
+cwx()    { scrub env HEIMDALL_COMPACT_NOW_NO_TIMER=1 CLAUDE_CODE_EXECPATH="$1" "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?; }   # no seam: the version is read from the running binary
+tval()   { "$PY" -I -c 'import json,sys
+e = json.load(open(sys.argv[1])).get("env")
+print(json.dumps(e["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) if isinstance(e, dict) and "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in e else "ABSENT")' "$S"; }
+hasenv() { "$PY" -I -c 'import json,sys; print("env" in json.load(open(sys.argv[1])))' "$S"; }
+trec()   { find "$H/.heimdall/compact-window" -type f -name '*.compact-now.state.json' 2>/dev/null | head -n 1; }
+tstate() { find "$H/.heimdall/compact-window" -type f \( -name '*.compact-now.state.json' -o -name '*.compact-now.settings.json.bak' \) 2>/dev/null | wc -l | tr -d ' '; }   # the trigger's records and backups
+rfield() { "$PY" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$(trec)" "$1"; }
+consented() { [ -f "$H/.heimdall/compact-window/compact-now.consent" ]; }
+yn()     { if "$@"; then echo yes; else echo no; fi; }
+nbytes() { wc -c <"$1" | tr -d ' '; }
+
+# round trip inside an existing env object
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cwt on --compact-now --yes
+eq "S1: on --compact-now --yes arms: exit 0, env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is the JSON string \"1\"" '0|"1"' "$RC|$(tval)"
+chk "S1: it was appended inside the file's own env object, text-exact (1.50 and the 20-digit integer untouched)" "$PY" -I "$TMP/chk.py" armed "$TMP/orig" "$S"
+eq "S1: a record and a backup of the trigger's own are kept, and the person's yes is remembered" "2|yes" "$(tstate)|$(yn consented)"
+cwt off --compact-now --yes
+eq "S1: off --compact-now exits 0, the record and the backup are gone" "0|0" "$RC|$(tstate)"
+chk "S1: ...and the file is back byte for byte" same "$S" "$TMP/orig"
+
+# other layouts: no env object, an empty one, no file at all, a file another tool rewrote
+for layout in COMPACT TABS; do
+  new_home; printf '%s' "${!layout}" >"$S"; cp "$S" "$TMP/orig"
+  cwt on --compact-now --yes
+  eq "S2/$layout: no env object yet: it is added, with the trigger in it" '0|"1"' "$RC|$(tval)"
+  chk "S2/$layout: every other member is the same, in order" env CHK_KEY=env "$PY" -I "$TMP/chk.py" others "$TMP/orig" "$S"
+  cwt off --compact-now --yes
+  chk "S2/$layout: off returns the file byte for byte" same "$S" "$TMP/orig"
+done
+new_home; printf '{"env": {}, "x": 1}' >"$S"; cp "$S" "$TMP/orig"
+cwt on --compact-now --yes
+eq "S2: an empty env object takes the member" '0|"1"' "$RC|$(tval)"
+cwt off --compact-now --yes
+chk "S2: ...and off returns it byte for byte" same "$S" "$TMP/orig"
+new_home; rmdir "$H/.claude"
+cwt on --compact-now --yes
+eq "S2: no settings file: on creates it, with only the trigger in it" '0|"1"' "$RC|$(tval)"
+cwt off --compact-now --yes
+eq "S2: off removes the file hmd created" "0|no" "$RC|$(yn test -e "$S")"
+new_home; printf '%s' "$COMPACT" >"$S"
+cwt on --compact-now --yes
+"$PY" -I "$TMP/chk.py" reserialize "$S"
+cwt off --compact-now --yes
+eq "S2: the file was rewritten by another tool in between: off exits 0, the trigger is gone with the env object hmd made for it" "0|ABSENT|False" "$RC|$(tval)|$(hasenv)"
+chk "S2: ...what the other tool added is kept" grep -q '"addedLater"' "$S"
+chk "S2: ...and off says only the key was reverted" grep -q "only the key was reverted" "$OUT"
+new_home; printf '{"env": 5}' >"$S"; cp "$S" "$TMP/orig"
+cwt on --compact-now --yes
+eq "S2: an env that is not an object is never touched: exit 1, the file as it was, nothing recorded" "1|same|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
+
+# a value of the person's own is never replaced
+new_home; printf '{\n  "env": {\n    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"\n  }\n}\n' >"$S"; cp "$S" "$TMP/orig"
+cwt on --compact-now --yes
+eq "S3: a value of the person's own in the env block: exit 4, the file untouched, no record, no yes remembered" "4|same|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
+chk "S3: stderr says it is theirs" grep -q "your own setting" "$ERR"
+cwt on --compact-now --yes --force
+eq "S3: --force is not accepted with the trigger: usage error, exit 2, the file untouched" "2|same" "$RC|$(yn same "$S" "$TMP/orig")"
+new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
+scrub env CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60 HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S3: a CLAUDE_AUTOCOMPACT_PCT_OVERRIDE of the person's own in the environment is refused too: exit 4, untouched, nothing recorded" "4|same|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
+
+# the build and automatic compaction must be able to honour it: otherwise exit 5 and nothing is written
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+for v in 2.1.328 2.1.9 1.9.999 "" "not-a-version"; do
+  CCV="$v" cwt on --compact-now --yes
+  eq "S4: Claude Code [$v] cannot take the override back, or cannot be told: exit 5, nothing written, no record, no yes remembered" "5|same|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
+done
+CCV=2.1.328 cwt on --compact-now --yes
+chk "S4: the reason names the first build that takes it back (2.1.329)" grep -qF "2.1.329" "$ERR"
+for v in 2.1.329 2.1.330 2.2.0 3.0.0; do
+  CCV="$v" cwt on --compact-now --yes
+  eq "S4: Claude Code $v arms" '0|"1"' "$RC|$(tval)"
+  cwt off --compact-now --yes
+done
+chk "S4: ...and each off left the file as it was" same "$S" "$TMP/orig"
+mkdir -p "$TMP/cc/versions"; : >"$TMP/cc/versions/2.1.330"
+printf '#!/bin/sh\necho "2.1.327 (Claude Code)"\n' >"$TMP/cc/old"; printf '#!/bin/sh\necho "v20.11.0"\n' >"$TMP/cc/node"; printf '#!/bin/sh\necho "2.1.331 (Claude Code)"\n' >"$TMP/cc/new"
+chmod +x "$TMP/cc/old" "$TMP/cc/node" "$TMP/cc/new"
+new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
+cwx "$TMP/cc/versions/2.1.330"
+eq "S4: the running binary named by its version (the native layout), no seam: 2.1.330 arms" '0|"1"' "$RC|$(tval)"
+cwt off --compact-now --yes
+cwx "$TMP/cc/new"
+eq "S4: any other layout is asked (--version): a binary that answers 2.1.331 (Claude Code) arms" '0|"1"' "$RC|$(tval)"
+cwt off --compact-now --yes
+cwx "$TMP/cc/old"
+eq "S4: ...one that answers 2.1.327 is refused: exit 5, untouched" "5|same" "$RC|$(yn same "$S" "$TMP/orig")"
+cwx "$TMP/cc/node"
+eq "S4: ...one that is not claude (node answers with its own version) is refused: exit 5" 5 "$RC"
+cwx "relative/claude"
+eq "S4: a CLAUDE_CODE_EXECPATH that is not absolute is refused: exit 5" 5 "$RC"
+scrub env HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S4: no CLAUDE_CODE_EXECPATH and no seam (not inside a session; the claude on PATH may be another build, so it is not asked): exit 5, untouched" "5|same" "$RC|$(yn same "$S" "$TMP/orig")"
+new_home; printf '{\n  "autoCompactEnabled": false\n}\n' >"$S"; cp "$S" "$TMP/orig"
+cwt on --compact-now --yes
+eq "S4: autoCompactEnabled false in the settings: exit 5, untouched, nothing recorded" "5|same|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
+new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
+for name in DISABLE_AUTO_COMPACT DISABLE_COMPACT; do
+  scrub env "$name=1" HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+  eq "S4: $name=1 in the environment (automatic compaction is off): exit 5, untouched" "5|same" "$RC|$(yn same "$S" "$TMP/orig")"
+done
+
+# consent: asked once
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cwt on --compact-now
+eq "S5: no terminal, no --yes and no earlier yes: exit 3, the file untouched, nothing recorded" "3|same|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
+chk "S5: stderr gives the command to run again with --yes" grep -qF "on --compact-now --yes" "$ERR"
+cwt on --compact-now --yes
+cwt off --compact-now --yes
+cwt on --compact-now
+eq "S5: once a yes was given, the next arm needs no --yes: exit 0, armed" '0|"1"' "$RC|$(tval)"
+cwt off --compact-now --yes
+cwt revoke
+eq "S5: revoke forgets the yes: exit 0, the stamp is gone" "0|no" "$RC|$(yn consented)"
+cwt on --compact-now
+eq "S5: ...and the next arm asks again: exit 3" 3 "$RC"
+new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
+cwptyt y on --compact-now
+eq "S5: a person at a terminal who says yes: armed, and the yes is remembered" '0|"1"|yes' "$RC|$(tval)|$(yn consented)"
+cwt off --compact-now --yes
+new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
+cwptyt n on --compact-now
+eq "S5: a person at a terminal who says no: exit 3, untouched, no yes remembered" "3|same|no" "$RC|$(yn same "$S" "$TMP/orig")|$(yn consented)"
+new_home; printf '%s' "$COMPACT" >"$S"
+cwt on --compact-now --yes
+cwt revoke
+eq "S5: revoke also puts an armed trigger back" "0|ABSENT|0" "$RC|$(tval)|$(tstate)"
+
+# release: what the hooks run
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cwt on --compact-now --yes
+cwt release
+eq "S6: release exits 0 and prints nothing on stdout (a SessionStart hook's stdout reaches the model)" "0|0" "$RC|$(nbytes "$OUT")"
+chk "S6: ...the file is back byte for byte" same "$S" "$TMP/orig"
+eq "S6: ...the record and the backup are gone" 0 "$(tstate)"
+cwt release
+eq "S6: a second release is a quiet no-op" "0|0|0" "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")"
+cwt on --compact-now
+sed -i.bak 's/"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "1"/"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "7"/' "$S" && rm -f "$S.bak"
+cwt release
+eq "S6: a value the person changed meanwhile is theirs: release leaves it and clears the record" '0|"7"|0' "$RC|$(tval)|$(tstate)"
+new_home; mkdir -p "$H/second"; printf '%s' "$COMPACT" >"$H/second/settings.json"; cp "$H/second/settings.json" "$TMP/orig2"
+scrub env CLAUDE_CONFIG_DIR="$H/second" HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S6: the trigger armed in a second settings file (another CLAUDE_CONFIG_DIR)" 0 "$RC"
+cwt release
+eq "S6: release run with the default config dir still puts it back in the file it was armed in, byte for byte" "0|same|0" "$RC|$(yn same "$H/second/settings.json" "$TMP/orig2")|$(tstate)"
+
+# expiry: nothing compacted and no hook ran
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_TTL_S=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S7: armed with a one-second life (the timer left running): exit 0, armed" '0|"1"' "$RC|$(tval)"
+for _ in $(seq 1 60); do [ "$(tval)" = ABSENT ] && break; sleep 0.2; done
+eq "S7: nobody compacted and no hook ran: the expiry timer put the file back by itself, byte for byte" "ABSENT|same|0" "$(tval)|$(yn same "$S" "$TMP/orig")|$(tstate)"
+new_home; printf '%s' "$PRETTY" >"$S"
+cwt on --compact-now --yes
+cw status
+eq "S7: status says hmd armed it and when it expires" "1|1" "$(grep '^trigger' "$OUT" | grep -c 'set by hmd')|$(grep '^trigger' "$OUT" | grep -c 'expires at')"
+"$PY" -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["expires_at"]=1; json.dump(d, open(p,"w"))' "$(trec)"
+cw status
+eq "S7: an arming whose time is up says EXPIRED in status" 1 "$(grep '^trigger' "$OUT" | grep -c 'EXPIRED')"
+cwt release
+eq "S7: ...and release puts it back all the same" "0|ABSENT|0" "$RC|$(tval)|$(tstate)"
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cwt on --compact-now --yes
+FIRST_ARM="$(rfield arm_id)"
+cwt on --compact-now
+eq "S7: arming twice: exit 0, one record and one backup, a new arming id" "0|2|yes" "$RC|$(tstate)|$([ "$FIRST_ARM" != "$(rfield arm_id)" ] && echo yes || echo no)"
+cwt off --compact-now --yes
+chk "S7: ...and off returns the very first file byte for byte" same "$S" "$TMP/orig"
+
+# both levers in one file, in either order
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cw on --yes; cwt on --compact-now --yes
+eq "S8: the window and the trigger are both in the file" '300000|"1"' "$(value)|$(tval)"
+cwt release
+eq "S8: release puts only the trigger back: the window stays" '300000|ABSENT' "$(value)|$(tval)"
+cw off --yes
+chk "S8: ...and the window's off then returns the very first file" same "$S" "$TMP/orig"
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cw on --yes; cwt on --compact-now --yes; cw off --yes
+eq "S8: the window off first while the trigger is armed: the trigger stays" 'ABSENT|"1"' "$(value)|$(tval)"
+cwt release
+chk "S8: ...and release then leaves the file as it was before either" same "$S" "$TMP/orig"
+
+# the real hook commands from hooks.json
+"$PY" -I - "$REPO/hooks/hooks.json" "$REPO/hooks/hooks.metadata.json" "$TMP" >"$TMP/hookinfo" 2>&1 <<'PY'
+import json, sys
+hooks = json.load(open(sys.argv[1]))["hooks"]
+meta = dict((e["id"], e) for e in json.load(open(sys.argv[2]))["hooks"])
+errs = []
+for hid, event in (("compact-now-release-start", "SessionStart"), ("compact-now-release-precompact", "PreCompact")):
+    entry = meta.get(hid)
+    if entry is None:
+        errs.append("hooks.metadata.json has no hook %s" % hid)
+        continue
+    group = hooks[entry["event"]][entry["index"]]
+    cmd = group["hooks"][0]["command"]
+    open("%s/%s.cmd" % (sys.argv[3], hid), "w").write(cmd)
+    if entry["event"] != event:
+        errs.append("%s is %s, want %s" % (hid, entry["event"], event))
+    if group.get("matcher"):
+        errs.append("%s has the matcher %r: it must fire for every %s" % (hid, group.get("matcher"), event))
+    if entry.get("locked") is not False:
+        errs.append("%s is locked: the operator could not switch it off" % hid)
+    if "hmd_hook_enabled %s" % hid not in cmd:
+        errs.append("%s is not gated by hmd_hook_enabled" % hid)
+    if "bin/heimdall-compact-window" not in cmd or " release" not in cmd:
+        errs.append("%s does not run heimdall-compact-window release" % hid)
+    if not cmd.rstrip().endswith("exit 0") or "set -e" in cmd:
+        errs.append("%s does not end in exit 0 (a hook that can fail the session start or the compaction)" % hid)
+    if not isinstance(group["hooks"][0].get("timeout"), int):
+        errs.append("%s sets no timeout" % hid)
+print("OK" if not errs else "; ".join(errs))
+PY
+eq "S9: hooks.json carries both release hooks (SessionStart for every source, PreCompact): advisory, gated by hmd_hook_enabled, fail-open, with a timeout" "OK" "$(cat "$TMP/hookinfo")"
+runhook() {   # ID PAYLOAD: the command from hooks.json as Claude Code runs it (the payload on stdin, the plugin root in the environment)
+  printf '%s' "$2" | scrub env CLAUDE_PLUGIN_ROOT="$REPO" sh -c "$(cat "$TMP/$1.cmd")" >"$OUT" 2>"$ERR"; RC=$?
+}
+for src in startup resume clear compact; do
+  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+  cwt on --compact-now --yes
+  runhook compact-now-release-start "{\"hook_event_name\":\"SessionStart\",\"source\":\"$src\"}"
+  eq "S9: a SessionStart ($src) puts the trigger back: exit 0, nothing on stdout, the file byte for byte, the record gone" "0|0|same|0" "$RC|$(nbytes "$OUT")|$(yn same "$S" "$TMP/orig")|$(tstate)"
+done
+new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cwt on --compact-now --yes
+runhook compact-now-release-precompact '{"hook_event_name":"PreCompact","trigger":"auto"}'
+eq "S9: a PreCompact (before the summary is written) puts it back: exit 0, nothing on stdout, the file byte for byte" "0|0|same|0" "$RC|$(nbytes "$OUT")|$(yn same "$S" "$TMP/orig")|$(tstate)"
+runhook compact-now-release-start '{"hook_event_name":"SessionStart","source":"startup"}'
+eq "S9: a hook with nothing armed is a quiet no-op" "0|0|0" "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")"
+new_home; printf '%s' "$PRETTY" >"$S"
+cwt on --compact-now --yes
+printf 'compact-now-release-start\n' >"$H/.heimdall/hooks-disabled"
+runhook compact-now-release-start '{"hook_event_name":"SessionStart","source":"startup"}'
+eq "S9: the operator's switch (heimdall-hooks disable) is honoured: the hook does nothing, the trigger stays armed" '0|"1"' "$RC|$(tval)"
+cwt off --compact-now --yes
+
+cw --help
+chk "S10: --help documents --compact-now, release and revoke" sh -c "grep -qF -- '--compact-now' '$OUT' && grep -qF 'release' '$OUT' && grep -qF 'revoke' '$OUT'"
+new_home; printf '%s' "$PRETTY" >"$S"
+cwt on --compact-now --yes; cw status
+eq "S10: status after a yes: the consent row says it was given, the window row says nothing of hmd" "1|0" "$(grep '^consent' "$OUT" | grep -c 'given')|$(grep '^window' "$OUT" | grep -c 'set by hmd')"
+cwt off --compact-now --yes
 
 echo
 echo "compact-window: $PASS passed, $FAIL failed"
