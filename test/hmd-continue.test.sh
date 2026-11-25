@@ -25,7 +25,7 @@
 #   5. THE MATRIX   the freshness window, the once-only rule, the source rule and the size cap, on the helper.
 #   6. PROVENANCE   a cloned repository controls .planning/CONTINUE.md and can ship one that looks fresh, so
 #                   a handoff is believed only when git does NOT track it AND its id and time match a record
-#                   /hmd:continue kept under HEIMDALL_HOME (absolute, in no git work tree, 0600 in a 0700
+#                   /hmd:save kept under HEIMDALL_HOME (absolute, in no git work tree, 0600 in a 0700
 #                   directory, reached through no link). Anything else injects nothing. Every refusal here
 #                   is graded next to a control that IS injected, so none of them can pass for lack of a handoff.
 #   7. LINKS        a link on the way down is refused; a project with no handoff costs the hook nothing.
@@ -399,7 +399,7 @@ PS="$(mk_project savepath)"
 SAVE_CALL="$(awk '/heimdall-continue" write <<.HMD_NOTE./ { on = 1 } on { print } on && /^HMD_NOTE$/ { exit }' "$CMD")"
 ( cd "$PS" && CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$PS" bash -c "$SAVE_CALL" ) >"$TMPROOT/sout" 2>"$TMPROOT/serr"; rc=$?
 if [ -n "$SAVE_CALL" ] && [ "$rc" = "0" ] && [ -f "$PS/.planning/CHECKPOINT.md" ] && [ -f "$PS/.planning/CONTINUE.md" ] \
-   && grep -qF -- 'next: the exact next step' "$PS/.planning/CHECKPOINT.md" && grep -q 'the exact next step' "$PS/.planning/CONTINUE.md"; then
+   && grep -qF -- 'the exact next step' "$PS/.planning/CHECKPOINT.md" && grep -qF -- 'the exact next step' "$PS/.planning/CONTINUE.md"; then
   ok "3o. the tool call as commands/save.md documents it writes CHECKPOINT.md and CONTINUE.md in one go, the note in both (exit 0)"
 else
   bad "3o. the tool call taken from commands/save.md did not write both files (rc=$rc, call found: $([ -n "$SAVE_CALL" ] && echo yes || echo no)): $(head -c 300 "$TMPROOT/serr")"
@@ -673,7 +673,7 @@ OTHER="$(mk_project other)"
 
 arm "$(( $(now_s) - 60 ))" ""
 inj --source compact
-expect_injected "6a. control: a handoff git does not track, whose id and time match the record /hmd:continue kept, IS injected"
+expect_injected "6a. control: a handoff git does not track, whose id and time match the record /hmd:save kept, IS injected"
 
 # the finding itself: a repository that ships a fresh-looking, well-formed handoff of its own
 PC="$(mk_project clone)"
@@ -779,18 +779,29 @@ fi
 
 # ── 8. the docs name it, and no case wrote into the real repo or the real home ───
 echo "8. docs and hermeticity"
-if grep -q 'heimdall-continue' "$REPO/docs/INVENTORY.md" && grep -q '/hmd:continue' "$REPO/skills/heimdall/SKILL.md" \
+if grep -q 'heimdall-continue' "$REPO/docs/INVENTORY.md" && grep -qE '/hmd:save.*/compact|/compact.*/hmd:save' "$REPO/skills/heimdall/SKILL.md" \
    && grep -qE '`continue`' "$REPO/docs/INVENTORY.md" && grep -q '/hmd:continue' "$REPO/CHANGELOG.md" \
-   && grep -q 'continue-inject' "$REPO/docs/INVENTORY.md" && grep -q 'continue-inject' "$REPO/commands/continue.md" \
+   && grep -q 'continue-inject' "$REPO/docs/INVENTORY.md" && grep -q 'continue-inject' "$CMD" \
    && python3 -I - "$META" <<'PY'
 import json, sys
 d = [e for e in json.load(open(sys.argv[1]))["hooks"] if e["id"] == "continue-inject"]
 sys.exit(0 if len(d) == 1 and len(d[0]["description"]) > 120 and "resume-probe" in d[0]["description"] and "tracked" in d[0]["description"] else 1)
 PY
 then
-  ok "8a. docs/INVENTORY.md (tool, command, hook), skills/heimdall/SKILL.md, commands/continue.md, CHANGELOG.md and the hook's description in hooks.metadata.json name it"
+  ok "8a. docs/INVENTORY.md (tool, command, hook), skills/heimdall/SKILL.md (/hmd:save with its /compact line), commands/save.md, CHANGELOG.md and the hook's description in hooks.metadata.json name it"
 else
-  bad "8a. a doc that lists commands or hooks does not mention /hmd:continue / heimdall-continue / continue-inject"
+  bad "8a. a doc that lists commands or hooks does not mention /hmd:save with its /compact line / heimdall-continue / continue-inject"
+fi
+STALE=""
+for f in skills/heimdall/SKILL.md skills/heimdall/references/planning-pipeline.md docs/INVENTORY.md README.md packages/runheimdall/README.md \
+         hooks/hooks.metadata.json guardrails.manifest.json bin/heimdall-ctx-meter bin/heimdall-compact-window bin/heimdall-resume-probe \
+         bin/heimdall-checkpoint bin/heimdall-continue bin/lib/hmd_continue.py; do
+  [ -z "$(grep -n '/hmd:continue' "$REPO/$f" 2>/dev/null | grep -viE 'alias|deprecat')" ] || STALE="$STALE $f"
+done
+if [ -z "$STALE" ]; then
+  ok "8d. no doc, nag, hook description or tool message sends anyone to /hmd:continue: it is named only as the deprecated alias"
+else
+  bad "8d. still pointing at /hmd:continue (a mention is fine only on a line that calls it the alias):$STALE"
 fi
 if [ "$REAL_BEFORE" = "$(real_digest)" ]; then
   ok "8b. the real repo's .planning/CONTINUE.md is untouched (hermetic)"
