@@ -239,12 +239,166 @@ case "$codes" in
   *)      ok  "18. no input produced exit 2 (codes:$codes)" ;;
 esac
 
-# ── 19. the REAL repo's ledger checkpoints are byte-identical to when we started ──
+# ── 19-24. a busy repo: the save's work is shared out, not queued ───────────
+# THE DEFECT (2026-11-26): on the real repo (57 worktrees, 266 local branches) a manual /compact printed "checkpoint writer
+# exceeded 8s and was stopped" and saved NOTHING, because the writer only writes once every measurement is in. Measured one
+# stage at a time, the seconds went to: the notes store read SEVEN times (a python launch each, ~0.3 s apiece behind a pyenv
+# shim), every other python launch paying that shim too (13 per save), `git status` + `merge-base` + `rev-list` run for one
+# worktree and one branch after another, and three slow read-only probes (the gate verdict, the open-agents list, this
+# session's edits) run back to back. These cases pin each cause by COUNTING steps (launches, probes running at once), never by
+# timing, so a loaded runner cannot make them flap. One save on a repo shaped like the real one feeds all six.
+REAL_GIT="$(command -v git)"
+REAL_PY=""
+for c in /usr/bin/python3 "$(command -v python3 2>/dev/null)"; do
+  if [ -n "$c" ] && [ -x "$c" ] && "$c" -c pass >/dev/null 2>&1; then REAL_PY="$c"; break; fi
+done
+
+# A project with every shape the scans must report: a dirty worktree, an unmerged one, a clean one, one whose directory is
+# gone, and three branches that hold 1, 2 and 3 commits with no worktree at all.
+mk_busy_project() { # <name> -> path
+  local d base b n tree parent
+  d="$(mk_project "$1")"
+  base="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
+  git -C "$d" worktree add -q -b wt-dirty "$d-wt-dirty" >/dev/null 2>&1
+  printf 'scratch\n' > "$d-wt-dirty/scratch.txt"
+  git -C "$d" worktree add -q -b wt-unmerged "$d-wt-unmerged" >/dev/null 2>&1
+  git -C "$d-wt-unmerged" commit -q --allow-empty -m "unmerged work" --no-verify
+  git -C "$d" worktree add -q -b wt-clean "$d-wt-clean" >/dev/null 2>&1
+  git -C "$d" worktree add -q -b wt-gone "$d-wt-gone" >/dev/null 2>&1
+  rm -rf "$d-wt-gone"
+  tree="$(git -C "$d" rev-parse 'HEAD^{tree}')"
+  for b in held-a:1 held-b:2 held-c:3; do
+    parent="$(git -C "$d" rev-parse HEAD)"
+    n="${b#*:}"
+    while [ "$n" -gt 0 ]; do
+      parent="$(git -C "$d" commit-tree "$tree" -p "$parent" -m "held work")"
+      n=$((n - 1))
+    done
+    git -C "$d" update-ref "refs/heads/${b%:*}" "$parent"
+  done
+  printf '%s' "$d"
+}
+
+# Shims, none of which changes what a tool answers. git: holds every `status` and `rev-list --count` open for half a second and
+# logs S(tart)/E(nd), so two of them running at once is visible. python: logs which hmd_nofollow_write.py verb ran, then runs
+# the real interpreter; one copy stands in for the PATH python3, one for HMD_PYTHON (the resolver's own override).
+BUSY="$TMPROOT/busy"; mkdir -p "$BUSY/bin" "$BUSY/fast"
+cat > "$BUSY/bin/git" <<'EOF'
+#!/bin/sh
+kind=""
+case " $* " in
+  *" status "*) kind=status ;;
+  *" rev-list --count "*) kind=revlist ;;
+esac
+if [ -n "$kind" ]; then
+  printf 'S\n' >> "$BUSY_LOGS/$kind.log"
+  sleep 0.5
+  "$REAL_GIT" "$@"; rc=$?
+  printf 'E\n' >> "$BUSY_LOGS/$kind.log"
+  exit "$rc"
+fi
+exec "$REAL_GIT" "$@"
+EOF
+cat > "$BUSY/bin/python3" <<'EOF'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in check|read|write|append) printf '%s\n' "$a" >> "$BUSY_LOGS/python-on-path.log"; break ;; esac
+done
+exec "$REAL_PY" "$@"
+EOF
+cat > "$BUSY/fast/python3" <<'EOF'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in check|read|write|append) printf '%s\n' "$a" >> "$BUSY_LOGS/python-fast.log"; break ;; esac
+done
+exec "$REAL_PY" "$@"
+EOF
+chmod +x "$BUSY/bin/git" "$BUSY/bin/python3" "$BUSY/fast/python3"
+BUSY_LOGS="$BUSY/logs"; mkdir -p "$BUSY_LOGS"
+max_overlap() { # <log>: the most S(tarts) that were open at once
+  awk '$1=="S"{c++; if(c>m)m=c} $1=="E"{c--} END{print m+0}' "$1" 2>/dev/null
+}
+
+if [ -n "$REAL_PY" ]; then
+  PB="$(mk_busy_project busy)"
+  PBASE="$(git -C "$PB" rev-parse --abbrev-ref HEAD)"
+  payload manual "$PB" > "$TMPROOT/inbusy"
+  PATH="$BUSY/bin:$PATH" REAL_GIT="$REAL_GIT" REAL_PY="$REAL_PY" BUSY_LOGS="$BUSY_LOGS" HMD_PYTHON="$BUSY/fast/python3" \
+    HMD_PRECOMPACT_BUDGET=120 HEIMDALL_HOME="$PB/.hmdhome" \
+    "$HOOK" --repo "$PB" <"$TMPROOT/inbusy" >"$TMPROOT/out" 2>"$TMPROOT/err"; rc=$?
+  CKB="$PB/.planning/CHECKPOINT.md"
+  PBN="$(basename "$PB")"
+
+  # 19. the save still says what it said before the work was shared out: every flagged worktree, in `git worktree list` order,
+  # every held branch with its own count, all six contract fields.
+  held_line="$(grep '^- \*\*Held branches:\*\* ' "$CKB" 2>/dev/null)"
+  want_order="$(git -C "$PB" worktree list --porcelain | sed -n 's|^worktree .*/'"$PBN"'-\(wt-[a-z]*\)$|\1|p' | grep -E '^wt-(dirty|unmerged|gone)$' | tr '\n' ' ')"
+  got_order="$(sed -n -e 's|^- DIRTY `.*/'"$PBN"'-\(wt-[a-z]*\)` — .*|\1|p' -e 's|^- UNMERGED `.*/'"$PBN"'-\(wt-[a-z]*\)` — .*|\1|p' -e 's|^- MISSING `.*/'"$PBN"'-\(wt-[a-z]*\)` — .*|\1|p' "$CKB" 2>/dev/null | tr '\n' ' ')"
+  six=0
+  for lbl in 'In progress' 'Gated decisions' 'Held branches' 'Unpushed' 'Open warnings' 'Refuted claims'; do
+    [ "$(grep -c "^- \*\*$lbl:\*\* " "$CKB" 2>/dev/null)" = "1" ] && six=$((six + 1))
+  done
+  if [ "$rc" = "0" ] && grep -q 'checkpoint saved' "$TMPROOT/err" \
+     && grep -q '(5 of 5 worktree(s) scanned)' "$CKB" 2>/dev/null \
+     && grep -q "^- DIRTY \`.*-wt-dirty\` — 1 uncommitted file(s)" "$CKB" \
+     && grep -q "^- UNMERGED \`.*-wt-unmerged\` — HEAD has commits not on \`$PBASE\`" "$CKB" \
+     && grep -q "^- MISSING \`.*-wt-gone\` — worktree directory no longer exists" "$CKB" \
+     && ! grep -q -- '-wt-clean` — ' "$CKB" \
+     && [ -n "$want_order" ] && [ "$want_order" = "$got_order" ]; then
+    ok "19. busy repo: saved; dirty, unmerged and missing worktrees flagged in worktree-list order (${got_order% }), the clean one is not"
+  else
+    bad "19. busy repo ledger wrong (rc=$rc, want order [$want_order] got [$got_order]): $(grep -A8 'Worktree ledger' "$CKB" 2>/dev/null | head -12 | tr '\n' '|')"
+  fi
+  if printf '%s' "$held_line" | grep -q "wt-unmerged (1 commit(s) not on $PBASE, at " \
+     && printf '%s' "$held_line" | grep -q "held-a (1 commit(s) not on $PBASE).*held-b (2 commit(s) not on $PBASE).*held-c (3 commit(s) not on $PBASE)" \
+     && [ "$six" = "6" ]; then
+    ok "20. held branches keep their own commit counts (1, 2, 3) and all six contract fields are written once each"
+  else
+    bad "20. held-branch field or contract fields wrong (fields=$six): $held_line"
+  fi
+
+  # 21. the notes store is read ONCE per save (it was read seven times: notice, four fields, key count, key presence).
+  nreads="$(grep -c '^read$' "$BUSY_LOGS/python-fast.log" 2>/dev/null)"
+  if [ "${nreads:-0}" = "1" ]; then
+    ok "21. the notes store is read once per save, not once per field"
+  else
+    bad "21. the notes store was read ${nreads:-0} times in one save (want 1)"
+  fi
+
+  # 22. every python the save launches is the resolved interpreter (HMD_PYTHON), none the PATH python3 -- which on this
+  # machine is a ~0.3 s version-manager shim. The path check, the notes read, the checkpoint and key writes and the note's
+  # append all go through it.
+  nwrites="$(grep -c '^write$' "$BUSY_LOGS/python-fast.log" 2>/dev/null)"
+  nappend="$(grep -c '^append$' "$BUSY_LOGS/python-fast.log" 2>/dev/null)"
+  ncheck="$(grep -c '^check$' "$BUSY_LOGS/python-fast.log" 2>/dev/null)"
+  if [ ! -s "$BUSY_LOGS/python-on-path.log" ] && [ "${ncheck:-0}" -ge 1 ] && [ "${nwrites:-0}" -ge 2 ] && [ "${nappend:-0}" = "1" ]; then
+    ok "22. the note and the save run on the resolved interpreter (check ${ncheck}, write ${nwrites}, append ${nappend}), the PATH python3 never"
+  else
+    bad "22. python launches: via PATH=$(wc -l < "$BUSY_LOGS/python-on-path.log" 2>/dev/null | tr -d ' ') via HMD_PYTHON: check ${ncheck:-0} write ${nwrites:-0} append ${nappend:-0}"
+  fi
+
+  # 23/24. the per-worktree `git status` probes, and the per-branch `rev-list --count` probes, overlap.
+  so="$(max_overlap "$BUSY_LOGS/status.log")"; ro="$(max_overlap "$BUSY_LOGS/revlist.log")"
+  if [ "${so:-0}" -ge 2 ]; then
+    ok "23. worktree status probes run side by side (up to $so at once), not one after another"
+  else
+    bad "23. worktree status probes never overlapped (max $so at once): the scan is sequential again"
+  fi
+  if [ "${ro:-0}" -ge 2 ]; then
+    ok "24. held-branch count probes run side by side (up to $ro at once), not one after another"
+  else
+    bad "24. held-branch count probes never overlapped (max $ro at once): the branch walk is sequential again"
+  fi
+else
+  ok "19-24. skipped: no working python3 on this machine to stand behind the shims"
+fi
+
+# ── 25. the REAL repo's ledger checkpoints are byte-identical to when we started ──
 LEDGER_AFTER="$(ledger_digest)"
 if [ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ]; then
-  ok "19. no case wrote into the real repo's .planning/ledger/checkpoints (hermetic)"
+  ok "25. no case wrote into the real repo's .planning/ledger/checkpoints (hermetic)"
 else
-  bad "19. a case wrote into the REAL repo's ledger checkpoints -- the tree-integrity class of bug"
+  bad "25. a case wrote into the REAL repo's ledger checkpoints -- the tree-integrity class of bug"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

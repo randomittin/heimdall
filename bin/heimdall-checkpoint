@@ -74,6 +74,15 @@
 #     CHECKPOINT.md is TRACKED, so what the reader prints is data it has already made safe: a notice counts only from a row the harness wrote,
 #     a description is redacted (URL user:pass@, Bearer/Authorization, KEY=/TOKEN=/SECRET=/PASSWORD= values, long tokens), cleaned, capped and
 #     quoted, and a background shell with no description shows "-", never its command text.
+#   - Budget-aware (2026-11-27): the PreCompact hook stops this at HMD_PRECOMPACT_BUDGET (8 s) and then NOTHING is saved, because `write`
+#     only writes once every measurement is in; a manual /compact on the real repo (57 worktrees, 266 branches) hit it. Measured by
+#     stage: the notes store read seven times (a python launch each), python launched thirteen times behind a pyenv shim (~0.3 s each),
+#     `git status` / `merge-base` / `rev-list` for one worktree and one branch after another, three slow read-only probes (gate verdict,
+#     open agents, this session's edits) run back to back. Now: the store is read ONCE per save; every python is the interpreter
+#     bin/lib/hmd-python.sh resolves, once (HMD_PYTHON overrides); the per-worktree and per-branch probes run eight at a time and are
+#     assembled in `git worktree list` order; the three probes start when the save passes its checks and are collected when the block
+#     needs them. Nothing a field says changed, only when it is computed. The worst case is the slowest probe's own cap (open agents,
+#     4 s) plus the writes, not the sum of every stage.
 #
 # USAGE
 #   heimdall-checkpoint write [project_dir]   # write/update .planning/CHECKPOINT.md
@@ -134,6 +143,8 @@ else
 fi
 # Optional, unlike the contract: without it hmd_sweep_live is undefined, _defer_for_sweep below answers "no sweep" and `write` does what it did before.
 [ -r "$_CKPT_BIN/lib/hmd_sweep_live.sh" ] && . "$_CKPT_BIN/lib/hmd_sweep_live.sh"
+# Optional too: the interpreter resolver. Without it every python below is the PATH python3, as before.
+[ -r "$_CKPT_BIN/lib/hmd-python.sh" ] && . "$_CKPT_BIN/lib/hmd-python.sh"
 
 _timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown"; }
 
@@ -155,8 +166,8 @@ _bounded() {
 # planted there. Found by this script's own location, like resume-contract.sh. python3 is required — a path
 # this script cannot vet is a path it does not write (127 and one line say so).
 _nofollow() { # <helper args…>; stdout/stderr are the helper's
-  local py
-  py="$(command -v python3)" || { echo "python3 not found: cannot tell whether a path is a link" >&2; return 127; }
+  local py="${HMD_PYTHON:-}"
+  [ -n "$py" ] || py="$(command -v python3)" || { echo "python3 not found: cannot tell whether a path is a link" >&2; return 127; }
   "$py" -I "$_CKPT_BIN/lib/hmd_nofollow_write.py" "$@"
 }
 
@@ -179,6 +190,136 @@ _sibling_tool() {
   else
     command -v "$name" 2>/dev/null || true
   fi
+}
+
+# `python3` on PATH is often a version-manager SHIM (pyenv, asdf): ~0.3 s a launch behind one, and a PreCompact save launches python thirteen
+# times, 4 s of its 8 s budget (2026-11-27). bin/lib/hmd-python.sh picks a real interpreter and runs it before trusting it (HMD_PYTHON overrides
+# it); it is resolved ONCE per process into HMD_PYTHON, which _nofollow, rc_notes_read (lib/resume-contract.sh) and _publish_shared honour.
+# No resolver, or none that runs: HMD_PYTHON stays empty and every launch is the PATH python3, as before.
+_use_fast_python() {
+  [ -n "${HMD_PYTHON:-}" ] && return 0
+  type hmd_python >/dev/null 2>&1 || return 0
+  HMD_PYTHON="$(hmd_python 2>/dev/null)" || HMD_PYTHON=""
+}
+
+# Scratch space for work done side by side: one directory per save, made when the save starts and removed when it ends (the EXIT trap in
+# cmd_write). Without one (mktemp failed) nothing below starts in the background: each probe is run where its result is wanted, one after
+# another, as it was before.
+_CKPT_TMP=""
+_scratch_open()  { _CKPT_TMP="$(mktemp -d 2>/dev/null)" || _CKPT_TMP=""; }
+_scratch_close() { [ -z "$_CKPT_TMP" ] || rm -rf "$_CKPT_TMP" 2>/dev/null; _CKPT_TMP=""; return 0; }
+_scratch_dir() { # <label>: a fresh directory under the scratch space, or nothing
+  [ -n "$_CKPT_TMP" ] && [ -d "$_CKPT_TMP" ] || return 0
+  mktemp -d "$_CKPT_TMP/$1.XXXXXX" 2>/dev/null || true
+}
+
+# Run `<fn> <item>` for every line on stdin, up to <width> at a time; item N's stdout lands in <dir>/N. For independent READS only: the
+# per-worktree and per-branch git probes, which one after another were most of a save's seconds on a repo with dozens of both. <dir> empty or
+# gone: nothing starts, and _par_get computes each result where it is wanted. Job stderr and the shell's "terminated" notices are dropped.
+_par_map() { # <dir> <width> <fn>, items on stdin
+  local dir="$1" width="$2" fn="$3" item i=0 live=0 pids=""
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    i=$((i + 1)); live=$((live + 1))
+    ( "$fn" "$item" >"$dir/$i.part" && mv "$dir/$i.part" "$dir/$i" ) >/dev/null 2>&1 </dev/null &
+    pids="$pids $!"
+    if [ "$live" -ge "$width" ]; then
+      # shellcheck disable=SC2086  # one pid per word
+      wait $pids 2>/dev/null
+      pids=""; live=0
+    fi
+  done
+  # shellcheck disable=SC2086  # one pid per word
+  [ -z "$pids" ] || wait $pids 2>/dev/null
+  return 0
+}
+_par_get() { # <dir> <index> <fn> <item>: item <index>'s result: the job's, or computed now when it left none (killed, scratch full)
+  if [ -n "$1" ] && [ -s "$1/$2" ]; then cat "$1/$2"; else shift 2; "$@"; fi
+}
+
+# Slow, independent READS (the gate verdict, the open-agents list, this session's edits) start when the save passes its checks and are
+# collected when the block needs them, so their seconds overlap each other and the git work instead of adding up: on the real repo
+# `heimdall-agents open` alone is ~3 s of a PreCompact save's 8. A probe's stdout lands in <scratch>/<name>.out and its exit status in
+# <scratch>/<name>.rc; one that left no status is simply run again where its result is wanted.
+_probe_start() { # <name> <fn> [args...]
+  local name="$1"; shift
+  [ -n "$_CKPT_TMP" ] && [ -d "$_CKPT_TMP" ] || return 0
+  ( "$@" >"$_CKPT_TMP/$name.out"; echo "$?" >"$_CKPT_TMP/$name.rc" ) >/dev/null 2>&1 </dev/null &
+  eval "_CKPT_PID_$name=$!"
+}
+_probe_wait() { # <name>: from the shell that started it (a $(...) subshell cannot wait for its parent's job)
+  local pid=""
+  eval "pid=\${_CKPT_PID_$1:-}"
+  [ -z "$pid" ] || wait "$pid" 2>/dev/null
+  return 0
+}
+_probe_out() { # <name> <fn> [args...]: the probe's stdout, and its exit status as ours
+  local name="$1" rc
+  if [ -n "$_CKPT_TMP" ] && [ -s "$_CKPT_TMP/$name.rc" ]; then
+    rc="$(cat "$_CKPT_TMP/$name.rc" 2>/dev/null)"
+    cat "$_CKPT_TMP/$name.out" 2>/dev/null
+    case "$rc" in ''|*[!0-9]*) return 1 ;; esac
+    return "$rc"
+  fi
+  shift
+  "$@" </dev/null
+}
+_probe_gate() { # <project_dir>: heimdall-state's verdict text on stdout (stderr folded in), its exit status as ours; 127 when there is none
+  local hstate
+  hstate="$(_sibling_tool heimdall-state)"
+  [ -n "$hstate" ] || return 127
+  cd "$1" 2>/dev/null && _bounded 3 "$hstate" check-quality-gates 2>&1
+}
+_probe_agents() { # <project_dir>: `heimdall-agents open --brief` on stdout, its exit status as ours; 127 when there is none
+  local tool
+  tool="$(_sibling_tool heimdall-agents)"
+  [ -n "$tool" ] || return 127
+  cd "$1" 2>/dev/null && HMD_AGENT_CWD="$1" _bounded 4 "$tool" open --brief 2>/dev/null
+}
+
+# The measurements of ONE worktree, as one line: MISSING, or "<uncommitted files> <merged yes|no> <branch|-> <commits not on base|->".
+# Read-only; GIT_OPTIONAL_LOCKS=0 keeps `status` from taking the index lock of a checkout another agent may be committing in.
+_wt_probe() { # <worktree dir>; WT_BASE is the base branch
+  local wt="$1" n merged=yes wtbranch="-" ahead="-"
+  if [ ! -d "$wt" ]; then echo MISSING; return 0; fi
+  n=$(GIT_OPTIONAL_LOCKS=0 git -C "$wt" status --porcelain 2>/dev/null | grep -c .)
+  [ -n "$n" ] || n=0
+  git -C "$wt" merge-base --is-ancestor HEAD "$WT_BASE" 2>/dev/null || merged=no
+  if [ "$merged" = "no" ]; then
+    wtbranch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)
+    [ -n "$wtbranch" ] || wtbranch=detached
+    ahead=$(git -C "$wt" rev-list --count "$WT_BASE..HEAD" 2>/dev/null || echo "?")
+  fi
+  printf '%s %s %s %s\n' "$n" "$merged" "$wtbranch" "$ahead"
+}
+
+# Commits on <branch> that are not on the base. Run by _par_map, so WT_BASE and _CKPT_PROJECT are globals it inherits.
+_CKPT_PROJECT=""
+_branch_ahead() { # <branch>
+  git -C "$_CKPT_PROJECT" rev-list --count "$WT_BASE..$1" 2>/dev/null || echo "?"
+}
+
+# The notes store, READ ONCE per save: rc_notes_read launches a python each time, and the save read it seven times (the notice, four fields,
+# the key's count, the key's presence). The copy holds exactly what the one read printed; its status and its reason are kept for the notice
+# and the key. A refused store (a link, a FIFO, a hard-linked file) is refused once and every reader sees no notes. No scratch space:
+# every reader reads the store itself, as before.
+_CKPT_NOTES_FILE=""; _CKPT_NOTES_RC=1; _CKPT_NOTES_ERR=""
+_notes_prime() { # <project_dir>
+  [ -n "$_CKPT_TMP" ] && [ -d "$_CKPT_TMP" ] || return 0
+  _CKPT_NOTES_ERR="$(rc_notes_read "$1" 2>&1 >"$_CKPT_TMP/notes")"; _CKPT_NOTES_RC=$?
+  _CKPT_NOTES_FILE="$_CKPT_TMP/notes"
+}
+_notes_stream() { # <project_dir>: the store's bytes
+  if [ -n "$_CKPT_NOTES_FILE" ]; then cat "$_CKPT_NOTES_FILE" 2>/dev/null; else rc_notes_read "$1"; fi
+}
+_notes_count() { # <project_dir>: observations held (rc_notes_count's answer)
+  local n
+  n="$(_notes_stream "$1" 2>/dev/null | grep -c .)"
+  printf '%s' "${n:-0}"
+}
+_notes_present() { # <project_dir>: whether the store was read (rc_notes_present's answer)
+  if [ -n "$_CKPT_NOTES_FILE" ]; then [ "$_CKPT_NOTES_RC" -eq 0 ]; else rc_notes_present "$1"; fi
 }
 
 # "Nothing is lost" proof (mechanical, no LLM): enumerate every git worktree of this
@@ -206,33 +347,36 @@ _scan_worktrees() {
   [ -n "$base" ] || base="main"
   WT_BASE="$base"
 
-  local wt_paths total_count
+  local wt_paths total_count scan_paths pm
   wt_paths=$(printf '%s\n' "$raw" | awk '/^worktree /{print $2}')
   total_count=$(printf '%s\n' "$wt_paths" | grep -c .)
   [ -n "$total_count" ] || total_count=0
   WT_TOTAL="$total_count"
 
-  local scanned=0 clean=0 flagged_count=0 flagged_lines="" held="" wt n merged ok wtbranch ahead
+  # The first wt_max worktrees (a blank line never counts) are the only ones looked at; their probes run eight at a time and the loop
+  # below reads the answers back in `git worktree list` order, so the ledger reads exactly as it did when they ran one by one.
+  scan_paths=$(printf '%s\n' "$wt_paths" | grep . | head -n "$wt_max")
+  pm="$(_scratch_dir wt)"
+  _par_map "$pm" 8 _wt_probe <<WTSCAN
+$scan_paths
+WTSCAN
+
+  local scanned=0 clean=0 flagged_count=0 flagged_lines="" held="" wt n merged ok wtbranch ahead rec i=0
   while IFS= read -r wt; do
     [ -n "$wt" ] || continue
-    scanned=$((scanned + 1))
-    if [ "$scanned" -gt "$wt_max" ]; then
-      scanned=$((scanned - 1))
-      break
-    fi
+    scanned=$((scanned + 1)); i=$((i + 1))
+    rec="$(_par_get "$pm" "$i" _wt_probe "$wt")"
 
-    if [ ! -d "$wt" ]; then
+    if [ "$rec" = "MISSING" ]; then
       flagged_count=$((flagged_count + 1))
       flagged_lines="${flagged_lines}- MISSING \`${wt}\` — worktree directory no longer exists"$'\n'
       held="${held}${wt} MISSING — the directory is gone; its commits are only in the object store"$'\n'
       continue
     fi
 
-    n=$(git -C "$wt" status --porcelain 2>/dev/null | grep -c .)
-    [ -n "$n" ] || n=0
-
-    merged=yes
-    git -C "$wt" merge-base --is-ancestor HEAD "$base" 2>/dev/null || merged=no
+    read -r n merged wtbranch ahead <<WTREC
+$rec
+WTREC
 
     ok=yes
     if [ "$n" != "0" ]; then
@@ -242,8 +386,6 @@ _scan_worktrees() {
     if [ "$merged" = "no" ]; then
       ok=no
       flagged_lines="${flagged_lines}- UNMERGED \`${wt}\` — HEAD has commits not on \`${base}\`"$'\n'
-      wtbranch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)
-      ahead=$(git -C "$wt" rev-list --count "$base..HEAD" 2>/dev/null || echo "?")
       held="${held}${wtbranch} (${ahead} commit(s) not on ${base}, at ${wt})"$'\n'
     fi
     if [ "$ok" = "yes" ]; then
@@ -252,7 +394,7 @@ _scan_worktrees() {
       flagged_count=$((flagged_count + 1))
     fi
   done <<WTPATHS
-$wt_paths
+$scan_paths
 WTPATHS
 
   WT_SCANNED="$scanned"; WT_CLEAN="$clean"
@@ -302,11 +444,10 @@ _session_edits() {
 OA_COUNT=0; OA_LINES=""
 
 _scan_open_agents() {
-  local project_dir="$1" tool out
+  local project_dir="$1" out
   OA_COUNT=0; OA_LINES=""
-  tool="$(_sibling_tool heimdall-agents)"
-  [ -n "$tool" ] || return 0
-  out="$(cd "$project_dir" 2>/dev/null && HMD_AGENT_CWD="$project_dir" _bounded 4 "$tool" open --brief 2>/dev/null)" || return 0
+  _probe_wait agents
+  out="$(_probe_out agents _probe_agents "$project_dir")" || return 0
   [ -n "$out" ] || return 0
   OA_LINES="$out"
   OA_COUNT="$(printf '%s\n' "$out" | grep -c '^- `')"
@@ -328,18 +469,16 @@ GS_VERDICT="NOT-EVALUATED"; GS_DETAIL=""; GS_FAILCOUNT=0; GS_FAILLINES=""; GS_FA
 
 _scan_gate() {
   local project_dir="$1"
-  local hstate rc
-  hstate="$(_sibling_tool heimdall-state)"
+  local rc
 
   GS_VERDICT="NOT-EVALUATED"; GS_DETAIL=""
-  if [ -n "$hstate" ]; then
-    GS_DETAIL=$(cd "$project_dir" 2>/dev/null && _bounded 3 "$hstate" check-quality-gates 2>&1)
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-      GS_VERDICT="PASS"
-    elif [ "$rc" -eq 2 ]; then
-      GS_VERDICT="FAILING"
-    fi
+  _probe_wait gate
+  GS_DETAIL="$(_probe_out gate _probe_gate "$project_dir")"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    GS_VERDICT="PASS"
+  elif [ "$rc" -eq 2 ]; then
+    GS_VERDICT="FAILING"
   fi
 
   local reports f st gid hint
@@ -433,7 +572,7 @@ _scan_facts() {
 # file outside it would have that file's note-shaped lines copied into CHECKPOINT.md. A store that cannot be read plainly
 # (not there, a link, a FIFO, a hard-linked file) yields no notes.
 _notes_text() { # <project_dir> <contract-id> [max]
-  rc_notes_read "$1" 2>/dev/null \
+  _notes_stream "$1" 2>/dev/null \
     | grep -F "\"category\": \"$2\"" \
     | tail -"${3:-6}" \
     | sed -n 's/.*"text": "\(.*\)"}$/\1/p' \
@@ -445,7 +584,11 @@ _notes_text() { # <project_dir> <contract-id> [max]
 # without the notes — they are an optional input, so this never fails the save. One line on stderr, naming what was refused.
 _notes_notice() { # <project_dir>
   local err rc
-  err="$(rc_notes_read "$1" 2>&1 >/dev/null)"; rc=$?
+  if [ -n "$_CKPT_NOTES_FILE" ]; then
+    err="$_CKPT_NOTES_ERR"; rc="$_CKPT_NOTES_RC"
+  else
+    err="$(rc_notes_read "$1" 2>&1 >/dev/null)"; rc=$?
+  fi
   [ "$rc" -eq 4 ] || return 0
   err="$(printf '%s' "${err#hmd_nofollow_write: }" | tr '\n' ' ')"
   echo "[heimdall-checkpoint] notes skipped — ${err}; the save goes on without the recorded notes" >&2
@@ -485,7 +628,7 @@ _derive_gated() {
 }
 
 _derive_held() {
-  local project_dir="$1" out="$WT_HELD" b ahead
+  local project_dir="$1" out="$WT_HELD" b ahead todo="" pm i=0
   # Unmerged LOCAL branches too: work can be held on a branch with no worktree.
   # hmd/context is excluded by construction — it is an orphan ref that is never
   # merged by design, so listing it every run would make this field pure noise.
@@ -494,11 +637,26 @@ _derive_held() {
       [ -n "$b" ] || continue
       case "$b" in hmd/context) continue ;; esac
       printf '%s' "$out" | grep -qF "$b " && continue
-      ahead=$(git -C "$project_dir" rev-list --count "$WT_BASE..$b" 2>/dev/null || echo "?")
-      out="${out}${b} (${ahead} commit(s) not on ${WT_BASE})"$'\n'
+      todo="${todo}${b}"$'\n'
     done <<BRANCHES
 $(git -C "$project_dir" branch --no-merged "$WT_BASE" --format='%(refname:short)' 2>/dev/null)
 BRANCHES
+    # One commit count per branch still to report, eight at a time, read back in the order git listed them.
+    if [ -n "$todo" ]; then
+      _CKPT_PROJECT="$project_dir"
+      pm="$(_scratch_dir held)"
+      _par_map "$pm" 8 _branch_ahead <<HELDTODO
+$todo
+HELDTODO
+      while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        i=$((i + 1))
+        ahead="$(_par_get "$pm" "$i" _branch_ahead "$b")"
+        out="${out}${b} (${ahead} commit(s) not on ${WT_BASE})"$'\n'
+      done <<HELDTODO
+$todo
+HELDTODO
+    fi
   fi
   out="$(printf '%s' "$out" | rc_flatten)"
   [ -n "$out" ] || out="none — every worktree and local branch is merged into ${WT_BASE}"
@@ -592,7 +750,7 @@ _build_block() {
 
   _worktree_ledger "$project_dir"
   _open_agents_section
-  _session_edits
+  _probe_out edits _session_edits
   _gate_state "$project_dir"
 
   printf '### Recent commits\n'
@@ -710,7 +868,8 @@ _publish_shared() {
   bindir="$(cd "$(dirname "$self")" && pwd)"
   lib="$bindir/lib"
   [ -f "$lib/checkpoint_share.py" ] || return 0
-  py="$(command -v python3 || command -v python || true)"
+  py="${HMD_PYTHON:-}"
+  [ -n "$py" ] || py="$(command -v python3 || command -v python || true)"
   [ -n "$py" ] || return 0
 
   branch="$(git -C "$project_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
@@ -803,6 +962,7 @@ _completeness_gate() { # <written-block-file>
       continue
     fi
     dl="$(printf '%s' "$live" | rc_digest)" || dl=""
+    eval "RC_DIG_$id=\$dl"   # the key (_write_key) digests the same live value: once is enough
     db="$(printf '%s' "$back" | rc_digest)" || db=""
     if [ -z "$dl" ] || [ -z "$db" ]; then
       CKPT_MISSES="${CKPT_MISSES}${label} (${id}) — no sha256 on this machine, so completeness cannot be verified"$'\n'
@@ -844,7 +1004,7 @@ _write_key() { # <project_dir> <ts>
   local tmp id label layer live dig len notes ncount first now put_rc
   tmp="$(mktemp)" || return 1
   notes="$(rc_notes_path "$project_dir")"
-  ncount="$(rc_notes_count "$project_dir")"
+  ncount="$(_notes_count "$project_dir")"
   now="$(date +%s 2>/dev/null || echo 0)"
   rc_ctx_branch "$project_dir"
 
@@ -862,7 +1022,8 @@ _write_key() { # <project_dir> <ts>
       label="$(rc_label "$id")"
       layer="$(rc_layer "$id")"
       eval "live=\${RC_VAL_$id:-}"
-      dig="$(printf '%s' "$live" | rc_digest)" || dig=""
+      eval "dig=\${RC_DIG_$id:-}"
+      [ -n "$dig" ] || { dig="$(printf '%s' "$live" | rc_digest)" || dig=""; }
       len="$(printf '%s' "$live" | rc_normalize | wc -c | tr -d ' ')"
       [ "$first" = 1 ] || printf ',\n'
       first=0
@@ -873,7 +1034,7 @@ _write_key() { # <project_dir> <ts>
     printf '  "layers": {\n'
     printf '    "checkpoint": {"path": "%s", "present": true},\n' "$(rc_json_esc "$(rc_ckpt_path "$project_dir")")"
     printf '    "index": {"path": "%s", "present": %s, "entries": %s},\n' \
-      "$(rc_json_esc "$notes")" "$(rc_notes_present "$project_dir" && printf true || printf false)" "$ncount"
+      "$(rc_json_esc "$notes")" "$(_notes_present "$project_dir" && printf true || printf false)" "$ncount"
     printf '    "context-branch": {"ref": "refs/heads/hmd/context", "present": %s, "head": "%s", "worklog_ts": %s}\n' \
       "$([ "$RC_CB_PRESENT" = yes ] && printf true || printf false)" "$RC_CB_HEAD" "$RC_CB_TS"
     printf '  }\n'
@@ -911,6 +1072,7 @@ cmd_note() { # <kind> <text...>
   # to the repository, so the append walks down from the project without following a link and REFUSES — nothing
   # written, exit 4 — a .heimdall or resume-notes.ndjson that is a symlink (a dangling one too) or not a plain
   # directory / regular file. `>>` would write through the link, create a dangling one's target and hang on a FIFO.
+  _use_fast_python
   store="$(rc_notes_path "$PWD")"
   if [ -n "${HEIMDALL_HOME:-}" ]; then
     root="$(rc_home "$PWD")"; rel=""
@@ -953,6 +1115,8 @@ cmd_write() {
   # A sweep grading this checkout must not see a tracked file change under it. Asked before anything is measured, so a deferred save costs nothing...
   _defer_for_sweep "$project_dir" && return 5
 
+  _use_fast_python
+
   # LINK SAFETY, before anything under .planning is read or written: a repository controls every name below
   # its root, and this runs unattended. A link (a dangling one too) or a non-plain entry at .planning or at a
   # file written below is REFUSED — the whole save is skipped (a key beside a checkpoint that was not written
@@ -973,12 +1137,22 @@ cmd_write() {
 
   # Measure once, in THIS shell — the printers below run in a subshell and the
   # completeness gate needs the same values afterwards.
+  # The slow READS start first and are collected when the block needs them (see _probe_start); the git probes inside _scan_worktrees and
+  # _derive_held run side by side; the notes store is read once. The scratch directory goes with the process, on every way out.
+  _scratch_open
+  trap _scratch_close EXIT
+  _probe_start gate   _probe_gate   "$project_dir"
+  _probe_start agents _probe_agents "$project_dir"
+  _probe_start edits  _session_edits
+
   _scan_facts "$project_dir"
   _scan_worktrees "$project_dir"
   _scan_gate "$project_dir"
-  _scan_open_agents "$project_dir"
+  _notes_prime "$project_dir"
   _notes_notice "$project_dir"
   _derive_contract "$project_dir"
+  _scan_open_agents "$project_dir"
+  _probe_wait edits
 
   block=$(_build_block "$project_dir" "$ts") || return 0
 

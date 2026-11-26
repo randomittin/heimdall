@@ -156,7 +156,7 @@ rc_notes_read() { # <repo>
   local store py root rel
   store="$(rc_notes_path "$1")"
   [ -e "$store" ] || [ -L "$store" ] || return 1   # nothing there (the usual case): nothing to read, no python to start
-  py="$(command -v python3)" || return 127
+  py="${HMD_PYTHON:-}"; [ -n "$py" ] || py="$(command -v python3)" || return 127   # HMD_PYTHON: the interpreter the caller resolved (lib/hmd-python.sh), else the PATH one
   if [ -n "${HEIMDALL_HOME:-}" ]; then root="$HEIMDALL_HOME"; rel=""; else root="$1"; rel=".heimdall"; fi
   "$py" -I "$_RC_LIB_DIR/hmd_nofollow_write.py" read --root "$root" --rel "$rel" --name "${store##*/}"
 }
