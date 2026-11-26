@@ -48,10 +48,14 @@
 #      the command, a person at a terminal, remembered after a yes for that project only, forgotten by `revoke` run inside it, never recorded for an arm that was refused); `release` (what the hooks run) is quiet, puts it back in
 #      every project it was armed in, from any directory, and leaves a value the person changed; the expiry timer puts it back when nothing else did, and status says EXPIRED for an arming whose time is up; re-arming; the window
 #      in the user-level file and the trigger in the project's, each undone on its own; the real SessionStart (every source) and PreCompact hook commands from hooks.json release it and honour the operator's switch
+#   S11 the expiry check, for the day the timer died and no session starts (`release-expired`, what the compact-now-expiry-prompt hook on UserPromptSubmit and the compact-now-expiry-stop hook on Stop run): an arming whose time is over is put back,
+#      from a directory in no project too, and only that one (the time is judged per arming, and arming again gives a new one); one still inside its time is kept; a record with no usable expiry counts as over; a value the person changed meanwhile
+#      is left; a record that is not JSON is skipped and one that cannot be used costs ONE line on stderr; nothing is printed on stdout and the exit status is 0 whatever the state; the real hook commands from hooks.json do the same, each honours
+#      the operator's switch on its own id, and a hook that cannot find the tool says one line on stderr
 #
 # HERMETIC. HOME, HEIMDALL_HOME and the settings file are throwaway for every scenario; CLAUDE_CONFIG_DIR is unset; nothing reads or writes the operator's ~/.claude
 # or ~/.heimdall. CW_BIN=<file> points the suite at another copy of the tool (a mutant, for the break-it check).
-# budget: about 50 s solo: roughly 540 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git; 140 in R, the Bash cap; about 170 in S, the trigger, each of which also asks git twice), about twenty-two on a pty, one on a pty that waits out the 1 s seam, one wait of about 1 s for the expiry timer. No network.
+# budget: about 60 s solo: roughly 630 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git; 140 in R, the Bash cap; about 260 in S, the trigger and its expiry check, an arming also asking git twice), about twenty-two on a pty, one on a pty that waits out the 1 s seam, one wait of about 1 s for the expiry timer. No network.
 # EXIT: 0 = every assertion passes; 1 = any FAIL.
 set -uo pipefail
 
@@ -1137,6 +1141,138 @@ newp; putl "$PRETTY"
 cwt on --compact-now --yes; cwp status
 eq "S10: status after a yes: the consent row says it was given, the window row says nothing of hmd" "1|0" "$(grep '^consent' "$OUT" | grep -c 'given')|$(grep '^window' "$OUT" | grep -c 'set by hmd')"
 cwt off --compact-now --yes
+
+# S11. the expiry check, for the day the timer died and no session starts: `release-expired` (what the compact-now-expiry-prompt hook on UserPromptSubmit and the compact-now-expiry-stop hook on Stop run) puts back every arming whose time is
+# over, and only those; it never fails the hook that runs it
+recset() {   # FIELD JSON [SETTINGS]: set FIELD of the record that arms SETTINGS (the first record when none is named) to the JSON value, or remove it when the value is -
+  "$PY" -I -c 'import glob, json, os, sys
+directory, field, value, wanted = sys.argv[1], sys.argv[2], sys.argv[3], (sys.argv[4:] or [""])[0]
+for path in sorted(glob.glob(os.path.join(directory, "*.compact-now.state.json"))):
+    with open(path, encoding="utf-8") as handle:
+        record = json.load(handle)
+    if wanted and record["settings"] != os.path.realpath(wanted):
+        continue
+    if value == "-":
+        record.pop(field, None)
+    else:
+        record[field] = json.loads(value)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle)
+    break' "$H/.heimdall/compact-window" "$@"
+}
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
+cwt on --compact-now --yes
+cwt release-expired
+eq "S11: an arming still inside its time stays armed: exit 0, nothing on stdout or stderr, the trigger still \"1\", the record and the backup kept" '0|0|0|"1"|2' "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")|$(tval)|$(tstate)"
+recset expires_at 1
+cw release-expired
+eq "S11: the same arming once its time is up is put back, from a directory in no project: exit 0, nothing on stdout, the project's file byte for byte, the record and the backup gone" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+cwt release-expired
+eq "S11: ...and the next check has nothing to do: a quiet no-op" "0|0|0" "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
+cwt release-expired
+eq "S11: nothing was ever armed (no state directory yet): exit 0, no output at all, the project's file untouched" "0|0|0|yes" "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")|$(yn same "$PL" "$TMP/orig")"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"; PROJA="$PROJ"; PLA="$PL"
+PROJ="$H/projb"; PL="$PROJ/.claude/settings.local.json"; PLB="$PL"; mkdir -p "$PROJ"; git -c init.defaultBranch=main -C "$PROJ" init -q; putl "$COMPACT"
+cwt on --compact-now --yes
+PROJ="$PROJA"; PL="$PLA"
+cwt on --compact-now --yes
+recset expires_at 1 "$PLA"
+cw release-expired
+eq "S11: two projects armed, one past its time: that one is put back byte for byte and the other stays armed (the time is judged per arming)" "0|yes|\"1\"|2" "$RC|$(yn same "$PLA" "$TMP/orig")|$(PL="$PLB" tval)|$(tstate)"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
+cwt on --compact-now --yes
+recset expires_at '"soon"'
+cwt release-expired
+eq "S11: a record whose expiry is no number cannot show it is inside its time, so it counts as over: put back, byte for byte" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+cwt on --compact-now --yes
+recset expires_at -
+cwt release-expired
+eq "S11: ...and so does a record with no expiry at all" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+newp; putl "$PRETTY"
+cwt on --compact-now --yes
+sed -i.bak 's/"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "1"/"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "7"/' "$PL" && rm -f "$PL.bak"
+recset expires_at 1
+cwt release-expired
+eq "S11: a value the person changed meanwhile is theirs: the check leaves it and clears the record, as release does" '0|"7"|0' "$RC|$(tval)|$(tstate)"
+newp; putl "$PRETTY"
+cwt on --compact-now --yes
+recset expires_at 1
+cwt on --compact-now
+cwt release-expired
+eq "S11: arming again gives the arming a new time: the check judges the arming that stands, not the first one" '0|"1"|2' "$RC|$(tval)|$(tstate)"
+newp; putl "$PRETTY"
+cwt on --compact-now --yes
+printf 'not json at all' >"$(trec)"
+cwt release-expired
+eq "S11: a record that is not JSON is skipped, as release skips it: exit 0, nothing on stdout or stderr, the project's file left armed, the record left as it is" '0|0|0|"1"|not json at all' "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")|$(tval)|$(cat "$(trec)")"
+newp; putl "$PRETTY"
+cwt on --compact-now --yes
+recset had_file -
+recset expires_at 1
+cwt release-expired
+eq "S11: an expired record that cannot be used (a field is missing): exit 0, nothing on stdout, ONE line on stderr, the project's file and the record left as they are" '0|0|1|"1"|yes' "$RC|$(nbytes "$OUT")|$(grep -c '' "$ERR")|$(tval)|$(yn test -f "$(trec)")"
+
+# the real hook commands from hooks.json
+"$PY" -I - "$REPO/hooks/hooks.json" "$REPO/hooks/hooks.metadata.json" "$TMP" >"$TMP/hookinfo2" 2>&1 <<'PY'
+import json, sys
+hooks = json.load(open(sys.argv[1]))["hooks"]
+meta = dict((e["id"], e) for e in json.load(open(sys.argv[2]))["hooks"])
+errs = []
+for hid, event in (("compact-now-expiry-prompt", "UserPromptSubmit"), ("compact-now-expiry-stop", "Stop")):
+    entry = meta.get(hid)
+    if entry is None:
+        errs.append("hooks.metadata.json has no hook %s" % hid)
+        continue
+    group = hooks[entry["event"]][entry["index"]]
+    cmd = group["hooks"][0]["command"]
+    open("%s/%s.cmd" % (sys.argv[3], hid), "w").write(cmd)
+    if entry["event"] != event:
+        errs.append("%s is %s, want %s" % (hid, entry["event"], event))
+    if group.get("matcher"):
+        errs.append("%s has the matcher %r: it must fire for every %s" % (hid, group.get("matcher"), event))
+    if entry.get("locked") is not False:
+        errs.append("%s is locked: the operator could not switch it off" % hid)
+    if "hmd_hook_enabled %s" % hid not in cmd:
+        errs.append("%s is not gated by hmd_hook_enabled" % hid)
+    if "bin/heimdall-compact-window" not in cmd or '"$HOOK" release-expired >/dev/null' not in cmd:
+        errs.append("%s does not run heimdall-compact-window release-expired with its stdout cut off (a UserPromptSubmit hook's stdout reaches the model)" % hid)
+    if not cmd.rstrip().endswith("exit 0") or "set -e" in cmd:
+        errs.append("%s does not end in exit 0 (a hook that can fail the prompt or the turn's end)" % hid)
+    if not isinstance(group["hooks"][0].get("timeout"), int):
+        errs.append("%s sets no timeout" % hid)
+print("OK" if not errs else "; ".join(errs))
+PY
+eq "S11: hooks.json carries the expiry check on UserPromptSubmit and on Stop: advisory, gated by hmd_hook_enabled, stdout cut off, fail-open, with a timeout" "OK" "$(cat "$TMP/hookinfo2")"
+UPS='{"hook_event_name":"UserPromptSubmit","prompt":"carry on"}'; STP='{"hook_event_name":"Stop","stop_hook_active":false}'
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
+cwt on --compact-now --yes
+runhook compact-now-expiry-prompt "$UPS"
+eq "S11: the UserPromptSubmit hook leaves an arming still inside its time armed: exit 0, nothing on stdout or stderr" '0|0|0|"1"' "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")|$(tval)"
+recset expires_at 1
+runhook compact-now-expiry-prompt "$UPS"
+eq "S11: ...and puts one whose time is up back before the request goes out: exit 0, nothing on stdout (it would reach the model), the project's file byte for byte, the record gone" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+runhook compact-now-expiry-prompt "$UPS"
+eq "S11: ...with nothing armed it is a quiet no-op" "0|0|0" "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")"
+cwt on --compact-now --yes
+recset expires_at 1
+printf 'compact-now-expiry-prompt\n' >"$H/.heimdall/hooks-disabled"
+runhook compact-now-expiry-prompt "$UPS"
+eq "S11: the operator's switch (heimdall-hooks disable) is honoured: the UserPromptSubmit hook puts nothing back" '0|"1"' "$RC|$(tval)"
+runhook compact-now-expiry-stop "$STP"
+eq "S11: ...and it switches off only that hook: the Stop one still puts the expired arming back, exit 0, nothing on stdout, the file byte for byte, the record gone" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+cwt on --compact-now --yes
+recset expires_at 1
+printf 'compact-now-expiry-stop\n' >"$H/.heimdall/hooks-disabled"
+runhook compact-now-expiry-stop "$STP"
+eq "S11: the Stop hook has a switch of its own: with it off nothing is put back" '0|"1"' "$RC|$(tval)"
+rm -f "$H/.heimdall/hooks-disabled"
+mkdir -p "$TMP/emptyroot"
+printf '%s' "$UPS" | scrub env CLAUDE_PLUGIN_ROOT="$TMP/emptyroot" sh -c "$(cat "$TMP/compact-now-expiry-prompt.cmd")" >"$OUT" 2>"$ERR"; RC=$?
+eq "S11: a hook that cannot find the tool (a stale plugin root) while something is armed: exit 0, nothing on stdout, ONE line on stderr, nothing changed" '0|0|1|"1"' "$RC|$(nbytes "$OUT")|$(grep -c '' "$ERR")|$(tval)"
+printf 'garbage' >"$(trec)"
+runhook compact-now-expiry-prompt "$UPS"
+eq "S11: a broken record: the hook still exits 0, with nothing on stdout or stderr" "0|0|0" "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")"
 
 echo
 echo "compact-window: $PASS passed, $FAIL failed"

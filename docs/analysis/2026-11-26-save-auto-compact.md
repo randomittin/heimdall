@@ -118,7 +118,7 @@ later, read from `CLAUDE_CODE_EXECPATH`; otherwise print the paste line as befor
 
 1. `/hmd:save` writes the handoff as today, then arms the override. The first request after Claude Code reloads the file compacts.
 2. The PreCompact hook (compaction is starting, so the override has done its job and must not outlive it, or the smaller context
-   would compact again), any SessionStart, and an expiry check on UserPromptSubmit and Stop put the user's file back exactly.
+   would compact again), any SessionStart, and an expiry check on UserPromptSubmit and Stop (`release-expired`, built in the last section) put the user's file back exactly.
 3. The printed `/compact` line stays as the fallback: no consent yet, an older build, auto-compact turned off, a value of the
    person's own in the way, an unusable settings file.
 
@@ -171,3 +171,26 @@ Residual risks, carried into the report: another session in the SAME repository 
 session); a session whose settings root is another directory (a different launch directory, a worktree started elsewhere) does not read the file, so
 the arming does nothing and the paste line is still printed; the folder's trust must have been accepted and no ConfigChange hook may block the reload;
 whether `--setting-sources` can leave `local` out of `Ko()` was not traced; no live end-to-end run was done.
+
+## Follow-up (2026-11-27): the expiry check closes the last gap
+
+Release used to happen on four paths only: the PreCompact hook, any SessionStart, the detached 300 s `watch` timer, and `off`. The gap: when the timer dies
+(its process killed, a logout) and no session starts, an arming whose compaction never came stays in the project's file, and every request of every session in
+that repository compacts until one of the other three paths runs. The expiry check that step 2 of "Chosen mechanism" named is now built, and the gap is closed.
+
+- `bin/heimdall-compact-window release-expired` puts back every arming whose `expires_at` has passed, through the same `undo` path as `release` (text-exact, from
+  the backup and the record; a value the person changed meanwhile is left and its record cleared), and no other: an arming still inside its time stays, so the Stop
+  hook that ends the very turn `/hmd:save` armed in does not undo it. A record that gives no usable expiry counts as over (putting the file back is the safe way to be
+  wrong; the paste line is the fallback), and a record that is not JSON is skipped, as `release` skips it.
+- Two hooks, appended last in their events so no existing index moves: `compact-now-expiry-prompt` on UserPromptSubmit (it runs before the prompt's request goes out)
+  and `compact-now-expiry-stop` on Stop (the end of every turn). Each is advisory, gated by `hmd_hook_enabled` on its own id (`heimdall-hooks disable <id>`), has a
+  10 s timeout and starts with one `ls` of the record glob, so while nothing is armed it costs one process. Armed, it runs the tool: no network, no `git`, no
+  version probe (`running_build` is asked only by `on`), one attempt per arming (the next prompt or turn end is the retry, so a record that cannot be used does
+  not add a sleep to each of them), nothing on stdout (a UserPromptSubmit hook's stdout reaches the model), exit 0 always, one line on stderr for what could not be
+  done, a missing tool included.
+- The bound that remains: an arming is put back at the first prompt or turn end after its `expires_at`. Nothing runs between the requests of one turn, so a turn
+  that outlives the arming can still make requests that compact until it ends; a turn that starts without a prompt (a background agent finishing) can make one
+  request before its Stop hook runs. Idle time costs nothing: no prompt, no request.
+- Proof: `test/compact-window.test.sh`, section S11 (the verb on an expired and an unexpired arming, from outside any project, per arming across two projects, a
+  re-arm, a record with no usable expiry, a value the person changed, a record that is not JSON, one that cannot be used; then the real hook commands from
+  `hooks.json`, each on its own switch, with a stale plugin root).

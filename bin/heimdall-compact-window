@@ -5,6 +5,7 @@
     heimdall-compact-window on  [--tokens N | --bash-cap [CHARS] | --compact-now] [--yes] [--force]
     heimdall-compact-window off [--bash-cap | --compact-now] [--yes] [--force]
     heimdall-compact-window release
+    heimdall-compact-window release-expired
     heimdall-compact-window revoke
     heimdall-compact-window offer
     heimdall-compact-window -h | --help
@@ -28,7 +29,8 @@ of the window: the next request compacts) to the PROJECT's .claude/settings.loca
 (Claude Code sets it for hooks), else the top of the git work tree the working directory is in. It has the window's guarantees (a text-exact edit, a backup, a record; a value of the person's own, in the environment or in a settings file the
 project's local one outranks, is never replaced and --force is not accepted), and hmd puts it back by itself:
 `release` (the hooks compact-now-release-start, on every SessionStart, and compact-now-release-precompact, which fires BEFORE the summary is written so the smaller context cannot compact again),
-an expiry timer (a detached `watch` process; HEIMDALL_COMPACT_NOW_TTL_S seconds, default 300), or `off --compact-now`. It is refused (exit 5, nothing written; the /compact line stays the way) when the
+an expiry timer (a detached `watch` process; HEIMDALL_COMPACT_NOW_TTL_S seconds, default 300), the expiry check `release-expired` (the hooks compact-now-expiry-prompt, on every UserPromptSubmit, and compact-now-expiry-stop, on every Stop: for the
+day the timer is gone and no session starts, the arming is put back at the first prompt or turn end after its time has passed), or `off --compact-now`. It is refused (exit 5, nothing written; the /compact line stays the way) when the
 running Claude Code is older than 2.1.329 or its version is unknown (read from CLAUDE_CODE_EXECPATH, the session's own binary, not the one on PATH; HEIMDALL_COMPACT_NOW_CC_VERSION is the test seam), when
 automatic compaction is off (autoCompactEnabled false in the project's local or shared settings or in the user-level one, DISABLE_AUTO_COMPACT or DISABLE_COMPACT), or when the project's file cannot carry it: there is no project, git tracks the file
 or cannot say (a tracked file is the repository's text, not the person's), a link is anywhere on the way to it, or it is not a plain file with one link. The person's yes is given per repository: the first `on --compact-now --yes` (or a yes at
@@ -64,6 +66,11 @@ off     put the key back as hmd found it, in the settings file of this environme
         with its own CLAUDE_CONFIG_DIR.
 release put every armed compact-now trigger back, in whichever settings file hmd armed it: the verb the hooks and the timer run. It never asks and prints nothing on stdout (a SessionStart hook's
         stdout reaches the model); a value that is no longer hmd's is the person's and is left, the record cleared. Exit 0 unless a file could not be restored (1).
+release-expired
+        `release` for the armings whose time is over (expires_at has passed; a record that gives no usable expiry counts as over) and for no other: what the hooks compact-now-expiry-prompt (UserPromptSubmit) and compact-now-expiry-stop (Stop)
+        run, so an arming is put back at the first prompt or turn end after its time has passed even when the expiry timer is gone. It runs on every prompt and turn end while anything is armed, so it asks nothing of git, the network or the running build, makes ONE attempt
+        per arming (the next prompt or turn is the retry, so a record that cannot be used never slows them down) and prints nothing on stdout, a UserPromptSubmit hook's stdout reaching the model. It never fails the hook that runs it: exit 0 whatever
+        the state, one line on stderr for each file or record it could not use.
 revoke  forget the standing yes to the compact-now trigger in this project (run it inside the repository), and put every armed trigger back.
 offer   the one-time question install and update ask at a terminal about the window: nothing is printed, read or written without a terminal on stdin and stdout, a setting that is
         already there is never asked about, and an answer (yes or no) is kept in $HEIMDALL_HOME/compact-window/offered so it is asked once. Always exits 0.
@@ -943,9 +950,16 @@ def cmd_off(args):
     return undo(lever, os.path.realpath(os.path.join(root, *PROJECT_REL)), args.yes, args.force)
 
 
-def armed_settings(arm=None):
+def run_out(record, now):
+    """Whether the arming `record` describes is over at `now` (an epoch second): its expires_at is not a later second. A record that gives no usable expiry (no whole number) cannot show it is still inside its time, so it
+    counts as over: putting the file back is the safe way to be wrong, and the compact line is the fallback."""
+    expires = record.get("expires_at")
+    return not (isinstance(expires, int) and expires > now)
+
+
+def armed_settings(arm=None, expired_by=None):
     """The settings files hmd has the compact-now trigger armed in: every record of the trigger on disk, whatever CLAUDE_CONFIG_DIR this process has (a hook may run in another one). Given `arm`, only the
-    file that arming (its id) is in."""
+    file that arming (its id) is in; given `expired_by` (an epoch second), only the files whose arming is over by then (run_out)."""
     suffix = "." + TRIGGER.infix + STATE_FILE
     try:
         names = sorted(name for name in os.listdir(state_dir()) if name.endswith(suffix) and "." not in name[:-len(suffix)])
@@ -958,27 +972,40 @@ def armed_settings(arm=None):
             settings = record["settings"]
         except (Unusable, ValueError, TypeError, KeyError, RecursionError):
             continue
-        if isinstance(settings, str) and settings not in found and (arm is None or record.get("arm_id") == arm):
+        if isinstance(settings, str) and settings not in found and (arm is None or record.get("arm_id") == arm) and (expired_by is None or run_out(record, expired_by)):
             found.append(settings)
     return found
 
 
-def release_all(arm=None):
-    """Put every armed trigger back (the one with id `arm`, when given), quietly. A file somebody else saved at that very moment is retried: the check before the rename fails the write, never the person's change."""
+def release_all(arm=None, expired_by=None, tries=RELEASE_TRIES):
+    """Put every armed trigger back (the one with id `arm`, when given; only those whose time is over by `expired_by`, when given), quietly. A file somebody else saved at that very moment is retried, `tries` attempts in all: the check
+    before the rename fails the write, never the person's change."""
     worst = 0
     with quietly():
-        for settings in armed_settings(arm):
-            for _ in range(RELEASE_TRIES):
+        for settings in armed_settings(arm, expired_by):
+            for attempt in range(tries):
                 code = undo(TRIGGER, settings, True, False, release=True)
                 if code != EXIT_FAILED:
                     break
-                time.sleep(0.2)
+                if attempt + 1 < tries:
+                    time.sleep(0.2)
             worst = max(worst, code)
     return 0 if worst == 0 else EXIT_FAILED
 
 
 def cmd_release(args):
     return release_all()
+
+
+def cmd_release_expired(args):
+    """The expiry check the UserPromptSubmit and Stop hooks run, for the day the expiry timer is gone: put back the armings whose time is over and leave the others. Nothing on stdout (a UserPromptSubmit hook's stdout reaches
+    the model), one attempt per arming (the next prompt or turn end is the retry: a record that cannot be used must not slow every one of them down), and it never fails the hook: what could not be done is one line on stderr,
+    the exit status is 0."""
+    try:
+        release_all(expired_by=time.time(), tries=1)
+    except Exception as exc:   # the boundary of a hook: whatever went wrong is said once, on one line, and the prompt or the end of the turn goes on
+        warn("the expiry check failed (%s: %s): the next prompt or turn end tries again" % (type(exc).__name__, " ".join(str(exc).split())))
+    return 0
 
 
 def cmd_revoke(args):
@@ -1106,6 +1133,7 @@ def main(argv):
     verbs.add_parser("status")
     verbs.add_parser("offer")
     verbs.add_parser("release")
+    verbs.add_parser("release-expired")
     verbs.add_parser("revoke")
     timer = verbs.add_parser("watch")   # internal: the expiry timer `on --compact-now` starts
     timer.add_argument("--arm", required=True)
@@ -1134,7 +1162,7 @@ def main(argv):
         if parsed.compact_now and parsed.bash_cap:
             parser.error("--compact-now and --bash-cap each name a setting: one setting per command")
         parsed.lever = TRIGGER if parsed.compact_now else CAP if parsed.bash_cap else WINDOW
-    return {"status": cmd_status, "on": cmd_on, "off": cmd_off, "offer": cmd_offer, "release": cmd_release, "revoke": cmd_revoke, "watch": cmd_watch}[parsed.verb](parsed)
+    return {"status": cmd_status, "on": cmd_on, "off": cmd_off, "offer": cmd_offer, "release": cmd_release, "release-expired": cmd_release_expired, "revoke": cmd_revoke, "watch": cmd_watch}[parsed.verb](parsed)
 
 
 if __name__ == "__main__":

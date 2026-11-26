@@ -59,6 +59,15 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled compact-now-expiry-prompt && exit 0; ls \"${HEIMDALL_HOME:-$HOME/.heimdall}\"/compact-window/*.compact-now.state.json >/dev/null 2>&1 || exit 0; HOOK=\"$HMDP/bin/heimdall-compact-window\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" release-expired >/dev/null; else echo \"heimdall: compact-window not found (CLAUDE_PLUGIN_ROOT unset or stale, and no install at ~/.heimdall) - the expiry check of the compaction trigger did not run\" >&2; fi; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -502,6 +511,15 @@
           {
             "type": "command",
             "command": "[ -n \"${HMD_LAUNCHER_PID:-}\" ] || exit 0; HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled seamless-restart && exit 0; HOOK=\"$HMDP/bin/heimdall-restart-request\"; if [ -x \"$HOOK\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 5; exec @ARGV' \"$HOOK\" --claude-pid \"$PPID\" >/dev/null 2>&1; else \"$HOOK\" --claude-pid \"$PPID\" >/dev/null 2>&1; fi; fi; exit 0"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled compact-now-expiry-stop && exit 0; ls \"${HEIMDALL_HOME:-$HOME/.heimdall}\"/compact-window/*.compact-now.state.json >/dev/null 2>&1 || exit 0; HOOK=\"$HMDP/bin/heimdall-compact-window\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" release-expired >/dev/null; else echo \"heimdall: compact-window not found (CLAUDE_PLUGIN_ROOT unset or stale, and no install at ~/.heimdall) - the expiry check of the compaction trigger did not run\" >&2; fi; exit 0",
+            "timeout": 10
           }
         ]
       }

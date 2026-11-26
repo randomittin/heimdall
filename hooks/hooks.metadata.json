@@ -72,6 +72,16 @@
       "remote_toggle": false
     },
     {
+      "event": "UserPromptSubmit",
+      "index": 7,
+      "id": "compact-now-expiry-prompt",
+      "description": "Puts back an expired one-shot compaction trigger before the prompt's request goes out: the expiry check, for the day the detached expiry timer died and no session started (bin/heimdall-compact-window on --compact-now arms env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE in the repository's own .claude/settings.local.json, never the user-level file, for HEIMDALL_COMPACT_NOW_TTL_S seconds, default 300). Runs heimdall-compact-window release-expired only when an arming record exists under $HEIMDALL_HOME/compact-window (one ls otherwise): it puts back every arming whose expires_at has passed (a record with no usable expiry counts as passed) by the same path as release, and leaves one still inside its time and a value the person changed meanwhile. It asks nothing of git, the network or the running build, makes one attempt (the next prompt is the retry) and prints nothing on stdout (a UserPromptSubmit hook's stdout reaches the model). Fail-open: exit 0 always, one stderr line for what could not be done, timeout 10s. Disabling it (heimdall-hooks disable compact-now-expiry-prompt) leaves the Stop check, the SessionStart and PreCompact releases and the timer as the ways back.",
+      "matcher": "",
+      "fingerprint": "48b3bacf69eda651f4fbf711f29e92be5fd7a054fd1fa7670e6a046ddfa12a13",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "PreToolUse",
       "index": 0,
       "id": "bash-gate-chain",
@@ -558,6 +568,16 @@
       "description": "Seamless restart after an update, request half: at the end of a turn of a session an hmd launcher supervises (HMD_LAUNCHER_PID set), when heimdall-update-pending reports a newer claude or hmd than the session started with, bin/heimdall-restart-request writes $HMD_RESTART_DIR/req.json (atomically, 0600) and sends the launcher one SIGUSR1. It only asks: the launcher's restart gate decides whether and when ending claude is safe, and this hook never ends a process, never blocks the turn, prints nothing and always exits 0. A session without a launcher, HMD_AUTO_RESTART=off, a Stop that continues an earlier one, or nothing pending make it a no-op that forks nothing before its first exit.",
       "matcher": "",
       "fingerprint": "ad37016b62a3fc5970b50772ce3b6bb6685bf89becd645e1e5dd5a460875f73a",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
+      "event": "Stop",
+      "index": 7,
+      "id": "compact-now-expiry-stop",
+      "description": "The same expiry check at the end of every turn (see compact-now-expiry-prompt): runs heimdall-compact-window release-expired only when an arming record exists under $HEIMDALL_HOME/compact-window (one ls otherwise), so a one-shot compaction trigger whose time has passed is put back at the latest when the turn that outlived it ends. Same command and guarantees as compact-now-expiry-prompt: silent on stdout, one attempt, no network, no version probe; fail-open: exit 0 always, one stderr line on error, timeout 10s. Disabling it (heimdall-hooks disable compact-now-expiry-stop) leaves the UserPromptSubmit check, the SessionStart and PreCompact releases and the timer as the ways back.",
+      "matcher": "",
+      "fingerprint": "eecd3d0c09d1fa4e6362ee3424240c57d05b599a849059bda81cbca852f04544",
       "locked": false,
       "remote_toggle": false
     },
