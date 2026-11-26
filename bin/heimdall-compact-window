@@ -22,18 +22,22 @@ own, in this environment or in the "env" block of the settings file, is therefor
 (about 10,000 characters) is not governed by the cap. `off` undoes the window only and `off --bash-cap` the cap only, in either order.
 
 THE COMPACT-NOW TRIGGER (--compact-now). A third setting, a transient one, so /hmd:save can compact without the person pasting /compact (no command, skill or hook can run it). Claude Code re-applies
-the "env" block of settings.json to a running session when the file changes, reads CLAUDE_AUTOCOMPACT_PCT_OVERRIDE on every auto-compact check, and takes it back when no settings source supplies it any more
-(2.1.329 and later; the evidence is docs/analysis/2026-11-26-save-auto-compact.md). `on --compact-now` therefore adds env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "1" (a threshold of 1% of the window: the next
-request compacts), with the window's guarantees (a text-exact edit, a backup, a record; a value of the person's own is never replaced and --force is not accepted), and hmd puts it back by itself:
+the "env" block of a settings file to a running session when the file changes (the project's .claude/settings.local.json included, once the folder's trust was accepted), reads CLAUDE_AUTOCOMPACT_PCT_OVERRIDE on every auto-compact check,
+and takes it back when no settings source supplies it any more (2.1.329 and later; the evidence is docs/analysis/2026-11-26-save-auto-compact.md). `on --compact-now` therefore adds env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "1" (a threshold of 1%
+of the window: the next request compacts) to the PROJECT's .claude/settings.local.json and never to the user-level settings.json, which every Claude Code session on the machine, in any repository, reads. The project is $CLAUDE_PROJECT_DIR
+(Claude Code sets it for hooks), else the top of the git work tree the working directory is in. It has the window's guarantees (a text-exact edit, a backup, a record; a value of the person's own, in the environment or in a settings file the
+project's local one outranks, is never replaced and --force is not accepted), and hmd puts it back by itself:
 `release` (the hooks compact-now-release-start, on every SessionStart, and compact-now-release-precompact, which fires BEFORE the summary is written so the smaller context cannot compact again),
 an expiry timer (a detached `watch` process; HEIMDALL_COMPACT_NOW_TTL_S seconds, default 300), or `off --compact-now`. It is refused (exit 5, nothing written; the /compact line stays the way) when the
-running Claude Code is older than 2.1.329 or its version is unknown (read from CLAUDE_CODE_EXECPATH, the session's own binary, not the one on PATH; HEIMDALL_COMPACT_NOW_CC_VERSION is the test seam), or when
-automatic compaction is off (autoCompactEnabled false, DISABLE_AUTO_COMPACT or DISABLE_COMPACT). The person's yes is the window's, given once: the first `on --compact-now --yes` (or a yes at a terminal) is kept in
-$HEIMDALL_HOME/compact-window/compact-now.consent and covers the later ones; `revoke` forgets it and puts an armed trigger back. Every session that shares the settings file re-applies the override while it is
-armed, so another session, or a subagent still running in this one, that makes a request in that window compacts too: the window is as short as the hooks allow.
+running Claude Code is older than 2.1.329 or its version is unknown (read from CLAUDE_CODE_EXECPATH, the session's own binary, not the one on PATH; HEIMDALL_COMPACT_NOW_CC_VERSION is the test seam), when
+automatic compaction is off (autoCompactEnabled false in the project's local or shared settings or in the user-level one, DISABLE_AUTO_COMPACT or DISABLE_COMPACT), or when the project's file cannot carry it: there is no project, git tracks the file
+or cannot say (a tracked file is the repository's text, not the person's), a link is anywhere on the way to it, or it is not a plain file with one link. The person's yes is given per repository: the first `on --compact-now --yes` (or a yes at
+a terminal) in a project is kept in $HEIMDALL_HOME/compact-window/<id>.compact-now.consent (<id> a digest of the project's settings file, as for the records) and covers the later ones in THAT project only; `revoke`, run inside it, forgets it
+and puts every armed trigger back. Every session in the project, and every subagent still running in this one, that makes a request while it is armed compacts too; a session in another repository does not: the window is as short as the hooks allow.
 
-WHAT IT WRITES. One key per command: `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000), with --bash-cap `bashOutputMaxChars` (a character count) or, with
---compact-now, `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (a string, as every env value is), in the user-level settings.json of the agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. A symlink there is followed (the file it points to is edited and the link stays).
+WHAT IT WRITES. One key per command: `autoCompactWindow` (a token count, 100,000 or more, `--tokens N` or `--tokens 250k`, default 300,000) or, with --bash-cap, `bashOutputMaxChars` (a character count), in the user-level settings.json of the
+agent: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json (a symlink there is followed: the file it points to is edited and the link stays); with --compact-now, `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (a string, as every env value is) in
+the PROJECT's .claude/settings.local.json instead (above), a file no link may lead to, and never in the user-level one.
 The key is added to, or replaced in, the TEXT of the file, never by re-serializing the document, so every other byte survives: key order, indentation, escapes,
 the trailing newline. The write is a temp file in the same directory and a rename; the file is read again as the last step before the rename, and when it is no longer
 the one that was read (other bytes, or another file in its place) nothing is written and the exit status is 1. A file that is not a JSON object (or names the key
@@ -50,7 +54,7 @@ on      back up the settings file ($HEIMDALL_HOME/compact-window/<id>.settings.j
         <id>.compact-now.settings.json.bak, <id>.compact-now.state.json).
         A value of the person's own that differs from the one asked for is never replaced unless --force is given (exit 4); a value hmd wrote itself is updated in place and
         still undoes to the state before hmd.
-off     put the key back as hmd found it, in the settings file of this environment: removed when it was absent (the file removed when hmd created it), the old value
+off     put the key back as hmd found it, in the settings file of this environment (--compact-now: of this project): removed when it was absent (the file removed when hmd created it, and the .claude directory with it when hmd made that too), the old value
         when --force had replaced one. When the file is still byte-for-byte what hmd wrote and the other settings hmd keeps in it are not set, the backup is restored verbatim; when
         something else changed the file since, or another setting is still there (the backup also holds that setting's earlier state), only the key is reverted and the rest is
         kept: the key is cut out exactly as it was added, so the last `off` leaves the file as it was before any. A file hmd created is removed by the last `off`, whichever of the
@@ -60,12 +64,12 @@ off     put the key back as hmd found it, in the settings file of this environme
         with its own CLAUDE_CONFIG_DIR.
 release put every armed compact-now trigger back, in whichever settings file hmd armed it: the verb the hooks and the timer run. It never asks and prints nothing on stdout (a SessionStart hook's
         stdout reaches the model); a value that is no longer hmd's is the person's and is left, the record cleared. Exit 0 unless a file could not be restored (1).
-revoke  forget the standing yes to the compact-now trigger, and put an armed trigger back.
+revoke  forget the standing yes to the compact-now trigger in this project (run it inside the repository), and put every armed trigger back.
 offer   the one-time question install and update ask at a terminal about the window: nothing is printed, read or written without a terminal on stdin and stdout, a setting that is
         already there is never asked about, and an answer (yes or no) is kept in $HEIMDALL_HOME/compact-window/offered so it is asked once. Always exits 0.
         HEIMDALL_NO_COMPACT_WINDOW_OFFER=1 silences it. A question left unanswered for 300 seconds is dropped, and not recorded, so it is asked again later;
         HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S=<seconds> shortens that wait (the test seam: a number above 0 and below 300, anything else is ignored).
-status  the setting file, then the window, the cap and the trigger: the value in the file and whether hmd put it there, and any other settings file hmd set the key in. Exit 1 only when the file cannot be used.
+status  the settings file and the project's file, then the window, the cap and the trigger: the value in the file and whether hmd put it there, and any other settings file hmd set the key in. Exit 1 only when the settings file cannot be used.
 
 UPDATING FROM 2.4.12. That release kept ONE record and ONE backup for the whole machine, state.json and settings.json.bak. The first time `status`, `on` or `off` runs they are moved
 to the names of the settings file the record names (its real path, which the record is rewritten to say), so a yes given to 2.4.12 still has its `off`, `status` and `on --tokens`.
@@ -74,7 +78,7 @@ exit 1 with nothing moved, like any other.
 
 Exit 0 done or nothing to do. 1 a file that cannot be used or written (nothing was changed; stderr says why). 2 usage. 3 consent required (nothing was written).
 4 refused: the key holds a value that is not hmd's (for the cap also: a BASH_MAX_OUTPUT_LENGTH of the person's own), --force overrides (never for the trigger).
-5 unavailable: the compact-now trigger cannot work here (the build, or automatic compaction is off); nothing was written. stdlib only.
+5 unavailable: the compact-now trigger cannot work here (the build, automatic compaction is off, or the project's file cannot be used); nothing was written. stdlib only; the project's file is vetted with bin/lib/hmd_nofollow_write.py, beside this tool.
 """
 import argparse
 import collections
@@ -95,6 +99,8 @@ import time
 OFFER_WAIT_S = 300   # an offer left unanswered this long is not asked again that run, and not recorded as answered
 OFFER_WAIT_ENV = "HEIMDALL_COMPACT_WINDOW_OFFER_WAIT_S"   # the test seam: a shorter wait, in seconds
 STATE_FILE, BACKUP_FILE, OFFERED_FILE, CONSENT_FILE = "state.json", "settings.json.bak", "offered", "compact-now.consent"
+PROJECT_REL, GIT_BUDGET_S = (".claude", "settings.local.json"), 5   # the project's file the trigger is armed in; the seconds a question to git may take
+NO_PROJECT = "there is no project to arm it in: CLAUDE_PROJECT_DIR is unset and the working directory is not in a git work tree"
 EXIT_FAILED, EXIT_USAGE, EXIT_CONSENT, EXIT_REFUSED, EXIT_UNAVAILABLE = 1, 2, 3, 4, 5
 WHITESPACE = " \t\n\r"
 DECODER = json.JSONDecoder()
@@ -105,7 +111,7 @@ RELEASE_TRIES, WATCH_POLL_S = 3, 2.0
 QUIET = False   # `release` and the timer print nothing on stdout: a SessionStart hook's stdout reaches the model
 
 
-class Lever(collections.namedtuple("Lever", "key slot what unit default low high accepts select value_flag infix cost unset live env_var shadows parent quote transient", defaults=(None, False, False))):
+class Lever(collections.namedtuple("Lever", "key slot what unit default low high accepts select value_flag infix cost unset live env_var shadows parent quote transient project", defaults=(None, False, False, False))):
     """One key of the agent's settings that hmd sets with the person's yes and undoes exactly. Everything below works on a lever; these fields are all that differs between two.
     key: the member of settings.json. slot: its row in `status`. what, unit: how consent names it, and what its value counts. default, low, high: the value `on` writes when none is
     given, and the range `on` accepts (high may be infinity); accepts: the usage error for a value outside it. select, value_flag: the flag after the verb that picks the lever (none for the
@@ -113,7 +119,8 @@ class Lever(collections.namedtuple("Lever", "key slot what unit default low high
     unset: what `status` says while the key is absent. live: what follows "applies to sessions started from now on", from the value. env_var: the environment variable of the agent that bears on
     the same thing, which `status` shows. shadows: once the key is set the agent ignores that variable, so one of the person's own is a value of theirs `on` does not cover without --force.
     parent: the top-level object the key lives in (None: the key is top-level). quote: the value is written as a JSON string (every env value is one). transient: hmd puts it back by itself
-    (release, the expiry timer), so `on` needs the build and automatic compaction to be able to honour it, and --force is never accepted."""
+    (release, the expiry timer), so `on` needs the build and automatic compaction to be able to honour it, and --force is never accepted. project: the key lives in the project's own .claude/settings.local.json and not in the
+    user-level settings.json, which every session on the machine reads: a key that reaches every repository is the person's to set, with their yes (the window, the cap); the one-shot trigger is one repository's business and nobody else's."""
     __slots__ = ()
 
     def command(self, verb, value=None, force=False):
@@ -145,10 +152,10 @@ CAP = Lever(
 TRIGGER = Lever(
     key="CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", slot="trigger", what="the one-shot compaction trigger", unit="percent of the window", default=1, low=1, high=99,
     accepts="1", select=" --compact-now", value_flag="", infix="compact-now.",
-    cost="the agent compacts the conversation on its next request once it has reloaded the file (a threshold of {}% of the window); every session that shares this file, and every subagent still running in this one, that makes a request "
-         "meanwhile compacts too; hmd puts the file back when a compaction starts, on any session start, or when the minutes are up; needs Claude Code 2.1.329 or later",
-    unset="not armed (`hmd compact-window on --compact-now` arms it for a few minutes, with your yes; /hmd:save does it)",
-    live=lambda percent: "", env_var="CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", shadows=True, parent="env", quote=True, transient=True)
+    cost="the agent compacts the conversation on its next request once it has reloaded the file (a threshold of {}% of the window); every session in this project, and every subagent still running in this one, that makes a request "
+         "meanwhile compacts too, and no session in another repository does; hmd puts the file back when a compaction starts, on any session start, or when the minutes are up; needs Claude Code 2.1.329 or later",
+    unset="not armed (`hmd compact-window on --compact-now` arms it in this project's .claude/settings.local.json for a few minutes, with your yes; /hmd:save does it)",
+    live=lambda percent: "", env_var="CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", shadows=True, parent="env", quote=True, transient=True, project=True)
 LEVERS = (WINDOW, CAP, TRIGGER)
 
 
@@ -195,10 +202,88 @@ def settings_path():
     return os.path.join(config, "settings.json")
 
 
+def git_env():
+    """The environment of every git this tool asks: no GIT_* variable (a session's environment is the repository's to set, and GIT_DIR or GIT_INDEX_FILE would make git answer about another repository) and English messages (an answer is read from one)."""
+    env = dict((key, value) for key, value in os.environ.items() if not key.startswith("GIT_"))
+    env["LC_ALL"] = "C"
+    return env
+
+
+def git(argv, cwd):
+    """(exit status, stdout, stderr) of `git argv` run in `cwd` (None: here); (None, "", why) when it could not run or took longer than GIT_BUDGET_S."""
+    try:
+        done = subprocess.run(["git"] + argv, cwd=cwd, env=git_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=GIT_BUDGET_S)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, "", str(exc)
+    return done.returncode, os.fsdecode(done.stdout), os.fsdecode(done.stderr)
+
+
+def project_root():
+    """The project the trigger is armed in, by its real path: $CLAUDE_PROJECT_DIR (Claude Code sets it for hooks; an absolute directory), else the top of the git work tree the working directory is in. None when neither names one."""
+    named = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if os.path.isabs(named) and os.path.isdir(named):
+        return os.path.realpath(named)
+    code, out, _ = git(["rev-parse", "--show-toplevel"], None)
+    top = out.rstrip("\n")
+    return os.path.realpath(top) if code == 0 and os.path.isabs(top) else None
+
+
+def plain_problem(root):
+    """Why the project's .claude/settings.local.json is not a file to arm, None when it is plain or not there yet: a link anywhere on the way, or an entry that is not a regular file (bin/lib/hmd_nofollow_write.check, the walk the /hmd:save handoff
+    goes through: each component opened without following a link), or a file with a second hard link (the atomic replace below would detach it from the other name)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+    try:
+        import hmd_nofollow_write
+    except ImportError:
+        return "bin/lib/hmd_nofollow_write.py was not found beside this tool, so the project's file cannot be vetted"
+    target = os.path.join(root, *PROJECT_REL)
+    try:
+        hmd_nofollow_write.check(root, [PROJECT_REL[0] + "/", "/".join(PROJECT_REL)])
+        links = os.lstat(target).st_nlink
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return "%s cannot be used: %s" % (tilde(target), exc)
+    return "%s has more than one hard link" % tilde(target) if links > 1 else None
+
+
+def tracked_problem(root):
+    """None when git says the project's .claude/settings.local.json is not tracked, else why the trigger is not armed in it: git tracks it (a repository can ship one: it is the repository's text, not the person's), or git could not say (not a work
+    tree, a failure, a timeout, any answer but "unknown to git"). The probe Claude Code itself makes of the file, with an icase pathspec so the other spelling on a case-folding file system counts too."""
+    target = tilde(os.path.join(root, *PROJECT_REL))
+    code, _, err = git(["ls-files", "--error-unmatch", "--", ":(icase)" + "/".join(PROJECT_REL)], root)
+    if code == 0:
+        return "git tracks %s: it is the repository's text, not yours, and the trigger is never armed in it" % target
+    if code == 1 and "did not match any file(s) known to git" in err:
+        return None
+    lines = [line.strip() for line in err.split("\n") if line.strip()]
+    return "git could not say whether %s is tracked (%s)" % (target, lines[-1] if lines else "exit %s" % code)
+
+
+def project_target():
+    """(the project's .claude/settings.local.json, None), or (None, why the trigger cannot be armed in it)."""
+    root = project_root()
+    if root is None:
+        return None, NO_PROJECT
+    why = plain_problem(root) or tracked_problem(root)
+    return (None, why) if why else (os.path.join(root, *PROJECT_REL), None)
+
+
+def lever_target(lever):
+    """(the settings file `lever` lives in, None), or (None, why it cannot be used). The window and the cap reach every session and are the person's to set: the user-level settings.json. The trigger is one repository's business: that project's
+    .claude/settings.local.json."""
+    return project_target() if lever.project else (settings_path(), None)
+
+
+def stem_of(settings):
+    """The digest every record, backup and consent stamp of one settings file is named by: of its canonical path (Doc.path)."""
+    return sha256(os.fsencode(settings))[:16]
+
+
 def state_files(lever, settings):
     """(record, backup): the two files `on` keeps for one lever of one settings file, named by a digest of its canonical path (Doc.path). A second settings file (another
     CLAUDE_CONFIG_DIR) gets a pair of its own, and so does the second lever of one file, so setting one never takes the other's undo away."""
-    stem = sha256(os.fsencode(settings))[:16]
+    stem = stem_of(settings)
     return tuple(os.path.join(state_dir(), "%s.%s%s" % (stem, lever.infix, name)) for name in (STATE_FILE, BACKUP_FILE))
 
 
@@ -552,23 +637,25 @@ def utc_stamp(epoch=None):
     return datetime.datetime.fromtimestamp(time.time() if epoch is None else epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def consent_stamp():
-    return os.path.join(state_dir(), CONSENT_FILE)
+def consent_stamp(settings):
+    """The person's yes to the compact-now trigger in one project, kept per project: <id>.compact-now.consent, <id> the digest of the project's settings.local.json (stem_of). A yes given in one repository covers no other."""
+    return os.path.join(state_dir(), "%s.%s" % (stem_of(settings), CONSENT_FILE))
 
 
-def has_standing_consent():
-    """Whether the person already said yes to the compact-now trigger (the stamp `on --compact-now` keeps once a yes was given)."""
+def has_standing_consent(settings):
+    """Whether the person already said yes to the compact-now trigger in the project whose settings file is `settings` (the stamp `on --compact-now` keeps once a yes was given)."""
     try:
-        return (read_bytes(consent_stamp()) or b"").split()[:1] == [b"yes"]
+        return (read_bytes(consent_stamp(settings)) or b"").split()[:1] == [b"yes"]
     except Unusable:
         return False
 
 
-def remember_consent():
+def remember_consent(settings):
+    stamp = consent_stamp(settings)
     try:
-        write_atomic(consent_stamp(), ("yes %s\n" % utc_stamp()).encode("utf-8"), 0o700)
+        write_atomic(stamp, ("yes %s\n" % utc_stamp()).encode("utf-8"), 0o700)
     except OSError as exc:
-        warn("could not record your yes in %s (%s): you will be asked again" % (tilde(consent_stamp()), exc))
+        warn("could not record your yes in %s (%s): you will be asked again" % (tilde(stamp), exc))
 
 
 def parse_amount(lever, text):
@@ -586,16 +673,36 @@ def parse_chars(text):
     return parse_amount(CAP, text)
 
 
+def read_object(path):
+    """The top-level object of the settings file `path`, only read; {} when it is not there, cannot be read or is not a JSON object (such a file names no setting, and nothing here edits it)."""
+    try:
+        with open(path, "rb") as handle:
+            document = json.loads(handle.read())
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def env_homes(lever, doc):
+    """(path, document) of every settings file whose env block may hold a value of the person's own for lever.env_var: the file the key is set in and, for a project-scoped key, the two files that file outranks (the project's shared
+    .claude/settings.json and the user-level settings.json), where a value would be shadowed for as long as the key is set."""
+    homes = [(doc.path, doc.document)]
+    if lever.project:
+        homes += [(path, read_object(path)) for path in (os.path.join(os.path.dirname(doc.path), "settings.json"), settings_path())]
+    return homes
+
+
 def own_rival(lever, doc):
-    """(its value, where it is) of an environment variable of the person's own that setting the key would make the agent ignore: set in this environment, or in the "env" block of the settings
-    file. None when the lever shadows no variable, or the person set none (an empty one is unset to the agent too)."""
+    """(its value, where it is) of an environment variable of the person's own that setting the key would make the agent ignore: set in this environment, or in the "env" block of a settings file
+    (env_homes). None when the lever shadows no variable, or the person set none (an empty one is unset to the agent too)."""
     if not lever.shadows:
         return None
     if os.environ.get(lever.env_var):
         return os.environ[lever.env_var], "this environment"
-    block = doc.document.get("env")
-    if isinstance(block, dict) and block.get(lever.env_var) not in (None, ""):
-        return json.dumps(block[lever.env_var]), "the env block of %s" % tilde(doc.path)
+    for path, document in env_homes(lever, doc):
+        block = document.get("env")
+        if isinstance(block, dict) and block.get(lever.env_var) not in (None, ""):
+            return json.dumps(block[lever.env_var]), "the env block of %s" % tilde(path)
     return None
 
 
@@ -632,8 +739,11 @@ def trigger_unavailable(doc):
     for name in ("DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"):
         if os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on"):
             return "%s is set in this environment: automatic compaction is off" % name
-    if doc.document.get("autoCompactEnabled") is False:
-        return "autoCompactEnabled is false in %s: automatic compaction is off" % tilde(doc.path)
+    shared = os.path.join(os.path.dirname(doc.path), "settings.json")
+    for path, document in ((doc.path, doc.document), (shared, read_object(shared)), (settings_path(), read_object(settings_path()))):   # the most specific file that names the key decides
+        value = document.get("autoCompactEnabled")
+        if isinstance(value, bool):
+            return "autoCompactEnabled is false in %s: automatic compaction is off" % tilde(path) if value is False else None
     return None
 
 
@@ -657,8 +767,12 @@ def start_timer(arm_id, expires_at):
 
 def cmd_on(args):
     lever, value = args.lever, args.value
+    target, why = lever_target(lever)
+    if why is not None:
+        warn("the compact-now trigger is not available: %s. Nothing was written (the compact line is the way)" % why)
+        return EXIT_UNAVAILABLE
     try:
-        doc = Doc(settings_path(), lever)
+        doc = Doc(target, lever)
         record = load_state(lever, doc.path)
     except Unusable as exc:
         warn(str(exc))
@@ -692,7 +806,7 @@ def cmd_on(args):
         return EXIT_REFUSED
     backup = state_files(lever, doc.path)[1]
     now = "not set" if found is None else "%s (%s)" % (current, "set by hmd earlier" if ours else "yours; --force replaces it")
-    standing = lever.transient and not args.yes and has_standing_consent()   # the yes given before covers this one
+    standing = lever.transient and not args.yes and has_standing_consent(doc.path)   # the yes given before, in this project, covers this one
     if standing:
         args.yes = True
     where = "%s (only the key %s%s; every other byte stays as it is)" % (tilde(doc.path), lever.key, " in %s" % lever.parent if lever.parent else "")
@@ -704,7 +818,7 @@ def cmd_on(args):
         "  undo    %s" % lever.command("off"),
         "  cost    %s" % lever.cost.format(format(value, ","))]
     if lever.transient:
-        details.append("  asked   once: your yes covers the next ones too; `hmd compact-window revoke` takes it back")
+        details.append("  asked   once per project: your yes covers the next ones in this project only; `hmd compact-window revoke`, run inside it, takes it back")
     if rival is not None:
         details.append("  note    %s is %s in %s; the agent ignores it while the key is set" % (lever.env_var, rival[0], rival[1]))
     if not consent(args, "this writes %s" % tilde(doc.path), details, lever.command("on", value, args.force)):
@@ -717,6 +831,7 @@ def cmd_on(args):
                    "had_key": found is not None, "previous_raw": current, "written": value, "sha256_after": sha256(new), "set_at": utc_stamp()}
     if lever.transient:
         written.setdefault("parent_created", doc.parent_absent)   # kept across a re-arm: the parent object was made by the first one
+        written.setdefault("dir_created", not os.path.isdir(os.path.dirname(doc.path)))   # ... and so was the .claude directory, which goes with the file hmd made
         written.update(arm_id=os.urandom(4).hex(), expires_at=int(time.time()) + trigger_ttl(), session=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     try:
         if not ours:
@@ -736,16 +851,23 @@ def cmd_on(args):
         return EXIT_FAILED
     if lever.transient:
         if not standing:
-            remember_consent()
+            remember_consent(doc.path)
         start_timer(written["arm_id"], written["expires_at"])
         say("armed: %s is %s in the env block of %s (arm %s)" % (lever.key, wanted, tilde(doc.path), written["arm_id"]))
-        say("Claude Code compacts on its next request once it has reloaded the file. It is put back by itself: when a compaction starts, on any session start, or at %s (%d s); by hand: %s"
+        say("In this project only: Claude Code compacts on its next request once it has reloaded the file. It is put back by itself: when a compaction starts, on any session start, or at %s (%d s); by hand: %s"
             % (utc_stamp(written["expires_at"]), written["expires_at"] - int(time.time()), lever.command("off")))
         return 0
     say("set %s to %s %s in %s" % (lever.key, format(value, ","), lever.unit, tilde(doc.path)))
     say("backup %s; undo: %s" % (tilde(backup), lever.command("off")))
     say("It applies to sessions started from now on%s." % lever.live(value))
     return 0
+
+
+def undo_elsewhere(lever):
+    """How to undo a key hmd set in another settings file: with that file's own CLAUDE_CONFIG_DIR, or, for the project trigger, from inside its project (or with `release`, which puts every armed trigger back)."""
+    if lever.project:
+        return "undo that one from inside its project, %s, or put every armed trigger back with `hmd compact-window release`" % lever.command("off")
+    return "undo that one with its own CLAUDE_CONFIG_DIR, %s" % lever.command("off")
 
 
 def undo(lever, settings, yes, force, release=False):
@@ -756,7 +878,7 @@ def undo(lever, settings, yes, force, release=False):
         if record is None:
             say("hmd did not set %s in %s: nothing to undo" % (lever.key, tilde(settings)))
             for other in other_records(lever, settings):
-                say("hmd did set it in %s: undo that one with its own CLAUDE_CONFIG_DIR, %s" % (tilde(other), lever.command("off")))
+                say("hmd did set it in %s: %s" % (tilde(other), undo_elsewhere(lever)))
             return 0
         doc = Doc(settings, lever)
     except Unusable as exc:
@@ -791,6 +913,9 @@ def undo(lever, settings, yes, force, release=False):
         if bare:
             ensure_unchanged(doc)
             remove(doc.path)
+            if record.get("dir_created"):
+                with contextlib.suppress(OSError):   # the .claude directory hmd made for the file goes with it, unless something else has been put in it (rmdir refuses a directory that is not empty)
+                    os.rmdir(os.path.dirname(doc.path))
         elif exact:
             replace_settings(doc, backup)
         else:
@@ -806,7 +931,16 @@ def undo(lever, settings, yes, force, release=False):
 
 
 def cmd_off(args):
-    return undo(args.lever, os.path.realpath(settings_path()), args.yes, args.force)
+    lever = args.lever
+    if not lever.project:
+        return undo(lever, os.path.realpath(settings_path()), args.yes, args.force)
+    root = project_root()
+    if root is None:
+        say("hmd did not arm %s here: %s" % (lever.key, NO_PROJECT))
+        for other in other_records(lever, ""):
+            say("hmd did set it in %s: %s" % (tilde(other), undo_elsewhere(lever)))
+        return 0
+    return undo(lever, os.path.realpath(os.path.join(root, *PROJECT_REL)), args.yes, args.force)
 
 
 def armed_settings(arm=None):
@@ -849,8 +983,12 @@ def cmd_release(args):
 
 def cmd_revoke(args):
     code = release_all()
-    remove(consent_stamp())
-    say("forgot your yes to the compact-now trigger%s: it will ask again" % ("" if code == 0 else " (an armed trigger could not be put back: see stderr)"))
+    root = project_root()
+    if root is None:
+        warn("%s: run revoke inside the repository whose yes you want to take back. Nothing was forgotten" % NO_PROJECT.replace("to arm it in", "to forget a yes for"))
+        return code or EXIT_USAGE
+    remove(consent_stamp(os.path.realpath(os.path.join(root, *PROJECT_REL))))
+    say("forgot your yes to the compact-now trigger in %s%s: it will ask again there" % (tilde(root), "" if code == 0 else " (an armed trigger could not be put back: see stderr)"))
     return code
 
 
@@ -866,12 +1004,31 @@ def cmd_watch(args):
     return release_all(args.arm)
 
 
+def lever_rows(lever, doc, record):
+    """The rows `status` shows for one lever: its value in `doc` and who set it, the other settings files hmd set it in, and the environment variable of the agent that bears on the same thing."""
+    ours = record is not None and doc.value_text == lever.text(record["written"])
+    if doc.member is None:
+        say("%-9s %s" % (lever.slot, lever.unset))
+    else:
+        until = ""
+        if lever.transient and ours and isinstance(record.get("expires_at"), int):
+            until = "; %s %s" % ("EXPIRED at" if record["expires_at"] <= time.time() else "expires at", utc_stamp(record["expires_at"]))
+        say("%-9s %s (%s)" % (lever.slot, doc.value_text,
+                              "set by hmd%s; `%s` undoes it" % (until, lever.command("off")) if ours else "your own setting; hmd did not set it"))
+    for other in other_records(lever, doc.path):
+        say("%-9s hmd also set it in %s; %s" % ("elsewhere", tilde(other), undo_elsewhere(lever)))
+    if os.environ.get(lever.env_var):
+        say("%-9s %s=%s is also set in this environment%s" % ("env", lever.env_var, os.environ[lever.env_var],
+                                                              "; the agent ignores it while %s is set" % lever.key if lever.shadows and not lever.transient else ""))
+
+
 def cmd_status(args):
     try:
         seen = []
         for lever in LEVERS:
-            doc = Doc(settings_path(), lever)
-            seen.append((lever, doc, load_state(lever, doc.path)))
+            if not lever.project:
+                doc = Doc(settings_path(), lever)
+                seen.append((lever, doc, load_state(lever, doc.path)))
         offered = read_bytes(os.path.join(state_dir(), OFFERED_FILE))
     except Unusable as exc:
         warn(str(exc))
@@ -879,21 +1036,24 @@ def cmd_status(args):
     first = seen[0][1]
     say("%-9s %s%s" % ("settings", tilde(first.path), "" if first.raw is not None else " (does not exist yet)"))
     for lever, doc, record in seen:
-        ours = record is not None and doc.value_text == lever.text(record["written"])
-        if doc.member is None:
-            say("%-9s %s" % (lever.slot, lever.unset))
+        lever_rows(lever, doc, record)
+    root, given = project_root(), False
+    if root is None:
+        say("%-9s none found (CLAUDE_PROJECT_DIR is unset and the working directory is not in a git work tree): the trigger arms a project's %s" % ("project", "/".join(PROJECT_REL)))
+        say("%-9s not armed here" % TRIGGER.slot)
+        for other in other_records(TRIGGER, ""):
+            say("%-9s hmd also set it in %s; %s" % ("elsewhere", tilde(other), undo_elsewhere(TRIGGER)))
+    else:
+        try:
+            doc = Doc(os.path.join(root, *PROJECT_REL), TRIGGER)
+            record = load_state(TRIGGER, doc.path)
+        except Unusable as exc:
+            say("%-9s %s" % (TRIGGER.slot, "cannot be read: %s" % exc))
         else:
-            until = ""
-            if lever.transient and ours and isinstance(record.get("expires_at"), int):
-                until = "; %s %s" % ("EXPIRED at" if record["expires_at"] <= time.time() else "expires at", utc_stamp(record["expires_at"]))
-            say("%-9s %s (%s)" % (lever.slot, doc.value_text,
-                                  "set by hmd%s; `%s` undoes it" % (until, lever.command("off")) if ours else "your own setting; hmd did not set it"))
-        for other in other_records(lever, doc.path):
-            say("%-9s hmd also set it in %s; undo that one with its own CLAUDE_CONFIG_DIR, %s" % ("elsewhere", tilde(other), lever.command("off")))
-        if os.environ.get(lever.env_var):
-            say("%-9s %s=%s is also set in this environment%s" % ("env", lever.env_var, os.environ[lever.env_var],
-                                                                  "; the agent ignores it while %s is set" % lever.key if lever.shadows and not lever.transient else ""))
-    say("%-9s %s" % ("consent", "given for the compact-now trigger (`hmd compact-window revoke` takes it back)" if has_standing_consent() else "asked before the compact-now trigger is first armed"))
+            say("%-9s %s%s" % ("project", tilde(doc.path), "" if doc.raw is not None else " (does not exist yet)"))
+            lever_rows(TRIGGER, doc, record)
+            given = has_standing_consent(doc.path)
+    say("%-9s %s" % ("consent", "given for this project (`hmd compact-window revoke` takes it back)" if given else "asked before the trigger is first armed in a project"))
     answer = (offered or b"").decode("utf-8", "replace").split()
     say("%-9s %s" % ("offer", answer[0] if answer else "not asked yet"))
     return 0

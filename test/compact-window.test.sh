@@ -39,16 +39,19 @@
 #      race, a record that cannot be used, --help
 #
 #   S  the compact-now trigger, a transient third lever (`on --compact-now`: env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "1", so Claude Code compacts on its next request and /hmd:save can arm it instead of asking the person to
-#      paste /compact; the evidence is docs/analysis/2026-11-26-save-auto-compact.md): armed inside an existing env object, a new one, an empty one and a new file, text-exact, and put back byte for byte (key-only after another
-#      tool rewrote the file); a value of the person's own (the env block, the environment) is never replaced and --force is a usage error; refused with exit 5 and nothing written for a Claude Code older than 2.1.329 or
-#      whose version is unknown (the session's own binary, CLAUDE_CODE_EXECPATH, by its name or by asking it) and when automatic compaction is off; the person's yes is asked once (exit 3 and the command, a person at a
-#      terminal, remembered after a yes, forgotten by `revoke`, never recorded for an arm that was refused); `release` (what the hooks run) is quiet, puts it back wherever it was armed and leaves a value the person changed;
-#      the expiry timer puts it back when nothing else did, and status says EXPIRED for an arming whose time is up; re-arming; both levers in one file in either order; the real SessionStart (every source) and PreCompact
-#      hook commands from hooks.json release it and honour the operator's switch
+#      paste /compact; the evidence is docs/analysis/2026-11-26-save-auto-compact.md), armed in the PROJECT's .claude/settings.local.json and never in the user-level settings.json, which every session on the machine reads (S0: the
+#      user-level file is untouched by arming and by release): the project is CLAUDE_PROJECT_DIR, else the git toplevel of the cwd (a subdirectory too); refused with exit 5 and nothing written for a file git tracks, a symlinked
+#      .claude or settings.local.json, a directory or a hard-linked file in its place, and no project; armed inside an existing env object, a new one, an empty one and a new file (the .claude directory hmd made goes with it),
+#      text-exact, and put back byte for byte (key-only after another tool rewrote the file); a value of the person's own (the env block of the project's local file, of its shared settings.json or of the user-level one, or the
+#      environment) is never replaced and --force is a usage error; refused with exit 5 and nothing written for a Claude Code older than 2.1.329 or whose version is unknown (the session's own binary, CLAUDE_CODE_EXECPATH, by
+#      its name or by asking it) and when automatic compaction is off (the most specific of the local, shared and user-level files that names autoCompactEnabled decides); the person's yes is asked once PER REPOSITORY (exit 3 and
+#      the command, a person at a terminal, remembered after a yes for that project only, forgotten by `revoke` run inside it, never recorded for an arm that was refused); `release` (what the hooks run) is quiet, puts it back in
+#      every project it was armed in, from any directory, and leaves a value the person changed; the expiry timer puts it back when nothing else did, and status says EXPIRED for an arming whose time is up; re-arming; the window
+#      in the user-level file and the trigger in the project's, each undone on its own; the real SessionStart (every source) and PreCompact hook commands from hooks.json release it and honour the operator's switch
 #
 # HERMETIC. HOME, HEIMDALL_HOME and the settings file are throwaway for every scenario; CLAUDE_CONFIG_DIR is unset; nothing reads or writes the operator's ~/.claude
 # or ~/.heimdall. CW_BIN=<file> points the suite at another copy of the tool (a mutant, for the break-it check).
-# budget: about 36 s solo: roughly 440 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git; 140 in R, the Bash cap; 100 in S, the trigger), about twenty-two on a pty, one on a pty that waits out the 1 s seam, one wait of about 1 s for the expiry timer. No network.
+# budget: about 50 s solo: roughly 540 starts of one python script (30 of them in Q, which runs the real 2.4.12 tool read from git; 140 in R, the Bash cap; about 170 in S, the trigger, each of which also asks git twice), about twenty-two on a pty, one on a pty that waits out the 1 s seam, one wait of about 1 s for the expiry timer. No network.
 # EXIT: 0 = every assertion passes; 1 = any FAIL.
 set -uo pipefail
 
@@ -66,6 +69,7 @@ echo "compact-window"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/compact-window.XXXXXX")" || exit 1
 TMP="$(cd "$TMP" && pwd -P)"
 trap 'chmod -R u+rwx "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
+cd "$TMP" || exit 1   # every scenario runs from here, outside any git work tree: a command that names no project has none (the trigger's project is a scratch repository the scenario makes)
 OUT="$TMP/out"; ERR="$TMP/err"; : >"$OUT"; : >"$ERR"
 [ -x "$CW" ] || { bad "the tool is executable: $CW"; exit 1; }
 
@@ -179,7 +183,7 @@ PYEOF
 
 H=""; S=""; N=0
 new_home() { N=$((N + 1)); H="$TMP/h$N"; mkdir -p "$H/.claude" "$H/.heimdall"; S="$H/.claude/settings.json"; }
-scrub() { env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u BASH_MAX_OUTPUT_LENGTH -u HEIMDALL_NO_COMPACT_WINDOW_OFFER -u CLAUDE_AUTOCOMPACT_PCT_OVERRIDE -u DISABLE_AUTO_COMPACT -u DISABLE_COMPACT -u CLAUDE_CODE_EXECPATH -u CLAUDE_CODE_SESSION_ID -u HEIMDALL_COMPACT_NOW_CC_VERSION -u HEIMDALL_COMPACT_NOW_TTL_S -u HEIMDALL_COMPACT_NOW_NO_TIMER HOME="$H" HEIMDALL_HOME="$H/.heimdall" "$@"; }
+scrub() { env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u BASH_MAX_OUTPUT_LENGTH -u HEIMDALL_NO_COMPACT_WINDOW_OFFER -u CLAUDE_AUTOCOMPACT_PCT_OVERRIDE -u DISABLE_AUTO_COMPACT -u DISABLE_COMPACT -u CLAUDE_CODE_EXECPATH -u CLAUDE_CODE_SESSION_ID -u HEIMDALL_COMPACT_NOW_CC_VERSION -u HEIMDALL_COMPACT_NOW_TTL_S -u HEIMDALL_COMPACT_NOW_NO_TIMER -u CLAUDE_PROJECT_DIR HOME="$H" HEIMDALL_HOME="$H/.heimdall" "$@"; }
 cw()    { scrub "$CW" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }                                 # no terminal
 cwpty() { local a="$1"; shift; scrub "$PY" -I "$TMP/pty_drive.py" "$a" -- "$CW" "$@" >"$OUT" 2>"$ERR"; RC=$?; }   # a person at a terminal who types $a
 value() { "$PY" -I "$TMP/chk.py" value "$S"; }
@@ -786,79 +790,141 @@ eq "R: a cap record that cannot be used does not hold the window back (it carrie
 cw --help
 chk "R: --help documents --bash-cap" grep -qF -- "--bash-cap" "$OUT"
 
-# ---- S. the compact-now trigger: env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, armed for a few minutes, put back by itself ---------------------------------------------------------
+# ---- S. the compact-now trigger: env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE in the PROJECT's .claude/settings.local.json, armed for a few minutes, put back by itself -------------------
 echo "S. the compact-now trigger"
 CCV="2.1.330"
-cwt()    { scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }   # a Claude Code that takes the override back, and no expiry timer
-cwptyt() { local a="$1"; shift; scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$PY" -I "$TMP/pty_drive.py" "$a" -- "$CW" "$@" >"$OUT" 2>"$ERR"; RC=$?; }
-cwx()    { scrub env HEIMDALL_COMPACT_NOW_NO_TIMER=1 CLAUDE_CODE_EXECPATH="$1" "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?; }   # no seam: the version is read from the running binary
+newp()   { new_home; PROJ="$H/proj"; PL="$PROJ/.claude/settings.local.json"; mkdir -p "$PROJ"; git -c init.defaultBranch=main -C "$PROJ" init -q; }   # a scratch home and a scratch git work tree to arm; PL is the file the trigger arms
+putl()   { mkdir -p "$PROJ/.claude"; printf '%s' "$1" >"$PL"; }                                                                                   # the project's local settings file as the person left it
+putf()   { mkdir -p "$PROJ/.claude"; printf "$1" >"$PL"; }                                                                                        # ... from a printf format
+inproj() { ( cd "$PROJ" && "$@" ); }                                                                                                              # run as a session that sits in the project does
+cwt()    { inproj scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }   # a Claude Code that takes the override back, and no expiry timer
+cwptyt() { local a="$1"; shift; inproj scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$PY" -I "$TMP/pty_drive.py" "$a" -- "$CW" "$@" >"$OUT" 2>"$ERR"; RC=$?; }
+cwx()    { inproj scrub env HEIMDALL_COMPACT_NOW_NO_TIMER=1 CLAUDE_CODE_EXECPATH="$1" "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?; }   # no seam: the version is read from the running binary
+cwp()    { inproj scrub "$CW" "$@" </dev/null >"$OUT" 2>"$ERR"; RC=$?; }                                                                          # no seam, in the project
 tval()   { "$PY" -I -c 'import json,sys
-e = json.load(open(sys.argv[1])).get("env")
-print(json.dumps(e["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) if isinstance(e, dict) and "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in e else "ABSENT")' "$S"; }
-hasenv() { "$PY" -I -c 'import json,sys; print("env" in json.load(open(sys.argv[1])))' "$S"; }
+try:
+    e = json.load(open(sys.argv[1])).get("env")
+except OSError:
+    e = None
+print(json.dumps(e["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) if isinstance(e, dict) and "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in e else "ABSENT")' "$PL"; }
+hasenv() { "$PY" -I -c 'import json,sys; print("env" in json.load(open(sys.argv[1])))' "$PL"; }
 trec()   { find "$H/.heimdall/compact-window" -type f -name '*.compact-now.state.json' 2>/dev/null | head -n 1; }
+tbak()   { find "$H/.heimdall/compact-window" -type f -name '*.compact-now.settings.json.bak' 2>/dev/null | head -n 1; }
 tstate() { find "$H/.heimdall/compact-window" -type f \( -name '*.compact-now.state.json' -o -name '*.compact-now.settings.json.bak' \) 2>/dev/null | wc -l | tr -d ' '; }   # the trigger's records and backups
 rfield() { "$PY" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$(trec)" "$1"; }
-consented() { [ -f "$H/.heimdall/compact-window/compact-now.consent" ]; }
+consented() { ls "$H/.heimdall/compact-window"/*.compact-now.consent >/dev/null 2>&1; }                                                          # a yes is kept, for some project
+nconsent()  { ls "$H/.heimdall/compact-window"/*.compact-now.consent 2>/dev/null | wc -l | tr -d ' '; }                                           # how many projects have one
 yn()     { if "$@"; then echo yes; else echo no; fi; }
 nbytes() { wc -c <"$1" | tr -d ' '; }
 
+# S0. the contracts of the review finding: the trigger arms the PROJECT's local file and never the user-level one; a tracked file is refused; release restores the project file byte for byte; the user settings are never touched
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/user-orig"
+cwt on --compact-now --yes
+eq "S0: on --compact-now arms the PROJECT's .claude/settings.local.json: exit 0, the value is the JSON string \"1\"" '0|"1"' "$RC|$(tval)"
+chk "S0: ...the user-level settings.json is untouched, byte for byte: it is not the file the trigger arms" same "$S" "$TMP/user-orig"
+eq "S0: ...the record names the project's file, and the backup is that file as it was" "yes|yes" "$(yn grep -q "\"settings\": \"$PL\"" "$(trec)")|$(yn same "$(tbak)" "$TMP/orig")"
+cwt release
+eq "S0: release restores the project's file byte for byte, and the record and the backup are gone" "0|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+chk "S0: ...and the user-level settings.json is still untouched" same "$S" "$TMP/user-orig"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
+git -C "$PROJ" add -f .claude/settings.local.json
+git -C "$PROJ" -c user.email=t@t.t -c user.name=t -c commit.gpgsign=false commit -q --no-verify -m seed
+cwt on --compact-now --yes
+eq "S0: a file git tracks is the repository's text, not the person's: exit 5, the file byte for byte, no record, no yes remembered" "5|yes|0|no" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)|$(yn consented)"
+chk "S0: ...stderr says git tracks it" grep -q "git tracks" "$ERR"
+newp; putl "$PRETTY"; mv "$PL" "$H/real-local.json"; ln -s "$H/real-local.json" "$PL"; cp "$H/real-local.json" "$TMP/orig"
+cwt on --compact-now --yes
+eq "S0: a symlinked settings.local.json is never followed: exit 5, the link and its target untouched, no record" "5|link|yes|0" "$RC|$([ -L "$PL" ] && echo link)|$(yn same "$H/real-local.json" "$TMP/orig")|$(tstate)"
+chk "S0: ...stderr says it is a symbolic link" grep -q "symbolic link" "$ERR"
+newp; mkdir -p "$H/real-claude"; printf '%s' "$PRETTY" >"$H/real-claude/settings.local.json"; ln -s "$H/real-claude" "$PROJ/.claude"; cp "$H/real-claude/settings.local.json" "$TMP/orig"
+cwt on --compact-now --yes
+eq "S0: a symlinked .claude directory is refused too: exit 5, the file it leads to untouched, no record" "5|yes|0" "$RC|$(yn same "$H/real-claude/settings.local.json" "$TMP/orig")|$(tstate)"
+newp; mkdir -p "$PROJ/.claude/settings.local.json"
+cwt on --compact-now --yes
+eq "S0: a directory where the file belongs is not a plain file: exit 5, nothing written" "5|0" "$RC|$(tstate)"
+newp; putl "$PRETTY"; ln "$PL" "$H/second-name"; cp "$PL" "$TMP/orig"
+cwt on --compact-now --yes
+eq "S0: a file with a second hard link is refused (the atomic replace would detach it): exit 5, untouched, no record" "5|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+new_home; mkdir -p "$H/nogit"
+( cd "$H/nogit" && scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes ) </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S0: no project (the working directory is no git work tree and CLAUDE_PROJECT_DIR is unset): exit 5, nothing written, no yes remembered" "5|0|no" "$RC|$(tstate)|$(yn consented)"
+newp; mkdir -p "$PROJ/sub/deeper"; putl "$PRETTY"
+( cd "$PROJ/sub/deeper" && scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes ) </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S0: from a subdirectory the project is the top of the git work tree: its file is armed, and no .claude is made below" '0|"1"|no' "$RC|$(tval)|$(yn test -e "$PROJ/sub/deeper/.claude")"
+cwt release
+newp; mkdir -p "$H/other"; git -c init.defaultBranch=main -C "$H/other" init -q
+( cd "$PROJ" && scrub env CLAUDE_PROJECT_DIR="$H/other" HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes ) </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S0: CLAUDE_PROJECT_DIR names the project, ahead of the working directory: its file is armed, the one the shell sits in is not" "0|yes|no" "$RC|$(yn test -f "$H/other/.claude/settings.local.json")|$(yn test -e "$PL")"
+( cd "$H" && scrub "$CW" release ) </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S0: release run from another directory finds it by its record: the file hmd made, and the .claude directory it made, are gone" "0|no|no|0" "$RC|$(yn test -e "$H/other/.claude/settings.local.json")|$(yn test -d "$H/other/.claude")|$(tstate)"
+
 # round trip inside an existing env object
-new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
 cwt on --compact-now --yes
 eq "S1: on --compact-now --yes arms: exit 0, env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is the JSON string \"1\"" '0|"1"' "$RC|$(tval)"
-chk "S1: it was appended inside the file's own env object, text-exact (1.50 and the 20-digit integer untouched)" "$PY" -I "$TMP/chk.py" armed "$TMP/orig" "$S"
+chk "S1: it was appended inside the file's own env object, text-exact (1.50 and the 20-digit integer untouched)" "$PY" -I "$TMP/chk.py" armed "$TMP/orig" "$PL"
 eq "S1: a record and a backup of the trigger's own are kept, and the person's yes is remembered" "2|yes" "$(tstate)|$(yn consented)"
 cwt off --compact-now --yes
 eq "S1: off --compact-now exits 0, the record and the backup are gone" "0|0" "$RC|$(tstate)"
-chk "S1: ...and the file is back byte for byte" same "$S" "$TMP/orig"
+chk "S1: ...and the file is back byte for byte" same "$PL" "$TMP/orig"
 
-# other layouts: no env object, an empty one, no file at all, a file another tool rewrote
+# other layouts: no env object, an empty one, no file at all, a .claude directory with no file, a file another tool rewrote
 for layout in COMPACT TABS; do
-  new_home; printf '%s' "${!layout}" >"$S"; cp "$S" "$TMP/orig"
+  newp; putl "${!layout}"; cp "$PL" "$TMP/orig"
   cwt on --compact-now --yes
   eq "S2/$layout: no env object yet: it is added, with the trigger in it" '0|"1"' "$RC|$(tval)"
-  chk "S2/$layout: every other member is the same, in order" env CHK_KEY=env "$PY" -I "$TMP/chk.py" others "$TMP/orig" "$S"
+  chk "S2/$layout: every other member is the same, in order" env CHK_KEY=env "$PY" -I "$TMP/chk.py" others "$TMP/orig" "$PL"
   cwt off --compact-now --yes
-  chk "S2/$layout: off returns the file byte for byte" same "$S" "$TMP/orig"
+  chk "S2/$layout: off returns the file byte for byte" same "$PL" "$TMP/orig"
 done
-new_home; printf '{"env": {}, "x": 1}' >"$S"; cp "$S" "$TMP/orig"
+newp; putl '{"env": {}, "x": 1}'; cp "$PL" "$TMP/orig"
 cwt on --compact-now --yes
 eq "S2: an empty env object takes the member" '0|"1"' "$RC|$(tval)"
 cwt off --compact-now --yes
-chk "S2: ...and off returns it byte for byte" same "$S" "$TMP/orig"
-new_home; rmdir "$H/.claude"
+chk "S2: ...and off returns it byte for byte" same "$PL" "$TMP/orig"
+newp
 cwt on --compact-now --yes
-eq "S2: no settings file: on creates it, with only the trigger in it" '0|"1"' "$RC|$(tval)"
+eq "S2: no settings file and no .claude directory: on creates both, with only the trigger in the file" '0|"1"' "$RC|$(tval)"
 cwt off --compact-now --yes
-eq "S2: off removes the file hmd created" "0|no" "$RC|$(yn test -e "$S")"
-new_home; printf '%s' "$COMPACT" >"$S"
+eq "S2: off removes the file hmd created, and the .claude directory it made with it" "0|no|no" "$RC|$(yn test -e "$PL")|$(yn test -d "$PROJ/.claude")"
+newp; mkdir -p "$PROJ/.claude"
 cwt on --compact-now --yes
-"$PY" -I "$TMP/chk.py" reserialize "$S"
+cwt off --compact-now --yes
+eq "S2: a .claude directory that was there stays when the file hmd made goes" "0|no|yes" "$RC|$(yn test -e "$PL")|$(yn test -d "$PROJ/.claude")"
+newp; putl "$COMPACT"
+cwt on --compact-now --yes
+"$PY" -I "$TMP/chk.py" reserialize "$PL"
 cwt off --compact-now --yes
 eq "S2: the file was rewritten by another tool in between: off exits 0, the trigger is gone with the env object hmd made for it" "0|ABSENT|False" "$RC|$(tval)|$(hasenv)"
-chk "S2: ...what the other tool added is kept" grep -q '"addedLater"' "$S"
+chk "S2: ...what the other tool added is kept" grep -q '"addedLater"' "$PL"
 chk "S2: ...and off says only the key was reverted" grep -q "only the key was reverted" "$OUT"
-new_home; printf '{"env": 5}' >"$S"; cp "$S" "$TMP/orig"
+newp; putl '{"env": 5}'; cp "$PL" "$TMP/orig"
 cwt on --compact-now --yes
-eq "S2: an env that is not an object is never touched: exit 1, the file as it was, nothing recorded" "1|yes|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
+eq "S2: an env that is not an object is never touched: exit 1, the file as it was, nothing recorded" "1|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)"
 
-# a value of the person's own is never replaced
-new_home; printf '{\n  "env": {\n    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"\n  }\n}\n' >"$S"; cp "$S" "$TMP/orig"
+# a value of the person's own is never replaced: in the project's file, in the settings files it outranks, in the environment
+newp; putf '{\n  "env": {\n    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"\n  }\n}\n'; cp "$PL" "$TMP/orig"
 cwt on --compact-now --yes
-eq "S3: a value of the person's own in the env block: exit 4, the file untouched, no record, no yes remembered" "4|yes|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
+eq "S3: a value of the person's own in the env block of the project's file: exit 4, the file untouched, no record, no yes remembered" "4|yes|0|no" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)|$(yn consented)"
 chk "S3: stderr says it is theirs" grep -q "your own setting" "$ERR"
 cwt on --compact-now --yes --force
-eq "S3: --force is not accepted with the trigger: usage error, exit 2, the file untouched" "2|yes" "$RC|$(yn same "$S" "$TMP/orig")"
-new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
-scrub env CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60 HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
-eq "S3: a CLAUDE_AUTOCOMPACT_PCT_OVERRIDE of the person's own in the environment is refused too: exit 4, untouched, nothing recorded" "4|yes|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
+eq "S3: --force is not accepted with the trigger: usage error, exit 2, the file untouched" "2|yes" "$RC|$(yn same "$PL" "$TMP/orig")"
+newp; putl "$COMPACT"; cp "$PL" "$TMP/orig"; printf '{\n  "env": {\n    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"\n  }\n}\n' >"$S"; cp "$S" "$TMP/user-orig"
+cwt on --compact-now --yes
+eq "S3: a value of the person's own in the USER-level settings.json would be shadowed by the project's file: exit 4, both files untouched, no record" "4|yes|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(yn same "$S" "$TMP/user-orig")|$(tstate)"
+chk "S3: ...stderr names the user-level file" grep -q "env block of ~/.claude/settings.json" "$ERR"
+newp; putl "$COMPACT"; cp "$PL" "$TMP/orig"; printf '{"env": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70"}}' >"$PROJ/.claude/settings.json"
+cwt on --compact-now --yes
+eq "S3: ...and in the project's shared .claude/settings.json: exit 4, the file untouched, no record" "4|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+newp; putl "$COMPACT"; cp "$PL" "$TMP/orig"
+inproj scrub env CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60 HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S3: a CLAUDE_AUTOCOMPACT_PCT_OVERRIDE of the person's own in the environment is refused too: exit 4, untouched, nothing recorded" "4|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)"
 
 # the build and automatic compaction must be able to honour it: otherwise exit 5 and nothing is written
-new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
 for v in 2.1.328 2.1.9 1.9.999 "" "not-a-version"; do
   CCV="$v" cwt on --compact-now --yes
-  eq "S4: Claude Code [$v] cannot take the override back, or cannot be told: exit 5, nothing written, no record, no yes remembered" "5|yes|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
+  eq "S4: Claude Code [$v] cannot take the override back, or cannot be told: exit 5, nothing written, no record, no yes remembered" "5|yes|0|no" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)|$(yn consented)"
 done
 CCV=2.1.328 cwt on --compact-now --yes
 chk "S4: the reason names the first build that takes it back (2.1.329)" grep -qF "2.1.329" "$ERR"
@@ -867,11 +933,11 @@ for v in 2.1.329 2.1.330 2.2.0 3.0.0; do
   eq "S4: Claude Code $v arms" '0|"1"' "$RC|$(tval)"
   cwt off --compact-now --yes
 done
-chk "S4: ...and each off left the file as it was" same "$S" "$TMP/orig"
+chk "S4: ...and each off left the file as it was" same "$PL" "$TMP/orig"
 mkdir -p "$TMP/cc/versions"; : >"$TMP/cc/versions/2.1.330"
 printf '#!/bin/sh\necho "2.1.327 (Claude Code)"\n' >"$TMP/cc/old"; printf '#!/bin/sh\necho "v20.11.0"\n' >"$TMP/cc/node"; printf '#!/bin/sh\necho "2.1.331 (Claude Code)"\n' >"$TMP/cc/new"
 chmod +x "$TMP/cc/old" "$TMP/cc/node" "$TMP/cc/new"
-new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
+newp; putl "$COMPACT"; cp "$PL" "$TMP/orig"
 cwx "$TMP/cc/versions/2.1.330"
 eq "S4: the running binary named by its version (the native layout), no seam: 2.1.330 arms" '0|"1"' "$RC|$(tval)"
 cwt off --compact-now --yes
@@ -879,103 +945,137 @@ cwx "$TMP/cc/new"
 eq "S4: any other layout is asked (--version): a binary that answers 2.1.331 (Claude Code) arms" '0|"1"' "$RC|$(tval)"
 cwt off --compact-now --yes
 cwx "$TMP/cc/old"
-eq "S4: ...one that answers 2.1.327 is refused: exit 5, untouched" "5|yes" "$RC|$(yn same "$S" "$TMP/orig")"
+eq "S4: ...one that answers 2.1.327 is refused: exit 5, untouched" "5|yes" "$RC|$(yn same "$PL" "$TMP/orig")"
 cwx "$TMP/cc/node"
 eq "S4: ...one that is not claude (node answers with its own version) is refused: exit 5" 5 "$RC"
 cwx "relative/claude"
 eq "S4: a CLAUDE_CODE_EXECPATH that is not absolute is refused: exit 5" 5 "$RC"
-scrub env HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
-eq "S4: no CLAUDE_CODE_EXECPATH and no seam (not inside a session; the claude on PATH may be another build, so it is not asked): exit 5, untouched" "5|yes" "$RC|$(yn same "$S" "$TMP/orig")"
-new_home; printf '{\n  "autoCompactEnabled": false\n}\n' >"$S"; cp "$S" "$TMP/orig"
+inproj scrub env HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S4: no CLAUDE_CODE_EXECPATH and no seam (not inside a session; the claude on PATH may be another build, so it is not asked): exit 5, untouched" "5|yes" "$RC|$(yn same "$PL" "$TMP/orig")"
+newp; putl "$COMPACT"; cp "$PL" "$TMP/orig"; printf '{\n  "autoCompactEnabled": false\n}\n' >"$S"
 cwt on --compact-now --yes
-eq "S4: autoCompactEnabled false in the settings: exit 5, untouched, nothing recorded" "5|yes|0" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)"
-new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
+eq "S4: autoCompactEnabled false in the user-level settings (automatic compaction is off for every session): exit 5, the project's file untouched, nothing recorded" "5|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+putl '{"autoCompactEnabled": true}'; cp "$PL" "$TMP/orig"
+cwt on --compact-now --yes
+eq "S4: ...but the project's own true outranks the user-level false (the most specific file decides): armed" '0|"1"' "$RC|$(tval)"
+cwt off --compact-now --yes
+chk "S4: ...and off returns the project's file byte for byte" same "$PL" "$TMP/orig"
+putl '{"autoCompactEnabled": false}'; cp "$PL" "$TMP/orig"; rm -f "$S"
+cwt on --compact-now --yes
+eq "S4: autoCompactEnabled false in the project's own file: exit 5, untouched, nothing recorded" "5|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+newp; putl "$COMPACT"; cp "$PL" "$TMP/orig"; printf '{"autoCompactEnabled": false}' >"$PROJ/.claude/settings.json"
+cwt on --compact-now --yes
+eq "S4: autoCompactEnabled false in the project's shared .claude/settings.json: exit 5, untouched, nothing recorded" "5|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+newp; putl "$COMPACT"; cp "$PL" "$TMP/orig"
 for name in DISABLE_AUTO_COMPACT DISABLE_COMPACT; do
-  scrub env "$name=1" HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
-  eq "S4: $name=1 in the environment (automatic compaction is off): exit 5, untouched" "5|yes" "$RC|$(yn same "$S" "$TMP/orig")"
+  inproj scrub env "$name=1" HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+  eq "S4: $name=1 in the environment (automatic compaction is off): exit 5, untouched" "5|yes" "$RC|$(yn same "$PL" "$TMP/orig")"
 done
 
-# consent: asked once
-new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+# consent: asked once, per repository
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
 cwt on --compact-now
-eq "S5: no terminal, no --yes and no earlier yes: exit 3, the file untouched, nothing recorded" "3|yes|0|no" "$RC|$(yn same "$S" "$TMP/orig")|$(tstate)|$(yn consented)"
+eq "S5: no terminal, no --yes and no earlier yes: exit 3, the file untouched, nothing recorded" "3|yes|0|no" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)|$(yn consented)"
 chk "S5: stderr gives the command to run again with --yes" grep -qF "on --compact-now --yes" "$ERR"
 cwt on --compact-now --yes
 cwt off --compact-now --yes
 cwt on --compact-now
-eq "S5: once a yes was given, the next arm needs no --yes: exit 0, armed" '0|"1"' "$RC|$(tval)"
+eq "S5: once a yes was given in this project, the next arm needs no --yes: exit 0, armed" '0|"1"' "$RC|$(tval)"
 cwt off --compact-now --yes
-cwt revoke
-eq "S5: revoke forgets the yes: exit 0, the stamp is gone" "0|no" "$RC|$(yn consented)"
+newp; putl "$PRETTY"; PROJA="$PROJ"; PLA="$PL"
+cwt on --compact-now --yes
+cwt off --compact-now --yes
+PROJ="$H/projb"; PL="$PROJ/.claude/settings.local.json"; mkdir -p "$PROJ"; git -c init.defaultBranch=main -C "$PROJ" init -q; putl "$PRETTY"; cp "$PL" "$TMP/orig"
 cwt on --compact-now
-eq "S5: ...and the next arm asks again: exit 3" 3 "$RC"
-new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
+eq "S5: a yes given in one repository arms no other: project B asks again (exit 3), its file untouched, nothing recorded" "3|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+cwt on --compact-now --yes
+cwt off --compact-now --yes
+eq "S5: two projects, two yes stamps" 2 "$(nconsent)"
+cwt revoke
+eq "S5: revoke, run inside B, forgets B's yes only: exit 0, one stamp is left" "0|1" "$RC|$(nconsent)"
+cwt on --compact-now
+eq "S5: ...B asks again (exit 3)" 3 "$RC"
+PROJ="$PROJA"; PL="$PLA"
+cwt on --compact-now
+eq "S5: ...and A, whose yes stands, arms without --yes" '0|"1"' "$RC|$(tval)"
+cwt off --compact-now --yes
+newp; putl "$COMPACT"; cp "$PL" "$TMP/orig"
 cwptyt y on --compact-now
 eq "S5: a person at a terminal who says yes: armed, and the yes is remembered" '0|"1"|yes' "$RC|$(tval)|$(yn consented)"
 cwt off --compact-now --yes
-new_home; printf '%s' "$COMPACT" >"$S"; cp "$S" "$TMP/orig"
+newp; putl "$COMPACT"; cp "$PL" "$TMP/orig"
 cwptyt n on --compact-now
-eq "S5: a person at a terminal who says no: exit 3, untouched, no yes remembered" "3|yes|no" "$RC|$(yn same "$S" "$TMP/orig")|$(yn consented)"
-new_home; printf '%s' "$COMPACT" >"$S"
+eq "S5: a person at a terminal who says no: exit 3, untouched, no yes remembered" "3|yes|no" "$RC|$(yn same "$PL" "$TMP/orig")|$(yn consented)"
+newp; putl "$COMPACT"
 cwt on --compact-now --yes
 cwt revoke
 eq "S5: revoke also puts an armed trigger back" "0|ABSENT|0" "$RC|$(tval)|$(tstate)"
+new_home; mkdir -p "$H/nogit"
+( cd "$H/nogit" && scrub "$CW" revoke ) </dev/null >"$OUT" 2>"$ERR"; RC=$?
+eq "S5: revoke outside any project forgets nothing and says so: exit 2" "2|1" "$RC|$(grep -c 'Nothing was forgotten' "$ERR")"
 
 # release: what the hooks run
-new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
 cwt on --compact-now --yes
 cwt release
 eq "S6: release exits 0 and prints nothing on stdout (a SessionStart hook's stdout reaches the model)" "0|0" "$RC|$(nbytes "$OUT")"
-chk "S6: ...the file is back byte for byte" same "$S" "$TMP/orig"
+chk "S6: ...the file is back byte for byte" same "$PL" "$TMP/orig"
 eq "S6: ...the record and the backup are gone" 0 "$(tstate)"
 cwt release
 eq "S6: a second release is a quiet no-op" "0|0|0" "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")"
 cwt on --compact-now
-sed -i.bak 's/"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "1"/"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "7"/' "$S" && rm -f "$S.bak"
+sed -i.bak 's/"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "1"/"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "7"/' "$PL" && rm -f "$PL.bak"
 cwt release
 eq "S6: a value the person changed meanwhile is theirs: release leaves it and clears the record" '0|"7"|0' "$RC|$(tval)|$(tstate)"
-new_home; mkdir -p "$H/second"; printf '%s' "$COMPACT" >"$H/second/settings.json"; cp "$H/second/settings.json" "$TMP/orig2"
-scrub env CLAUDE_CONFIG_DIR="$H/second" HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_NO_TIMER=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
-eq "S6: the trigger armed in a second settings file (another CLAUDE_CONFIG_DIR)" 0 "$RC"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"; PROJA="$PROJ"; PLA="$PL"
+PROJ="$H/projb"; PL="$PROJ/.claude/settings.local.json"; mkdir -p "$PROJ"; git -c init.defaultBranch=main -C "$PROJ" init -q; putl "$COMPACT"; cp "$PL" "$TMP/origb"
+cwt on --compact-now --yes
+PROJ="$PROJA"; PL="$PLA"
+cwt on --compact-now --yes
+eq "S6: the trigger armed in two projects: a record and a backup for each" 4 "$(tstate)"
 cwt release
-eq "S6: release run with the default config dir still puts it back in the file it was armed in, byte for byte" "0|yes|0" "$RC|$(yn same "$H/second/settings.json" "$TMP/orig2")|$(tstate)"
+eq "S6: one release puts every armed trigger back, in each project: both files byte for byte, no record left" "0|yes|yes|0" "$RC|$(yn same "$PL" "$TMP/orig")|$(yn same "$H/projb/.claude/settings.local.json" "$TMP/origb")|$(tstate)"
 
 # expiry: nothing compacted and no hook ran
-new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
-scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_TTL_S=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
+inproj scrub env HEIMDALL_COMPACT_NOW_CC_VERSION="$CCV" HEIMDALL_COMPACT_NOW_TTL_S=1 "$CW" on --compact-now --yes </dev/null >"$OUT" 2>"$ERR"; RC=$?
 eq "S7: armed with a one-second life (the timer left running): exit 0 and says so (the file is not read back: on a loaded machine the timer may already have run)" "0|1" "$RC|$(grep -c '^armed: ' "$OUT")"
 for _ in $(seq 1 150); do [ "$(tval)" = ABSENT ] && [ "$(tstate)" = 0 ] && break; sleep 0.2; done
-eq "S7: nobody compacted and no hook ran: the expiry timer put the file back by itself, byte for byte" "ABSENT|yes|0" "$(tval)|$(yn same "$S" "$TMP/orig")|$(tstate)"
-new_home; printf '%s' "$PRETTY" >"$S"
+eq "S7: nobody compacted and no hook ran: the expiry timer put the file back by itself, byte for byte" "ABSENT|yes|0" "$(tval)|$(yn same "$PL" "$TMP/orig")|$(tstate)"
+newp; putl "$PRETTY"
 cwt on --compact-now --yes
-cw status
-eq "S7: status says hmd armed it and when it expires" "1|1" "$(grep '^trigger' "$OUT" | grep -c 'set by hmd')|$(grep '^trigger' "$OUT" | grep -c 'expires at')"
+cwp status
+eq "S7: status names the project's file, says hmd armed it and when it expires" "1|1|1" "$(grep -c '^project .*\.claude/settings\.local\.json' "$OUT")|$(grep '^trigger' "$OUT" | grep -c 'set by hmd')|$(grep '^trigger' "$OUT" | grep -c 'expires at')"
 "$PY" -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["expires_at"]=1; json.dump(d, open(p,"w"))' "$(trec)"
-cw status
+cwp status
 eq "S7: an arming whose time is up says EXPIRED in status" 1 "$(grep '^trigger' "$OUT" | grep -c 'EXPIRED')"
 cwt release
 eq "S7: ...and release puts it back all the same" "0|ABSENT|0" "$RC|$(tval)|$(tstate)"
-new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+cw status
+eq "S7: status outside any project says there is none, and that nothing is armed here" "1|1" "$(grep -c '^project .*none found' "$OUT")|$(grep '^trigger' "$OUT" | grep -c 'not armed here')"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
 cwt on --compact-now --yes
 FIRST_ARM="$(rfield arm_id)"
 cwt on --compact-now
 eq "S7: arming twice: exit 0, one record and one backup, a new arming id" "0|2|yes" "$RC|$(tstate)|$([ "$FIRST_ARM" != "$(rfield arm_id)" ] && echo yes || echo no)"
 cwt off --compact-now --yes
-chk "S7: ...and off returns the very first file byte for byte" same "$S" "$TMP/orig"
+chk "S7: ...and off returns the very first file byte for byte" same "$PL" "$TMP/orig"
 
-# both levers in one file, in either order
-new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+# the window (user-level) and the trigger (project) in their own files, in either order
+newp; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/user-orig"; putl "$COMPACT"; cp "$PL" "$TMP/orig"
 cw on --yes; cwt on --compact-now --yes
-eq "S8: the window and the trigger are both in the file" '300000|"1"' "$(value)|$(tval)"
+eq "S8: the window is in the user-level file and the trigger in the project's: each set in its own" '300000|"1"' "$(value)|$(tval)"
 cwt release
 eq "S8: release puts only the trigger back: the window stays" '300000|ABSENT' "$(value)|$(tval)"
 cw off --yes
-chk "S8: ...and the window's off then returns the very first file" same "$S" "$TMP/orig"
-new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+chk "S8: ...and the window's off then returns the user-level file as it was" same "$S" "$TMP/user-orig"
+chk "S8: ...the project's file was never the window's: byte for byte too" same "$PL" "$TMP/orig"
+newp; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/user-orig"; putl "$COMPACT"; cp "$PL" "$TMP/orig"
 cw on --yes; cwt on --compact-now --yes; cw off --yes
 eq "S8: the window off first while the trigger is armed: the trigger stays" 'ABSENT|"1"' "$(value)|$(tval)"
 cwt release
-chk "S8: ...and release then leaves the file as it was before either" same "$S" "$TMP/orig"
+chk "S8: ...and release then leaves the project's file as it was" same "$PL" "$TMP/orig"
+chk "S8: ...and the user-level file as it was" same "$S" "$TMP/user-orig"
 
 # the real hook commands from hooks.json
 "$PY" -I - "$REPO/hooks/hooks.json" "$REPO/hooks/hooks.metadata.json" "$TMP" >"$TMP/hookinfo" 2>&1 <<'PY'
@@ -1012,18 +1112,18 @@ runhook() {   # ID PAYLOAD: the command from hooks.json as Claude Code runs it (
   printf '%s' "$2" | scrub env CLAUDE_PLUGIN_ROOT="$REPO" sh -c "$(cat "$TMP/$1.cmd")" >"$OUT" 2>"$ERR"; RC=$?
 }
 for src in startup resume clear compact; do
-  new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+  newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
   cwt on --compact-now --yes
   runhook compact-now-release-start "{\"hook_event_name\":\"SessionStart\",\"source\":\"$src\"}"
-  eq "S9: a SessionStart ($src) puts the trigger back: exit 0, nothing on stdout, the file byte for byte, the record gone" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$S" "$TMP/orig")|$(tstate)"
+  eq "S9: a SessionStart ($src) puts the trigger back: exit 0, nothing on stdout, the project's file byte for byte, the record gone" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$PL" "$TMP/orig")|$(tstate)"
 done
-new_home; printf '%s' "$PRETTY" >"$S"; cp "$S" "$TMP/orig"
+newp; putl "$PRETTY"; cp "$PL" "$TMP/orig"
 cwt on --compact-now --yes
 runhook compact-now-release-precompact '{"hook_event_name":"PreCompact","trigger":"auto"}'
-eq "S9: a PreCompact (before the summary is written) puts it back: exit 0, nothing on stdout, the file byte for byte" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$S" "$TMP/orig")|$(tstate)"
+eq "S9: a PreCompact (before the summary is written) puts it back: exit 0, nothing on stdout, the project's file byte for byte" "0|0|yes|0" "$RC|$(nbytes "$OUT")|$(yn same "$PL" "$TMP/orig")|$(tstate)"
 runhook compact-now-release-start '{"hook_event_name":"SessionStart","source":"startup"}'
 eq "S9: a hook with nothing armed is a quiet no-op" "0|0|0" "$RC|$(nbytes "$OUT")|$(nbytes "$ERR")"
-new_home; printf '%s' "$PRETTY" >"$S"
+newp; putl "$PRETTY"
 cwt on --compact-now --yes
 printf 'compact-now-release-start\n' >"$H/.heimdall/hooks-disabled"
 runhook compact-now-release-start '{"hook_event_name":"SessionStart","source":"startup"}'
@@ -1032,8 +1132,9 @@ cwt off --compact-now --yes
 
 cw --help
 chk "S10: --help documents --compact-now, release and revoke" sh -c "grep -qF -- '--compact-now' '$OUT' && grep -qF 'release' '$OUT' && grep -qF 'revoke' '$OUT'"
-new_home; printf '%s' "$PRETTY" >"$S"
-cwt on --compact-now --yes; cw status
+chk "S10: --help says the trigger lives in the project's .claude/settings.local.json" grep -qF -- ".claude/settings.local.json" "$OUT"
+newp; putl "$PRETTY"
+cwt on --compact-now --yes; cwp status
 eq "S10: status after a yes: the consent row says it was given, the window row says nothing of hmd" "1|0" "$(grep '^consent' "$OUT" | grep -c 'given')|$(grep '^window' "$OUT" | grep -c 'set by hmd')"
 cwt off --compact-now --yes
 
