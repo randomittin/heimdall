@@ -278,9 +278,9 @@ def run(argv, cwd, timeout, env=None):
     return done.returncode, done.stdout.decode("utf-8", "replace"), done.stderr.decode("utf-8", "replace")
 
 
-def last_line(text):
+def last_line(text, cap=200):
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-    return clean(lines[-1], 200) if lines else ""
+    return clean(lines[-1], cap) if lines else ""
 
 
 def checkpoint_pass(root, note):
@@ -448,7 +448,8 @@ def arm_compaction(root):
         warn("[heimdall-continue] auto-compact NOT armed: it needs the person's yes once for this repository (it adds env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE to this repository's .claude/settings.local.json for a few minutes and puts "
              "it back by itself; no other repository is touched). Ask them; on yes run `%s on --compact-now --yes`, which arms it now and is not asked again in this repository. Until then the /compact line below is the way" % tool)
         return False
-    warn("[heimdall-continue] auto-compact not armed (%s); the /compact line below is the way" % (last_line(err) or "exit %d" % rc))
+    # the reason names a settings path before saying why it was left alone, so a 200-character cut could drop the why: keep the whole sentence
+    warn("[heimdall-continue] auto-compact not armed (%s); the /compact line below is the way" % (last_line(err, 800) or "exit %d" % rc))
     return False
 
 

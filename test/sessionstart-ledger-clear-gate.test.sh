@@ -460,12 +460,18 @@ fi
 #                                           agents-auto-prune` (or `hmd guardrails off
 #                                           agents-auto-prune`), covered by
 #                                           test/agents-auto-prune.test.sh.
+#   18 (2.4.16) compact-now-release-start — a session that starts releases any
+#                                           --compact-now arming left in a settings
+#                                           file (heimdall-compact-window release),
+#                                           so a trigger armed by /hmd:save never
+#                                           outlives the session it was meant for.
+#                                           Covered by test/heimdall-compact-window.test.sh.
 # ══════════════════════════════════════════════════════════════════════════
 SS_COUNT="$(jq '.hooks.SessionStart | length' "$HOOKS_JSON")"
-if [ "$SS_COUNT" -eq 17 ]; then
-  ok "G9 all 17 SessionStart entries still present"
+if [ "$SS_COUNT" -eq 18 ]; then
+  ok "G9 all 18 SessionStart entries still present"
 else
-  bad "G9 expected 17 SessionStart entries, found $SS_COUNT"
+  bad "G9 expected 18 SessionStart entries, found $SS_COUNT"
 fi
 
 # The caveman `rules` entry specifically: it is the ONLY thing that puts hmd's
