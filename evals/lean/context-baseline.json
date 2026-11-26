@@ -1,20 +1,20 @@
 {
-  "digest": "eabf88436aa447268587c3205dae2710fd562e90ac737b0a7c22ec4233de976a",
+  "digest": "929310ac14778f66ab685d22f42a38e62312f323dd136ae3e14beb63030946d7",
   "info": {
     "git_trees": {
       "agents": "c38b8a6e3cb3c115de2a1688ffd5b41dc7d74e2a",
       "commands": "35806076db491d49d6d9f3942b15bccd38841223",
-      "hooks": "a6562c56766a71d60cc2c2b7f29688eb8ceaa901",
+      "hooks": "d1cc7c08520ffe47a26ee81b01c65a9f08a54208",
       "settings.json": "a801e6987fbbc30fb191d45da20e52b211cf767f",
       "skills": "08948eb622334057b5d11e9393d21255656207de"
     },
-    "recorded_utc": "2026-11-25T21:07:33Z",
+    "recorded_utc": "2026-11-26T18:49:11Z",
     "summary": {
       "agents": 17,
       "bytes": 659674,
       "commands": 20,
       "hooks_run": 17,
-      "hooks_skipped": 8,
+      "hooks_skipped": 9,
       "skill_files": 37
     },
     "tool": "bin/lib/lean_context_parity.py"
@@ -747,11 +747,18 @@
           "bytes": 0,
           "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         }
+      },
+      "UserPromptSubmit/07-compact-now-expiry-prompt": {
+        "command_sha256": "516cf0b30105fc213d1a08627fd429a0f881fdb7b64990c295642a343b080791",
+        "id": "compact-now-expiry-prompt",
+        "matcher": null,
+        "run": false,
+        "skipped": "not vetted for sandbox execution"
       }
     },
     "hooks_json": {
       "hooks/hooks.json": {
-        "bytes": 41425,
+        "bytes": 42939,
         "events": {
           "PostToolUse": 8,
           "PostToolUseFailure": 1,
@@ -759,11 +766,11 @@
           "PreToolUse": 11,
           "SessionEnd": 3,
           "SessionStart": 18,
-          "Stop": 7,
+          "Stop": 8,
           "SubagentStop": 4,
-          "UserPromptSubmit": 7
+          "UserPromptSubmit": 8
         },
-        "sha256": "5ae1781f925a77e8dd8ecfa887c56a6ffe944edbf9e7655fef0245c74829c4f0"
+        "sha256": "85d7cb84a6068ab12dc2d6a255bc4700ecb758eedacfe4faf37fbf37a9e0f989"
       }
     },
     "settings": {
