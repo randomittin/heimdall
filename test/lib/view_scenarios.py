@@ -543,8 +543,10 @@ def g_size(st):
           "size: sealed plain (a phone without z-zlib) the whole frame is still under the 1 MiB envelope cap", plain and plain["envelope_bytes"])
     before = st.phone.mark()
     st.phone.resync(VP.FULL_CAPS)
-    squeezed = st.phone.state(lambda s: ((s.get("views") or {}).get("result") or {}).get("id") == (wide or {}).get("id"), since=before)
-    check(squeezed is not None and plain is not None and squeezed["z"] is True and squeezed["envelope_bytes"] < plain["envelope_bytes"],
+    # a plain frame the client already had in flight may still land after `before`: only a compressed one answers the resync
+    squeezed = st.phone.wait(lambda f: f["type"] == "state" and f["z"] and ((f["body"]["state"].get("views") or {}).get("result") or {}).get("id") == (wide or {}).get("id"),
+                             since=before)
+    check(squeezed is not None and plain is not None and squeezed["envelope_bytes"] < plain["envelope_bytes"],
           "size: for a phone that listed z-zlib the same frame goes out zlib-compressed and smaller", squeezed and squeezed["envelope_bytes"])
     for i in range(2100):  # staged, not modified: the index against HEAD is the cheap diff, and git's speed is not what is tested
         r.write("many/f%04d.txt" % i, "v%d\n" % i)
