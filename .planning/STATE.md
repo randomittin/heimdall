@@ -1,9 +1,9 @@
-# State — 2026-10-23
+# State — 2026-11-26
 
-- **Phase:** idle — released 2.4.10 everywhere; awaiting operator GTM review.
-- **Done:** 2.4.8 (2be30a44), 2.4.9 (3afb282d), 2.4.10 (1a3f80e6); release-loop enforcement (d9c006a9, e82a7a72, 1604cf84); /hmd:continue; SessionEnd hooks detached.
+- **Phase:** idle — 2.4.16 released (GitHub ccb9d1b1, site e3ed900); npm pending operator.
+- **Done:** 2.4.14 (save absorbs continue; compact-window --bash-cap; ship.sh pins site), 2.4.15 (ship fetch guard, relay-client shutdown join + ghost fix 522e3019, journal prefix, read-dedup outline), 2.4.16 (/hmd:save auto-compacts via project .claude/settings.local.json trigger; sweep reds fixed eb4ca8de, 97aa9527).
 - **In progress:** none.
-- **Next:** (1) GTM review of docs/GTM-2.4.x.md [operator, hard gate]; (2) ship.sh commits site page pins itself; (3) 3.x M1 skill registry (no behaviour change, no release before GTM review); (4) .planning/BACKLOG.md.
-- **Blockers:** GTM review gates any new version.
-- **Decisions:** one review per release, only BLOCKER/HIGH block, MEDIUM/LOW→backlog, one sweep last, --failed after red (enforced by hooks + heimdall-findings); pairing default-ON with gh token only to built-in/approved relay; operator opt-out read from real ~/.heimdall.
-- **Key files:** test/run-all.sh, bin/lib/suite_closure.py, release/ship.sh, hooks/hooks.json, bin/heimdall-app, bin/lib/hmd_pair_optin.py, bin/lib/hmd_relay_approval.py, bin/lib/hmd_nofollow_write.py, bin/lib/hmd_sweep_guard.py, bin/heimdall-findings, bin/heimdall-continue, CLAUDE.md.
+- **Next:** operator npm publish 2.4.16; operator live /hmd:save auto-compact test; backlog (compact-now expiry check on UserPromptSubmit/Stop MEDIUM; 2.4.15 LOWs).
+- **Blockers:** disk ~10.1% free = at hook floor; sweeps need inline HMD_MIN_FREE_PCT=8.
+- **Decisions:** compact-now arms project settings.local.json only (review HIGH), consent per repo; release path = one review, cached sweep, --failed after red.
+- **Key files:** bin/heimdall-compact-window, bin/lib/hmd_continue.py, commands/save.md, hooks/hooks.json, release/ship.sh, test/lib/view_scenarios.py.

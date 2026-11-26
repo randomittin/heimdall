@@ -108,3 +108,5 @@
 - DONE in 2.4.15 (close): site push safety (ship.sh:818/826), app-session-revoke-race (real relay-client race), journal subject nesting, outline numbering, save.md staging/alias/paste prompt, compact-window `{}` leftover.
 
 - [x] DONE (2.4.16, wait for the zlib frame as the transcript twin does) LOW (2.4.16 sweep): companion-view `size: for a phone that listed z-zlib the same frame goes out zlib-compressed and smaller` failed twice inside the 4-job sweep (parallel + retry), 159/0 solo right after. Likely the `st.phone.state(...)` wait for the resync frame timing out under load (squeezed=None). Fix: count frames/steps instead of a wall-clock wait, or widen the wait in test/lib/view_scenarios.py:546.
+
+- [ ] LOW (2.4.16): disk-floor hook treats a `*.test.sh` path inside heredoc TEXT (e.g. a /hmd:save note naming a suite) as a test run and denies the call. Match only an executed command word, not quoted/heredoc data.
