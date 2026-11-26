@@ -117,3 +117,7 @@
 - [ ] LOW (2.4.17): release/lean-budget.json + lean-install-budget.json red on 9/48 metrics (hooks_total 63 vs ceiling 59); no gate enforces. Raise ceilings deliberately or cut hooks.
 - [ ] LOW (2.4.17): rc_flatten joins record fields with no separator on macOS BSD sed → 'Held branches' runs together in CHECKPOINT.md.
 - [ ] LOW (2.4.17): precompact checkpoint still >8 s under load avg ~100+; open-agents probe (4 s cap) is the critical-path floor.
+- [ ] MEDIUM (2.4.17 review): compact-window `undo` does not recheck expiry (release-expired) or arm_id (watch timer) after reload → a re-arm landing between list and undo is released early. Pass expired_by/arm_id into undo; no-op unless still matching.
+- [ ] MEDIUM (2.4.17 review): heimdall-checkpoint `_probe_gate` 3 s cap now runs alongside 8 git jobs → gate field reads NOT-EVALUATED under load. Start it after `_scan_worktrees` or give it its own cap.
+- [ ] LOW (2.4.17 review): corrupt `*.compact-now.state.json` passes the hook ls fast-path → python launch every prompt/turn end, never cleared. Drop unparseable records.
+- [ ] LOW (2.4.17 review): heimdall-checkpoint `_scratch_close` does not kill background probe pids → probes outlive a killed writer; rm -rf can race a `.part` write. Track pids, kill in trap; chain any prior EXIT trap.
