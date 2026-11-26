@@ -3420,6 +3420,26 @@ EOF
     [ "$#" -gt 0 ] || set -- scan
     exec "$SCAN_529_BIN" "$@"
     ;;
+  portable-brief)
+    # Pass-through to bin/heimdall-portable-brief: turns .planning/CHECKPOINT.md
+    # into a scrubbed, size-bounded brief for a fallback (possibly non-Claude)
+    # model. It only writes/prints the brief and NEVER transmits it; sending it
+    # anywhere stays a human or routing-layer decision. Its only mentions were
+    # docs, so heimdall-deadcode reported it DEAD and its
+    # bin/lib/reachability-exemptions.tsv row expired 2026-11-26; install.sh puts
+    # only `hmd`/`heimdall` on PATH, so an installed operator could not run it at
+    # all. A bare `hmd portable-brief` defaults to `build` (the tool's one verb);
+    # every explicit arg list forwards verbatim.
+    shift
+    PORTABLE_BRIEF_BIN="$PLUGIN_DIR/bin/heimdall-portable-brief"
+    if [ ! -x "$PORTABLE_BRIEF_BIN" ]; then
+      echo "  Error: heimdall-portable-brief not found at $PORTABLE_BRIEF_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    [ "$#" -gt 0 ] || set -- build
+    exec "$PORTABLE_BRIEF_BIN" "$@"
+    ;;
   board)
     # Pass-through to bin/heimdall-board: the live TEAM WALL — presence x claims x
     # tasks x gate, JOINed from the stores that already compute each (heimdall-who,
