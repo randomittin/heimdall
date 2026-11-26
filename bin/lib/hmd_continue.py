@@ -20,7 +20,10 @@ Usage:
         Inside a Claude Code session (CLAUDE_CODE_SESSION_ID) it then also tries to ARM the compaction (above), so the person pastes nothing: only when the
         checkpoint was saved and the handoff will be re-injected (compacting without it would lose the thread), and never with --no-compact. Arming
         is best-effort and changes neither the exit status nor the last line: a missing yes, an old build, automatic compaction off, a value of the person's own
-        all say why on stderr and leave the line as the way.
+        all say why on stderr and leave the line as the way. Armed, the line above the /compact line also says how long the arming lasts and until when (read from
+        compact-window's own end time) and that any session starting or compacting anywhere releases it sooner: a release leaves no record (compact-window deletes it
+        when it puts the trigger back), so nothing after the save can tell the person it happened, and they are told up front what the arming depends on and that
+        the paste is the way if it was released.
   heimdall-continue focus
         the note on stdin; prints the `/compact <focus>` line and nothing else (no checkpoint, nothing written).
   heimdall-continue inject [--repo DIR] [--source S]
@@ -97,6 +100,8 @@ INJECT_CAP = 9000  # chars of additionalContext (the harness caps hook context a
 DEFAULT_WINDOW_MIN = 30
 CW_NAME = "heimdall-compact-window"  # the tool that arms Claude Code's own auto-compact (a sibling of this launcher's bin directory)
 CW_BUDGET_S = 30  # `on --compact-now` may ask the session's binary for its version (10 s) and start the expiry timer
+UNTIL_RE = re.compile(r"\bor at \d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})Z \((\d+) s\)")  # the end of the arming as `on --compact-now` prints it: "... or at 2026-11-26T18:32:20Z (300 s); by hand: ..."
+RELEASED_SOONER = "any session starting or compacting anywhere releases it sooner"  # compact-window's `release` runs on every SessionStart and every PreCompact, in any repository
 SKEW_S = 120  # a clock this far ahead still reads as now; further is a planted date
 MAX_FILE = 1 << 20
 MAX_NOTE = 1 << 16
@@ -430,27 +435,37 @@ def cmd_focus(args):
     return OK
 
 
+def end_of(line):
+    """(how long the arming lasts, the UTC clock time it ends) as `on --compact-now` printed them in `line` ("... or at 2026-11-26T18:32:20Z (300 s); ..."): ("5 min", "18:32:20"). ("a few minutes", "") when the
+    line has no end in that form: the arming is still announced, only without a time. The tool prints the seconds left, 299 when the clock ticked between its two reads, so a minute count is the nearest one."""
+    found = UNTIL_RE.search(line)
+    if found is None:
+        return "a few minutes", ""
+    seconds = int(found.group(2))
+    return ("%d s" % seconds if seconds < 90 else "%d min" % ((seconds + 30) // 60)), found.group(1)
+
+
 def arm_compaction(root):
-    """Ask bin/heimdall-compact-window to arm Claude Code's own auto-compact (the transient `on --compact-now` change, put back by itself) so the person pastes nothing. True when it is armed. Says
-    what happened: on stdout when armed, on stderr when not, with the exact command to run when the only thing missing is the person's yes."""
+    """Ask bin/heimdall-compact-window to arm Claude Code's own auto-compact (the transient `on --compact-now` change, put back by itself) so the person pastes nothing. (how long it lasts, when it ends: end_of) when it is armed,
+    None when it is not. Says what happened: on stdout when armed, on stderr when not, with the exact command to run when the only thing missing is the person's yes."""
     tool = sibling(CW_NAME)
     if tool is None:
         warn("[heimdall-continue] auto-compact not armed: bin/%s was not found beside this tool; the /compact line below is the way" % CW_NAME)
-        return False
+        return None
     rc, out, err = run([tool, "on", "--compact-now"], root, CW_BUDGET_S)
     if rc == 0:
         said = [ln.strip() for ln in out.split("\n") if ln.strip()]
         say("[heimdall-continue] auto-compact armed: Claude Code compacts on its next request and the handoff comes back by itself")
         if said:
             say("[heimdall-continue] %s" % clean(said[-1], 400))
-        return True
+        return end_of(said[-1] if said else "")
     if rc == 3:
         warn("[heimdall-continue] auto-compact NOT armed: it needs the person's yes once for this repository (it adds env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE to this repository's .claude/settings.local.json for a few minutes and puts "
              "it back by itself; no other repository is touched). Ask them; on yes run `%s on --compact-now --yes`, which arms it now and is not asked again in this repository. Until then the /compact line below is the way" % tool)
-        return False
+        return None
     # the reason names a settings path before saying why it was left alone, so a 200-character cut could drop the why: keep the whole sentence
     warn("[heimdall-continue] auto-compact not armed (%s); the /compact line below is the way" % (last_line(err, 800) or "exit %d" % rc))
-    return False
+    return None
 
 
 def cmd_write(args):
@@ -482,7 +497,7 @@ def cmd_write(args):
              % ("; ".join(holds), REL, NAME))
     else:
         say("[heimdall-continue] it is re-injected once, after the first compaction within %d min" % window)
-    armed = False
+    armed = None   # (how long it lasts, when it ends) once the compaction is armed
     if args.no_compact or not os.environ.get("CLAUDE_CODE_SESSION_ID"):
         pass   # asked to only save, or not inside a Claude Code session: there is nothing to compact
     elif problems or holds or window == 0:
@@ -491,7 +506,9 @@ def cmd_write(args):
         armed = arm_compaction(root)
     line = focus_line(note)
     if armed:
-        say("[heimdall-continue] auto-compact is armed; if it has not started, paste to compact with the thread kept (%d of %d chars; only you can run /compact):" % (len(line), LINE_CAP))
+        span, until = armed
+        say("[heimdall-continue] auto-compact is armed for %s (%s%s): if it was released or has not started, paste to compact with the thread kept (%d of %d chars; only you can run /compact):"
+            % (span, "until %s UTC; " % until if until else "", RELEASED_SOONER, len(line), LINE_CAP))
     else:
         say("[heimdall-continue] paste to compact with the thread kept; ignore to just save (%d of %d chars; only you can run /compact):" % (len(line), LINE_CAP))
     say(line)
