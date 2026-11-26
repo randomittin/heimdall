@@ -483,6 +483,8 @@ fi
 # one takes about 4 s a run and is exercised by 3a-3p): `note` succeeds, `write` leaves a CHECKPOINT.md with the six fields hmd_continue reads back. The Claude Code session is in the environment (CLAUDE_CODE_SESSION_ID), the build
 # is one that takes the override back, no expiry timer is started, and the settings are scratch ones: nothing here reads or writes the real ~/.claude. The arming goes to THIS repository's .claude/settings.local.json (the project
 # the call sits in: the scratch project), never to the user-level settings.json (SETF), which every session on the machine reads: every case checks that file was not written.
+# 3r2, 3s2-3s4, 3z2: nothing after step 7 can see an arming being released (its record is deleted when it is put back), so the person is told up front how long it lasts and what releases it sooner, and
+# step 7 of commands/save.md reads the one signal there is, the `trigger` row of `status`: `expires at` while it holds, `not armed` once anything released it, `EXPIRED at` (still with `set by hmd`) once its time is up.
 echo "3q-3z. write arms the auto-compact"
 ARMT="$TMPROOT/armtree"; mkdir -p "$ARMT/bin/lib"
 cp "$CONT" "$ARMT/bin/heimdall-continue"; cp "$REPO/bin/heimdall-compact-window" "$ARMT/bin/heimdall-compact-window"
@@ -517,6 +519,13 @@ except OSError:
     e = None
 print(json.dumps(e["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) if isinstance(e, dict) and "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in e else "ABSENT")' "$(projf)"; }
 line_ok() { [ -n "$ALINE" ] && [ "$(grep -cE '^/compact ' "$TMPROOT/aout")" = "1" ] && [ "$(tail -n 1 "$TMPROOT/aout")" = "$ALINE" ] && [ "${#ALINE}" -le 1500 ]; }
+trig_row() { # [VAR=value ...]: the `trigger` row `heimdall-compact-window status` prints for PROJ -- the row step 7 of commands/save.md tells the model to read
+  ( cd "$PROJ" && env "${CWENV[@]}" "$@" "$ARMT/bin/heimdall-compact-window" status 2>/dev/null | grep '^trigger' )
+}
+aexpl()    { tail -n 2 "$TMPROOT/aout" | sed -n 1p; }   # the explanation line, right above the /compact line
+end_said() { sed -n -E 's/.*\(until ([0-9]{2}:[0-9]{2}:[0-9]{2}) UTC;.*/\1/p'; }   # stdin: the explanation line -> the end time it tells the person
+end_kept() { sed -n -E 's/.*expires at [0-9]{4}-[0-9]{2}-[0-9]{2}T([0-9]{2}:[0-9]{2}:[0-9]{2})Z.*/\1/p'; }   # stdin: the trigger row -> the end time the tool really keeps
+unarm() { env "${CWENV[@]}" "$ARMT/bin/heimdall-compact-window" release >/dev/null 2>&1; }   # what any session start runs
 WEXTRA=""
 
 rm -f "$SETF"; PROJ="$(mk_project arm1)"; awrite
@@ -529,16 +538,54 @@ fi
 
 PROJ="$(mk_project arm2)"; give_yes; awrite
 if [ "$ARC" = "0" ] && [ "$(trigger_val)" = '"1"' ] && [ ! -e "$SETF" ] && line_ok && grep -qF 'auto-compact armed' "$TMPROOT/aout" && ! grep -qF 'NOT armed' "$TMPROOT/aerr" \
-   && tail -n 2 "$TMPROOT/aout" | sed -n 1p | grep -qF 'auto-compact is armed; if it has not started, paste to compact with the thread kept'; then
+   && tail -n 2 "$TMPROOT/aout" | sed -n 1p | grep -qF 'auto-compact is armed for '; then
   ok "3r. with the person's yes on record for this repository: write arms the PROJECT's .claude/settings.local.json (env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is \"1\"), never the user-level settings.json, exits 0, says so, and the /compact line stays the last line as the fallback with its own explanation"
 else
   bad "3r. a write with a yes on record did not arm cleanly (rc=$ARC, trigger=$(trigger_val), user-level file written: $([ -e "$SETF" ] && echo yes || echo no)): $(head -c 300 "$TMPROOT/aout") // $(head -c 300 "$TMPROOT/aerr")"
+fi
+# 3r2. armed: the person is told how long the arming lasts and what releases it sooner, and the end time is the one the tool really keeps (the `expires at` of the status row, which 3s2 pins), not a constant
+AEXPL="$(aexpl)"; ROW="$(trig_row)"
+if printf '%s\n' "$AEXPL" | grep -qE '^\[heimdall-continue\] auto-compact is armed for 5 min \(until [0-9]{2}:[0-9]{2}:[0-9]{2} UTC; any session starting or compacting anywhere releases it sooner\): if it was released or has not started, paste to compact with the thread kept \([0-9]+ of 1500 chars; only you can run /compact\):$' \
+   && [ -n "$(printf '%s\n' "$AEXPL" | end_said)" ] && [ "$(printf '%s\n' "$AEXPL" | end_said)" = "$(printf '%s\n' "$ROW" | end_kept)" ]; then
+  ok "3r2. armed: the line above the /compact line says how long the arming lasts (5 min) and until when (the end time the tool keeps, the one status shows), that any session starting or compacting anywhere releases it sooner, and that the paste is the way if it was released"
+else
+  bad "3r2. the armed explanation lacks the duration, the real end time or the release conditions: '$AEXPL' / status row '$ROW'"
 fi
 CLAUDE_CONFIG_DIR="$CFGDIR" "$ARMT/bin/heimdall-compact-window" release >"$TMPROOT/rout" 2>&1; rrc=$?
 if [ "$rrc" = "0" ] && [ ! -s "$TMPROOT/rout" ] && [ ! -e "$(projf)" ] && [ ! -d "$PROJ/.claude" ] && [ ! -e "$SETF" ]; then
   ok "3s. release (what the hooks run) puts it back, from any directory: exit 0, nothing printed, the settings file hmd made for it gone again, and the .claude directory it made with it"
 else
   bad "3s. release did not put the trigger back (rc=$rrc, project file: $(cat "$(projf)" 2>/dev/null | head -c 200)): $(head -c 200 "$TMPROOT/rout")"
+fi
+
+# 3s2. the signal step 7 reads, in the other two states: `not armed` once anything released the arming (3s just did), and `EXPIRED at` once its time is up before any timer ran (none is started here) -- with
+# `set by hmd` still in that row, which is why `set by hmd` alone cannot mean "still armed". The end time is in the past by construction, so a slow machine only makes it more expired.
+ROW_RELEASED="$(trig_row)"
+PROJ="$(mk_project arm10)"; give_yes; awrite HEIMDALL_COMPACT_NOW_TTL_S=1; sleep 2.2; ROW_EXPIRED="$(trig_row)"; unarm
+if printf '%s\n' "$ROW_RELEASED" | grep -qF 'not armed' && ! printf '%s\n' "$ROW_RELEASED" | grep -qE 'expires at|EXPIRED|set by hmd' \
+   && printf '%s\n' "$ROW_EXPIRED" | grep -qF 'EXPIRED at' && printf '%s\n' "$ROW_EXPIRED" | grep -qF 'set by hmd' && ! printf '%s\n' "$ROW_EXPIRED" | grep -qF 'expires at'; then
+  ok "3s2. the status row step 7 reads: 'not armed' once anything released the arming, 'EXPIRED at' (still 'set by hmd', and no 'expires at') once its time is up with no timer having run"
+else
+  bad "3s2. the trigger row of status is not what step 7 tells the model to read: released='$ROW_RELEASED' expired='$ROW_EXPIRED'"
+fi
+
+# 3s3. the duration the person is told is the real one, not a constant: a 30-minute arming (HEIMDALL_COMPACT_NOW_TTL_S=1800) is announced as 30 min, and its end time still matches status
+PROJ="$(mk_project arm11)"; give_yes; awrite HEIMDALL_COMPACT_NOW_TTL_S=1800; AEXPL="$(aexpl)"; ROW="$(trig_row)"; unarm
+if [ "$ARC" = "0" ] && printf '%s\n' "$AEXPL" | grep -qF 'auto-compact is armed for 30 min (until ' && [ -n "$(printf '%s\n' "$AEXPL" | end_said)" ] \
+   && [ "$(printf '%s\n' "$AEXPL" | end_said)" = "$(printf '%s\n' "$ROW" | end_kept)" ]; then
+  ok "3s3. a 30-minute arming is announced as 30 min, with the end time status shows"
+else
+  bad "3s3. the announced duration or end time is not the real one (rc=$ARC): '$AEXPL' / status row '$ROW'"
+fi
+
+# 3s4. a compact-window whose line about when it puts the trigger back has no end this tool can read: the arming is still announced, as lasting a few minutes, with the same release conditions and the paste as the way
+ARMT2="$TMPROOT/armtree2"; cp -R "$ARMT" "$ARMT2"
+printf '#!/usr/bin/env bash\necho "armed: stand-in"\necho "In this project only: it is put back by itself at some point"\n' >"$ARMT2/bin/heimdall-compact-window"; chmod +x "$ARMT2/bin/heimdall-compact-window"
+PROJ="$(mk_project arm12)"; note_of | env "${CWENV[@]}" "$ARMT2/bin/heimdall-continue" write --repo "$PROJ" >"$TMPROOT/aout" 2>"$TMPROOT/aerr"; ARC=$?
+if [ "$ARC" = "0" ] && aexpl | grep -qF 'auto-compact is armed for a few minutes (any session starting or compacting anywhere releases it sooner): if it was released or has not started, paste to compact with the thread kept ('; then
+  ok "3s4. no readable end in the tool's line: still announced as lasting a few minutes, with the release conditions and the paste as the way"
+else
+  bad "3s4. the fallback explanation is wrong (rc=$ARC): '$(aexpl)' // $(head -c 200 "$TMPROOT/aerr")"
 fi
 
 PROJ="$(mk_project arm3)"; give_yes; WEXTRA="--no-compact"; awrite; WEXTRA=""
@@ -596,6 +643,17 @@ if grep -qF -- '--no-compact' "$CMD" && grep -qF 'on --compact-now --yes' "$CMD"
   ok "3z. commands/save.md tells the model about --no-compact and the one question that precedes arming (with the command to run on yes), says the arming affects sessions in this repository only and never names the user-level file, tells it to check status and say plainly when the arming was released before the compaction, and keeps the armed file out of the checkpoint commit"
 else
   bad "3z. commands/save.md does not document --no-compact, the per-repository consent question and its command, the status check and the released-before-compaction message, or the commit exclusion"
+fi
+# 3z2. step 7 names the three states of the status row exactly as the real tool prints them (3r2 and 3s2 pin those), tells the person up front what the arming depends on, and no longer takes `set by hmd`
+# (which an EXPIRED row carries too) for "still armed"
+STEP7="$(awk '/^### 7\. /{on=1} /^## When it does not go cleanly/{on=0} on' "$CMD")"
+if [ -n "$STEP7" ] && printf '%s\n' "$STEP7" | grep -qF 'heimdall-compact-window" status' \
+   && printf '%s\n' "$STEP7" | grep -qF '`expires at <time>`' && printf '%s\n' "$STEP7" | grep -qF '`EXPIRED at <time>`' && printf '%s\n' "$STEP7" | grep -qF '`not armed`' \
+   && printf '%s\n' "$STEP7" | grep -qF 'Compacting automatically if your next message comes before' && printf '%s\n' "$STEP7" | grep -qF 'another session starts or compacts first' \
+   && printf '%s\n' "$STEP7" | grep -qF 'released before the compaction began' && ! printf '%s\n' "$STEP7" | grep -qF 'says `set by hmd`'; then
+  ok "3z2. step 7 of commands/save.md reads the status row by its three states (expires at / EXPIRED at / not armed), tells the person the deadline and that another session starting or compacting first releases it, and does not take 'set by hmd' for still armed"
+else
+  bad "3z2. step 7 of commands/save.md does not name the status row states, the deadline message or the release by another session (section found: $([ -n "$STEP7" ] && echo yes || echo no))"
 fi
 
 # ── helpers for the hook and the helper cases (P holds a fresh, recorded, untracked handoff from the real write) ─
