@@ -86,6 +86,7 @@ authenticity-check
 queue
 quota-advisor
 529-scan
+portable-brief
 board
 ast
 md
